@@ -1,9 +1,11 @@
 import logging
+import importlib
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 import time
 
-from .config import SUMMARY_LOG_CHARS, TEST_MODE
+from .config import ALERT_CALLABLE, SUMMARY_LOG_CHARS, SUMMARIZER_CALLABLE, TEST_MODE
+from .summarizer import do_summary as default_do_summary
 from .trace import log_event
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,83 @@ def _extract_batch_summaries(summary_result: Any, fallback_text: str) -> List[st
     if normalized:
         return normalized
     return [fallback_text] if fallback_text else []
+
+
+def _load_callable(path: str) -> Callable[..., Any]:
+    if ":" in path:
+        module_path, attr_name = path.split(":", 1)
+    else:
+        module_path, attr_name = path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    fn = getattr(module, attr_name, None)
+    if fn is None or not callable(fn):
+        raise ValueError(f"Callable '{path}' не найден или не является callable")
+    return fn
+
+
+def _call_summarizer_adapter(
+    fn: Callable[..., Any],
+    *,
+    period_start_dt: datetime,
+    period_end_dt: datetime,
+    anomaly: Dict[str, Any],
+) -> Any:
+    attempts = [
+        {
+            "period_start": period_start_dt.isoformat(),
+            "period_end": period_end_dt.isoformat(),
+            "anomaly": anomaly,
+        },
+        {
+            "start_dt": period_start_dt,
+            "end_dt": period_end_dt,
+            "anomaly": anomaly,
+        },
+        {
+            "start_dt": period_start_dt,
+            "end_dt": period_end_dt,
+        },
+    ]
+    last_error: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            return fn(**kwargs)
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return fn()
+
+
+def _call_alert_adapter(
+    fn: Callable[..., Any],
+    *,
+    alert_text: str,
+    summary: str,
+    anomaly: Dict[str, Any],
+) -> Any:
+    attempts = [
+        {
+            "summary_text": alert_text,
+            "summary": summary,
+            "anomaly": anomaly,
+        },
+        {
+            "summary_text": alert_text,
+        },
+        {
+            "message": alert_text,
+        },
+    ]
+    last_error: Optional[Exception] = None
+    for kwargs in attempts:
+        try:
+            return fn(**kwargs)
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return fn(alert_text)
 
 
 def process_anomalies(
@@ -245,9 +324,7 @@ def process_anomalies(
                     },
                 )
             else:
-                from llm_log_summarizer import do_summary
-                from make_alert import make_alert
-                # Генерируем summary логов через существующий суммаризатор
+                # Генерируем summary логов через адаптер из env или существующий суммаризатор
                 logger.info(
                     "do_summary.start: anomaly_ts=%s, window_start=%s, window_end=%s",
                     timestamp_str,
@@ -263,9 +340,21 @@ def process_anomalies(
                     },
                 )
                 t0 = time.time()
-                summary_result = do_summary.do_summary(
-                    start_dt=period_start, end_dt=period_end
-                )
+                if SUMMARIZER_CALLABLE:
+                    logger.info("Using custom summarizer callable: %s", SUMMARIZER_CALLABLE)
+                    summarizer_fn = _load_callable(SUMMARIZER_CALLABLE)
+                    summary_result = _call_summarizer_adapter(
+                        summarizer_fn,
+                        period_start_dt=period_start,
+                        period_end_dt=period_end,
+                        anomaly=anomaly,
+                    )
+                else:
+                    summary_result = default_do_summary(
+                        start_dt=period_start,
+                        end_dt=period_end,
+                        anomaly=anomaly,
+                    )
                 elapsed = time.time() - t0
 
                 # Извлекаем итоговый summary
@@ -358,7 +447,19 @@ def process_anomalies(
                         "mode": "real",
                     },
                 )
-                alert_result = make_alert(summary_text=alert_text)
+                if ALERT_CALLABLE:
+                    logger.info("Using custom alert callable: %s", ALERT_CALLABLE)
+                    alert_fn = _load_callable(ALERT_CALLABLE)
+                    alert_result = _call_alert_adapter(
+                        alert_fn,
+                        alert_text=alert_text,
+                        summary=summary,
+                        anomaly=anomaly,
+                    )
+                else:
+                    from .alerts import make_alert
+
+                    alert_result = make_alert(alert_text)
                 result["alert_result"] = alert_result
                 log_event(logger, "process_anomalies.alert_sent", index=i, alert_result=alert_result)
                 _emit(

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
+from .actuals import fetch_actual_metrics_df
 from .api_client import build_api_response
 from .anomaly_detectors import get_anomaly_detector
 from .config import (
@@ -33,7 +34,6 @@ from .config import (
 from .logging_config import configure_logging
 from .predictions_db import fetch_predictions_from_db
 from .processing import process_anomalies
-from .prometheus_io import fetch_prometheus_df
 from .test_mode import generate_mock_data
 from .trace import StageTimer, log_dataframe, log_event
 from .utils import to_iso_z
@@ -95,7 +95,7 @@ def run_loop(sleep_seconds: int = 60) -> None:
                         len(predictions_df),
                     )
                 else:
-                    actual_df = fetch_prometheus_df(
+                    actual_df = fetch_actual_metrics_df(
                         query=PROM_QUERY,
                         start_time=start_time,
                         end_time=end_time,

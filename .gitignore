@@ -27,9 +27,7 @@ coverage.xml
 .vscode/
 
 # Environment files
-.env
-.env.*
-!.env.example
+
 *.local
 
 # Runtime artifacts

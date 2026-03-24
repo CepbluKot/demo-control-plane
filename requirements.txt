@@ -6,3 +6,5 @@ urllib3
 prometheus-api-client
 streamlit
 SQLAlchemy
+clickhouse-connect
+clickhouse-sqlalchemy

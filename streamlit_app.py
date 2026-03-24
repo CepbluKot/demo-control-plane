@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+from control_plane.actuals import fetch_actual_metrics_df
 from control_plane.api_client import build_api_response
 from control_plane.anomaly_detectors import get_anomaly_detector
 from control_plane.config import (
@@ -18,12 +19,15 @@ from control_plane.config import (
     ANOMALY_IQR_WINDOW,
     ANOMALY_ZSCORE,
     ARTIFACTS_DIR,
+    CLICKHOUSE_HOST,
+    CLICKHOUSE_QUERY,
     DATA_LOOKBACK_MINUTES,
     FORECAST_METRIC_NAME,
     FORECAST_SERVICE,
     FORECAST_TYPE,
     LOGS_DIR,
     LOOPBACK_MINUTES,
+    METRICS_SOURCE,
     PLOTS_DIR,
     PROCESS_ALERTS,
     PREDICTION_KIND,
@@ -38,7 +42,6 @@ from control_plane.config import (
 from control_plane.logging_config import configure_logging
 from control_plane.predictions_db import fetch_predictions_from_db
 from control_plane.processing import process_anomalies
-from control_plane.prometheus_io import fetch_prometheus_df
 from control_plane.test_mode import generate_mock_data
 from control_plane.utils import to_iso_z
 from control_plane.visualization import visualize, visualize_combined
@@ -111,7 +114,7 @@ def run_single_iteration(
             lookahead_minutes=prediction_lookahead_minutes,
         )
     else:
-        actual_df = fetch_prometheus_df(
+        actual_df = fetch_actual_metrics_df(
             query=query,
             start_time=start_time,
             end_time=end_time,
@@ -423,9 +426,13 @@ def _render_anomaly_cards(
 
 def _ui_runtime_config() -> Dict[str, Any]:
     masked_password = "***" if bool(PROM_PASSWORD) else ""
+    ch_query = CLICKHOUSE_QUERY if len(CLICKHOUSE_QUERY) <= 140 else f"{CLICKHOUSE_QUERY[:140]}..."
     return {
         "CONTROL_PLANE_TEST_MODE": TEST_MODE,
+        "CONTROL_PLANE_METRICS_SOURCE": METRICS_SOURCE,
         "CONTROL_PLANE_PROM_QUERY": PROM_QUERY,
+        "CONTROL_PLANE_CLICKHOUSE_QUERY": ch_query,
+        "CONTROL_PLANE_CLICKHOUSE_HOST": CLICKHOUSE_HOST,
         "CONTROL_PLANE_ANOMALY_DETECTOR": ANOMALY_DETECTOR,
         "CONTROL_PLANE_DATA_LOOKBACK_MINUTES": DATA_LOOKBACK_MINUTES,
         "CONTROL_PLANE_PREDICTION_LOOKAHEAD_MINUTES": PREDICTION_LOOKAHEAD_MINUTES,
