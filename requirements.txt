@@ -1,0 +1,8 @@
+numpy
+pandas
+matplotlib
+requests
+urllib3
+prometheus-api-client
+streamlit
+SQLAlchemy

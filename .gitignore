@@ -1,0 +1,41 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Environment files
+.env
+.env.*
+*.local
+
+# Runtime artifacts
+artifacts/
+
+# Streamlit local config/secrets
+.streamlit/secrets.toml
+
+# Logs
+*.log
