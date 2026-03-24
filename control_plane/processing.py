@@ -9,6 +9,60 @@ from .trace import log_event
 logger = logging.getLogger(__name__)
 
 
+def _extract_batch_summaries(summary_result: Any, fallback_text: str) -> List[str]:
+    candidates: List[Any] = []
+    if isinstance(summary_result, dict):
+        for key in (
+            "map_summaries",
+            "batch_summaries",
+            "chunk_summaries",
+            "partial_summaries",
+            "map_results",
+            "chunks",
+        ):
+            value = summary_result.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+    else:
+        for key in (
+            "map_summaries",
+            "batch_summaries",
+            "chunk_summaries",
+            "partial_summaries",
+            "map_results",
+            "chunks",
+        ):
+            value = getattr(summary_result, key, None)
+            if isinstance(value, list):
+                candidates = value
+                break
+
+    normalized: List[str] = []
+    for item in candidates:
+        if isinstance(item, str):
+            normalized.append(item)
+            continue
+        if isinstance(item, dict):
+            text = (
+                item.get("summary")
+                or item.get("text")
+                or item.get("content")
+                or item.get("chunk_summary")
+                or item.get("map_summary")
+            )
+            if text:
+                normalized.append(str(text))
+            continue
+        text = getattr(item, "summary", None) or getattr(item, "text", None)
+        if text:
+            normalized.append(str(text))
+
+    if normalized:
+        return normalized
+    return [fallback_text] if fallback_text else []
+
+
 def process_anomalies(
     anomalies: List[Dict[str, Any]],
     lookback_minutes: int = 30,
@@ -84,6 +138,48 @@ def process_anomalies(
                         "mode": "mock",
                     },
                 )
+                _emit(
+                    "map_start",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "mock",
+                    },
+                )
+                test_batches = [
+                    f"[Batch 1] Подготовка контекста перед {timestamp_str}",
+                    f"[Batch 2] Аномальный рост метрики и сопутствующие события",
+                    f"[Batch 3] Краткий вывод по вероятной причине выброса",
+                ]
+                for batch_idx, batch_summary in enumerate(test_batches):
+                    _emit(
+                        "map_batch",
+                        {
+                            "index": i,
+                            "timestamp": timestamp_str,
+                            "mode": "mock",
+                            "batch_index": batch_idx,
+                            "batch_total": len(test_batches),
+                            "batch_summary": batch_summary,
+                        },
+                    )
+                _emit(
+                    "map_done",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "mock",
+                        "batch_total": len(test_batches),
+                    },
+                )
+                _emit(
+                    "reduce_start",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "mock",
+                    },
+                )
                 summary = (
                     "[TEST MODE] Summary for anomaly at "
                     f"{timestamp_str} (window {period_start.isoformat()}..{period_end.isoformat()})"
@@ -106,7 +202,26 @@ def process_anomalies(
                         "summary_preview": preview,
                     },
                 )
+                _emit(
+                    "reduce_done",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "mock",
+                        "summary": summary,
+                    },
+                )
                 alert_text = f"Время выброса: {timestamp_str}\n\n{summary}"
+                result["alert_text"] = alert_text
+                _emit(
+                    "notification_ready",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "mock",
+                        "notification_text": alert_text,
+                    },
+                )
                 _emit(
                     "alert_start",
                     {
@@ -157,6 +272,44 @@ def process_anomalies(
                 summary = getattr(summary_result, "summary", str(summary_result))
                 result["summary"] = summary
                 preview = summary[:SUMMARY_LOG_CHARS] if isinstance(summary, str) else str(summary)
+                map_batches = _extract_batch_summaries(summary_result, preview)
+                _emit(
+                    "map_start",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                    },
+                )
+                for batch_idx, batch_summary in enumerate(map_batches):
+                    _emit(
+                        "map_batch",
+                        {
+                            "index": i,
+                            "timestamp": timestamp_str,
+                            "mode": "real",
+                            "batch_index": batch_idx,
+                            "batch_total": len(map_batches),
+                            "batch_summary": batch_summary,
+                        },
+                    )
+                _emit(
+                    "map_done",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                        "batch_total": len(map_batches),
+                    },
+                )
+                _emit(
+                    "reduce_start",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                    },
+                )
                 logger.info(
                     "do_summary.done: anomaly_ts=%s, seconds=%.2f, summary_len=%s, preview=%s",
                     timestamp_str,
@@ -175,8 +328,27 @@ def process_anomalies(
                         "summary_preview": preview,
                     },
                 )
+                _emit(
+                    "reduce_done",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                        "summary": summary,
+                    },
+                )
                 # Формируем текст алерта с summary и timestamp
                 alert_text = f"Время выброса: {timestamp_str}\n\n{summary}"
+                result["alert_text"] = alert_text
+                _emit(
+                    "notification_ready",
+                    {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                        "notification_text": alert_text,
+                    },
+                )
                 # Генерируем и отправляем алерт через существующий генератор
                 _emit(
                     "alert_start",

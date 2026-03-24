@@ -106,7 +106,7 @@ def visualize_combined(
     output_dir: Optional[Path] = None,
 ) -> Path:
     """
-    Комбинированный график: сверху все замеры с аномалиями, снизу — зум на первую аномалию.
+    График #1: прошлое + будущее + отмеченные аномалии.
     """
     log_event(
         logger,
@@ -120,7 +120,7 @@ def visualize_combined(
     output_dir = output_dir or Path(VISUALIZATION_CONFIG["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(14, 10))
+    fig, ax = plt.subplots(figsize=(14, 6))
     history_data = df
     last_actual_ts = history_data["timestamp"].max()
     future_predictions = predictions[predictions["timestamp"] > last_actual_ts].copy()
@@ -128,7 +128,7 @@ def visualize_combined(
     if not future_predictions.empty:
         forecast_end_ts = future_predictions["timestamp"].max()
 
-    ax_top.plot(
+    ax.plot(
         history_data["timestamp"],
         history_data["value"],
         label="Исторические данные",
@@ -136,21 +136,21 @@ def visualize_combined(
         linewidth=2,
     )
     if not future_predictions.empty:
-        ax_top.axvline(
+        ax.axvline(
             last_actual_ts,
             color="#6b7280",
             linestyle=":",
             linewidth=1.2,
             label="Начало прогноза",
         )
-        ax_top.axvspan(
+        ax.axvspan(
             last_actual_ts,
             forecast_end_ts,
             color="#ef4444",
             alpha=0.08,
             label="Прогнозный участок",
         )
-        ax_top.plot(
+        ax.plot(
             future_predictions["timestamp"],
             future_predictions["predicted"],
             label="Предсказанные значения (будущее)",
@@ -162,7 +162,7 @@ def visualize_combined(
     if "source" in anomalies.columns:
         actual_anomalies = anomalies[anomalies["source"] == "actual"]
     if not actual_anomalies.empty:
-        ax_top.scatter(
+        ax.scatter(
             actual_anomalies["timestamp"],
             actual_anomalies["value"],
             color="green",
@@ -172,80 +172,11 @@ def visualize_combined(
             marker="x",
             linewidth=2,
         )
-    ax_top.set_title("Все замеры и аномалии")
-    ax_top.set_xlabel("Время")
-    ax_top.set_ylabel("Значение")
-    ax_top.legend()
-    ax_top.grid(True, alpha=0.3)
-
-    if not actual_anomalies.empty:
-        latest = actual_anomalies.sort_values("timestamp").iloc[-1]
-        loopback_minutes = VISUALIZATION_CONFIG["anomaly_plot"]["loopback_minutes"]
-        start_time = latest["timestamp"] - pd.Timedelta(minutes=loopback_minutes)
-        end_time = latest["timestamp"] + pd.Timedelta(minutes=loopback_minutes)
-        window_data = df[(df["timestamp"] >= start_time) & (df["timestamp"] <= end_time)]
-        window_predictions = future_predictions[
-            (future_predictions["timestamp"] >= start_time)
-            & (future_predictions["timestamp"] <= end_time)
-        ]
-        ax_bot.plot(
-            window_data["timestamp"],
-            window_data["value"],
-            label="Исторические данные",
-            color="blue",
-            linewidth=2,
-        )
-        if not window_predictions.empty:
-            if start_time <= last_actual_ts <= end_time:
-                ax_bot.axvline(
-                    last_actual_ts,
-                    color="#6b7280",
-                    linestyle=":",
-                    linewidth=1.2,
-                    label="Начало прогноза",
-                )
-                ax_bot.axvspan(
-                    last_actual_ts,
-                    end_time,
-                    color="#ef4444",
-                    alpha=0.08,
-                    label="Прогнозный участок",
-                )
-            ax_bot.plot(
-                window_predictions["timestamp"],
-                window_predictions["predicted"],
-                label="Предсказанные значения (будущее)",
-                color="#ef4444",
-                linewidth=2,
-                linestyle="--",
-            )
-        ax_bot.scatter(
-            latest["timestamp"],
-            latest["value"],
-            color="green",
-            s=120,
-            zorder=5,
-            label="Последняя аномалия",
-            marker="x",
-            linewidth=2,
-        )
-        ax_bot.set_title(
-            f"Последняя аномалия ({latest['timestamp'].strftime('%Y-%m-%d %H:%M:%S')})"
-        )
-    else:
-        ax_bot.plot(
-            history_data["timestamp"],
-            history_data["value"],
-            label="Исторические данные",
-            color="blue",
-            linewidth=2,
-        )
-        ax_bot.set_title("Аномалий не найдено")
-
-    ax_bot.set_xlabel("Время")
-    ax_bot.set_ylabel("Значение")
-    ax_bot.legend()
-    ax_bot.grid(True, alpha=0.3)
+    ax.set_title("Все замеры и аномалии")
+    ax.set_xlabel("Время")
+    ax.set_ylabel("Значение")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     plt.xticks(rotation=45)
     plt.tight_layout()
 
