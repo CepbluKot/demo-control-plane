@@ -180,7 +180,8 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 
 - `CONTROL_PLANE_METRICS_SOURCE=prometheus|clickhouse`
 - `CONTROL_PLANE_CLICKHOUSE_METRICS_HOST|PORT|USERNAME|PASSWORD|SECURE|QUERY` (если source=clickhouse)
-- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST|PORT|USERNAME|PASSWORD|SECURE` (для таблицы `metrics_forecast`)
+- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST|PORT|USERNAME|PASSWORD|SECURE`
+- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY` (опциональный полный SQL для forecast)
 - `CONTROL_PLANE_FORECAST_*` для таблицы прогнозов
 - `CONTROL_PLANE_SUMMARIZER_CALLABLE` (опционально)
 - `CONTROL_PLANE_ALERT_CALLABLE` (опционально)

@@ -20,7 +20,17 @@ from control_plane.config import (
     ANOMALY_ZSCORE,
     ARTIFACTS_DIR,
     CLICKHOUSE_METRICS_HOST,
+    CLICKHOUSE_METRICS_PASSWORD,
+    CLICKHOUSE_METRICS_PORT,
     CLICKHOUSE_METRICS_QUERY,
+    CLICKHOUSE_METRICS_SECURE,
+    CLICKHOUSE_METRICS_USERNAME,
+    CLICKHOUSE_PREDICTIONS_HOST,
+    CLICKHOUSE_PREDICTIONS_PASSWORD,
+    CLICKHOUSE_PREDICTIONS_PORT,
+    CLICKHOUSE_PREDICTIONS_QUERY,
+    CLICKHOUSE_PREDICTIONS_SECURE,
+    CLICKHOUSE_PREDICTIONS_USERNAME,
     DATA_LOOKBACK_MINUTES,
     FORECAST_METRIC_NAME,
     FORECAST_SERVICE,
@@ -353,7 +363,24 @@ def run_single_iteration(
             },
         )
     else:
-        _emit("process_skip", 96, {"message": "Обработка пропущена"})
+        if not process_alerts:
+            _emit(
+                "process_skip",
+                96,
+                {
+                    "message": "Обработка отключена настройкой",
+                    "reason": "alerts_disabled",
+                },
+            )
+        else:
+            _emit(
+                "process_skip",
+                96,
+                {
+                    "message": "Аномалии не найдены, обработка не требуется",
+                    "reason": "no_anomalies",
+                },
+            )
 
     result = {
         "window_start": start_time,
@@ -471,6 +498,9 @@ def _render_anomaly_cards(
         st.subheader("3. Пошаговый анализ Top-N аномалий")
         rows = list(analysis_state.get("by_idx", {}).values())
         if not rows:
+            empty_message = analysis_state.get("empty_message")
+            if empty_message:
+                st.info(str(empty_message))
             return
         rows = sorted(rows, key=lambda x: x.get("anomaly_idx", 0))
         for row in rows:
@@ -530,10 +560,17 @@ def _render_anomaly_cards(
 
 def _ui_runtime_config() -> Dict[str, Any]:
     masked_password = "***" if bool(PROM_PASSWORD) else ""
+    masked_ch_metrics_password = "***" if bool(CLICKHOUSE_METRICS_PASSWORD) else ""
+    masked_ch_predictions_password = "***" if bool(CLICKHOUSE_PREDICTIONS_PASSWORD) else ""
     ch_query = (
         CLICKHOUSE_METRICS_QUERY
         if len(CLICKHOUSE_METRICS_QUERY) <= 140
         else f"{CLICKHOUSE_METRICS_QUERY[:140]}..."
+    )
+    ch_predictions_query = (
+        CLICKHOUSE_PREDICTIONS_QUERY
+        if len(CLICKHOUSE_PREDICTIONS_QUERY) <= 140
+        else f"{CLICKHOUSE_PREDICTIONS_QUERY[:140]}..."
     )
     return {
         "CONTROL_PLANE_TEST_MODE": TEST_MODE,
@@ -541,6 +578,16 @@ def _ui_runtime_config() -> Dict[str, Any]:
         "CONTROL_PLANE_PROM_METRICS_QUERY": PROM_QUERY,
         "CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY": ch_query,
         "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST": CLICKHOUSE_METRICS_HOST,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT": CLICKHOUSE_METRICS_PORT,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME": CLICKHOUSE_METRICS_USERNAME,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD": masked_ch_metrics_password,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE": CLICKHOUSE_METRICS_SECURE,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST": CLICKHOUSE_PREDICTIONS_HOST,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PORT": CLICKHOUSE_PREDICTIONS_PORT,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME": CLICKHOUSE_PREDICTIONS_USERNAME,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD": masked_ch_predictions_password,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE": CLICKHOUSE_PREDICTIONS_SECURE,
+        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY": ch_predictions_query,
         "CONTROL_PLANE_ANOMALY_DETECTOR": ANOMALY_DETECTOR,
         "CONTROL_PLANE_DATA_LOOKBACK_MINUTES": DATA_LOOKBACK_MINUTES,
         "CONTROL_PLANE_PREDICTION_LOOKAHEAD_MINUTES": PREDICTION_LOOKAHEAD_MINUTES,
@@ -583,6 +630,7 @@ def main() -> None:
         "merged_df": None,
         "predictions_df": None,
         "actual_end_ts": None,
+        "empty_message": None,
     }
     ui_data: Dict[str, Any] = {
         "actual_df": None,
@@ -621,6 +669,7 @@ def main() -> None:
         with anomalies_table_placeholder.container():
             st.markdown("2. Табличка с найденными аномалиями")
             if anomalies_df is None or anomalies_df.empty:
+                st.info("Аномалии не найдены за выбранное окно.")
                 return
             anomaly_columns = [c for c in ["timestamp", "value", "source"] if c in anomalies_df.columns]
             st.dataframe(anomalies_df[anomaly_columns], use_container_width=True)
@@ -660,6 +709,7 @@ def main() -> None:
             summary_state["selected_anomalies"] = {
                 str(idx): anomaly for idx, anomaly in enumerate(selected)
             }
+            summary_state["empty_message"] = None
 
         if stage == "process_live":
             event = payload.get("event")
@@ -748,12 +798,28 @@ def main() -> None:
         if stage == "detect_done":
             summary_state["merged_df"] = payload.get("merged_df")
             ui_data["anomalies_df"] = payload.get("anomalies_df")
+            anomalies_df = ui_data.get("anomalies_df")
+            if isinstance(anomalies_df, pd.DataFrame) and anomalies_df.empty:
+                summary_state["empty_message"] = "Аномалии не найдены. Пошаговый разбор не требуется."
+            else:
+                summary_state["empty_message"] = None
             _render_graph(
                 ui_data.get("actual_df"),
                 summary_state.get("predictions_df"),
                 ui_data.get("anomalies_df"),
             )
             _render_anomalies_table(ui_data.get("anomalies_df"))
+            _render_analysis_cards()
+
+        if stage == "process_skip":
+            reason = str(payload.get("reason", ""))
+            if reason == "no_anomalies":
+                summary_state["empty_message"] = "Аномалии не найдены. Пошаговый разбор не требуется."
+            elif reason == "alerts_disabled":
+                summary_state["empty_message"] = (
+                    "Обработка аномалий отключена настройкой `CONTROL_PLANE_PROCESS_ALERTS=false`."
+                )
+            _render_analysis_cards()
 
     try:
         result = run_single_iteration(

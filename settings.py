@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME: str = ""
     CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD: str = ""
     CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE: bool = False
+    CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY: str = ""
 
     # ClickHouse logs source (for my_summarizer)
     CONTROL_PLANE_LOGS_CLICKHOUSE_HOST: str = "localhost"

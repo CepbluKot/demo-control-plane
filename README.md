@@ -45,6 +45,12 @@
 
 Это совместимо с таблицей, где есть базовые поля без этих двух колонок.
 
+Дополнительно можно задать полный SQL для чтения прогнозов:
+
+- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY`
+- запрос должен вернуть `timestamp` и `predicted` (или `value`, тогда переименуется автоматически)
+- поддерживаются плейсхолдеры: `{service}`, `{metric_name}`, `{forecast_type}`, `{prediction_kind}`, `{start}`, `{end}`, `{start_ts}`, `{end_ts}`, `{table}`
+
 ### 3) Доступ к ClickHouse (важно)
 
 - Все runtime-запросы к ClickHouse идут через `clickhouse_connect.get_client(...).query_df(...)`.
@@ -183,12 +189,13 @@ CONTROL_PLANE_CLICKHOUSE_METRICS_HOST=...
 CONTROL_PLANE_CLICKHOUSE_METRICS_PORT=8123
 CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME=...
 CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD=...
-CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY=SELECT timestamp, value FROM your_actual_table WHERE timestamp >= parseDateTimeBestEffort('{start}') AND timestamp < parseDateTimeBestEffort('{end}') ORDER BY timestamp
+CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY=SELECT timestamp, value FROM your_actual_table ORDER BY timestamp
 CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST=...
 CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PORT=8123
 CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME=...
 CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD=...
 CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE=false
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY=SELECT timestamp, value AS predicted FROM metrics_forecast WHERE service='{service}' AND metric_name='{metric_name}' AND timestamp > now() ORDER BY timestamp
 CONTROL_PLANE_FORECAST_SERVICE=airflow-test-v1
 CONTROL_PLANE_FORECAST_METRIC_NAME=memory
 CONTROL_PLANE_FORECAST_TYPE=short

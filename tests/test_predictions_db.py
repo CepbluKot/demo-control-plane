@@ -33,7 +33,10 @@ class TestPredictionsDb(unittest.TestCase):
         ), patch(
             "control_plane.predictions_db._query_metrics_df",
             side_effect=[latest_df, rows_df],
-        ) as query_mock:
+        ) as query_mock, patch.multiple(
+            settings,
+            CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY="",
+        ):
             out = fetch_predictions_from_db(
                 service="svc-a",
                 metric_name="memory",
@@ -59,6 +62,9 @@ class TestPredictionsDb(unittest.TestCase):
         ), patch(
             "control_plane.predictions_db._query_metrics_df",
             return_value=latest_df,
+        ), patch.multiple(
+            settings,
+            CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY="",
         ):
             with self.assertRaises(ValueError):
                 fetch_predictions_from_db(
@@ -79,7 +85,10 @@ class TestPredictionsDb(unittest.TestCase):
         ), patch(
             "control_plane.predictions_db._query_metrics_df",
             side_effect=[latest_df, rows_df],
-        ) as query_mock:
+        ) as query_mock, patch.multiple(
+            settings,
+            CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY="",
+        ):
             fetch_predictions_from_db(
                 service="svc-a",
                 metric_name="memory",
@@ -123,6 +132,39 @@ class TestPredictionsDb(unittest.TestCase):
         self.assertEqual(captured["client_kwargs"]["username"], "pred-user")
         self.assertEqual(captured["client_kwargs"]["password"], "pred-pass")
         self.assertEqual(captured["client_kwargs"]["secure"], True)
+
+    def test_fetch_predictions_uses_custom_query_template(self) -> None:
+        custom_df = pd.DataFrame(
+            [
+                {"timestamp": "2026-03-25T12:00:00Z", "value": "13.7"},
+                {"timestamp": "2026-03-25T12:01:00Z", "value": "13.9"},
+            ]
+        )
+        with patch(
+            "control_plane.predictions_db._query_metrics_df",
+            return_value=custom_df,
+        ) as query_mock, patch.multiple(
+            settings,
+            CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY=(
+                "SELECT timestamp, value FROM metrics_forecast "
+                "WHERE service = '{service}' AND metric_name = '{metric_name}' "
+                "AND timestamp >= parseDateTimeBestEffort('{start}') "
+                "AND timestamp <= parseDateTimeBestEffort('{end}')"
+            ),
+        ):
+            out = fetch_predictions_from_db(
+                service="svc-a",
+                metric_name="memory",
+                start_time=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
+                end_time=datetime(2026, 3, 25, 10, 30, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(list(out.columns), ["timestamp", "predicted"])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(query_mock.call_count, 1)
+        rendered_query = query_mock.call_args_list[0].args[0]
+        self.assertIn("service = 'svc-a'", rendered_query)
+        self.assertIn("metric_name = 'memory'", rendered_query)
 
 
 if __name__ == "__main__":
