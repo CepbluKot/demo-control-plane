@@ -9,6 +9,7 @@ import pandas as pd
 
 from .timeseries import (
     detect_anomalies_from_merged,
+    detect_anomalies_on_series,
     detect_anomalies_rolling_iqr,
     merge_actual_and_predictions,
 )
@@ -58,17 +59,20 @@ class RollingIQRDetector:
         iqr_window: int = 60,
         iqr_scale: float = 1.5,
         min_periods: int = 30,
+        zscore_threshold: float = 3.0,
         **_: Any,
     ) -> None:
         self.iqr_window = iqr_window
         self.iqr_scale = iqr_scale
         self.min_periods = min_periods
+        self.fallback_zscore = zscore_threshold
         log_event(
             logger,
             "RollingIQRDetector.init",
             iqr_window=iqr_window,
             iqr_scale=iqr_scale,
             min_periods=min_periods,
+            fallback_zscore=zscore_threshold,
         )
 
     def detect(
@@ -85,6 +89,19 @@ class RollingIQRDetector:
             step=step,
         )
         merged_df = merge_actual_and_predictions(actual_df, predictions_df, step=step)
+        if merged_df.empty:
+            log_event(
+                logger,
+                "RollingIQRDetector.detect.fallback_actual_only",
+                reason="no_overlap_with_predictions",
+                actual_rows=len(actual_df),
+                zscore_threshold=self.fallback_zscore,
+            )
+            series_out, anomalies_df = detect_anomalies_on_series(
+                actual_df,
+                zscore_threshold=self.fallback_zscore,
+            )
+            return DetectionResult(merged_df=series_out, anomalies_df=anomalies_df)
         merged_df, anomalies_df = detect_anomalies_rolling_iqr(
             merged_df,
             window=self.iqr_window,

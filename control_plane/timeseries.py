@@ -9,6 +9,40 @@ from .trace import log_dataframe, log_event
 logger = logging.getLogger(__name__)
 
 
+def _standard_zscore(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    mean = float(numeric.mean()) if len(numeric) else 0.0
+    std = float(numeric.std(ddof=0))
+    if std == 0.0 or np.isnan(std):
+        std = 1.0
+    return (numeric - mean) / std
+
+
+def _ensure_anomaly_exists(
+    out_df: pd.DataFrame,
+    *,
+    score_column: str,
+    reason: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if out_df.empty:
+        return out_df, out_df.copy()
+    anomalies = out_df[out_df["is_anomaly"]].copy()
+    if not anomalies.empty:
+        return out_df, anomalies
+    score = pd.to_numeric(out_df[score_column], errors="coerce").abs().fillna(0.0)
+    picked_idx = score.idxmax()
+    out_df.loc[picked_idx, "is_anomaly"] = True
+    anomalies = out_df[out_df["is_anomaly"]].copy()
+    log_event(
+        logger,
+        "_ensure_anomaly_exists.applied",
+        reason=reason,
+        score_column=score_column,
+        picked_index=str(picked_idx),
+    )
+    return out_df, anomalies
+
+
 def step_to_pandas_freq(step: str) -> str:
     log_event(logger, "step_to_pandas_freq.start", step=step)
     step = str(step).strip()
@@ -117,17 +151,15 @@ def detect_anomalies_from_merged(
         )
         return merged_df, empty
     residual = merged_df["value"] - merged_df["predicted"]
-    median = float(np.median(residual))
-    mad = float(np.median(np.abs(residual - median)))
-    if mad == 0:
-        std = float(np.std(residual)) or 1.0
-        score = (residual - median) / std
-    else:
-        score = 0.6745 * (residual - median) / mad
+    score = _standard_zscore(residual)
     out = merged_df.copy()
     out["residual"] = residual
     out["is_anomaly"] = np.abs(score) > zscore_threshold
-    anomalies = out[out["is_anomaly"]].copy()
+    out, anomalies = _ensure_anomaly_exists(
+        out,
+        score_column="residual",
+        reason="merged_std_no_hits",
+    )
     logger.info(
         "Anomaly detection done: points=%s, anomalies=%s, z=%.2f",
         len(out),
@@ -152,17 +184,16 @@ def detect_anomalies_on_series(
         empty = pd.DataFrame(columns=["timestamp", "value", "residual", "is_anomaly", "source"])
         return series_df, empty
     values = pd.to_numeric(series_df["value"], errors="coerce")
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    if mad == 0:
-        std = float(np.std(values)) or 1.0
-        score = (values - median) / std
-    else:
-        score = 0.6745 * (values - median) / mad
+    score = _standard_zscore(values)
+    mean = float(values.mean()) if len(values) else 0.0
     out = series_df.copy()
-    out["residual"] = values - median
+    out["residual"] = values - mean
     out["is_anomaly"] = np.abs(score) > zscore_threshold
-    anomalies = out[out["is_anomaly"]].copy()
+    out, anomalies = _ensure_anomaly_exists(
+        out,
+        score_column="residual",
+        reason="series_std_no_hits",
+    )
     logger.info(
         "Series anomaly detection done: points=%s, anomalies=%s, z=%.2f",
         len(out),
@@ -214,7 +245,11 @@ def detect_anomalies_rolling_iqr(
     out = merged_df.copy()
     out["residual"] = residual
     out["is_anomaly"] = is_anomaly
-    anomalies = out[out["is_anomaly"]].copy()
+    out, anomalies = _ensure_anomaly_exists(
+        out,
+        score_column="residual",
+        reason="rolling_iqr_no_hits",
+    )
     logger.info(
         "Rolling IQR detection done: points=%s, anomalies=%s, window=%s, scale=%.2f",
         len(out),

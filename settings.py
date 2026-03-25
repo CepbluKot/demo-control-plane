@@ -116,7 +116,7 @@ class Settings(BaseSettings):
 
     # Anomaly detector
     CONTROL_PLANE_ANOMALY_DETECTOR: str = "rolling_iqr"
-    CONTROL_PLANE_ANOMALY_ZSCORE: float = 3.5
+    CONTROL_PLANE_ANOMALY_ZSCORE: float = 3.0
     CONTROL_PLANE_ANOMALY_IQR_WINDOW: int = 60
     CONTROL_PLANE_ANOMALY_IQR_SCALE: float = 1.5
     CONTROL_PLANE_ANOMALY_IQR_MIN_PERIODS: int = 30
