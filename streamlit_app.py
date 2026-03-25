@@ -125,6 +125,19 @@ def run_single_iteration(
         if on_stage is not None:
             on_stage(stage, progress, payload)
 
+    def _emit_stage_error(stage_name: str, progress: int, exc: Exception) -> None:
+        error_text = f"{exc.__class__.__name__}: {exc}"
+        logger.exception("run_single_iteration.%s.failed", stage_name)
+        _emit(
+            "stage_error",
+            progress,
+            {
+                "stage_name": stage_name,
+                "message": f"Ошибка на этапе {stage_name}",
+                "error": error_text,
+            },
+        )
+
     log_event(
         logger,
         "run_single_iteration.start",
@@ -150,30 +163,35 @@ def run_single_iteration(
             "test_mode": test_mode,
         },
     )
-    if test_mode:
-        actual_df, predictions_df = generate_mock_data(
-            start_time=start_time,
-            end_time=end_time,
-            step=PROM_STEP,
-            lookahead_minutes=prediction_lookahead_minutes,
-        )
-    else:
-        actual_df = fetch_actual_metrics_df(
-            query=query,
-            start_time=start_time,
-            end_time=end_time,
-            step=PROM_STEP,
-            max_points=PROM_MAX_POINTS,
-            series_index=PROM_SERIES_INDEX,
-        )
-        predictions_df = fetch_predictions_from_db(
-            service=FORECAST_SERVICE,
-            metric_name=FORECAST_METRIC_NAME,
-            start_time=start_time,
-            end_time=end_time + timedelta(minutes=prediction_lookahead_minutes),
-            forecast_type=FORECAST_TYPE,
-            prediction_kind=PREDICTION_KIND,
-        )
+    try:
+        if test_mode:
+            logger.info("TEST_MODE=true: внешние запросы (Prometheus/DB) пропущены")
+            actual_df, predictions_df = generate_mock_data(
+                start_time=start_time,
+                end_time=end_time,
+                step=PROM_STEP,
+                lookahead_minutes=prediction_lookahead_minutes,
+            )
+        else:
+            actual_df = fetch_actual_metrics_df(
+                query=query,
+                start_time=start_time,
+                end_time=end_time,
+                step=PROM_STEP,
+                max_points=PROM_MAX_POINTS,
+                series_index=PROM_SERIES_INDEX,
+            )
+            predictions_df = fetch_predictions_from_db(
+                service=FORECAST_SERVICE,
+                metric_name=FORECAST_METRIC_NAME,
+                start_time=start_time,
+                end_time=end_time + timedelta(minutes=prediction_lookahead_minutes),
+                forecast_type=FORECAST_TYPE,
+                prediction_kind=PREDICTION_KIND,
+            )
+    except Exception as exc:
+        _emit_stage_error("fetch", 10, exc)
+        raise
     log_dataframe(logger, "run_single_iteration.actual_df", actual_df)
     log_dataframe(logger, "run_single_iteration.predictions_df", predictions_df)
     _emit(
@@ -187,18 +205,22 @@ def run_single_iteration(
     )
 
     _emit("detect_start", 45, {"message": "Поиск аномалий"})
-    detector = get_anomaly_detector(
-        detector_name,
-        iqr_window=ANOMALY_IQR_WINDOW,
-        iqr_scale=ANOMALY_IQR_SCALE,
-        min_periods=ANOMALY_IQR_MIN_PERIODS,
-        zscore_threshold=ANOMALY_ZSCORE,
-    )
-    detection_result = detector.detect(actual_df, predictions_df, step=PROM_STEP)
-    merged_df = detection_result.merged_df
-    anomalies_df = detection_result.anomalies_df
-    if not anomalies_df.empty and "source" not in anomalies_df.columns:
-        anomalies_df["source"] = "actual"
+    try:
+        detector = get_anomaly_detector(
+            detector_name,
+            iqr_window=ANOMALY_IQR_WINDOW,
+            iqr_scale=ANOMALY_IQR_SCALE,
+            min_periods=ANOMALY_IQR_MIN_PERIODS,
+            zscore_threshold=ANOMALY_ZSCORE,
+        )
+        detection_result = detector.detect(actual_df, predictions_df, step=PROM_STEP)
+        merged_df = detection_result.merged_df
+        anomalies_df = detection_result.anomalies_df
+        if not anomalies_df.empty and "source" not in anomalies_df.columns:
+            anomalies_df["source"] = "actual"
+    except Exception as exc:
+        _emit_stage_error("detect", 45, exc)
+        raise
     log_dataframe(logger, "run_single_iteration.merged_df", merged_df)
     log_dataframe(logger, "run_single_iteration.anomalies_df", anomalies_df)
     _emit(
@@ -228,7 +250,11 @@ def run_single_iteration(
     )
 
     _emit("viz_start", 70, {"message": "Построение графиков"})
-    plot_info = visualize(query, api_response)
+    try:
+        plot_info = visualize(query, api_response)
+    except Exception as exc:
+        _emit_stage_error("visualization", 70, exc)
+        raise
     _emit("viz_done", 82, {"message": "Графики готовы", "plot_info": plot_info})
 
     processing_results: List[Dict[str, Any]] = []
@@ -296,13 +322,17 @@ def run_single_iteration(
                 },
             )
 
-        processing_results = process_anomalies(
-            anomalies=recent_anomalies,
-            lookback_minutes=process_lookback_minutes,
-            continue_on_error=True,
-            test_mode=test_mode,
-            on_event=_on_processing_event,
-        )
+        try:
+            processing_results = process_anomalies(
+                anomalies=recent_anomalies,
+                lookback_minutes=process_lookback_minutes,
+                continue_on_error=True,
+                test_mode=test_mode,
+                on_event=_on_processing_event,
+            )
+        except Exception as exc:
+            _emit_stage_error("process", 88, exc)
+            raise
         log_event(
             logger,
             "run_single_iteration.process_anomalies.done",
@@ -534,9 +564,11 @@ def main() -> None:
         st.caption("Параметры редактируются через файл .env")
         run_clicked = st.button("Запустить 1 итерацию", type="primary", use_container_width=True)
 
+    runtime_error_placeholder = st.empty()
     graph_placeholder = st.empty()
     anomalies_table_placeholder = st.empty()
     anomaly_cards_placeholder = st.empty()
+    had_stage_error = False
 
     summary_state: Dict[str, Any] = {
         "by_idx": {},
@@ -600,6 +632,7 @@ def main() -> None:
         return
 
     def _on_stage(stage: str, progress: int, payload: Dict[str, Any]) -> None:
+        nonlocal had_stage_error
         log_event(
             logger,
             "streamlit.on_stage",
@@ -607,6 +640,14 @@ def main() -> None:
             progress=progress,
             **_payload_for_log(payload),
         )
+        if stage == "stage_error":
+            had_stage_error = True
+            stage_name = payload.get("stage_name", "unknown")
+            error_text = payload.get("error", "Unknown error")
+            with runtime_error_placeholder.container():
+                st.error(f"Ошибка на этапе `{stage_name}`: {error_text}")
+            return
+
         if stage == "process_selected":
             selected = payload.get("recent_anomalies", [])
             summary_state["selected_anomalies"] = {
@@ -721,7 +762,8 @@ def main() -> None:
         )
     except Exception as exc:
         logger.exception("Streamlit iteration failed")
-        st.error(f"Ошибка выполнения: {exc}")
+        if not had_stage_error:
+            st.error(f"Ошибка выполнения: {exc}")
         st.stop()
 
     actual_end_ts = (
