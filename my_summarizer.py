@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
+
+from settings import settings
 
 
 LOGS_SQL_COLUMNS: tuple[str, str] = ("timestamp", "value")
@@ -39,7 +40,7 @@ def _resolve_service(anomaly: Optional[Dict[str, Any]]) -> str:
 
 
 def _resolve_logs_query_template() -> str:
-    template = os.getenv("CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "").strip()
+    template = str(settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY).strip()
     if template:
         return template
     raise ValueError(
@@ -84,10 +85,10 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     except Exception as exc:
         raise ImportError("clickhouse-connect is required for logs batch fetch") from exc
 
-    host = os.getenv("CONTROL_PLANE_LOGS_CH_HOST", "localhost").strip()
-    port = int(os.getenv("CONTROL_PLANE_LOGS_CH_PORT", "8123"))
-    username = os.getenv("CONTROL_PLANE_LOGS_CH_USERNAME", "").strip() or None
-    password = os.getenv("CONTROL_PLANE_LOGS_CH_PASSWORD", "").strip() or None
+    host = str(settings.CONTROL_PLANE_LOGS_CH_HOST).strip() or "localhost"
+    port = int(settings.CONTROL_PLANE_LOGS_CH_PORT)
+    username = str(settings.CONTROL_PLANE_LOGS_CH_USERNAME).strip() or None
+    password = str(settings.CONTROL_PLANE_LOGS_CH_PASSWORD).strip() or None
 
     client = clickhouse_connect.get_client(
         host=host,
@@ -148,7 +149,7 @@ def summarize_logs(
         start_dt=start_dt,
         end_dt=end_dt,
     )
-    page_limit = int(os.getenv("CONTROL_PLANE_LOGS_PAGE_LIMIT", "1000"))
+    page_limit = int(settings.CONTROL_PLANE_LOGS_PAGE_LIMIT)
 
     db_fetch_page = _build_db_fetch_page(anomaly)
 

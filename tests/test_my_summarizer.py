@@ -1,4 +1,3 @@
-import os
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -11,6 +10,7 @@ from my_summarizer import (
     _render_logs_query,
     summarize_logs,
 )
+from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
@@ -60,17 +60,17 @@ class TestMySummarizer(unittest.TestCase):
 
             return _fetch_page
 
-        env = {
+        config_overrides = {
             "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
                 "SELECT timestamp, value FROM logs_svc_a "
                 "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
                 "AND timestamp < parseDateTimeBestEffort('{period_end}') "
                 "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
             ),
-            "CONTROL_PLANE_LOGS_PAGE_LIMIT": "1000",
+            "CONTROL_PLANE_LOGS_PAGE_LIMIT": 1000,
         }
 
-        with patch.dict(os.environ, env, clear=False):
+        with patch.multiple(settings, **config_overrides):
             with patch("my_summarizer._build_db_fetch_page", side_effect=fake_fetcher):
                 result = summarize_logs(
                     start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
@@ -84,14 +84,14 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("Сервис: svc-a", result["summary"])
 
     def test_build_db_fetch_page_without_offset_placeholder_single_shot(self) -> None:
-        env = {
+        config_overrides = {
             "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
                 "SELECT timestamp, value FROM logs_svc_a "
                 "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
                 "AND timestamp < parseDateTimeBestEffort('{period_end}') "
                 "ORDER BY timestamp LIMIT {limit}"
             ),
-            "CONTROL_PLANE_LOGS_PAGE_LIMIT": "1",
+            "CONTROL_PLANE_LOGS_PAGE_LIMIT": 1,
         }
         calls = {"count": 0}
 
@@ -103,7 +103,7 @@ class TestMySummarizer(unittest.TestCase):
             get_client=lambda **_kwargs: SimpleNamespace(query_df=fake_query_df)
         )
 
-        with patch.dict(os.environ, env, clear=False), patch.dict(
+        with patch.multiple(settings, **config_overrides), patch.dict(
             "sys.modules",
             {"clickhouse_connect": fake_module},
         ):
@@ -128,16 +128,16 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
 
     def test_summarize_logs_requires_service_in_anomaly(self) -> None:
-        env = {
+        config_overrides = {
             "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
                 "SELECT timestamp, value FROM logs_svc_a "
                 "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
                 "AND timestamp < parseDateTimeBestEffort('{period_end}') "
                 "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
             ),
-            "CONTROL_PLANE_LOGS_PAGE_LIMIT": "1000",
+            "CONTROL_PLANE_LOGS_PAGE_LIMIT": 1000,
         }
-        with patch.dict(os.environ, env, clear=False):
+        with patch.multiple(settings, **config_overrides):
             with self.assertRaises(ValueError):
                 summarize_logs(
                     start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),

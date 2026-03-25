@@ -8,3 +8,5 @@ streamlit
 SQLAlchemy
 clickhouse-connect
 clickhouse-sqlalchemy
+pydantic
+pydantic-settings
