@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from my_summarizer import (
+    _make_llm_call,
     _build_db_fetch_page,
     _render_logs_query,
     summarize_logs,
@@ -13,6 +14,15 @@ from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
+    def test_make_llm_call_uses_new_llm_functions(self) -> None:
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=lambda *, message, system_prompt="": f"ok::{message}",
+        ):
+            llm_call = _make_llm_call()
+            out = llm_call("test prompt")
+        self.assertEqual(out, "ok::test prompt")
+
     def test_render_logs_query_substitutes_placeholders(self) -> None:
         query = _render_logs_query(
             query_template=(

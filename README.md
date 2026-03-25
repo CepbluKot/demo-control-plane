@@ -71,9 +71,13 @@
 - Базовый адаптер: `control_plane/summarizer.py` (`do_summary`).
 - Кастомный путь: `CONTROL_PLANE_SUMMARIZER_CALLABLE`.
 - Готовый шаблон для старта: `my_summarizer.py::summarize_logs`.
-- В `my_summarizer.py` реализован batched-fetch логов из ClickHouse:
+- В `my_summarizer.py` реализован map-reduce summarizer:
+  - batched-fetch логов из ClickHouse;
+  - MAP: summary по чанкам;
+  - REDUCE: объединение partial summary в итоговый вывод;
+  - если LLM недоступна, включается эвристический fallback (pipeline не падает).
   - в `.env` задается один полный SQL: `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
-  - SQL обязан вернуть колонки `timestamp` и `value`;
+  - SQL должен возвращать логовые поля (минимум `timestamp`, остальное опционально);
   - в SQL можно использовать плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
   - `anomaly['service']` обязателен (fallback-сервиса больше нет);
   - если в запросе нет `{offset}`, фетч работает как single-shot (одна страница).

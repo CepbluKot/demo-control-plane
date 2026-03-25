@@ -35,7 +35,7 @@ Pipeline для SRE-кейса:
   - orchestration обработки аномалий
   - события map/reduce/alert
 - `control_plane/summarizer.py`
-  - дефолтный адаптер к `llm_log_summarizer`
+  - дефолтный адаптер к `my_summarizer.summarize_logs`
 - `control_plane/alerts.py`
   - интерфейс отправки алерта (сейчас stub)
 - `control_plane/visualization.py`
@@ -95,11 +95,11 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 2. дефолт `control_plane/summarizer.py::do_summary`
 3. шаблон для быстрой интеграции: `my_summarizer.py::summarize_logs`
 
-`my_summarizer.py::summarize_logs` делает batched-fetch логов из ClickHouse:
+`my_summarizer.py::summarize_logs` делает map-reduce суммаризацию логов:
 
 - берёт service из `anomaly['service']` (обязательное поле);
 - использует один полный SQL-шаблон из `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
-- SQL обязан вернуть колонки `timestamp` и `value`;
+- SQL возвращает логовые поля (минимум `timestamp`);
 - поддерживает плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
 - если `{offset}` отсутствует, делает single-shot (одна страница);
 - возвращает `chunk_summaries` для live UI.

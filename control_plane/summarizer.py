@@ -11,7 +11,7 @@ class PeriodSummarizer(Protocol):
     """
     Интерфейс суммаризации логов за период.
     Реализацию можно подложить через CONTROL_PLANE_SUMMARIZER_CALLABLE
-    или через внешний пакет llm_log_summarizer.
+    или использовать дефолтный my_summarizer (map-reduce).
     """
 
     def __call__(
@@ -31,33 +31,20 @@ def do_summary(
     anomaly: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
-    Дефолтный адаптер к внешнему llm_log_summarizer.
-    Возвращает объект с полем summary или строку (как вернет внешний сервис).
+    Дефолтный адаптер: встроенный map-reduce summarizer (`my_summarizer.summarize_logs`).
+    Возвращает dict с итоговым summary и промежуточными map summary.
     """
-    del anomaly  # anomaly оставляем в интерфейсе для единообразия адаптеров
     try:
-        from llm_log_summarizer import do_summary as do_summary_module
+        from my_summarizer import summarize_logs
     except Exception as exc:
         raise ImportError(
-            "Не удалось импортировать llm_log_summarizer. "
-            "Установи пакет или задай CONTROL_PLANE_SUMMARIZER_CALLABLE."
+            "Не удалось импортировать my_summarizer.summarize_logs. "
+            "Проверь файл my_summarizer.py или задай CONTROL_PLANE_SUMMARIZER_CALLABLE."
         ) from exc
-
-    # Поддерживаем оба варианта:
-    # 1) do_summary_module — уже функция
-    # 2) do_summary_module — модуль с функцией do_summary внутри
-    if callable(do_summary_module):
-        fn = do_summary_module
-    else:
-        fn = getattr(do_summary_module, "do_summary", None)
-    if not callable(fn):
-        raise ValueError(
-            "llm_log_summarizer.do_summary.do_summary не найден или не является callable"
-        )
 
     logger.info(
         "summarizer.do_summary.default_adapter: start=%s end=%s",
         start_dt.isoformat(),
         end_dt.isoformat(),
     )
-    return fn(start_dt=start_dt, end_dt=end_dt)
+    return summarize_logs(start_dt=start_dt, end_dt=end_dt, anomaly=anomaly)
