@@ -29,7 +29,7 @@
 
 ### 2) Прогнозы (`predictions`)
 
-Читаются из `metrics_forecast` через `control_plane/predictions_db.py`.
+Читаются из таблицы `metrics_forecast` через `control_plane/predictions_db.py`.
 Используются поля таблицы:
 
 - `timestamp`
@@ -48,7 +48,7 @@
 ### 3) Доступ к ClickHouse (важно)
 
 - Все runtime-запросы к ClickHouse идут через `clickhouse_connect.get_client(...).query_df(...)`.
-- `control_plane/predictions_db.py` читает `metrics_forecast` через `query_df` (без SQLAlchemy-сессий).
+- `control_plane/predictions_db.py` читает `metrics_forecast` через `query_df`.
 - `my_summarizer.py` читает логи батчами через `query_df` по `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`.
 - `control_plane/actuals.py` читает исходные метрики (`timestamp`, `value`) через `query_df`.
 
@@ -184,7 +184,11 @@ CONTROL_PLANE_CLICKHOUSE_METRICS_PORT=8123
 CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME=...
 CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD=...
 CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY=SELECT timestamp, value FROM your_actual_table WHERE timestamp >= parseDateTimeBestEffort('{start}') AND timestamp < parseDateTimeBestEffort('{end}') ORDER BY timestamp
-
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST=...
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PORT=8123
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME=...
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD=...
+CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE=false
 CONTROL_PLANE_FORECAST_SERVICE=airflow-test-v1
 CONTROL_PLANE_FORECAST_METRIC_NAME=memory
 CONTROL_PLANE_FORECAST_TYPE=short

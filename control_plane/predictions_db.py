@@ -9,9 +9,7 @@ from settings import settings
 from .trace import log_dataframe, log_event
 
 logger = logging.getLogger(__name__)
-
 METRICS_FORECAST_TABLE = "metrics_forecast"
-
 
 def _escape_sql_string(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "''")
@@ -29,19 +27,19 @@ def _query_metrics_df(query: str) -> pd.DataFrame:
     except Exception as exc:
         raise ImportError("Для чтения предсказаний из ClickHouse нужен пакет clickhouse-connect") from exc
 
-    host = str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_HOST).strip()
+    host = str(settings.CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST).strip()
     if not host:
         raise ValueError(
-            "Укажи CONTROL_PLANE_CLICKHOUSE_METRICS_HOST в .env "
+            "Укажи CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST в .env "
             "для чтения предсказаний из ClickHouse"
         )
 
     client = clickhouse_connect.get_client(
         host=host,
-        port=int(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_PORT),
-        username=str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME).strip() or None,
-        password=str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD).strip() or None,
-        secure=bool(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE),
+        port=int(settings.CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PORT),
+        username=str(settings.CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME).strip() or None,
+        password=str(settings.CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD).strip() or None,
+        secure=bool(settings.CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE),
     )
     try:
         return client.query_df(query)
@@ -86,6 +84,7 @@ def fetch_predictions_from_db(
         prediction_kind,
     )
 
+    log_event(logger, "fetch_predictions_from_db.table", table=METRICS_FORECAST_TABLE)
     available_columns = _load_metrics_forecast_columns()
     log_event(
         logger,
