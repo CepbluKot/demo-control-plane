@@ -169,10 +169,6 @@ class Settings(BaseSettings):
     CONTROL_PLANE_TEST_NOISE_SCALE: float = 1.5
 
     # Predictions DB
-    TGT_DATABASE_HOST: str = "localhost"
-    TGT_DATABASE_PORT: int = 8123
-    TGT_DATABASE_USERNAME: str = ""
-    TGT_DATABASE_PASSWORD: str = ""
     METRICS_PREDICTIONS_DATABASE: str = "default"
 
     # LLM credentials

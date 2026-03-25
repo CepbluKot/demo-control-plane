@@ -17,19 +17,19 @@ def _read_setting(name: str, default: str | None = None) -> str | None:
 
 
 db_username = _read_setting(
-    "TGT_DATABASE_USERNAME",
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME",
     default="",
 ) or ""
 db_password = _read_setting(
-    "TGT_DATABASE_PASSWORD",
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD",
     default="",
 ) or ""
 db_host = _read_setting(
-    "TGT_DATABASE_HOST",
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST",
     default="localhost",
 ) or "localhost"
 db_port = _read_setting(
-    "TGT_DATABASE_PORT",
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT",
     default="8123",
 ) or "8123"
 db_name = _read_setting(
