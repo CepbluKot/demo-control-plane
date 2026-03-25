@@ -77,6 +77,18 @@ def _load_callable(path: str) -> Callable[..., Any]:
     return fn
 
 
+def _payload_for_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in payload.items():
+        target_key = key
+        if key == "event":
+            target_key = "payload_event"
+        elif key == "level":
+            target_key = "payload_level"
+        out[target_key] = value
+    return out
+
+
 def _call_summarizer_adapter(
     fn: Callable[..., Any],
     *,
@@ -159,6 +171,12 @@ def process_anomalies(
         Список результатов обработки каждого выброса
     """
     def _emit(event: str, payload: Dict[str, Any]) -> None:
+        log_event(
+            logger,
+            "process_anomalies.emit",
+            emitted_event=event,
+            **_payload_for_log(payload),
+        )
         if on_event is not None:
             on_event(event, payload)
 

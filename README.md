@@ -26,11 +26,12 @@
 - либо вернуть другие имена и задать:
   - `CONTROL_PLANE_CLICKHOUSE_TIMESTAMP_COLUMN`
   - `CONTROL_PLANE_CLICKHOUSE_VALUE_COLUMN`
+- рекомендуется хранить в `CONTROL_PLANE_CLICKHOUSE_QUERY` только базу:
+  - `SELECT ... FROM ...`
+  - `WHERE` по времени, `ORDER BY` и `LIMIT` добавляются автоматически.
 
-Плейсхолдеры в `CONTROL_PLANE_CLICKHOUSE_QUERY`:
-
-- `{start}` / `{end}` — ISO datetime;
-- `{start_ts}` / `{end_ts}` — unix timestamp (секунды).
+Для backward compatibility поддержан и старый full-query формат с плейсхолдерами:
+`{start}`, `{end}`, `{start_ts}`, `{end_ts}`.
 
 ### 2) Прогнозы (`predictions`)
 
@@ -176,7 +177,7 @@ CONTROL_PLANE_CLICKHOUSE_PORT=8123
 CONTROL_PLANE_CLICKHOUSE_DATABASE=...
 CONTROL_PLANE_CLICKHOUSE_USERNAME=...
 CONTROL_PLANE_CLICKHOUSE_PASSWORD=...
-CONTROL_PLANE_CLICKHOUSE_QUERY=SELECT timestamp, value FROM your_actual_table WHERE timestamp >= parseDateTimeBestEffort('{start}') AND timestamp < parseDateTimeBestEffort('{end}') ORDER BY timestamp
+CONTROL_PLANE_CLICKHOUSE_QUERY=SELECT timestamp, value FROM your_actual_table
 
 CONTROL_PLANE_FORECAST_SERVICE=airflow-test-v1
 CONTROL_PLANE_FORECAST_METRIC_NAME=memory
@@ -195,6 +196,12 @@ CONTROL_PLANE_ALERT_CALLABLE=my_alert.send_sre_alert
 ```bash
 python -m py_compile control-plane.py streamlit_app.py control_plane/*.py
 ```
+
+### Логи в файлы
+
+В файл пишутся только уровни `INFO/WARNING/ERROR`:
+
+- `artifacts/logs/control-plane.log`
 
 ### Если Matplotlib ругается на кэш-директорию
 

@@ -43,6 +43,7 @@ from control_plane.logging_config import configure_logging
 from control_plane.predictions_db import fetch_predictions_from_db
 from control_plane.processing import process_anomalies
 from control_plane.test_mode import generate_mock_data
+from control_plane.trace import log_dataframe, log_event
 from control_plane.utils import to_iso_z
 from control_plane.visualization import visualize, visualize_combined
 
@@ -76,6 +77,27 @@ def _prepare_anomalies(anomalies_df: pd.DataFrame) -> List[Dict[str, Any]]:
     return anomalies
 
 
+def _payload_for_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for key, value in payload.items():
+        target_key = key
+        if key == "event":
+            target_key = "payload_event"
+        elif key == "level":
+            target_key = "payload_level"
+        if isinstance(value, pd.DataFrame):
+            compact[f"{target_key}_rows"] = len(value)
+            continue
+        if isinstance(value, dict):
+            compact[f"{target_key}_keys"] = list(value.keys())[:10]
+            continue
+        if isinstance(value, list):
+            compact[f"{target_key}_len"] = len(value)
+            continue
+        compact[target_key] = value
+    return compact
+
+
 def run_single_iteration(
     *,
     test_mode: bool,
@@ -88,10 +110,32 @@ def run_single_iteration(
     process_alerts: bool,
     on_stage: Optional[Callable[[str, int, Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
+    if not logging.getLogger().handlers:
+        _ensure_runtime()
+        log_event(logger, "run_single_iteration.logging_autoconfigured")
+
     def _emit(stage: str, progress: int, payload: Dict[str, Any]) -> None:
+        log_event(
+            logger,
+            "run_single_iteration.emit",
+            stage=stage,
+            progress=progress,
+            **_payload_for_log(payload),
+        )
         if on_stage is not None:
             on_stage(stage, progress, payload)
 
+    log_event(
+        logger,
+        "run_single_iteration.start",
+        test_mode=test_mode,
+        detector=detector_name,
+        lookback_minutes=data_lookback_minutes,
+        prediction_lookahead_minutes=prediction_lookahead_minutes,
+        analyze_top_n=analyze_top_n,
+        process_lookback_minutes=process_lookback_minutes,
+        process_alerts=process_alerts,
+    )
     _emit("init", 2, {"message": "Инициализация запуска"})
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=data_lookback_minutes)
@@ -130,6 +174,8 @@ def run_single_iteration(
             forecast_type=FORECAST_TYPE,
             prediction_kind=PREDICTION_KIND,
         )
+    log_dataframe(logger, "run_single_iteration.actual_df", actual_df)
+    log_dataframe(logger, "run_single_iteration.predictions_df", predictions_df)
     _emit(
         "fetch_done",
         35,
@@ -153,6 +199,8 @@ def run_single_iteration(
     anomalies_df = detection_result.anomalies_df
     if not anomalies_df.empty and "source" not in anomalies_df.columns:
         anomalies_df["source"] = "actual"
+    log_dataframe(logger, "run_single_iteration.merged_df", merged_df)
+    log_dataframe(logger, "run_single_iteration.anomalies_df", anomalies_df)
     _emit(
         "detect_done",
         60,
@@ -170,6 +218,14 @@ def run_single_iteration(
     log_filename = LOGS_DIR / f"api_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(log_filename, "w", encoding="utf-8") as f:
         json.dump(api_response, f, ensure_ascii=False, indent=2, default=str)
+    log_event(
+        logger,
+        "run_single_iteration.api_response_saved",
+        path=str(log_filename),
+        merged=len(api_response.get("data", {}).get("merged_data", [])),
+        predictions=len(api_response.get("data", {}).get("predictions", [])),
+        anomalies=len(api_response.get("data", {}).get("anomalies", [])),
+    )
 
     _emit("viz_start", 70, {"message": "Построение графиков"})
     plot_info = visualize(query, api_response)
@@ -247,6 +303,13 @@ def run_single_iteration(
             test_mode=test_mode,
             on_event=_on_processing_event,
         )
+        log_event(
+            logger,
+            "run_single_iteration.process_anomalies.done",
+            processed=len(processing_results),
+            success=sum(1 for item in processing_results if item.get("success")),
+            errors=sum(1 for item in processing_results if item.get("error")),
+        )
         _emit(
             "process_done",
             96,
@@ -272,6 +335,13 @@ def run_single_iteration(
         "api_log_path": str(log_filename),
         "detector": getattr(detector, "name", detector.__class__.__name__),
     }
+    log_event(
+        logger,
+        "run_single_iteration.done",
+        anomalies=len(anomalies),
+        processing_results=len(processing_results),
+        detector=result["detector"],
+    )
     _emit("done", 100, {"message": "Итерация завершена", "result": result})
     return result
 
@@ -530,6 +600,13 @@ def main() -> None:
         return
 
     def _on_stage(stage: str, progress: int, payload: Dict[str, Any]) -> None:
+        log_event(
+            logger,
+            "streamlit.on_stage",
+            stage=stage,
+            progress=progress,
+            **_payload_for_log(payload),
+        )
         if stage == "process_selected":
             selected = payload.get("recent_anomalies", [])
             summary_state["selected_anomalies"] = {

@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -29,7 +30,25 @@ class _SafeFormatDict(dict):
         return "{" + key + "}"
 
 
-def _render_clickhouse_query(query_template: str, start_time: datetime, end_time: datetime) -> str:
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_identifier(name: str) -> str:
+    if not _IDENT_RE.match(name):
+        raise ValueError(
+            f"Некорректное имя колонки: {name!r}. Разрешены только [A-Za-z0-9_], начиная с буквы/_."
+        )
+    return name
+
+
+def _render_clickhouse_query(
+    query_template: str,
+    start_time: datetime,
+    end_time: datetime,
+    *,
+    limit: int,
+    timestamp_column: str,
+) -> tuple[str, str]:
     params = _SafeFormatDict(
         start=start_time.isoformat(),
         end=end_time.isoformat(),
@@ -38,7 +57,23 @@ def _render_clickhouse_query(query_template: str, start_time: datetime, end_time
         start_ts=int(start_time.timestamp()),
         end_ts=int(end_time.timestamp()),
     )
-    return query_template.format_map(params)
+    query_template = query_template.strip().rstrip(";")
+    # Backward compatibility: if template already has time placeholders,
+    # treat it as full query and only format.
+    if any(token in query_template for token in ("{start", "{end", "{start_ts}", "{end_ts}")):
+        return query_template.format_map(params), "full"
+
+    ts_col = _safe_identifier(timestamp_column)
+    safe_limit = max(int(limit), 1)
+    wrapped = (
+        "SELECT *\n"
+        f"FROM ({query_template}) AS src\n"
+        f"WHERE src.{ts_col} >= parseDateTimeBestEffort('{params['start']}')\n"
+        f"  AND src.{ts_col} < parseDateTimeBestEffort('{params['end']}')\n"
+        f"ORDER BY src.{ts_col}\n"
+        f"LIMIT {safe_limit}"
+    )
+    return wrapped, "base"
 
 
 def _fetch_clickhouse_actuals(
@@ -46,6 +81,7 @@ def _fetch_clickhouse_actuals(
     start_time: datetime,
     end_time: datetime,
     query_template: str,
+    limit: int,
 ) -> pd.DataFrame:
     try:
         import clickhouse_connect
@@ -81,7 +117,20 @@ def _fetch_clickhouse_actuals(
         database=CLICKHOUSE_DATABASE or None,
         secure=CLICKHOUSE_SECURE,
     )
-    query = _render_clickhouse_query(query_template, start_time, end_time)
+    query, query_mode = _render_clickhouse_query(
+        query_template,
+        start_time,
+        end_time,
+        limit=limit,
+        timestamp_column=CLICKHOUSE_TIMESTAMP_COLUMN,
+    )
+    log_event(
+        logger,
+        "fetch_actuals.clickhouse.query",
+        query_mode=query_mode,
+        limit=limit,
+        query_preview=query[:600],
+    )
     df = client.query_df(query)
 
     if df.empty:
@@ -154,6 +203,7 @@ def fetch_actual_metrics_df(
             start_time=start_time,
             end_time=end_time,
             query_template=CLICKHOUSE_QUERY,
+            limit=max_points,
         )
 
     raise ValueError(
