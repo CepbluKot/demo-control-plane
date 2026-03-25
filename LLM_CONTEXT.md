@@ -93,6 +93,13 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 2. дефолт `control_plane/summarizer.py::do_summary`
 3. шаблон для быстрой интеграции: `my_summarizer.py::summarize_logs`
 
+`my_summarizer.py::summarize_logs` делает batched-fetch логов из ClickHouse:
+
+- берёт service из `anomaly['service']` или `CONTROL_PLANE_LOGS_DEFAULT_SERVICE`;
+- определяет таблицу через `CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON`;
+- строит запрос из `CONTROL_PLANE_LOGS_BASE_SELECT` + авто `WHERE period` + `ORDER BY` + `LIMIT/OFFSET`;
+- возвращает `chunk_summaries` для live UI.
+
 Поддерживаемые сигнатуры callable:
 
 - `fn(period_start: str, period_end: str, anomaly: dict)`
@@ -172,6 +179,7 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - `CONTROL_PLANE_FORECAST_*` для таблицы прогнозов
 - `CONTROL_PLANE_SUMMARIZER_CALLABLE` (опционально)
 - `CONTROL_PLANE_ALERT_CALLABLE` (опционально)
+- `CONTROL_PLANE_LOGS_*` (если используется `my_summarizer.py`)
 
 ## 9) Ограничения/риски
 
