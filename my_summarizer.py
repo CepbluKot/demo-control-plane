@@ -88,14 +88,12 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     port = int(os.getenv("CONTROL_PLANE_LOGS_CH_PORT", "8123"))
     username = os.getenv("CONTROL_PLANE_LOGS_CH_USERNAME", "").strip() or None
     password = os.getenv("CONTROL_PLANE_LOGS_CH_PASSWORD", "").strip() or None
-    database = os.getenv("CONTROL_PLANE_LOGS_CH_DATABASE", "default").strip() or None
 
     client = clickhouse_connect.get_client(
         host=host,
         port=port,
         username=username,
         password=password,
-        database=database,
     )
 
     def _db_fetch_page(

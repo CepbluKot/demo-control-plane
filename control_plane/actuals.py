@@ -5,7 +5,6 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from .config import (
-    CLICKHOUSE_METRICS_DATABASE,
     CLICKHOUSE_METRICS_HOST,
     CLICKHOUSE_METRICS_PASSWORD,
     CLICKHOUSE_METRICS_PORT,
@@ -69,7 +68,6 @@ def _fetch_clickhouse_actuals(
         "fetch_actuals.clickhouse.start",
         host=CLICKHOUSE_METRICS_HOST,
         port=CLICKHOUSE_METRICS_PORT,
-        database=CLICKHOUSE_METRICS_DATABASE,
         secure=CLICKHOUSE_METRICS_SECURE,
         start=start_time.isoformat(),
         end=end_time.isoformat(),
@@ -79,7 +77,6 @@ def _fetch_clickhouse_actuals(
         port=CLICKHOUSE_METRICS_PORT,
         username=CLICKHOUSE_METRICS_USERNAME or None,
         password=CLICKHOUSE_METRICS_PASSWORD or None,
-        database=CLICKHOUSE_METRICS_DATABASE or None,
         secure=CLICKHOUSE_METRICS_SECURE,
     )
     query = _render_clickhouse_query(
