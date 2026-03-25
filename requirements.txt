@@ -5,8 +5,6 @@ requests
 urllib3
 prometheus-api-client
 streamlit
-SQLAlchemy
 clickhouse-connect
-clickhouse-sqlalchemy
 pydantic
 pydantic-settings

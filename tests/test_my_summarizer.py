@@ -2,6 +2,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pandas as pd
+
 from my_summarizer import (
     _build_db_fetch_page,
     _render_logs_query,
@@ -92,28 +94,15 @@ class TestMySummarizer(unittest.TestCase):
         }
         calls = {"count": 0}
 
-        class _FakeMappings:
-            @staticmethod
-            def all():
-                return [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
-
-        class _FakeResult:
-            @staticmethod
-            def mappings():
-                return _FakeMappings()
-
-        class _FakeSession:
-            def execute(self, _statement):
-                calls["count"] += 1
-                return _FakeResult()
-
-            @staticmethod
-            def close() -> None:
-                return None
+        def _fake_query_df(_query: str):
+            calls["count"] += 1
+            return pd.DataFrame(
+                [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
+            )
 
         with patch.multiple(settings, **config_overrides), patch(
-            "sqlalchemy_stuff.engine.LogsSession",
-            return_value=_FakeSession(),
+            "my_summarizer._query_logs_df",
+            side_effect=_fake_query_df,
         ):
             fetch_page = _build_db_fetch_page({"service": "svc-a"})
             first_page = fetch_page(

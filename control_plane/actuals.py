@@ -72,13 +72,6 @@ def _fetch_clickhouse_actuals(
         start=start_time.isoformat(),
         end=end_time.isoformat(),
     )
-    client = clickhouse_connect.get_client(
-        host=CLICKHOUSE_METRICS_HOST,
-        port=CLICKHOUSE_METRICS_PORT,
-        username=CLICKHOUSE_METRICS_USERNAME or None,
-        password=CLICKHOUSE_METRICS_PASSWORD or None,
-        secure=CLICKHOUSE_METRICS_SECURE,
-    )
     query = _render_clickhouse_query(
         query_template,
         start_time,
@@ -89,7 +82,20 @@ def _fetch_clickhouse_actuals(
         "fetch_actuals.clickhouse.query",
         query_preview=query[:600],
     )
-    df = client.query_df(query)
+    client = clickhouse_connect.get_client(
+        host=CLICKHOUSE_METRICS_HOST,
+        port=CLICKHOUSE_METRICS_PORT,
+        username=CLICKHOUSE_METRICS_USERNAME or None,
+        password=CLICKHOUSE_METRICS_PASSWORD or None,
+        secure=CLICKHOUSE_METRICS_SECURE,
+    )
+    try:
+        df = client.query_df(query)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.warning("ClickHouse client close failed for actual metrics query")
 
     if df.empty:
         log_event(logger, "fetch_actuals.clickhouse.empty")

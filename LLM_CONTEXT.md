@@ -40,10 +40,8 @@ Pipeline для SRE-кейса:
   - интерфейс отправки алерта (сейчас stub)
 - `control_plane/visualization.py`
   - генерация графиков
-- `sqlalchemy_stuff/engine.py`
-  - отдельные ClickHouse-сессии: `MetricsSession`/`Session` и `LogsSession`
-- `sqlalchemy_stuff/tables.py`
-  - ORM-таблицы, включая `MetricsForecast` (привязка к metrics-session)
+- `control_plane/predictions_db.py`, `control_plane/actuals.py`, `my_summarizer.py`
+  - ClickHouse-запросы выполняются через `clickhouse_connect.get_client(...).query_df(...)`
 
 ## 4) Ключевые DataFrame-контракты
 

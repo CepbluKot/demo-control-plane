@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -9,6 +10,7 @@ from settings import settings
 
 
 LOGS_SQL_COLUMNS: tuple[str, str] = ("timestamp", "value")
+logger = logging.getLogger(__name__)
 
 
 def _normalize_period(
@@ -100,23 +102,39 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
             offset=offset,
             service=service,
         )
-        try:
-            from sqlalchemy import text
-            from sqlalchemy_stuff.engine import LogsSession
-        except Exception as exc:
-            raise ImportError("sqlalchemy_stuff LogsSession is required for logs batch fetch") from exc
-
-        session = LogsSession()
-        try:
-            result = session.execute(text(query))
-            rows = result.mappings().all()
-            if not rows:
-                return []
-            return [dict(row) for row in rows]
-        finally:
-            session.close()
+        page_df = _query_logs_df(query)
+        if page_df.empty:
+            return []
+        return [dict(row) for row in page_df.to_dict(orient="records")]
 
     return _db_fetch_page
+
+
+def _query_logs_df(query: str) -> pd.DataFrame:
+    try:
+        import clickhouse_connect
+    except Exception as exc:
+        raise ImportError("Для чтения логов нужен пакет clickhouse-connect") from exc
+
+    host = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_HOST).strip()
+    if not host:
+        raise ValueError(
+            "Set CONTROL_PLANE_LOGS_CLICKHOUSE_HOST in .env for logs summarization"
+        )
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=int(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PORT),
+        username=str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME).strip() or None,
+        password=str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD).strip() or None,
+    )
+    try:
+        return client.query_df(query)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.warning("ClickHouse client close failed for logs query")
 
 
 def summarize_logs(

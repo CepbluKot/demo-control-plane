@@ -53,7 +53,6 @@ def configure_logging() -> None:
     logging.getLogger("control_plane").setLevel(logging.INFO)
     logging.getLogger("matplotlib").setLevel(logging.INFO)
     logging.getLogger("urllib3").setLevel(logging.INFO)
-    logging.getLogger("sqlalchemy").setLevel(logging.INFO)
     logging.getLogger(__name__).info(
         "Logging configured: levels=INFO|WARNING|ERROR, file=%s",
         log_file,
