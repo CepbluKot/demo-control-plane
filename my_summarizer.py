@@ -85,10 +85,10 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     except Exception as exc:
         raise ImportError("clickhouse-connect is required for logs batch fetch") from exc
 
-    host = str(settings.CONTROL_PLANE_LOGS_CH_HOST).strip() or "localhost"
-    port = int(settings.CONTROL_PLANE_LOGS_CH_PORT)
-    username = str(settings.CONTROL_PLANE_LOGS_CH_USERNAME).strip() or None
-    password = str(settings.CONTROL_PLANE_LOGS_CH_PASSWORD).strip() or None
+    host = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_HOST).strip() or "localhost"
+    port = int(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PORT)
+    username = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME).strip() or None
+    password = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD).strip() or None
 
     client = clickhouse_connect.get_client(
         host=host,

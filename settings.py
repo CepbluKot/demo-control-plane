@@ -86,62 +86,20 @@ class Settings(BaseSettings):
         ),
     )
 
-    # ClickHouse metrics source (new names + legacy aliases)
-    CONTROL_PLANE_CLICKHOUSE_METRICS_HOST: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST",
-            "CONTROL_PLANE_CLICKHOUSE_HOST",
-        ),
-    )
-    CONTROL_PLANE_CLICKHOUSE_METRICS_PORT: int = Field(
-        default=8123,
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT",
-            "CONTROL_PLANE_CLICKHOUSE_PORT",
-        ),
-    )
-    CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME",
-            "CONTROL_PLANE_CLICKHOUSE_USERNAME",
-        ),
-    )
-    CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD",
-            "CONTROL_PLANE_CLICKHOUSE_PASSWORD",
-        ),
-    )
-    CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE: bool = Field(
-        default=False,
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE",
-            "CONTROL_PLANE_CLICKHOUSE_SECURE",
-        ),
-    )
-    CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY",
-            "CONTROL_PLANE_CLICKHOUSE_QUERY",
-        ),
-    )
+    # ClickHouse metrics source
+    CONTROL_PLANE_CLICKHOUSE_METRICS_HOST: str = ""
+    CONTROL_PLANE_CLICKHOUSE_METRICS_PORT: int = 8123
+    CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME: str = ""
+    CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD: str = ""
+    CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE: bool = False
+    CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY: str = ""
 
-    # Logs source (for my_summarizer)
-    CONTROL_PLANE_LOGS_CH_HOST: str = "localhost"
-    CONTROL_PLANE_LOGS_CH_PORT: int = 8123
-    CONTROL_PLANE_LOGS_CH_USERNAME: str = ""
-    CONTROL_PLANE_LOGS_CH_PASSWORD: str = ""
-    CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY",
-            "CONTROL_PLANE_LOGS_QUERY",
-        ),
-    )
+    # ClickHouse logs source (for my_summarizer)
+    CONTROL_PLANE_LOGS_CLICKHOUSE_HOST: str = "localhost"
+    CONTROL_PLANE_LOGS_CLICKHOUSE_PORT: int = 8123
+    CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME: str = ""
+    CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD: str = ""
+    CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY: str = ""
     CONTROL_PLANE_LOGS_PAGE_LIMIT: int = 1000
 
     # Forecast metadata
@@ -167,9 +125,6 @@ class Settings(BaseSettings):
     CONTROL_PLANE_TEST_SPIKE_RATE: float = 0.03
     CONTROL_PLANE_TEST_SPIKE_SCALE: float = 12.0
     CONTROL_PLANE_TEST_NOISE_SCALE: float = 1.5
-
-    # Predictions DB
-    METRICS_PREDICTIONS_DATABASE: str = "default"
 
     # LLM credentials
     OPENAI_API_BASE_DB: str = ""

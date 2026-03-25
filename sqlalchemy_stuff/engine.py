@@ -32,10 +32,7 @@ db_port = _read_setting(
     "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT",
     default="8123",
 ) or "8123"
-db_name = _read_setting(
-    "METRICS_PREDICTIONS_DATABASE",
-    default="default",
-) or "default"
+db_name = "default"
 
 encoded_user = quote_plus(db_username)
 encoded_pass = quote_plus(db_password)
