@@ -45,6 +45,12 @@
 
 Это совместимо с таблицей, где есть базовые поля без этих двух колонок.
 
+### 3) DB-сессии (важно)
+
+- `MetricsSession`/`Session` из `sqlalchemy_stuff/engine.py` привязаны к `CONTROL_PLANE_CLICKHOUSE_METRICS_HOST`.
+- ORM-таблица `MetricsForecast` (`sqlalchemy_stuff/tables.py`) работает только через metrics-engine.
+- Для логового ClickHouse поднята отдельная сессия `LogsSession` (другой host), а batched-fetch в `my_summarizer.py` использует те же `CONTROL_PLANE_LOGS_CLICKHOUSE_*` параметры.
+
 ## Расширяемые интерфейсы
 
 ### Детектор аномалий
@@ -230,3 +236,5 @@ export MPLCONFIGDIR=/tmp/matplotlib
 - `control_plane/alerts.py` — интерфейс/заглушка отправки алерта.
 - `control_plane/visualization.py` — построение графиков.
 - `control_plane/config.py` — конфиг из `.env`.
+- `sqlalchemy_stuff/engine.py` — отдельные сессии Metrics/Logs для ClickHouse.
+- `sqlalchemy_stuff/tables.py` — ORM-модели (включая `MetricsForecast`).

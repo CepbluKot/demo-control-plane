@@ -35,13 +35,13 @@ def fetch_predictions_from_db(
     )
     try:
         from sqlalchemy import func
-        from sqlalchemy_stuff.engine import Session
+        from sqlalchemy_stuff.engine import MetricsSession
         from sqlalchemy_stuff.tables import MetricsForecast
     except Exception as exc:
         logger.exception("DB predictions fetch import error")
         raise ImportError("sqlalchemy_stuff недоступен для чтения предсказаний из БД") from exc
 
-    session = Session()
+    session = MetricsSession()
     try:
         filters = [
             MetricsForecast.service == service,

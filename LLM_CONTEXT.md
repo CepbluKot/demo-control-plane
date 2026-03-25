@@ -21,7 +21,7 @@ Pipeline для SRE-кейса:
 ## 3) Основные модули
 
 - `control_plane/config.py`
-  - загружает `.env`
+  - читает runtime-конфиг через `settings.py` (Pydantic Settings)
   - хранит runtime-конфиг
 - `control_plane/actuals.py`
   - единый интерфейс получения `actual`
@@ -40,6 +40,10 @@ Pipeline для SRE-кейса:
   - интерфейс отправки алерта (сейчас stub)
 - `control_plane/visualization.py`
   - генерация графиков
+- `sqlalchemy_stuff/engine.py`
+  - отдельные ClickHouse-сессии: `MetricsSession`/`Session` и `LogsSession`
+- `sqlalchemy_stuff/tables.py`
+  - ORM-таблицы, включая `MetricsForecast` (привязка к metrics-session)
 
 ## 4) Ключевые DataFrame-контракты
 
@@ -177,11 +181,13 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 ## 8) Конфиг, который критичен для интеграции
 
 - `CONTROL_PLANE_METRICS_SOURCE=prometheus|clickhouse`
-- `CONTROL_PLANE_CLICKHOUSE_*` (если source=clickhouse)
+- `CONTROL_PLANE_CLICKHOUSE_METRICS_HOST|PORT|USERNAME|PASSWORD|SECURE|QUERY` (если source=clickhouse)
 - `CONTROL_PLANE_FORECAST_*` для таблицы прогнозов
 - `CONTROL_PLANE_SUMMARIZER_CALLABLE` (опционально)
 - `CONTROL_PLANE_ALERT_CALLABLE` (опционально)
-- `CONTROL_PLANE_LOGS_*` (если используется `my_summarizer.py`)
+- `CONTROL_PLANE_LOGS_CLICKHOUSE_HOST|PORT|USERNAME|PASSWORD`
+- `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`
+- `CONTROL_PLANE_LOGS_PAGE_LIMIT`
 
 ## 9) Ограничения/риски
 

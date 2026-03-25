@@ -1,9 +1,6 @@
 import unittest
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from unittest.mock import patch
-
-import pandas as pd
 
 from my_summarizer import (
     _build_db_fetch_page,
@@ -95,17 +92,28 @@ class TestMySummarizer(unittest.TestCase):
         }
         calls = {"count": 0}
 
-        def fake_query_df(_query):
-            calls["count"] += 1
-            return pd.DataFrame([{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}])
+        class _FakeMappings:
+            @staticmethod
+            def all():
+                return [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
 
-        fake_module = SimpleNamespace(
-            get_client=lambda **_kwargs: SimpleNamespace(query_df=fake_query_df)
-        )
+        class _FakeResult:
+            @staticmethod
+            def mappings():
+                return _FakeMappings()
 
-        with patch.multiple(settings, **config_overrides), patch.dict(
-            "sys.modules",
-            {"clickhouse_connect": fake_module},
+        class _FakeSession:
+            def execute(self, _statement):
+                calls["count"] += 1
+                return _FakeResult()
+
+            @staticmethod
+            def close() -> None:
+                return None
+
+        with patch.multiple(settings, **config_overrides), patch(
+            "sqlalchemy_stuff.engine.LogsSession",
+            return_value=_FakeSession(),
         ):
             fetch_page = _build_db_fetch_page({"service": "svc-a"})
             first_page = fetch_page(

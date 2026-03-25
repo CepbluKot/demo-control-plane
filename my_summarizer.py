@@ -80,23 +80,6 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     query_template = _resolve_logs_query_template()
     has_offset_placeholder = "{offset}" in query_template
 
-    try:
-        import clickhouse_connect
-    except Exception as exc:
-        raise ImportError("clickhouse-connect is required for logs batch fetch") from exc
-
-    host = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_HOST).strip() or "localhost"
-    port = int(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PORT)
-    username = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME).strip() or None
-    password = str(settings.CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD).strip() or None
-
-    client = clickhouse_connect.get_client(
-        host=host,
-        port=port,
-        username=username,
-        password=password,
-    )
-
     def _db_fetch_page(
         *,
         columns: Sequence[str],
@@ -117,10 +100,21 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
             offset=offset,
             service=service,
         )
-        df = client.query_df(query)
-        if df.empty:
-            return []
-        return df.to_dict(orient="records")
+        try:
+            from sqlalchemy import text
+            from sqlalchemy_stuff.engine import LogsSession
+        except Exception as exc:
+            raise ImportError("sqlalchemy_stuff LogsSession is required for logs batch fetch") from exc
+
+        session = LogsSession()
+        try:
+            result = session.execute(text(query))
+            rows = result.mappings().all()
+            if not rows:
+                return []
+            return [dict(row) for row in rows]
+        finally:
+            session.close()
 
     return _db_fetch_page
 
