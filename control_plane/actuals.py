@@ -5,17 +5,13 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from .config import (
-    CLICKHOUSE_DATABASE,
-    CLICKHOUSE_HOST,
-    CLICKHOUSE_PASSWORD,
-    CLICKHOUSE_PORT,
-    CLICKHOUSE_QUERY,
-    CLICKHOUSE_SECURE,
-    CLICKHOUSE_TIMESTAMP_COLUMN,
-    CLICKHOUSE_TIMESTAMP_UNIT,
-    CLICKHOUSE_USERNAME,
-    CLICKHOUSE_VALUE_COLUMN,
-    CLICKHOUSE_VALUE_SCALE,
+    CLICKHOUSE_METRICS_DATABASE,
+    CLICKHOUSE_METRICS_HOST,
+    CLICKHOUSE_METRICS_PASSWORD,
+    CLICKHOUSE_METRICS_PORT,
+    CLICKHOUSE_METRICS_QUERY,
+    CLICKHOUSE_METRICS_SECURE,
+    CLICKHOUSE_METRICS_USERNAME,
     METRICS_SOURCE,
 )
 from .prometheus_io import fetch_prometheus_df
@@ -59,32 +55,32 @@ def _fetch_clickhouse_actuals(
             "Для чтения фактических метрик из ClickHouse нужен пакет clickhouse-connect"
         ) from exc
 
-    if not CLICKHOUSE_HOST:
+    if not CLICKHOUSE_METRICS_HOST:
         raise ValueError(
-            "Для METRICS_SOURCE=clickhouse укажи CONTROL_PLANE_CLICKHOUSE_HOST в .env"
+            "Для METRICS_SOURCE=clickhouse укажи CONTROL_PLANE_CLICKHOUSE_METRICS_HOST в .env"
         )
     if not query_template:
         raise ValueError(
-            "Для METRICS_SOURCE=clickhouse укажи CONTROL_PLANE_CLICKHOUSE_QUERY в .env"
+            "Для METRICS_SOURCE=clickhouse укажи CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY в .env"
         )
 
     log_event(
         logger,
         "fetch_actuals.clickhouse.start",
-        host=CLICKHOUSE_HOST,
-        port=CLICKHOUSE_PORT,
-        database=CLICKHOUSE_DATABASE,
-        secure=CLICKHOUSE_SECURE,
+        host=CLICKHOUSE_METRICS_HOST,
+        port=CLICKHOUSE_METRICS_PORT,
+        database=CLICKHOUSE_METRICS_DATABASE,
+        secure=CLICKHOUSE_METRICS_SECURE,
         start=start_time.isoformat(),
         end=end_time.isoformat(),
     )
     client = clickhouse_connect.get_client(
-        host=CLICKHOUSE_HOST,
-        port=CLICKHOUSE_PORT,
-        username=CLICKHOUSE_USERNAME or None,
-        password=CLICKHOUSE_PASSWORD or None,
-        database=CLICKHOUSE_DATABASE or None,
-        secure=CLICKHOUSE_SECURE,
+        host=CLICKHOUSE_METRICS_HOST,
+        port=CLICKHOUSE_METRICS_PORT,
+        username=CLICKHOUSE_METRICS_USERNAME or None,
+        password=CLICKHOUSE_METRICS_PASSWORD or None,
+        database=CLICKHOUSE_METRICS_DATABASE or None,
+        secure=CLICKHOUSE_METRICS_SECURE,
     )
     query = _render_clickhouse_query(
         query_template,
@@ -102,31 +98,11 @@ def _fetch_clickhouse_actuals(
         log_event(logger, "fetch_actuals.clickhouse.empty")
         return pd.DataFrame(columns=["timestamp", "value"])
 
-    if CLICKHOUSE_TIMESTAMP_COLUMN != "timestamp" and CLICKHOUSE_TIMESTAMP_COLUMN in df.columns:
-        df = df.rename(columns={CLICKHOUSE_TIMESTAMP_COLUMN: "timestamp"})
-    if CLICKHOUSE_VALUE_COLUMN != "value" and CLICKHOUSE_VALUE_COLUMN in df.columns:
-        df = df.rename(columns={CLICKHOUSE_VALUE_COLUMN: "value"})
-
     if "timestamp" not in df.columns or "value" not in df.columns:
-        raise ValueError(
-            "ClickHouse query должен вернуть колонки timestamp и value "
-            f"(или переименуй через env: timestamp={CLICKHOUSE_TIMESTAMP_COLUMN}, "
-            f"value={CLICKHOUSE_VALUE_COLUMN})"
-        )
+        raise ValueError("ClickHouse query должен вернуть колонки timestamp и value")
 
-    if CLICKHOUSE_TIMESTAMP_UNIT:
-        df["timestamp"] = pd.to_datetime(
-            df["timestamp"],
-            unit=CLICKHOUSE_TIMESTAMP_UNIT,
-            utc=True,
-            errors="coerce",
-        )
-    else:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    if CLICKHOUSE_VALUE_SCALE != 1.0:
-        df["value"] = df["value"] * float(CLICKHOUSE_VALUE_SCALE)
 
     out = df.dropna(subset=["timestamp", "value"]).sort_values("timestamp").reset_index(drop=True)
     log_dataframe(logger, "fetch_actuals.clickhouse.df", out)
@@ -167,7 +143,7 @@ def fetch_actual_metrics_df(
         return _fetch_clickhouse_actuals(
             start_time=start_time,
             end_time=end_time,
-            query_template=CLICKHOUSE_QUERY,
+            query_template=CLICKHOUSE_METRICS_QUERY,
         )
 
     raise ValueError(

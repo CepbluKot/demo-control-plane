@@ -46,52 +46,101 @@ LOOPBACK_MINUTES = _as_int(os.getenv("CONTROL_PLANE_LOOPBACK_MINUTES"), 30)
 DATA_LOOKBACK_MINUTES = _as_int(os.getenv("CONTROL_PLANE_DATA_LOOKBACK_MINUTES"), 60)
 PREDICTION_LOOKAHEAD_MINUTES = _as_int(os.getenv("CONTROL_PLANE_PREDICTION_LOOKAHEAD_MINUTES"), 60)
 METRICS_SOURCE = os.getenv("CONTROL_PLANE_METRICS_SOURCE", "prometheus").strip().lower()
-PROM_STEP = os.getenv("CONTROL_PLANE_PROM_STEP", "1m")
-PROM_MAX_POINTS = _as_int(os.getenv("CONTROL_PLANE_PROM_MAX_POINTS"), 11000)
-PROM_SERIES_INDEX = _as_int(os.getenv("CONTROL_PLANE_PROM_SERIES_INDEX"), 0)
+# Prometheus range-step is technical API detail; keep it fixed internally.
+PROM_STEP = "1m"
+PROM_MAX_POINTS = _as_int(
+    os.getenv(
+        "CONTROL_PLANE_PROM_METRICS_MAX_POINTS",
+        os.getenv("CONTROL_PLANE_PROM_MAX_POINTS"),
+    ),
+    11000,
+)
+PROM_SERIES_INDEX = _as_int(
+    os.getenv(
+        "CONTROL_PLANE_PROM_METRICS_SERIES_INDEX",
+        os.getenv("CONTROL_PLANE_PROM_SERIES_INDEX"),
+    ),
+    0,
+)
 PROM_QUERY = os.getenv(
-    "CONTROL_PLANE_PROM_QUERY",
-    getattr(
+    "CONTROL_PLANE_PROM_METRICS_QUERY",
+    os.getenv(
+        "CONTROL_PLANE_PROM_QUERY",
+    ),
+)
+if not PROM_QUERY:
+    PROM_QUERY = getattr(
         settings,
         "PROM_QUERY",
         'sum(container_memory_working_set_bytes{image!="", '
         'container="airflow-worker", node="ndp-v01wnl-n19"})',
+    )
+PROM_URL = os.getenv(
+    "CONTROL_PLANE_PROM_METRICS_URL",
+    os.getenv(
+        "CONTROL_PLANE_PROM_URL",
     ),
 )
-PROM_URL = os.getenv(
-    "CONTROL_PLANE_PROM_URL",
-    getattr(settings, "PROM_URL", "https://prom-ndp-v01.ndp-psi.int.gazprombank.ru"),
-)
+if not PROM_URL:
+    PROM_URL = getattr(settings, "PROM_URL", "https://prom-ndp-v01.ndp-psi.int.gazprombank.ru")
 PROM_USERNAME = os.getenv(
-    "CONTROL_PLANE_PROM_USERNAME",
-    getattr(settings, "PROM_USERNAME", "ndp-monitor"),
+    "CONTROL_PLANE_PROM_METRICS_USERNAME",
+    os.getenv(
+        "CONTROL_PLANE_PROM_USERNAME",
+    ),
 )
+if PROM_USERNAME is None or PROM_USERNAME == "":
+    PROM_USERNAME = getattr(settings, "PROM_USERNAME", "ndp-monitor")
 PROM_PASSWORD = os.getenv(
-    "CONTROL_PLANE_PROM_PASSWORD",
-    getattr(settings, "PROM_PASSWORD", ""),
+    "CONTROL_PLANE_PROM_METRICS_PASSWORD",
+    os.getenv(
+        "CONTROL_PLANE_PROM_PASSWORD",
+    ),
 )
+if PROM_PASSWORD is None:
+    PROM_PASSWORD = getattr(settings, "PROM_PASSWORD", "")
 PROM_DISABLE_SSL = _as_bool(
-    os.getenv("CONTROL_PLANE_PROM_DISABLE_SSL"),
+    os.getenv(
+        "CONTROL_PLANE_PROM_METRICS_DISABLE_SSL",
+        os.getenv("CONTROL_PLANE_PROM_DISABLE_SSL"),
+    ),
     bool(getattr(settings, "PROM_DISABLE_SSL", True)),
 )
 
-CLICKHOUSE_QUERY = os.getenv("CONTROL_PLANE_CLICKHOUSE_QUERY", "")
-CLICKHOUSE_HOST = os.getenv("CONTROL_PLANE_CLICKHOUSE_HOST", "")
-CLICKHOUSE_PORT = _as_int(os.getenv("CONTROL_PLANE_CLICKHOUSE_PORT"), 8123)
-CLICKHOUSE_USERNAME = os.getenv("CONTROL_PLANE_CLICKHOUSE_USERNAME", "")
-CLICKHOUSE_PASSWORD = os.getenv("CONTROL_PLANE_CLICKHOUSE_PASSWORD", "")
-CLICKHOUSE_DATABASE = os.getenv("CONTROL_PLANE_CLICKHOUSE_DATABASE", "")
-CLICKHOUSE_SECURE = _as_bool(os.getenv("CONTROL_PLANE_CLICKHOUSE_SECURE"), False)
-CLICKHOUSE_TIMESTAMP_COLUMN = os.getenv(
-    "CONTROL_PLANE_CLICKHOUSE_TIMESTAMP_COLUMN",
-    "timestamp",
+CLICKHOUSE_METRICS_QUERY = os.getenv(
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY",
+    os.getenv("CONTROL_PLANE_CLICKHOUSE_QUERY", ""),
 )
-CLICKHOUSE_VALUE_COLUMN = os.getenv(
-    "CONTROL_PLANE_CLICKHOUSE_VALUE_COLUMN",
-    "value",
+CLICKHOUSE_METRICS_HOST = os.getenv(
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST",
+    os.getenv("CONTROL_PLANE_CLICKHOUSE_HOST", ""),
 )
-CLICKHOUSE_TIMESTAMP_UNIT = os.getenv("CONTROL_PLANE_CLICKHOUSE_TIMESTAMP_UNIT")
-CLICKHOUSE_VALUE_SCALE = _as_float(os.getenv("CONTROL_PLANE_CLICKHOUSE_VALUE_SCALE"), 1.0)
+CLICKHOUSE_METRICS_PORT = _as_int(
+    os.getenv(
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT",
+        os.getenv("CONTROL_PLANE_CLICKHOUSE_PORT"),
+    ),
+    8123,
+)
+CLICKHOUSE_METRICS_USERNAME = os.getenv(
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME",
+    os.getenv("CONTROL_PLANE_CLICKHOUSE_USERNAME", ""),
+)
+CLICKHOUSE_METRICS_PASSWORD = os.getenv(
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD",
+    os.getenv("CONTROL_PLANE_CLICKHOUSE_PASSWORD", ""),
+)
+CLICKHOUSE_METRICS_DATABASE = os.getenv(
+    "CONTROL_PLANE_CLICKHOUSE_METRICS_DATABASE",
+    os.getenv("CONTROL_PLANE_CLICKHOUSE_DATABASE", ""),
+)
+CLICKHOUSE_METRICS_SECURE = _as_bool(
+    os.getenv(
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE",
+        os.getenv("CONTROL_PLANE_CLICKHOUSE_SECURE"),
+    ),
+    False,
+)
 
 FORECAST_SERVICE = os.getenv(
     "CONTROL_PLANE_FORECAST_SERVICE",

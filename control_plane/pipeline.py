@@ -145,6 +145,7 @@ def run_loop(sleep_seconds: int = 60) -> None:
                     anomalies.append(
                         {
                             "timestamp": to_iso_z(pd.to_datetime(row["timestamp"], utc=True)),
+                            "service": FORECAST_SERVICE,
                             "value": float(row["value"]),
                             "predicted": float(row.get("predicted")) if row.get("predicted") is not None else None,
                             "residual": float(row.get("residual")) if row.get("residual") is not None else None,

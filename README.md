@@ -23,10 +23,7 @@
 Контракт для `clickhouse`-запроса:
 
 - должен вернуть колонки `timestamp` и `value`;
-- либо вернуть другие имена и задать:
-  - `CONTROL_PLANE_CLICKHOUSE_TIMESTAMP_COLUMN`
-  - `CONTROL_PLANE_CLICKHOUSE_VALUE_COLUMN`
-- в `CONTROL_PLANE_CLICKHOUSE_QUERY` задается полный SQL для исходных метрик
+- в `CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY` задается полный SQL для исходных метрик
   (с `WHERE/ORDER BY/LIMIT` как нужно в вашем контуре).
 - поддерживаются плейсхолдеры: `{start}`, `{end}`, `{start_ts}`, `{end_ts}`.
 
@@ -62,9 +59,11 @@
 - Кастомный путь: `CONTROL_PLANE_SUMMARIZER_CALLABLE`.
 - Готовый шаблон для старта: `my_summarizer.py::summarize_logs`.
 - В `my_summarizer.py` реализован batched-fetch логов из ClickHouse:
-  - таблица выбирается по сервису (`CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON`);
-  - в конфиге задается базовый `SELECT ... FROM ...`;
-  - `WHERE` по периоду + `ORDER BY` + `LIMIT/OFFSET` добавляются автоматически.
+  - в `.env` задается один полный SQL: `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
+  - SQL обязан вернуть колонки `timestamp` и `value`;
+  - в SQL можно использовать плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
+  - `anomaly['service']` обязателен (fallback-сервиса больше нет);
+  - если в запросе нет `{offset}`, фетч работает как single-shot (одна страница).
 
 Ожидаемый callable (один из поддерживаемых вариантов сигнатуры):
 
@@ -173,12 +172,12 @@ CONTROL_PLANE_PROCESS_ALERTS=true
 CONTROL_PLANE_TEST_MODE=false
 CONTROL_PLANE_METRICS_SOURCE=clickhouse
 
-CONTROL_PLANE_CLICKHOUSE_HOST=...
-CONTROL_PLANE_CLICKHOUSE_PORT=8123
-CONTROL_PLANE_CLICKHOUSE_DATABASE=...
-CONTROL_PLANE_CLICKHOUSE_USERNAME=...
-CONTROL_PLANE_CLICKHOUSE_PASSWORD=...
-CONTROL_PLANE_CLICKHOUSE_QUERY=SELECT timestamp, value FROM your_actual_table WHERE timestamp >= parseDateTimeBestEffort('{start}') AND timestamp < parseDateTimeBestEffort('{end}') ORDER BY timestamp
+CONTROL_PLANE_CLICKHOUSE_METRICS_HOST=...
+CONTROL_PLANE_CLICKHOUSE_METRICS_PORT=8123
+CONTROL_PLANE_CLICKHOUSE_METRICS_DATABASE=...
+CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME=...
+CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD=...
+CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY=SELECT timestamp, value FROM your_actual_table WHERE timestamp >= parseDateTimeBestEffort('{start}') AND timestamp < parseDateTimeBestEffort('{end}') ORDER BY timestamp
 
 CONTROL_PLANE_FORECAST_SERVICE=airflow-test-v1
 CONTROL_PLANE_FORECAST_METRIC_NAME=memory
@@ -195,12 +194,7 @@ CONTROL_PLANE_LOGS_CH_PORT=8123
 CONTROL_PLANE_LOGS_CH_USERNAME=...
 CONTROL_PLANE_LOGS_CH_PASSWORD=...
 CONTROL_PLANE_LOGS_CH_DATABASE=...
-CONTROL_PLANE_LOGS_DEFAULT_SERVICE=airflow-test-v1
-CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON={"airflow-test-v1":"logs_airflow_test_v1"}
-CONTROL_PLANE_LOGS_BASE_SELECT=SELECT timestamp, level, message FROM {table}
-CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN=timestamp
-CONTROL_PLANE_LOGS_ORDER_BY=timestamp
-CONTROL_PLANE_LOGS_COLUMNS=timestamp,level,message
+CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, value FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
 CONTROL_PLANE_LOGS_PAGE_LIMIT=1000
 ```
 

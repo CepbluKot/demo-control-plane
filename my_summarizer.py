@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+LOGS_SQL_COLUMNS: tuple[str, str] = ("timestamp", "value")
 
 
 def _normalize_period(
@@ -26,85 +24,61 @@ def _normalize_period(
     raise ValueError("Provide either period_start+period_end or start_dt+end_dt")
 
 
-def _safe_identifier(name: str) -> str:
-    if not _IDENT_RE.match(name):
-        raise ValueError(f"Invalid SQL identifier: {name!r}")
-    return name
-
-
-def _resolve_logs_table(service: str) -> str:
-    by_service_raw = os.getenv("CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON", "{}").strip() or "{}"
-    try:
-        by_service = json.loads(by_service_raw)
-    except Exception as exc:
-        raise ValueError("CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON must be valid JSON object") from exc
-    if not isinstance(by_service, dict):
-        raise ValueError("CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON must be JSON object")
-
-    table = by_service.get(service) or os.getenv("CONTROL_PLANE_LOGS_DEFAULT_TABLE", "").strip()
-    if not table:
-        raise ValueError(
-            f"Logs table for service={service!r} not found. "
-            "Set CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON or CONTROL_PLANE_LOGS_DEFAULT_TABLE."
-        )
-    return _safe_identifier(table)
+class _SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
 
 
 def _resolve_service(anomaly: Optional[Dict[str, Any]]) -> str:
     if anomaly and anomaly.get("service"):
         return str(anomaly["service"])
-    service_env = os.getenv("CONTROL_PLANE_LOGS_DEFAULT_SERVICE", "").strip()
-    if service_env:
-        return service_env
     raise ValueError(
-        "Service is required for logs fetch. "
-        "Set anomaly['service'] or CONTROL_PLANE_LOGS_DEFAULT_SERVICE."
+        "Missing anomaly['service'] for logs summarization. "
+        "Pass service in anomaly payload."
     )
 
 
-def _resolve_columns() -> List[str]:
-    raw = os.getenv("CONTROL_PLANE_LOGS_COLUMNS", "timestamp,level,message")
-    cols = [c.strip() for c in raw.split(",") if c.strip()]
-    if not cols:
-        raise ValueError("CONTROL_PLANE_LOGS_COLUMNS must not be empty")
-    for col in cols:
-        _safe_identifier(col)
-    return cols
-
-
-def _build_base_select(table: str, columns: Sequence[str]) -> str:
-    template = os.getenv(
-        "CONTROL_PLANE_LOGS_BASE_SELECT",
-        "SELECT {columns} FROM {table}",
+def _resolve_logs_query_template() -> str:
+    template = os.getenv("CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "").strip()
+    if template:
+        return template
+    raise ValueError(
+        "Set CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY in .env "
+        "(full SQL string; optionally with placeholders)."
     )
-    return template.format(table=table, columns=", ".join(columns))
 
 
-def _build_logs_page_query(
+def _render_logs_query(
     *,
-    base_select: str,
+    query_template: str,
     period_start: str,
     period_end: str,
-    timestamp_column: str,
-    order_by: str,
     limit: int,
     offset: int,
+    service: str,
 ) -> str:
-    ts_col = _safe_identifier(timestamp_column)
-    order_col = _safe_identifier(order_by)
     safe_limit = max(int(limit), 1)
     safe_offset = max(int(offset), 0)
-    return (
-        "SELECT *\n"
-        f"FROM ({base_select}) AS src\n"
-        f"WHERE src.{ts_col} >= parseDateTimeBestEffort('{period_start}')\n"
-        f"  AND src.{ts_col} < parseDateTimeBestEffort('{period_end}')\n"
-        f"ORDER BY src.{order_col}\n"
-        f"LIMIT {safe_limit} OFFSET {safe_offset}"
+    params = _SafeFormatDict(
+        period_start=period_start,
+        period_end=period_end,
+        start=period_start,
+        end=period_end,
+        start_iso=period_start,
+        end_iso=period_end,
+        limit=safe_limit,
+        page_limit=safe_limit,
+        offset=safe_offset,
+        service=service,
     )
+    return query_template.strip().rstrip(";").format_map(params)
 
 
 def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., List[Dict[str, Any]]]:
+    service = _resolve_service(anomaly)
+    query_template = _resolve_logs_query_template()
+    has_offset_placeholder = "{offset}" in query_template
+
     try:
         import clickhouse_connect
     except Exception as exc:
@@ -115,13 +89,6 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     username = os.getenv("CONTROL_PLANE_LOGS_CH_USERNAME", "").strip() or None
     password = os.getenv("CONTROL_PLANE_LOGS_CH_PASSWORD", "").strip() or None
     database = os.getenv("CONTROL_PLANE_LOGS_CH_DATABASE", "default").strip() or None
-
-    service = _resolve_service(anomaly)
-    table = _resolve_logs_table(service)
-    timestamp_column = os.getenv("CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp").strip() or "timestamp"
-    order_by = os.getenv("CONTROL_PLANE_LOGS_ORDER_BY", timestamp_column).strip() or timestamp_column
-    _safe_identifier(timestamp_column)
-    _safe_identifier(order_by)
 
     client = clickhouse_connect.get_client(
         host=host,
@@ -139,17 +106,17 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
         limit: int,
         offset: int,
     ) -> List[Dict[str, Any]]:
-        for col in columns:
-            _safe_identifier(col)
-        base_select = _build_base_select(table, columns)
-        query = _build_logs_page_query(
-            base_select=base_select,
+        del columns
+        # Если offset-плейсхолдера нет, запрос считаем single-shot.
+        if offset > 0 and not has_offset_placeholder:
+            return []
+        query = _render_logs_query(
+            query_template=query_template,
             period_start=period_start,
             period_end=period_end,
-            timestamp_column=timestamp_column,
-            order_by=order_by,
             limit=limit,
             offset=offset,
+            service=service,
         )
         df = client.query_df(query)
         if df.empty:
@@ -168,7 +135,13 @@ def summarize_logs(
     anomaly: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Batch logs fetch for a period using per-service table mapping.
+    Batch logs fetch for a period using a full SQL query from env.
+    Query should be configured in CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY.
+    Supported placeholders:
+      {period_start}, {period_end}, {start}, {end}, {limit}, {offset}, {service}
+
+    If {offset} is missing in query template, request is treated as single-shot page.
+    Query must return exactly two columns: timestamp, value.
     This adapter can be wired as CONTROL_PLANE_SUMMARIZER_CALLABLE.
     """
     start_iso, end_iso = _normalize_period(
@@ -177,7 +150,6 @@ def summarize_logs(
         start_dt=start_dt,
         end_dt=end_dt,
     )
-    columns = _resolve_columns()
     page_limit = int(os.getenv("CONTROL_PLANE_LOGS_PAGE_LIMIT", "1000"))
 
     db_fetch_page = _build_db_fetch_page(anomaly)
@@ -189,7 +161,7 @@ def summarize_logs(
 
     while True:
         page = db_fetch_page(
-            columns=columns,
+            columns=LOGS_SQL_COLUMNS,
             period_start=start_iso,
             period_end=end_iso,
             limit=page_limit,
@@ -203,9 +175,14 @@ def summarize_logs(
         offset += rows
 
         page_df = pd.DataFrame(page)
-        ts_col = os.getenv("CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp")
-        ts_min = str(page_df[ts_col].min()) if ts_col in page_df.columns and not page_df.empty else "n/a"
-        ts_max = str(page_df[ts_col].max()) if ts_col in page_df.columns and not page_df.empty else "n/a"
+        missing_cols = [c for c in LOGS_SQL_COLUMNS if c not in page_df.columns]
+        if missing_cols:
+            raise ValueError(
+                "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY must return columns timestamp and value "
+                f"(missing: {', '.join(missing_cols)})"
+            )
+        ts_min = str(page_df["timestamp"].min()) if not page_df.empty else "n/a"
+        ts_max = str(page_df["timestamp"].max()) if not page_df.empty else "n/a"
 
         joined = " ".join(str(v).lower() for row in page for v in row.values())
         signal_hits = sum(1 for kw in ("error", "exception", "timeout", "failed", "fatal") if kw in joined)

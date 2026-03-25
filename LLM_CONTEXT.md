@@ -95,9 +95,11 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 
 `my_summarizer.py::summarize_logs` делает batched-fetch логов из ClickHouse:
 
-- берёт service из `anomaly['service']` или `CONTROL_PLANE_LOGS_DEFAULT_SERVICE`;
-- определяет таблицу через `CONTROL_PLANE_LOGS_TABLE_BY_SERVICE_JSON`;
-- строит запрос из `CONTROL_PLANE_LOGS_BASE_SELECT` + авто `WHERE period` + `ORDER BY` + `LIMIT/OFFSET`;
+- берёт service из `anomaly['service']` (обязательное поле);
+- использует один полный SQL-шаблон из `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
+- SQL обязан вернуть колонки `timestamp` и `value`;
+- поддерживает плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
+- если `{offset}` отсутствует, делает single-shot (одна страница);
 - возвращает `chunk_summaries` для live UI.
 
 Поддерживаемые сигнатуры callable:

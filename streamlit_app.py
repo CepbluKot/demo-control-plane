@@ -19,8 +19,8 @@ from control_plane.config import (
     ANOMALY_IQR_WINDOW,
     ANOMALY_ZSCORE,
     ARTIFACTS_DIR,
-    CLICKHOUSE_HOST,
-    CLICKHOUSE_QUERY,
+    CLICKHOUSE_METRICS_HOST,
+    CLICKHOUSE_METRICS_QUERY,
     DATA_LOOKBACK_MINUTES,
     FORECAST_METRIC_NAME,
     FORECAST_SERVICE,
@@ -57,7 +57,10 @@ def _ensure_runtime() -> None:
     configure_logging()
 
 
-def _prepare_anomalies(anomalies_df: pd.DataFrame) -> List[Dict[str, Any]]:
+def _prepare_anomalies(
+    anomalies_df: pd.DataFrame,
+    service: str,
+) -> List[Dict[str, Any]]:
     anomalies: List[Dict[str, Any]] = []
     if anomalies_df.empty:
         return anomalies
@@ -67,6 +70,7 @@ def _prepare_anomalies(anomalies_df: pd.DataFrame) -> List[Dict[str, Any]]:
         anomalies.append(
             {
                 "timestamp": to_iso_z(pd.to_datetime(row["timestamp"], utc=True)),
+                "service": service,
                 "value": float(row["value"]),
                 "predicted": float(row.get("predicted")) if row.get("predicted") is not None else None,
                 "residual": float(row.get("residual")) if row.get("residual") is not None else None,
@@ -234,7 +238,7 @@ def run_single_iteration(
         },
     )
 
-    anomalies = _prepare_anomalies(anomalies_df)
+    anomalies = _prepare_anomalies(anomalies_df, FORECAST_SERVICE)
     api_response = build_api_response(merged_df, predictions_df, anomalies_df)
 
     log_filename = LOGS_DIR / f"api_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -526,27 +530,30 @@ def _render_anomaly_cards(
 
 def _ui_runtime_config() -> Dict[str, Any]:
     masked_password = "***" if bool(PROM_PASSWORD) else ""
-    ch_query = CLICKHOUSE_QUERY if len(CLICKHOUSE_QUERY) <= 140 else f"{CLICKHOUSE_QUERY[:140]}..."
+    ch_query = (
+        CLICKHOUSE_METRICS_QUERY
+        if len(CLICKHOUSE_METRICS_QUERY) <= 140
+        else f"{CLICKHOUSE_METRICS_QUERY[:140]}..."
+    )
     return {
         "CONTROL_PLANE_TEST_MODE": TEST_MODE,
         "CONTROL_PLANE_METRICS_SOURCE": METRICS_SOURCE,
-        "CONTROL_PLANE_PROM_QUERY": PROM_QUERY,
-        "CONTROL_PLANE_CLICKHOUSE_QUERY": ch_query,
-        "CONTROL_PLANE_CLICKHOUSE_HOST": CLICKHOUSE_HOST,
+        "CONTROL_PLANE_PROM_METRICS_QUERY": PROM_QUERY,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY": ch_query,
+        "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST": CLICKHOUSE_METRICS_HOST,
         "CONTROL_PLANE_ANOMALY_DETECTOR": ANOMALY_DETECTOR,
         "CONTROL_PLANE_DATA_LOOKBACK_MINUTES": DATA_LOOKBACK_MINUTES,
         "CONTROL_PLANE_PREDICTION_LOOKAHEAD_MINUTES": PREDICTION_LOOKAHEAD_MINUTES,
         "CONTROL_PLANE_ANALYZE_TOP_N_ANOMALIES": ANALYZE_TOP_N_ANOMALIES,
         "CONTROL_PLANE_LOOPBACK_MINUTES": LOOPBACK_MINUTES,
         "CONTROL_PLANE_PROCESS_ALERTS": PROCESS_ALERTS,
-        "CONTROL_PLANE_PROM_STEP": PROM_STEP,
-        "CONTROL_PLANE_PROM_MAX_POINTS": PROM_MAX_POINTS,
-        "CONTROL_PLANE_PROM_SERIES_INDEX": PROM_SERIES_INDEX,
+        "CONTROL_PLANE_PROM_METRICS_MAX_POINTS": PROM_MAX_POINTS,
+        "CONTROL_PLANE_PROM_METRICS_SERIES_INDEX": PROM_SERIES_INDEX,
         "CONTROL_PLANE_FORECAST_SERVICE": FORECAST_SERVICE,
         "CONTROL_PLANE_FORECAST_METRIC_NAME": FORECAST_METRIC_NAME,
         "CONTROL_PLANE_FORECAST_TYPE": FORECAST_TYPE,
         "CONTROL_PLANE_PREDICTION_KIND": PREDICTION_KIND,
-        "CONTROL_PLANE_PROM_PASSWORD": masked_password,
+        "CONTROL_PLANE_PROM_METRICS_PASSWORD": masked_password,
     }
 
 
