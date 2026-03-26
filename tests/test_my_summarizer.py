@@ -90,6 +90,8 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(result["rows_processed"], 2)
         self.assertEqual(result["pages_fetched"], 1)
         self.assertTrue(result["chunk_summaries"])
+        self.assertTrue(result["map_batches"])
+        self.assertIn("rows", result["map_batches"][0])
         self.assertIn("Сервис: svc-a", result["summary"])
 
     def test_build_db_fetch_page_without_offset_placeholder_single_shot(self) -> None:

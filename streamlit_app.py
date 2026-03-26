@@ -1,5 +1,6 @@
 import json
 import logging
+import html
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -59,6 +60,11 @@ from control_plane.visualization import visualize, visualize_combined
 
 logger = logging.getLogger(__name__)
 
+LOGS_BATCH_TABLE_HEIGHT = 180
+ANOMALIES_TABLE_HEIGHT = 220
+SUMMARY_TEXT_HEIGHT = 140
+FINAL_TEXT_HEIGHT = 180
+
 
 def _ensure_runtime() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,6 +116,22 @@ def _payload_for_log(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         compact[target_key] = value
     return compact
+
+
+def _render_scrollable_text(value: Any, *, height: int) -> None:
+    safe_text = html.escape(str(value) if value is not None else "")
+    st.markdown(
+        (
+            f"<div style='max-height:{int(height)}px; overflow-y:auto; padding:0.55rem; "
+            "border:1px solid rgba(128,128,128,0.35); border-radius:0.45rem; "
+            "background:rgba(249,250,251,0.9);'>"
+            "<pre style='margin:0; white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, "
+            "Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; "
+            "font-size:0.84rem; line-height:1.35;'>"
+            f"{safe_text}</pre></div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def run_single_iteration(
@@ -539,19 +561,46 @@ def _render_anomaly_cards(
                 for batch in batches:
                     idx = int(batch.get("batch_index", 0)) + 1
                     total = batch.get("batch_total", len(batches))
+                    batch_logs = batch.get("batch_logs", [])
+                    if not isinstance(batch_logs, list):
+                        batch_logs = []
+                    batch_logs_count = batch.get("batch_logs_count")
+                    if batch_logs_count is None:
+                        batch_logs_count = len(batch_logs)
                     with st.chat_message("assistant"):
                         st.markdown(f"Map summary {idx}/{total}")
-                        st.code(str(batch.get("batch_summary", "")))
+                        _render_scrollable_text(
+                            batch.get("batch_summary", ""),
+                            height=SUMMARY_TEXT_HEIGHT,
+                        )
+                        st.caption(f"Логов в батче: {batch_logs_count}")
+                        if batch_logs:
+                            logs_df = pd.DataFrame(batch_logs)
+                            st.dataframe(
+                                logs_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=LOGS_BATCH_TABLE_HEIGHT,
+                            )
+                            st.caption("Скролл: наведите курсор на таблицу и крутите колесо.")
+                        else:
+                            st.caption("Логи батча не переданы.")
 
             if row.get("final_summary"):
                 with st.chat_message("assistant"):
                     st.markdown("Итоговый Reduce summary")
-                    st.code(str(row["final_summary"]))
+                    _render_scrollable_text(
+                        row["final_summary"],
+                        height=FINAL_TEXT_HEIGHT,
+                    )
 
             if row.get("notification_text"):
                 with st.chat_message("assistant"):
                     st.markdown("Уведомление для SRE")
-                    st.code(str(row["notification_text"]))
+                    _render_scrollable_text(
+                        row["notification_text"],
+                        height=SUMMARY_TEXT_HEIGHT,
+                    )
 
             if row.get("error"):
                 with st.chat_message("assistant"):
@@ -672,7 +721,13 @@ def main() -> None:
                 st.info("Аномалии не найдены за выбранное окно.")
                 return
             anomaly_columns = [c for c in ["timestamp", "value", "source"] if c in anomalies_df.columns]
-            st.dataframe(anomalies_df[anomaly_columns], use_container_width=True)
+            st.dataframe(
+                anomalies_df[anomaly_columns],
+                use_container_width=True,
+                hide_index=True,
+                height=ANOMALIES_TABLE_HEIGHT,
+            )
+            st.caption("Скролл: наведите курсор на таблицу и крутите колесо.")
 
     def _render_analysis_cards() -> None:
         _render_anomaly_cards(
@@ -754,6 +809,8 @@ def main() -> None:
                             "batch_index": payload.get("batch_index"),
                             "batch_total": payload.get("batch_total"),
                             "batch_summary": payload.get("batch_summary"),
+                            "batch_logs_count": payload.get("batch_logs_count"),
+                            "batch_logs": payload.get("batch_logs", []),
                         }
                     )
                 elif event == "map_done":

@@ -131,6 +131,8 @@ class Settings(BaseSettings):
     CONTROL_PLANE_TEST_SPIKE_RATE: float = 0.03
     CONTROL_PLANE_TEST_SPIKE_SCALE: float = 12.0
     CONTROL_PLANE_TEST_NOISE_SCALE: float = 1.5
+    CONTROL_PLANE_TEST_SUMMARY_BATCHES: int = 4
+    CONTROL_PLANE_TEST_LOGS_PER_BATCH: int = 120
 
     # LLM credentials
     OPENAI_API_BASE_DB: str = ""

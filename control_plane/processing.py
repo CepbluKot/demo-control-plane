@@ -4,11 +4,87 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 import time
 
-from .config import ALERT_CALLABLE, SUMMARY_LOG_CHARS, SUMMARIZER_CALLABLE, TEST_MODE
+from .config import (
+    ALERT_CALLABLE,
+    SUMMARY_LOG_CHARS,
+    SUMMARIZER_CALLABLE,
+    TEST_MODE,
+    TEST_MODE_LOGS_PER_BATCH,
+    TEST_MODE_SUMMARY_BATCHES,
+)
 from .summarizer import do_summary as default_do_summary
 from .trace import log_event
 
 logger = logging.getLogger(__name__)
+
+
+def _build_test_mode_batches(
+    *,
+    period_start: datetime,
+    period_end: datetime,
+    service: str,
+    batch_total: int,
+    logs_per_batch: int,
+) -> List[Dict[str, Any]]:
+    safe_batches = max(int(batch_total), 1)
+    safe_logs_per_batch = max(int(logs_per_batch), 1)
+    total_logs = safe_batches * safe_logs_per_batch
+    window_seconds = max(int((period_end - period_start).total_seconds()), total_logs + 1)
+    batch_titles = (
+        "Контекст перед деградацией",
+        "Рост latency и retry",
+        "Сбой зависимостей",
+        "Критическая фаза перед выбросом",
+    )
+
+    def _level_for(batch_idx: int, row_idx: int) -> str:
+        phase = (batch_idx + 1) / safe_batches
+        if phase < 0.35:
+            levels = ("INFO", "INFO", "WARN")
+        elif phase < 0.75:
+            levels = ("INFO", "WARN", "ERROR")
+        else:
+            levels = ("WARN", "ERROR", "ERROR", "CRITICAL")
+        return levels[(row_idx + batch_idx) % len(levels)]
+
+    def _message_for(level: str, event_idx: int) -> str:
+        if level == "CRITICAL":
+            return f"critical incident #{event_idx}: request queue overflow and timeout storm"
+        if level == "ERROR":
+            return f"error #{event_idx}: upstream timeout while processing request"
+        if level == "WARN":
+            return f"warn #{event_idx}: retry rate increased above baseline"
+        return f"info #{event_idx}: background processing in progress"
+
+    batches: List[Dict[str, Any]] = []
+    for batch_idx in range(safe_batches):
+        title = batch_titles[min(batch_idx, len(batch_titles) - 1)]
+        batch_rows: List[Dict[str, Any]] = []
+        for row_idx in range(safe_logs_per_batch):
+            global_idx = batch_idx * safe_logs_per_batch + row_idx + 1
+            sec_offset = int(global_idx * window_seconds / (total_logs + 1))
+            ts = period_start + timedelta(seconds=sec_offset)
+            level = _level_for(batch_idx, row_idx)
+            batch_rows.append(
+                {
+                    "timestamp": ts.isoformat(),
+                    "level": level,
+                    "message": _message_for(level, global_idx),
+                    "service": service,
+                    "pod": f"{service}-pod-{1 + (global_idx % 3)}",
+                    "container": "app",
+                    "node": f"node-{1 + (global_idx % 5):02d}",
+                    "cluster": "demo-cluster",
+                }
+            )
+
+        batches.append(
+            {
+                "batch_summary": f"[Batch {batch_idx + 1}] {title}",
+                "batch_logs": batch_rows,
+            }
+        )
+    return batches
 
 
 def _extract_batch_summaries(summary_result: Any, fallback_text: str) -> List[str]:
@@ -65,6 +141,109 @@ def _extract_batch_summaries(summary_result: Any, fallback_text: str) -> List[st
     return [fallback_text] if fallback_text else []
 
 
+def _extract_map_batches(summary_result: Any, fallback_text: str) -> List[Dict[str, Any]]:
+    candidates: List[Any] = []
+    if isinstance(summary_result, dict):
+        for key in (
+            "map_batches",
+            "batch_details",
+            "chunk_details",
+            "map_results",
+            "chunks",
+        ):
+            value = summary_result.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+    else:
+        for key in (
+            "map_batches",
+            "batch_details",
+            "chunk_details",
+            "map_results",
+            "chunks",
+        ):
+            value = getattr(summary_result, key, None)
+            if isinstance(value, list):
+                candidates = value
+                break
+
+    out: List[Dict[str, Any]] = []
+    for item in candidates:
+        if isinstance(item, str):
+            out.append(
+                {
+                    "batch_summary": item,
+                    "batch_logs_count": 0,
+                    "batch_logs": [],
+                }
+            )
+            continue
+
+        if isinstance(item, dict):
+            summary = (
+                item.get("batch_summary")
+                or item.get("summary")
+                or item.get("text")
+                or item.get("content")
+                or item.get("chunk_summary")
+                or item.get("map_summary")
+                or ""
+            )
+            logs = item.get("batch_logs")
+            if logs is None:
+                logs = item.get("logs")
+            if logs is None:
+                logs = item.get("rows")
+            if not isinstance(logs, list):
+                logs = []
+            normalized_logs: List[Dict[str, Any]] = []
+            for row in logs:
+                if isinstance(row, dict):
+                    normalized_logs.append(dict(row))
+                else:
+                    normalized_logs.append({"value": row})
+            logs_count = item.get("batch_logs_count")
+            if logs_count is None:
+                logs_count = item.get("logs_count")
+            if logs_count is None:
+                logs_count = item.get("rows_count")
+            if logs_count is None:
+                logs_count = len(normalized_logs)
+            out.append(
+                {
+                    "batch_summary": str(summary),
+                    "batch_logs_count": int(logs_count),
+                    "batch_logs": normalized_logs,
+                }
+            )
+            continue
+
+        summary = getattr(item, "summary", None) or getattr(item, "text", None) or str(item)
+        rows = getattr(item, "rows", None)
+        normalized_logs = rows if isinstance(rows, list) else []
+        out.append(
+            {
+                "batch_summary": str(summary),
+                "batch_logs_count": len(normalized_logs),
+                "batch_logs": normalized_logs,
+            }
+        )
+
+    if out:
+        return out
+
+    fallback_summaries = _extract_batch_summaries(summary_result, fallback_text)
+    return [
+        {
+            "batch_summary": str(text),
+            "batch_logs_count": 0,
+            "batch_logs": [],
+        }
+        for text in fallback_summaries
+    ]
+
+
 def _load_callable(path: str) -> Callable[..., Any]:
     if ":" in path:
         module_path, attr_name = path.split(":", 1)
@@ -85,6 +264,12 @@ def _payload_for_log(payload: Dict[str, Any]) -> Dict[str, Any]:
             target_key = "payload_event"
         elif key == "level":
             target_key = "payload_level"
+        if isinstance(value, list):
+            out[f"{target_key}_len"] = len(value)
+            continue
+        if isinstance(value, dict):
+            out[f"{target_key}_keys"] = list(value.keys())[:10]
+            continue
         out[target_key] = value
     return out
 
@@ -243,12 +428,15 @@ def process_anomalies(
                         "mode": "mock",
                     },
                 )
-                test_batches = [
-                    f"[Batch 1] Подготовка контекста перед {timestamp_str}",
-                    f"[Batch 2] Аномальный рост метрики и сопутствующие события",
-                    f"[Batch 3] Краткий вывод по вероятной причине выброса",
-                ]
-                for batch_idx, batch_summary in enumerate(test_batches):
+                test_batches = _build_test_mode_batches(
+                    period_start=period_start,
+                    period_end=period_end,
+                    service=str(anomaly.get("service") or "demo-service"),
+                    batch_total=TEST_MODE_SUMMARY_BATCHES,
+                    logs_per_batch=TEST_MODE_LOGS_PER_BATCH,
+                )
+                for batch_idx, batch in enumerate(test_batches):
+                    batch_logs = batch.get("batch_logs", [])
                     _emit(
                         "map_batch",
                         {
@@ -257,7 +445,9 @@ def process_anomalies(
                             "mode": "mock",
                             "batch_index": batch_idx,
                             "batch_total": len(test_batches),
-                            "batch_summary": batch_summary,
+                            "batch_summary": batch.get("batch_summary", ""),
+                            "batch_logs_count": len(batch_logs),
+                            "batch_logs": batch_logs,
                         },
                     )
                 _emit(
@@ -279,7 +469,8 @@ def process_anomalies(
                 )
                 summary = (
                     "[TEST MODE] Summary for anomaly at "
-                    f"{timestamp_str} (window {period_start.isoformat()}..{period_end.isoformat()})"
+                    f"{timestamp_str} (window {period_start.isoformat()}..{period_end.isoformat()}, "
+                    f"batches={len(test_batches)}, logs={sum(len(b.get('batch_logs', [])) for b in test_batches)})"
                 )
                 result["summary"] = summary
                 preview = summary[:SUMMARY_LOG_CHARS]
@@ -379,7 +570,7 @@ def process_anomalies(
                 summary = getattr(summary_result, "summary", str(summary_result))
                 result["summary"] = summary
                 preview = summary[:SUMMARY_LOG_CHARS] if isinstance(summary, str) else str(summary)
-                map_batches = _extract_batch_summaries(summary_result, preview)
+                map_batches = _extract_map_batches(summary_result, preview)
                 _emit(
                     "map_start",
                     {
@@ -388,7 +579,8 @@ def process_anomalies(
                         "mode": "real",
                     },
                 )
-                for batch_idx, batch_summary in enumerate(map_batches):
+                for batch_idx, batch_info in enumerate(map_batches):
+                    batch_logs = batch_info.get("batch_logs", [])
                     _emit(
                         "map_batch",
                         {
@@ -397,7 +589,9 @@ def process_anomalies(
                             "mode": "real",
                             "batch_index": batch_idx,
                             "batch_total": len(map_batches),
-                            "batch_summary": batch_summary,
+                            "batch_summary": batch_info.get("batch_summary", ""),
+                            "batch_logs_count": batch_info.get("batch_logs_count", len(batch_logs)),
+                            "batch_logs": batch_logs,
                         },
                     )
                 _emit(

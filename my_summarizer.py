@@ -63,6 +63,7 @@ class SummarizationResult:
     chunk_summaries: int
     reduce_rounds: int
     map_summaries: List[str]
+    map_batches: List[Dict[str, Any]]
 
 
 class _SafeFormatDict(dict):
@@ -335,6 +336,7 @@ class PeriodLogSummarizer:
         rows_processed = 0
         llm_calls = 0
         map_summaries: List[str] = []
+        map_batches: List[Dict[str, Any]] = []
 
         while True:
             page = self.db_fetch_page(
@@ -365,6 +367,14 @@ class PeriodLogSummarizer:
                     chunk_summary = "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
+                map_batches.append(
+                    {
+                        "batch_index": len(map_batches),
+                        "rows_count": len(ranked_chunk),
+                        "rows": [dict(row) for row in ranked_chunk],
+                        "summary": chunk_summary,
+                    }
+                )
                 llm_calls += 1
 
             if len(page) < self.config.page_limit:
@@ -379,6 +389,7 @@ class PeriodLogSummarizer:
                 chunk_summaries=0,
                 reduce_rounds=0,
                 map_summaries=[],
+                map_batches=[],
             )
 
         final_summary, reduce_calls, reduce_rounds = self._reduce_summaries(
@@ -395,6 +406,7 @@ class PeriodLogSummarizer:
             chunk_summaries=len(map_summaries),
             reduce_rounds=reduce_rounds,
             map_summaries=map_summaries,
+            map_batches=map_batches,
         )
 
     def _reduce_summaries(
@@ -571,6 +583,7 @@ def summarize_logs(
     return {
         "summary": summary_text,
         "chunk_summaries": result.map_summaries,
+        "map_batches": result.map_batches,
         "pages_fetched": result.pages_fetched,
         "rows_processed": result.rows_processed,
         "llm_calls": result.llm_calls,

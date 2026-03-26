@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from control_plane.processing import (
     _call_summarizer_adapter,
     _extract_batch_summaries,
+    _extract_map_batches,
     process_anomalies,
 )
 
@@ -38,6 +39,24 @@ class TestProcessing(unittest.TestCase):
         self.assertIn(period_end.isoformat(), out)
         self.assertIn(anomaly["timestamp"], out)
 
+    def test_extract_map_batches_includes_logs_and_count(self) -> None:
+        summary_result = {
+            "map_batches": [
+                {
+                    "summary": "batch one",
+                    "rows": [{"timestamp": "t1", "message": "m1"}],
+                },
+                "batch two",
+            ]
+        }
+        out = _extract_map_batches(summary_result, "fallback")
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["batch_summary"], "batch one")
+        self.assertEqual(out[0]["batch_logs_count"], 1)
+        self.assertEqual(out[0]["batch_logs"][0]["message"], "m1")
+        self.assertEqual(out[1]["batch_summary"], "batch two")
+        self.assertEqual(out[1]["batch_logs_count"], 0)
+
     def test_process_anomalies_test_mode_emits_map_reduce_flow(self) -> None:
         events = []
 
@@ -62,6 +81,10 @@ class TestProcessing(unittest.TestCase):
         self.assertIn("reduce_done", emitted_names)
         self.assertIn("notification_ready", emitted_names)
         self.assertIn("process_done", emitted_names)
+        map_batch_payloads = [payload for name, payload in events if name == "map_batch"]
+        self.assertTrue(map_batch_payloads)
+        self.assertIn("batch_logs_count", map_batch_payloads[0])
+        self.assertIn("batch_logs", map_batch_payloads[0])
 
 
 if __name__ == "__main__":
