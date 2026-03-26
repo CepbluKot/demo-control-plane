@@ -9,6 +9,13 @@ from typing import Any, Callable, Dict, List, Optional
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+from my_summarizer import PeriodLogSummarizer, SummarizerConfig, _make_llm_call, _query_logs_df
+from ui.pages import (
+    ControlPlanePageDeps,
+    LogsSummaryPageDeps,
+    render_control_plane_page,
+    render_logs_summary_page,
+)
 
 from control_plane.actuals import fetch_actual_metrics_df
 from control_plane.api_client import build_api_response
@@ -59,13 +66,15 @@ from control_plane.test_mode import generate_mock_data
 from control_plane.trace import log_dataframe, log_event
 from control_plane.utils import to_iso_z
 from control_plane.visualization import visualize, visualize_combined
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
-LOGS_BATCH_TABLE_HEIGHT = 180
+LOGS_BATCH_TABLE_HEIGHT = 240
 ANOMALIES_TABLE_HEIGHT = 220
-SUMMARY_TEXT_HEIGHT = 140
-FINAL_TEXT_HEIGHT = 180
+SUMMARY_TEXT_HEIGHT = 180
+FINAL_TEXT_HEIGHT = 230
+LOGS_SQL_TEXTAREA_HEIGHT = 220
 
 
 def _ensure_runtime() -> None:
@@ -73,6 +82,29 @@ def _ensure_runtime() -> None:
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     configure_logging()
+
+
+def _apply_large_text_forms_style() -> None:
+    st.markdown(
+        """
+        <style>
+        label[data-testid="stWidgetLabel"] p {
+            font-size: 1.02rem !important;
+        }
+        div[data-baseweb="input"] input {
+            font-size: 1.02rem !important;
+            min-height: 2.8rem !important;
+            padding-top: 0.5rem !important;
+            padding-bottom: 0.5rem !important;
+        }
+        div[data-baseweb="textarea"] textarea {
+            font-size: 1.0rem !important;
+            line-height: 1.45 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _prepare_anomalies(
@@ -129,7 +161,7 @@ def _render_scrollable_text(value: Any, *, height: int) -> None:
             "background:rgba(249,250,251,0.9);'>"
             "<pre style='margin:0; white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, "
             "Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; "
-            "font-size:0.84rem; line-height:1.35;'>"
+            "font-size:0.93rem; line-height:1.42;'>"
             f"{safe_text}</pre></div>"
         ),
         unsafe_allow_html=True,
@@ -192,7 +224,7 @@ def _render_pretty_summary_text(value: Any, *, height: int) -> None:
         (
             f"<div style='max-height:{int(height)}px; overflow-y:auto; padding:0.7rem 0.75rem; "
             "border:1px solid rgba(128,128,128,0.35); border-radius:0.55rem; "
-            "background:rgba(249,250,251,0.95); font-size:0.9rem; line-height:1.5;'>"
+            "background:rgba(249,250,251,0.95); font-size:0.98rem; line-height:1.56;'>"
             f"{''.join(html_lines)}"
             "</div>"
         ),
@@ -857,318 +889,74 @@ def _ui_runtime_config() -> Dict[str, Any]:
     }
 
 
+def _render_logs_summary_page() -> None:
+    deps = LogsSummaryPageDeps(
+        logger=logger,
+        page_limit=max(int(settings.CONTROL_PLANE_LOGS_PAGE_LIMIT), 1),
+        test_mode=TEST_MODE,
+        loopback_minutes=LOOPBACK_MINUTES,
+        logs_tail_limit=LOGS_TAIL_LIMIT,
+        period_log_summarizer_cls=PeriodLogSummarizer,
+        summarizer_config_cls=SummarizerConfig,
+        make_llm_call=_make_llm_call,
+        query_logs_df=_query_logs_df,
+        render_scrollable_text=_render_scrollable_text,
+        render_pretty_summary_text=_render_pretty_summary_text,
+        infer_batch_period=_infer_batch_period,
+        summary_text_height=SUMMARY_TEXT_HEIGHT,
+        final_text_height=FINAL_TEXT_HEIGHT,
+        logs_batch_table_height=LOGS_BATCH_TABLE_HEIGHT,
+        sql_textarea_height=LOGS_SQL_TEXTAREA_HEIGHT,
+        default_sql_query=(
+            str(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL).strip()
+            or str(settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY).strip()
+        ),
+    )
+    render_logs_summary_page(deps)
+
+
+def _render_control_plane_page() -> None:
+    deps = ControlPlanePageDeps(
+        logger=logger,
+        log_event=log_event,
+        payload_for_log=_payload_for_log,
+        run_single_iteration=run_single_iteration,
+        visualize_combined=visualize_combined,
+        build_predictions_focus_figure=_build_predictions_focus_figure,
+        only_future_predictions=_only_future_predictions,
+        render_anomaly_cards=_render_anomaly_cards,
+        plots_dir=PLOTS_DIR,
+        anomalies_table_height=ANOMALIES_TABLE_HEIGHT,
+        loopback_minutes=LOOPBACK_MINUTES,
+        test_mode=TEST_MODE,
+        prom_query=PROM_QUERY,
+        anomaly_detector=ANOMALY_DETECTOR,
+        data_lookback_minutes=DATA_LOOKBACK_MINUTES,
+        prediction_lookahead_minutes=PREDICTION_LOOKAHEAD_MINUTES,
+        analyze_top_n=ANALYZE_TOP_N_ANOMALIES,
+        process_alerts=PROCESS_ALERTS,
+    )
+    render_control_plane_page(deps)
+
+
 def main() -> None:
     st.set_page_config(page_title="Control Plane", layout="wide")
     _ensure_runtime()
+    _apply_large_text_forms_style()
 
     with st.sidebar:
-        st.subheader("Параметры (.env)")
-        params = _ui_runtime_config()
-        params_df = pd.DataFrame(
-            [{"param": key, "value": str(value)} for key, value in params.items()]
-        )
-        st.dataframe(params_df, hide_index=True, use_container_width=True, height=520)
-        st.caption("Параметры редактируются через файл .env")
-        run_clicked = st.button("Запустить 1 итерацию", type="primary", use_container_width=True)
-
-    runtime_error_placeholder = st.empty()
-    graph_placeholder = st.empty()
-    anomalies_table_placeholder = st.empty()
-    anomaly_cards_placeholder = st.empty()
-    had_stage_error = False
-
-    summary_state: Dict[str, Any] = {
-        "by_idx": {},
-        "selected_anomalies": {},
-        "merged_df": None,
-        "predictions_df": None,
-        "predictions_all_df": None,
-        "actual_end_ts": None,
-        "empty_message": None,
-    }
-    ui_data: Dict[str, Any] = {
-        "actual_df": None,
-        "anomalies_df": pd.DataFrame(columns=["timestamp", "value", "source"]),
-    }
-
-    def _render_graph(
-        actual_df: Optional[pd.DataFrame],
-        predictions_df: Optional[pd.DataFrame],
-        predictions_all_df: Optional[pd.DataFrame],
-        anomalies_df: Optional[pd.DataFrame],
-    ) -> None:
-        with graph_placeholder.container():
-            st.markdown("1. График прошлое + будущее с отмеченными аномалиями")
-            if (
-                actual_df is None
-                or predictions_df is None
-                or anomalies_df is None
-                or actual_df.empty
-            ):
-                return
-            try:
-                fig_path = visualize_combined(
-                    actual_df,
-                    predictions_df,
-                    anomalies_df,
-                    output_dir=PLOTS_DIR,
-                )
-                if Path(fig_path).exists():
-                    st.image(str(fig_path), use_container_width=True)
-                else:
-                    st.caption("Файл графика не найден")
-
-                focus_fig = _build_predictions_focus_figure(
-                    actual_df=actual_df,
-                    predictions_df=predictions_all_df if predictions_all_df is not None else predictions_df,
-                )
-                if focus_fig is not None:
-                    st.markdown(
-                        "Дополнительный единый график: история и все предикты "
-                        "(две линии с разным стилем)"
-                    )
-                    st.pyplot(focus_fig, use_container_width=True)
-                    plt.close(focus_fig)
-            except Exception as exc:
-                st.error(f"Ошибка построения графика: {exc}")
-
-    def _render_anomalies_table(anomalies_df: Optional[pd.DataFrame]) -> None:
-        with anomalies_table_placeholder.container():
-            st.markdown("2. Табличка с найденными аномалиями")
-            if anomalies_df is None or anomalies_df.empty:
-                st.info("Аномалии не найдены за выбранное окно.")
-                return
-            anomaly_columns = [c for c in ["timestamp", "value", "source"] if c in anomalies_df.columns]
-            st.dataframe(
-                anomalies_df[anomaly_columns],
-                use_container_width=True,
-                hide_index=True,
-                height=ANOMALIES_TABLE_HEIGHT,
-            )
-
-    def _render_analysis_cards() -> None:
-        _render_anomaly_cards(
-            anomaly_cards_placeholder,
-            summary_state,
-            summary_state.get("merged_df"),
-            summary_state.get("predictions_df"),
-            summary_state.get("actual_end_ts"),
-            LOOPBACK_MINUTES,
+        page = st.radio(
+            "Страницы",
+            ["Control Plane", "Logs Summarizer"],
+            index=0,
+            key="cp_page_selector",
         )
 
-    if not run_clicked:
+    if page == "Logs Summarizer":
+        _render_logs_summary_page()
         return
 
-    def _on_stage(stage: str, progress: int, payload: Dict[str, Any]) -> None:
-        nonlocal had_stage_error
-        log_event(
-            logger,
-            "streamlit.on_stage",
-            stage=stage,
-            progress=progress,
-            **_payload_for_log(payload),
-        )
-        if stage == "stage_error":
-            had_stage_error = True
-            stage_name = payload.get("stage_name", "unknown")
-            error_text = payload.get("error", "Unknown error")
-            with runtime_error_placeholder.container():
-                st.error(f"Ошибка на этапе `{stage_name}`: {error_text}")
-            return
-
-        if stage == "process_selected":
-            selected = payload.get("recent_anomalies", [])
-            summary_state["selected_anomalies"] = {
-                str(idx): anomaly for idx, anomaly in enumerate(selected)
-            }
-            summary_state["empty_message"] = None
-
-        if stage == "process_live":
-            event = payload.get("event")
-            idx = payload.get("index")
-            timestamp = payload.get("timestamp")
-            if idx is not None:
-                key = str(idx)
-                known_anomaly = summary_state.get("selected_anomalies", {}).get(key, {})
-                row = summary_state["by_idx"].setdefault(
-                    key,
-                    {
-                        "anomaly_idx": int(idx) + 1,
-                        "anomaly": known_anomaly,
-                        "timestamp": timestamp,
-                        "status": "queued",
-                        "elapsed_sec": None,
-                        "summary_len": None,
-                        "logs_processed": 0,
-                        "logs_total": None,
-                        "error": None,
-                        "map_batches": [],
-                        "final_summary": None,
-                        "notification_text": None,
-                    },
-                )
-                if known_anomaly and not row.get("anomaly"):
-                    row["anomaly"] = known_anomaly
-                if timestamp:
-                    row["timestamp"] = timestamp
-                    row.setdefault("anomaly", {})
-                    if not row["anomaly"].get("timestamp"):
-                        row["anomaly"]["timestamp"] = timestamp
-                if event == "anomaly_start":
-                    row["status"] = "queued"
-                if event == "summary_start":
-                    row["status"] = "summarizing"
-                elif event == "map_start":
-                    row["status"] = "map"
-                    row["map_batches"] = []
-                    row["logs_processed"] = payload.get("rows_processed", 0)
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "map_batch":
-                    row["status"] = "map"
-                    row.setdefault("map_batches", []).append(
-                        {
-                            "batch_index": payload.get("batch_index"),
-                            "batch_total": payload.get("batch_total"),
-                            "batch_summary": payload.get("batch_summary"),
-                            "batch_logs_count": payload.get("batch_logs_count"),
-                            "batch_logs": payload.get("batch_logs", []),
-                            "batch_period_start": payload.get("batch_period_start"),
-                            "batch_period_end": payload.get("batch_period_end"),
-                        }
-                    )
-                    if payload.get("rows_processed") is not None:
-                        row["logs_processed"] = payload.get("rows_processed")
-                    else:
-                        current_processed = int(row.get("logs_processed") or 0)
-                        current_processed += int(payload.get("batch_logs_count") or 0)
-                        row["logs_processed"] = current_processed
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "map_done":
-                    row["status"] = "reduce"
-                    if payload.get("rows_processed") is not None:
-                        row["logs_processed"] = payload.get("rows_processed")
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "reduce_start":
-                    row["status"] = "reduce"
-                elif event == "summary_progress":
-                    if payload.get("rows_processed") is not None:
-                        row["logs_processed"] = payload.get("rows_processed")
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "summary_done":
-                    row["status"] = "summary_ready"
-                    row["elapsed_sec"] = payload.get("elapsed_sec")
-                    row["summary_len"] = payload.get("summary_len")
-                    if payload.get("rows_processed") is not None:
-                        row["logs_processed"] = payload.get("rows_processed")
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "reduce_done":
-                    row["status"] = "summary_ready"
-                    if payload.get("summary"):
-                        row["final_summary"] = str(payload.get("summary"))
-                    if payload.get("rows_processed") is not None:
-                        row["logs_processed"] = payload.get("rows_processed")
-                    if payload.get("rows_total") is not None:
-                        row["logs_total"] = payload.get("rows_total")
-                elif event == "notification_ready":
-                    row["notification_text"] = payload.get("notification_text")
-                elif event == "alert_start":
-                    row["status"] = "sending_alert"
-                elif event == "alert_done":
-                    row["status"] = "done"
-                elif event == "anomaly_done":
-                    row["status"] = "done"
-                elif event == "anomaly_error":
-                    row["status"] = "error"
-                    row["error"] = payload.get("error")
-
-            _render_analysis_cards()
-
-        if stage == "fetch_done":
-            stage_actual_df = payload.get("actual_df")
-            stage_predictions_df = payload.get("predictions_df")
-            summary_state["predictions_all_df"] = stage_predictions_df
-            summary_state["predictions_df"] = stage_predictions_df
-            ui_data["actual_df"] = stage_actual_df
-            if isinstance(stage_actual_df, pd.DataFrame) and not stage_actual_df.empty:
-                summary_state["actual_end_ts"] = pd.to_datetime(
-                    stage_actual_df["timestamp"], utc=True
-                ).max()
-            summary_state["predictions_df"] = _only_future_predictions(
-                summary_state.get("predictions_df"),
-                summary_state.get("actual_end_ts"),
-            )
-
-        if stage == "detect_done":
-            summary_state["merged_df"] = payload.get("merged_df")
-            ui_data["anomalies_df"] = payload.get("anomalies_df")
-            anomalies_df = ui_data.get("anomalies_df")
-            if isinstance(anomalies_df, pd.DataFrame) and anomalies_df.empty:
-                summary_state["empty_message"] = "Аномалии не найдены. Пошаговый разбор не требуется."
-            else:
-                summary_state["empty_message"] = None
-            _render_graph(
-                ui_data.get("actual_df"),
-                summary_state.get("predictions_df"),
-                summary_state.get("predictions_all_df"),
-                ui_data.get("anomalies_df"),
-            )
-            _render_anomalies_table(ui_data.get("anomalies_df"))
-            _render_analysis_cards()
-
-        if stage == "process_skip":
-            reason = str(payload.get("reason", ""))
-            if reason == "no_anomalies":
-                summary_state["empty_message"] = "Аномалии не найдены. Пошаговый разбор не требуется."
-            elif reason == "alerts_disabled":
-                summary_state["empty_message"] = (
-                    "Обработка аномалий отключена настройкой `CONTROL_PLANE_PROCESS_ALERTS=false`."
-                )
-            _render_analysis_cards()
-
-    try:
-        result = run_single_iteration(
-            test_mode=TEST_MODE,
-            query=PROM_QUERY,
-            detector_name=ANOMALY_DETECTOR,
-            data_lookback_minutes=DATA_LOOKBACK_MINUTES,
-            prediction_lookahead_minutes=PREDICTION_LOOKAHEAD_MINUTES,
-            analyze_top_n=ANALYZE_TOP_N_ANOMALIES,
-            process_lookback_minutes=LOOPBACK_MINUTES,
-            process_alerts=PROCESS_ALERTS,
-            on_stage=_on_stage,
-        )
-    except Exception as exc:
-        logger.exception("Streamlit iteration failed")
-        if not had_stage_error:
-            st.error(f"Ошибка выполнения: {exc}")
-        st.stop()
-
-    actual_end_ts = (
-        pd.to_datetime(result["actual_df"]["timestamp"], utc=True).max()
-        if not result["actual_df"].empty
-        else None
-    )
-    future_predictions_df = _only_future_predictions(result["predictions_df"], actual_end_ts)
-    summary_state["actual_end_ts"] = actual_end_ts
-    summary_state["predictions_all_df"] = result["predictions_df"]
-    summary_state["predictions_df"] = future_predictions_df
-    summary_state["merged_df"] = result["merged_df"]
-    ui_data["actual_df"] = result["actual_df"]
-    ui_data["anomalies_df"] = result["anomalies_df"]
-
-    _render_graph(
-        ui_data.get("actual_df"),
-        summary_state.get("predictions_df"),
-        summary_state.get("predictions_all_df"),
-        ui_data.get("anomalies_df"),
-    )
-    _render_anomalies_table(ui_data.get("anomalies_df"))
-    _render_analysis_cards()
+    _render_control_plane_page()
 
 
 if __name__ == "__main__":
