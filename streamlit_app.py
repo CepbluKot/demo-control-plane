@@ -892,7 +892,8 @@ def _ui_runtime_config() -> Dict[str, Any]:
 def _render_logs_summary_page() -> None:
     deps = LogsSummaryPageDeps(
         logger=logger,
-        page_limit=max(int(settings.CONTROL_PLANE_LOGS_PAGE_LIMIT), 1),
+        page_limit=max(int(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_PAGE_LIMIT), 1),
+        llm_chunk_rows=max(int(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_CHUNK_ROWS), 1),
         test_mode=TEST_MODE,
         loopback_minutes=LOOPBACK_MINUTES,
         logs_tail_limit=LOGS_TAIL_LIMIT,

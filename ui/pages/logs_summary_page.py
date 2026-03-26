@@ -13,6 +13,7 @@ import streamlit as st
 class LogsSummaryPageDeps:
     logger: logging.Logger
     page_limit: int
+    llm_chunk_rows: int
     test_mode: bool
     loopback_minutes: int
     logs_tail_limit: int
@@ -420,7 +421,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "Размер LLM batch (rows/chunk)",
                 min_value=10,
                 max_value=5_000,
-                value=200,
+                value=max(int(deps.llm_chunk_rows), 1),
                 step=10,
                 key="logs_summary_llm_chunk_rows",
                 disabled=running,
@@ -496,7 +497,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     demo_mode = bool(pending_cfg.get("demo_mode", False))
     demo_logs_count = max(int(pending_cfg.get("demo_logs_count", max(int(deps.logs_tail_limit), 1000))), 1)
     page_limit = max(int(pending_cfg.get("page_limit", deps.page_limit)), 1)
-    llm_chunk_rows = max(int(pending_cfg.get("llm_chunk_rows", 200)), 1)
+    llm_chunk_rows = max(int(pending_cfg.get("llm_chunk_rows", deps.llm_chunk_rows)), 1)
 
     try:
         if not sql_query:

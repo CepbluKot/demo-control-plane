@@ -117,6 +117,8 @@ class Settings(BaseSettings):
     CONTROL_PLANE_LOGS_FETCH_MODE: str = "time_window"
     CONTROL_PLANE_LOGS_TAIL_LIMIT: int = 1000
     CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL: str = ""
+    CONTROL_PLANE_UI_LOGS_SUMMARY_PAGE_LIMIT: int = 1000
+    CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_CHUNK_ROWS: int = 200
 
     # Forecast metadata
     CONTROL_PLANE_FORECAST_SERVICE: str = "demo-service"
