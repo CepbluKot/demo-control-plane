@@ -13,8 +13,7 @@ import streamlit as st
 @dataclass(frozen=True)
 class LogsSummaryPageDeps:
     logger: logging.Logger
-    page_limit: int
-    llm_chunk_rows: int
+    batch_size: int
     test_mode: bool
     loopback_minutes: int
     logs_tail_limit: int
@@ -407,31 +406,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         )
 
     st.markdown("Параметры батчинга")
-    batch_col1, batch_col2 = st.columns(2)
-    with batch_col1:
-        page_limit_ui = int(
-            st.number_input(
-                "Размер страницы БД (rows/page)",
-                min_value=50,
-                max_value=50_000,
-                value=max(int(deps.page_limit), 1),
-                step=50,
-                key="logs_summary_page_limit",
-                disabled=running,
-            )
+    batch_size_ui = int(
+        st.number_input(
+            "Общий размер batch (и для БД, и для LLM)",
+            min_value=10,
+            max_value=50_000,
+            value=max(int(deps.batch_size), 1),
+            step=10,
+            key="logs_summary_batch_size",
+            disabled=running,
         )
-    with batch_col2:
-        llm_chunk_rows_ui = int(
-            st.number_input(
-                "Размер LLM batch (rows/chunk)",
-                min_value=10,
-                max_value=5_000,
-                value=max(int(deps.llm_chunk_rows), 1),
-                step=10,
-                key="logs_summary_llm_chunk_rows",
-                disabled=running,
-            )
-        )
+    )
 
     demo_mode = st.toggle(
         "Демо режим (без запросов к БД)",
@@ -478,8 +463,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "window_minutes": int(window_minutes),
             "demo_mode": bool(demo_mode),
             "demo_logs_count": int(demo_logs_count),
-            "page_limit": int(page_limit_ui),
-            "llm_chunk_rows": int(llm_chunk_rows_ui),
+            "batch_size": int(batch_size_ui),
         }
         st.session_state[last_state_key] = None
         st.session_state[running_key] = True
@@ -501,8 +485,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     window_minutes = max(int(pending_cfg.get("window_minutes", max(int(deps.loopback_minutes), 1))), 1)
     demo_mode = bool(pending_cfg.get("demo_mode", False))
     demo_logs_count = max(int(pending_cfg.get("demo_logs_count", max(int(deps.logs_tail_limit), 1000))), 1)
-    page_limit = max(int(pending_cfg.get("page_limit", deps.page_limit)), 1)
-    llm_chunk_rows = max(int(pending_cfg.get("llm_chunk_rows", deps.llm_chunk_rows)), 1)
+    batch_size = max(int(pending_cfg.get("batch_size", deps.batch_size)), 1)
+    page_limit = batch_size
+    llm_chunk_rows = batch_size
 
     try:
         if not sql_query:
@@ -541,8 +526,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "period_start": period_start_iso,
             "period_end": period_end_iso,
             "window_minutes": window_minutes,
-            "page_limit": page_limit,
-            "llm_chunk_rows": llm_chunk_rows,
+            "batch_size": batch_size,
             "logs_processed": 0,
             "logs_total": None,
             "events": [],
