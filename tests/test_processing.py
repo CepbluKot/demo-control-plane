@@ -67,13 +67,14 @@ class TestProcessing(unittest.TestCase):
             events.append((event, payload))
 
         anomaly = {"timestamp": "2026-03-25T11:00:00Z", "value": 42.0, "source": "actual"}
-        results = process_anomalies(
-            [anomaly],
-            lookback_minutes=20,
-            continue_on_error=True,
-            test_mode=True,
-            on_event=on_event,
-        )
+        with patch("control_plane.processing.ALERT_CALLABLE", ""):
+            results = process_anomalies(
+                [anomaly],
+                lookback_minutes=20,
+                continue_on_error=True,
+                test_mode=True,
+                on_event=on_event,
+            )
 
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]["success"])

@@ -588,10 +588,19 @@ def process_anomalies(
                         "mode": "mock",
                     },
                 )
-                result["alert_result"] = {
-                    "status": "mocked",
-                    "message_preview": alert_text[:120],
-                }
+                if ALERT_CALLABLE:
+                    logger.info("Using custom alert callable in TEST_MODE: %s", ALERT_CALLABLE)
+                    alert_fn = _load_callable(ALERT_CALLABLE)
+                    alert_result = _call_alert_adapter(
+                        alert_fn,
+                        alert_text=alert_text,
+                    )
+                else:
+                    alert_result = {
+                        "status": "mocked",
+                        "message_preview": alert_text[:120],
+                    }
+                result["alert_result"] = alert_result
                 log_event(logger, "process_anomalies.mock_alert", index=i, alert=result["alert_result"])
                 _emit(
                     "alert_done",
