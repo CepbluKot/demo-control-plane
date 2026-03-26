@@ -494,6 +494,11 @@ class PeriodLogSummarizer:
         map_summaries: List[str] = []
         map_batches: List[Dict[str, Any]] = []
         rows_mapped = 0
+        estimated_batch_total: Optional[int] = None
+        if total_rows_estimate and total_rows_estimate > 0:
+            estimated_batch_total = int(
+                math.ceil(total_rows_estimate / max(self.config.llm_chunk_rows, 1))
+            )
         self._emit_progress(
             "map_start",
             {
@@ -529,6 +534,20 @@ class PeriodLogSummarizer:
             for i in range(0, len(page), self.config.llm_chunk_rows):
                 rows_chunk = page[i : i + self.config.llm_chunk_rows]
                 ranked_chunk = self._rank_rows_by_problem_signal(rows_chunk, columns)
+                next_batch_index = len(map_batches)
+                batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
+                self._emit_progress(
+                    "map_batch_start",
+                    {
+                        "batch_index": next_batch_index,
+                        "batch_total": estimated_batch_total,
+                        "batch_logs_count": len(ranked_chunk),
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
+                        "rows_processed": rows_mapped,
+                        "rows_total": total_rows_estimate,
+                    },
+                )
                 prompt = self._build_chunk_prompt(
                     period_start=period_start,
                     period_end=period_end,
@@ -539,7 +558,6 @@ class PeriodLogSummarizer:
                 if not chunk_summary:
                     chunk_summary = "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
-                batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
                 map_summaries.append(chunk_summary)
                 map_batches.append(
                     {
@@ -552,11 +570,6 @@ class PeriodLogSummarizer:
                     }
                 )
                 rows_mapped += len(ranked_chunk)
-                estimated_batch_total: Optional[int] = None
-                if total_rows_estimate and total_rows_estimate > 0:
-                    estimated_batch_total = int(
-                        math.ceil(total_rows_estimate / max(self.config.llm_chunk_rows, 1))
-                    )
                 self._emit_progress(
                     "map_batch",
                     {
@@ -655,8 +668,18 @@ class PeriodLogSummarizer:
             if round_idx > self.config.max_reduce_rounds:
                 raise RuntimeError("Exceeded max reduce rounds")
             next_level: List[str] = []
+            groups_total = int(math.ceil(len(current) / max(self.config.reduce_group_size, 1)))
             for i in range(0, len(current), self.config.reduce_group_size):
                 group = current[i : i + self.config.reduce_group_size]
+                group_index = int(i / max(self.config.reduce_group_size, 1))
+                self._emit_progress(
+                    "reduce_group_start",
+                    {
+                        "reduce_round": round_idx,
+                        "group_index": group_index,
+                        "group_total": groups_total,
+                    },
+                )
                 prompt = self._build_reduce_prompt(
                     period_start=period_start,
                     period_end=period_end,
@@ -667,6 +690,14 @@ class PeriodLogSummarizer:
                 if not merged:
                     merged = "Пустой ответ LLM на reduce-этапе."
                 next_level.append(self._truncate(merged, self.config.max_summary_chars))
+                self._emit_progress(
+                    "reduce_group_done",
+                    {
+                        "reduce_round": round_idx,
+                        "group_index": group_index,
+                        "group_total": groups_total,
+                    },
+                )
                 llm_calls += 1
             current = next_level
         return current[0], llm_calls, round_idx

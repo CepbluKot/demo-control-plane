@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -239,6 +240,10 @@ def _render_logs_summary_chat(
                     )
                 else:
                     st.caption(f"Прогресс суммаризации логов: обработано {int(processed_num)} строк")
+            events = state.get("events", [])
+            if isinstance(events, list) and events:
+                for line in events[-8:]:
+                    st.caption(str(line))
 
         batches = state.get("map_batches", [])
         if batches:
@@ -540,6 +545,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "llm_chunk_rows": llm_chunk_rows,
             "logs_processed": 0,
             "logs_total": None,
+            "events": [],
             "map_batches": [],
             "final_summary": None,
             "stats": None,
@@ -656,6 +662,27 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if event == "map_start":
                 state["status"] = "map"
                 state["map_batches"] = []
+                state.setdefault("events", []).append("Map этап запущен")
+            elif event == "page_fetched":
+                state["status"] = "map"
+                page_index = payload.get("page_index")
+                page_rows = payload.get("page_rows")
+                state.setdefault("events", []).append(
+                    f"Получена страница #{page_index}: {page_rows} строк"
+                )
+            elif event == "map_batch_start":
+                state["status"] = "map"
+                batch_idx = int(payload.get("batch_index", 0)) + 1
+                batch_total = payload.get("batch_total")
+                logs_count = payload.get("batch_logs_count")
+                if batch_total:
+                    state.setdefault("events", []).append(
+                        f"LLM анализирует batch {batch_idx}/{batch_total} ({logs_count} строк)"
+                    )
+                else:
+                    state.setdefault("events", []).append(
+                        f"LLM анализирует batch {batch_idx} ({logs_count} строк)"
+                    )
             elif event == "map_batch":
                 state["status"] = "map"
                 state.setdefault("map_batches", []).append(
@@ -669,12 +696,43 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_period_end": payload.get("batch_period_end"),
                     }
                 )
+                batch_idx = int(payload.get("batch_index", 0)) + 1
+                batch_total = payload.get("batch_total")
+                if batch_total:
+                    state.setdefault("events", []).append(
+                        f"Map summary {batch_idx}/{batch_total} готов"
+                    )
+                else:
+                    state.setdefault("events", []).append(
+                        f"Map summary {batch_idx} готов"
+                    )
             elif event in ("map_done", "reduce_start"):
                 state["status"] = "reduce"
+                if event == "map_done":
+                    state.setdefault("events", []).append("Map этап завершен")
+                else:
+                    state.setdefault("events", []).append("Reduce этап запущен")
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
+                state.setdefault("events", []).append("Reduce этап завершен")
+            elif event == "reduce_group_start":
+                state["status"] = "reduce"
+                round_idx = payload.get("reduce_round")
+                group_idx = int(payload.get("group_index", 0)) + 1
+                group_total = payload.get("group_total")
+                state.setdefault("events", []).append(
+                    f"Reduce round {round_idx}: группа {group_idx}/{group_total} в работе"
+                )
+            elif event == "reduce_group_done":
+                state["status"] = "reduce"
+                round_idx = payload.get("reduce_round")
+                group_idx = int(payload.get("group_index", 0)) + 1
+                group_total = payload.get("group_total")
+                state.setdefault("events", []).append(
+                    f"Reduce round {round_idx}: группа {group_idx}/{group_total} готова"
+                )
 
             progress_rows = payload.get("rows_processed")
             if progress_rows is None:
@@ -684,6 +742,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if payload.get("rows_total") is not None:
                 state["logs_total"] = payload.get("rows_total")
             _render_logs_summary_chat(analysis_placeholder, state, deps)
+            # Gives Streamlit a tiny chance to flush UI deltas progressively.
+            time.sleep(0.01)
 
         state["status"] = "summarizing"
         _render_logs_summary_chat(analysis_placeholder, state, deps)
