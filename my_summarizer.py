@@ -56,6 +56,8 @@ class SummarizerConfig:
     max_reduce_rounds: int = 12
     max_cell_chars: int = 500
     max_summary_chars: int = 10_000
+    keep_map_batches_in_memory: bool = True
+    keep_map_summaries_in_result: bool = True
 
 
 @dataclass
@@ -493,6 +495,7 @@ class PeriodLogSummarizer:
         llm_calls = 0
         map_summaries: List[str] = []
         map_batches: List[Dict[str, Any]] = []
+        map_batch_index = 0
         rows_mapped = 0
         estimated_batch_total: Optional[int] = None
         if total_rows_estimate and total_rows_estimate > 0:
@@ -534,7 +537,7 @@ class PeriodLogSummarizer:
             for i in range(0, len(page), self.config.llm_chunk_rows):
                 rows_chunk = page[i : i + self.config.llm_chunk_rows]
                 ranked_chunk = self._rank_rows_by_problem_signal(rows_chunk, columns)
-                next_batch_index = len(map_batches)
+                next_batch_index = map_batch_index
                 batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
                 self._emit_progress(
                     "map_batch_start",
@@ -559,21 +562,22 @@ class PeriodLogSummarizer:
                     chunk_summary = "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
-                map_batches.append(
-                    {
-                        "batch_index": len(map_batches),
-                        "rows_count": len(ranked_chunk),
-                        "rows": [dict(row) for row in ranked_chunk],
-                        "summary": chunk_summary,
-                        "batch_period_start": batch_period_start,
-                        "batch_period_end": batch_period_end,
-                    }
-                )
+                if self.config.keep_map_batches_in_memory:
+                    map_batches.append(
+                        {
+                            "batch_index": next_batch_index,
+                            "rows_count": len(ranked_chunk),
+                            "rows": [dict(row) for row in ranked_chunk],
+                            "summary": chunk_summary,
+                            "batch_period_start": batch_period_start,
+                            "batch_period_end": batch_period_end,
+                        }
+                    )
                 rows_mapped += len(ranked_chunk)
                 self._emit_progress(
                     "map_batch",
                     {
-                        "batch_index": len(map_batches) - 1,
+                        "batch_index": next_batch_index,
                         "batch_total": estimated_batch_total,
                         "batch_summary": chunk_summary,
                         "batch_logs_count": len(ranked_chunk),
@@ -584,6 +588,7 @@ class PeriodLogSummarizer:
                         "rows_total": total_rows_estimate,
                     },
                 )
+                map_batch_index += 1
                 llm_calls += 1
 
             if len(page) < self.config.page_limit:
@@ -612,7 +617,7 @@ class PeriodLogSummarizer:
         self._emit_progress(
             "map_done",
             {
-                "batch_total": len(map_batches),
+                "batch_total": map_batch_index,
                 "rows_processed": rows_mapped,
                 "rows_total": total_rows_estimate,
             },
@@ -620,7 +625,7 @@ class PeriodLogSummarizer:
         self._emit_progress(
             "reduce_start",
             {
-                "batch_total": len(map_batches),
+                "batch_total": map_batch_index,
                 "rows_processed": rows_mapped,
                 "rows_total": total_rows_estimate,
             },
@@ -639,6 +644,7 @@ class PeriodLogSummarizer:
             },
         )
         llm_calls += reduce_calls
+        result_map_summaries = map_summaries if self.config.keep_map_summaries_in_result else []
         return SummarizationResult(
             summary=final_summary,
             pages_fetched=pages_fetched,
@@ -646,7 +652,7 @@ class PeriodLogSummarizer:
             llm_calls=llm_calls,
             chunk_summaries=len(map_summaries),
             reduce_rounds=reduce_rounds,
-            map_summaries=map_summaries,
+            map_summaries=result_map_summaries,
             map_batches=map_batches,
         )
 

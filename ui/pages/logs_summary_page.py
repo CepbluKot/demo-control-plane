@@ -11,6 +11,11 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+LIVE_BATCHES_TO_RENDER = 6
+FINAL_BATCHES_TO_RENDER = 24
+MAX_BATCH_LOG_ROWS_PREVIEW = 80
+MAX_EVENT_LINES = 200
+
 
 @dataclass(frozen=True)
 class LogsSummaryPageDeps:
@@ -154,6 +159,12 @@ def _save_logs_summary_result(
     }
 
 
+def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
+
+
 def _build_manual_logs_window_query(
     *,
     base_query: str,
@@ -178,6 +189,18 @@ def _build_manual_logs_window_query(
         ") AS cp_manual_window "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
+
+
+def _wrap_with_limit_offset(
+    *,
+    query: str,
+    limit: int,
+    offset: int,
+) -> str:
+    safe_limit = max(int(limit), 1)
+    safe_offset = max(int(offset), 0)
+    base = query.strip().rstrip(";")
+    return f"SELECT * FROM ({base}) AS cp_manual_limited LIMIT {safe_limit} OFFSET {safe_offset}"
 
 
 def _build_manual_logs_count_query(
@@ -314,7 +337,23 @@ def _render_logs_summary_chat(
 
         batches = state.get("map_batches", [])
         if batches:
-            for batch in batches:
+            status = str(state.get("status", ""))
+            if status in {"map", "reduce", "summarizing"} and len(batches) > LIVE_BATCHES_TO_RENDER:
+                shown_batches = batches[-LIVE_BATCHES_TO_RENDER:]
+                st.caption(
+                    f"Показаны последние {LIVE_BATCHES_TO_RENDER} map-batch из {len(batches)} "
+                    "(полный результат сохранен в файл)."
+                )
+            elif len(batches) > FINAL_BATCHES_TO_RENDER:
+                shown_batches = batches[-FINAL_BATCHES_TO_RENDER:]
+                st.caption(
+                    f"Показаны последние {FINAL_BATCHES_TO_RENDER} map-batch из {len(batches)} "
+                    "(полный результат сохранен в файл)."
+                )
+            else:
+                shown_batches = batches
+
+            for batch in shown_batches:
                 idx = int(batch.get("batch_index", 0)) + 1
                 total = batch.get("batch_total", len(batches))
                 batch_logs = batch.get("batch_logs", [])
@@ -369,13 +408,19 @@ def _render_logs_summary_chat(
 
         result_json_path = state.get("result_json_path")
         result_summary_path = state.get("result_summary_path")
-        if result_json_path or result_summary_path:
+        live_events_path = state.get("live_events_path")
+        live_batches_path = state.get("live_batches_path")
+        if result_json_path or result_summary_path or live_events_path or live_batches_path:
             with st.chat_message("assistant"):
                 st.markdown("Результаты сохранены в файлы")
                 if result_json_path:
                     st.code(str(result_json_path))
                 if result_summary_path:
                     st.code(str(result_summary_path))
+                if live_events_path:
+                    st.code(str(live_events_path))
+                if live_batches_path:
+                    st.code(str(live_batches_path))
 
 
 def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
@@ -488,7 +533,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         st.number_input(
             "Общий размер batch (и для БД, и для LLM)",
             min_value=10,
-            max_value=50_000,
+            max_value=5_000,
             value=max(int(deps.batch_size), 1),
             step=10,
             key="logs_summary_batch_size",
@@ -578,6 +623,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "demo_logs_count": demo_logs_count,
         "batch_size": batch_size,
     }
+    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    run_dir = deps.output_dir / "logs_summary_live" / f"run_{run_stamp}"
+    live_events_path = run_dir / "events.jsonl"
+    live_batches_path = run_dir / "batches.jsonl"
+    request_payload["live_events_path"] = str(live_events_path)
+    request_payload["live_batches_path"] = str(live_batches_path)
 
     try:
         if not sql_query:
@@ -626,11 +677,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "error": None,
             "result_json_path": None,
             "result_summary_path": None,
+            "live_events_path": str(live_events_path),
+            "live_batches_path": str(live_batches_path),
         }
         _render_logs_summary_chat(analysis_placeholder, state, deps)
 
         total_rows_estimate: Optional[int] = None
         demo_logs: List[Dict[str, Any]] = []
+        uses_template = False
+        uses_paging_template = False
         if demo_mode:
             demo_logs = _build_demo_logs_for_window(
                 period_start_dt=period_start_dt,
@@ -642,20 +697,29 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         else:
             uses_template = _query_uses_any_placeholders(sql_query)
             uses_paging_template = _query_uses_paging_placeholders(sql_query)
+            preview_limit = 1
             if uses_template:
-                preview_query = _render_query_template(
+                rendered_preview = _render_query_template(
                     query_template=sql_query,
                     period_start_iso=period_start_iso,
                     period_end_iso=period_end_iso,
-                    limit=page_limit,
+                    limit=preview_limit,
                     offset=0,
                 )
+                if uses_paging_template:
+                    preview_query = rendered_preview
+                else:
+                    preview_query = _wrap_with_limit_offset(
+                        query=rendered_preview,
+                        limit=preview_limit,
+                        offset=0,
+                    )
             else:
                 preview_query = _build_manual_logs_window_query(
                     base_query=sql_query,
                     period_start_iso=period_start_iso,
                     period_end_iso=period_end_iso,
-                    limit=page_limit,
+                    limit=preview_limit,
                     offset=0,
                 )
             preview_df = deps.query_logs_df(preview_query)
@@ -663,40 +727,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if "timestamp" not in columns:
                 raise ValueError("SQL должен возвращать колонку `timestamp`.")
 
-            try:
-                if uses_template and uses_paging_template:
-                    deps.logger.info(
-                        "manual logs summary: skip count estimate for SQL template with {limit}/{offset}"
-                    )
-                elif uses_template:
-                    rendered_for_count = _render_query_template(
-                        query_template=sql_query,
-                        period_start_iso=period_start_iso,
-                        period_end_iso=period_end_iso,
-                        limit=page_limit,
-                        offset=0,
-                    )
-                    count_query = f"SELECT count() AS total_rows FROM ({rendered_for_count}) AS cp_manual_cnt"
-                    count_df = deps.query_logs_df(count_query)
-                    if not count_df.empty:
-                        if "total_rows" in count_df.columns:
-                            total_rows_estimate = int(count_df.iloc[0]["total_rows"])
-                        else:
-                            total_rows_estimate = int(count_df.iloc[0, 0])
-                else:
-                    count_query = _build_manual_logs_count_query(
-                        base_query=sql_query,
-                        period_start_iso=period_start_iso,
-                        period_end_iso=period_end_iso,
-                    )
-                    count_df = deps.query_logs_df(count_query)
-                    if not count_df.empty:
-                        if "total_rows" in count_df.columns:
-                            total_rows_estimate = int(count_df.iloc[0]["total_rows"])
-                        else:
-                            total_rows_estimate = int(count_df.iloc[0, 0])
-            except Exception as exc:  # noqa: BLE001
-                deps.logger.warning("manual logs summary: failed to estimate total rows: %s", exc)
+            # Avoid expensive COUNT(*) over huge log tables; this can block UI for a long time.
+            # Progress bar still works via processed rows counter.
+            total_rows_estimate = None
 
         def _db_fetch_page(
             *,
@@ -711,13 +744,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 records = [dict(row) for row in rows]
             else:
                 if _query_uses_any_placeholders(sql_query):
-                    query = _render_query_template(
+                    rendered_query = _render_query_template(
                         query_template=sql_query,
                         period_start_iso=period_start,
                         period_end_iso=period_end,
                         limit=limit,
                         offset=offset,
                     )
+                    if uses_paging_template:
+                        query = rendered_query
+                    else:
+                        query = _wrap_with_limit_offset(
+                            query=rendered_query,
+                            limit=limit,
+                            offset=offset,
+                        )
                 else:
                     query = _build_manual_logs_window_query(
                         base_query=sql_query,
@@ -735,15 +776,35 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         def _on_progress(event: str, payload: Dict[str, Any]) -> None:
             if not isinstance(payload, dict):
                 payload = {}
+            try:
+                _append_jsonl(
+                    live_events_path,
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "event": event,
+                        "rows_processed": payload.get("rows_processed"),
+                        "rows_total": payload.get("rows_total"),
+                        "page_index": payload.get("page_index"),
+                        "page_rows": payload.get("page_rows"),
+                        "batch_index": payload.get("batch_index"),
+                        "batch_total": payload.get("batch_total"),
+                        "reduce_round": payload.get("reduce_round"),
+                        "group_index": payload.get("group_index"),
+                        "group_total": payload.get("group_total"),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                deps.logger.exception("failed to append live event")
+            events = state.setdefault("events", [])
             if event == "map_start":
                 state["status"] = "map"
                 state["map_batches"] = []
-                state.setdefault("events", []).append("Map этап запущен")
+                events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
                 page_index = payload.get("page_index")
                 page_rows = payload.get("page_rows")
-                state.setdefault("events", []).append(
+                events.append(
                     f"Получена страница #{page_index}: {page_rows} строк"
                 )
             elif event == "map_batch_start":
@@ -752,53 +813,81 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 batch_total = payload.get("batch_total")
                 logs_count = payload.get("batch_logs_count")
                 if batch_total:
-                    state.setdefault("events", []).append(
+                    events.append(
                         f"LLM анализирует batch {batch_idx}/{batch_total} ({logs_count} строк)"
                     )
                 else:
-                    state.setdefault("events", []).append(
+                    events.append(
                         f"LLM анализирует batch {batch_idx} ({logs_count} строк)"
                     )
             elif event == "map_batch":
                 state["status"] = "map"
-                state.setdefault("map_batches", []).append(
+                try:
+                    _append_jsonl(
+                        live_batches_path,
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "event": "map_batch",
+                            "batch_index": payload.get("batch_index"),
+                            "batch_total": payload.get("batch_total"),
+                            "batch_summary": payload.get("batch_summary"),
+                            "batch_logs_count": payload.get("batch_logs_count"),
+                            "batch_logs": payload.get("batch_logs", []),
+                            "batch_period_start": payload.get("batch_period_start"),
+                            "batch_period_end": payload.get("batch_period_end"),
+                            "rows_processed": payload.get("rows_processed"),
+                            "rows_total": payload.get("rows_total"),
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    deps.logger.exception("failed to append map batch")
+                batch_logs = payload.get("batch_logs", [])
+                if not isinstance(batch_logs, list):
+                    batch_logs = []
+                if len(batch_logs) > MAX_BATCH_LOG_ROWS_PREVIEW:
+                    batch_logs = batch_logs[:MAX_BATCH_LOG_ROWS_PREVIEW]
+                map_batches = state.setdefault("map_batches", [])
+                map_batches.append(
                     {
                         "batch_index": payload.get("batch_index"),
                         "batch_total": payload.get("batch_total"),
                         "batch_summary": payload.get("batch_summary"),
                         "batch_logs_count": payload.get("batch_logs_count"),
-                        "batch_logs": payload.get("batch_logs", []),
+                        "batch_logs": batch_logs,
                         "batch_period_start": payload.get("batch_period_start"),
                         "batch_period_end": payload.get("batch_period_end"),
                     }
                 )
+                if len(map_batches) > FINAL_BATCHES_TO_RENDER:
+                    for old_batch in map_batches[:-FINAL_BATCHES_TO_RENDER]:
+                        old_batch["batch_logs"] = []
                 batch_idx = int(payload.get("batch_index", 0)) + 1
                 batch_total = payload.get("batch_total")
                 if batch_total:
-                    state.setdefault("events", []).append(
+                    events.append(
                         f"Map summary {batch_idx}/{batch_total} готов"
                     )
                 else:
-                    state.setdefault("events", []).append(
+                    events.append(
                         f"Map summary {batch_idx} готов"
                     )
             elif event in ("map_done", "reduce_start"):
                 state["status"] = "reduce"
                 if event == "map_done":
-                    state.setdefault("events", []).append("Map этап завершен")
+                    events.append("Map этап завершен")
                 else:
-                    state.setdefault("events", []).append("Reduce этап запущен")
+                    events.append("Reduce этап запущен")
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
-                state.setdefault("events", []).append("Reduce этап завершен")
+                events.append("Reduce этап завершен")
             elif event == "reduce_group_start":
                 state["status"] = "reduce"
                 round_idx = payload.get("reduce_round")
                 group_idx = int(payload.get("group_index", 0)) + 1
                 group_total = payload.get("group_total")
-                state.setdefault("events", []).append(
+                events.append(
                     f"Reduce round {round_idx}: группа {group_idx}/{group_total} в работе"
                 )
             elif event == "reduce_group_done":
@@ -806,9 +895,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 round_idx = payload.get("reduce_round")
                 group_idx = int(payload.get("group_index", 0)) + 1
                 group_total = payload.get("group_total")
-                state.setdefault("events", []).append(
+                events.append(
                     f"Reduce round {round_idx}: группа {group_idx}/{group_total} готова"
                 )
+
+            if len(events) > MAX_EVENT_LINES:
+                state["events"] = events[-MAX_EVENT_LINES:]
 
             progress_rows = payload.get("rows_processed")
             if progress_rows is None:
@@ -847,6 +939,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             config=deps.summarizer_config_cls(
                 page_limit=page_limit,
                 llm_chunk_rows=llm_chunk_rows,
+                keep_map_batches_in_memory=False,
+                keep_map_summaries_in_result=False,
             ),
             on_progress=_on_progress,
         )
@@ -885,6 +979,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "error": str(exc),
             "result_json_path": None,
             "result_summary_path": None,
+            "live_events_path": str(live_events_path),
+            "live_batches_path": str(live_batches_path),
         }
         error_placeholder.error(str(exc))
         deps.logger.exception("manual logs summary failed")
