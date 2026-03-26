@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -24,6 +26,7 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "value",
 )
 logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[str, Dict[str, Any]], None]
 
 
 class DBPageFetcher(Protocol):
@@ -238,6 +241,51 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
     return _db_fetch_page
 
 
+def _build_count_query(data_query: str) -> str:
+    stripped = data_query.strip().rstrip(";")
+    without_limit_offset = re.sub(
+        r"(?is)\s+LIMIT\s+\d+\s+OFFSET\s+\d+\s*$",
+        "",
+        stripped,
+    )
+    without_limit_only = re.sub(
+        r"(?is)\s+LIMIT\s+\d+\s*$",
+        "",
+        without_limit_offset,
+    )
+    return f"SELECT count() AS total_rows FROM ({without_limit_only}) AS cp_logs"
+
+
+def _estimate_total_logs(
+    *,
+    anomaly: Optional[Dict[str, Any]],
+    period_start: str,
+    period_end: str,
+    page_limit: int,
+) -> Optional[int]:
+    try:
+        service = _resolve_service(anomaly)
+        query_template = _resolve_logs_query_template()
+        sample_query = _render_logs_query(
+            query_template=query_template,
+            period_start=period_start,
+            period_end=period_end,
+            limit=page_limit,
+            offset=0,
+            service=service,
+        )
+        count_query = _build_count_query(sample_query)
+        df = _query_logs_df(count_query)
+        if df.empty:
+            return None
+        if "total_rows" in df.columns:
+            return int(df.iloc[0]["total_rows"])
+        return int(df.iloc[0, 0])
+    except Exception as exc:
+        logger.warning("Failed to estimate total logs for progress: %s", exc)
+        return None
+
+
 def _heuristic_llm_call(prompt: str) -> str:
     lowered = prompt.lower()
     keywords = (
@@ -314,10 +362,17 @@ class PeriodLogSummarizer:
         db_fetch_page: DBPageFetcher,
         llm_call: LLMTextCaller,
         config: SummarizerConfig | None = None,
+        on_progress: Optional[ProgressCallback] = None,
     ) -> None:
         self.db_fetch_page = db_fetch_page
         self.llm_call = llm_call
         self.config = config or SummarizerConfig()
+        self.on_progress = on_progress
+
+    def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
+        if self.on_progress is None:
+            return
+        self.on_progress(event, payload)
 
     def summarize_period(
         self,
@@ -325,6 +380,7 @@ class PeriodLogSummarizer:
         period_start: str,
         period_end: str,
         columns: Sequence[str],
+        total_rows_estimate: Optional[int] = None,
     ) -> SummarizationResult:
         self._validate_iso_datetime(period_start)
         self._validate_iso_datetime(period_end)
@@ -337,6 +393,14 @@ class PeriodLogSummarizer:
         llm_calls = 0
         map_summaries: List[str] = []
         map_batches: List[Dict[str, Any]] = []
+        rows_mapped = 0
+        self._emit_progress(
+            "map_start",
+            {
+                "rows_processed": 0,
+                "rows_total": total_rows_estimate,
+            },
+        )
 
         while True:
             page = self.db_fetch_page(
@@ -352,6 +416,15 @@ class PeriodLogSummarizer:
             pages_fetched += 1
             rows_processed += len(page)
             offset += len(page)
+            self._emit_progress(
+                "page_fetched",
+                {
+                    "page_index": pages_fetched,
+                    "page_rows": len(page),
+                    "rows_fetched": rows_processed,
+                    "rows_total": total_rows_estimate,
+                },
+            )
 
             for i in range(0, len(page), self.config.llm_chunk_rows):
                 rows_chunk = page[i : i + self.config.llm_chunk_rows]
@@ -375,12 +448,38 @@ class PeriodLogSummarizer:
                         "summary": chunk_summary,
                     }
                 )
+                rows_mapped += len(ranked_chunk)
+                estimated_batch_total: Optional[int] = None
+                if total_rows_estimate and total_rows_estimate > 0:
+                    estimated_batch_total = int(
+                        math.ceil(total_rows_estimate / max(self.config.llm_chunk_rows, 1))
+                    )
+                self._emit_progress(
+                    "map_batch",
+                    {
+                        "batch_index": len(map_batches) - 1,
+                        "batch_total": estimated_batch_total,
+                        "batch_summary": chunk_summary,
+                        "batch_logs_count": len(ranked_chunk),
+                        "batch_logs": [dict(row) for row in ranked_chunk],
+                        "rows_processed": rows_mapped,
+                        "rows_total": total_rows_estimate,
+                    },
+                )
                 llm_calls += 1
 
             if len(page) < self.config.page_limit:
                 break
 
         if not map_summaries:
+            self._emit_progress(
+                "map_done",
+                {
+                    "batch_total": 0,
+                    "rows_processed": 0,
+                    "rows_total": total_rows_estimate,
+                },
+            )
             return SummarizationResult(
                 summary="Нет логов за указанный период.",
                 pages_fetched=pages_fetched,
@@ -392,10 +491,34 @@ class PeriodLogSummarizer:
                 map_batches=[],
             )
 
+        self._emit_progress(
+            "map_done",
+            {
+                "batch_total": len(map_batches),
+                "rows_processed": rows_mapped,
+                "rows_total": total_rows_estimate,
+            },
+        )
+        self._emit_progress(
+            "reduce_start",
+            {
+                "batch_total": len(map_batches),
+                "rows_processed": rows_mapped,
+                "rows_total": total_rows_estimate,
+            },
+        )
         final_summary, reduce_calls, reduce_rounds = self._reduce_summaries(
             chunk_summaries=map_summaries,
             period_start=period_start,
             period_end=period_end,
+        )
+        self._emit_progress(
+            "reduce_done",
+            {
+                "summary": final_summary,
+                "rows_processed": rows_mapped,
+                "rows_total": total_rows_estimate,
+            },
         )
         llm_calls += reduce_calls
         return SummarizationResult(
@@ -550,6 +673,7 @@ def summarize_logs(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
     anomaly: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
     """
     LLM map-reduce summarizer over paged logs from ClickHouse.
@@ -563,6 +687,12 @@ def summarize_logs(
     )
     service = _resolve_service(anomaly)
     page_limit = int(settings.CONTROL_PLANE_LOGS_PAGE_LIMIT)
+    total_rows_estimate = _estimate_total_logs(
+        anomaly=anomaly,
+        period_start=start_iso,
+        period_end=end_iso,
+        page_limit=page_limit,
+    )
 
     db_fetch_page = _build_db_fetch_page(anomaly)
     llm_call = _make_llm_call()
@@ -570,11 +700,13 @@ def summarize_logs(
         db_fetch_page=db_fetch_page,
         llm_call=llm_call,
         config=SummarizerConfig(page_limit=page_limit),
+        on_progress=on_progress,
     )
     result = summarizer.summarize_period(
         period_start=start_iso,
         period_end=end_iso,
         columns=list(DEFAULT_SUMMARY_COLUMNS),
+        total_rows_estimate=total_rows_estimate,
     )
     summary_text = str(result.summary)
     if summary_text and not summary_text.startswith("Сервис:"):
@@ -588,5 +720,6 @@ def summarize_logs(
         "rows_processed": result.rows_processed,
         "llm_calls": result.llm_calls,
         "reduce_rounds": result.reduce_rounds,
+        "rows_total_estimate": total_rows_estimate,
         "source": "llm_map_reduce",
     }

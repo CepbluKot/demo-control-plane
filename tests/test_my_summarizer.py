@@ -80,7 +80,10 @@ class TestMySummarizer(unittest.TestCase):
         }
 
         with patch.multiple(settings, **config_overrides):
-            with patch("my_summarizer._build_db_fetch_page", side_effect=fake_fetcher):
+            with patch("my_summarizer._build_db_fetch_page", side_effect=fake_fetcher), patch(
+                "my_summarizer._estimate_total_logs",
+                return_value=2,
+            ):
                 result = summarize_logs(
                     start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
                     end_dt=datetime(2026, 3, 25, 11, 0, 0, tzinfo=timezone.utc),
@@ -93,6 +96,58 @@ class TestMySummarizer(unittest.TestCase):
         self.assertTrue(result["map_batches"])
         self.assertIn("rows", result["map_batches"][0])
         self.assertIn("Сервис: svc-a", result["summary"])
+
+    def test_summarize_logs_emits_live_progress_events(self) -> None:
+        events = []
+
+        def fake_fetcher(_anomaly):
+            calls = {"count": 0}
+
+            def _fetch_page(*, columns, period_start, period_end, limit, offset):
+                _ = (columns, period_start, period_end, limit, offset)
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return [
+                        {"timestamp": "2026-03-25T10:00:00Z", "value": "ok"},
+                        {"timestamp": "2026-03-25T10:00:10Z", "value": "failed timeout"},
+                    ]
+                return []
+
+            return _fetch_page
+
+        config_overrides = {
+            "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
+                "SELECT timestamp, value FROM logs_svc_a "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
+            ),
+            "CONTROL_PLANE_LOGS_PAGE_LIMIT": 1000,
+        }
+
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer._build_db_fetch_page",
+            side_effect=fake_fetcher,
+        ), patch(
+            "my_summarizer._estimate_total_logs",
+            return_value=2,
+        ):
+            summarize_logs(
+                start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
+                end_dt=datetime(2026, 3, 25, 11, 0, 0, tzinfo=timezone.utc),
+                anomaly={"service": "svc-a"},
+                on_progress=lambda event, payload: events.append((event, payload)),
+            )
+
+        event_names = [name for name, _ in events]
+        self.assertIn("map_start", event_names)
+        self.assertIn("map_batch", event_names)
+        self.assertIn("map_done", event_names)
+        self.assertIn("reduce_start", event_names)
+        self.assertIn("reduce_done", event_names)
+        map_batch_payload = next(payload for name, payload in events if name == "map_batch")
+        self.assertIn("batch_logs", map_batch_payload)
+        self.assertIn("rows_processed", map_batch_payload)
 
     def test_build_db_fetch_page_without_offset_placeholder_single_shot(self) -> None:
         config_overrides = {

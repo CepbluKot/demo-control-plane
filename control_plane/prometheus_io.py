@@ -74,7 +74,10 @@ def parse_step_to_seconds(step: str) -> int:
 
 
 def calculate_max_range(step_seconds: int, max_points: int = 11000) -> int:
-    safe_points = int(max_points * 0.9)
+    # query_range returns both boundaries, so:
+    # points = floor((end - start) / step) + 1.
+    # To keep points per request <= max_points, use (max_points - 1) * step.
+    safe_points = max(int(max_points) - 1, 1)
     result = safe_points * step_seconds
     log_event(
         logger,
@@ -142,6 +145,9 @@ def fetch_metric_in_batches(
                     all_data[series_id]["values"].extend(new_values)
         except Exception as exc:
             logger.exception("Prometheus batch error: %s", exc)
+            raise RuntimeError(
+                "Prometheus batch fetch failed; partial data is not allowed"
+            ) from exc
         current_start = current_end
         time.sleep(0.05)
 

@@ -280,12 +280,20 @@ def _call_summarizer_adapter(
     period_start_dt: datetime,
     period_end_dt: datetime,
     anomaly: Dict[str, Any],
+    on_progress: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> Any:
     attempts = [
         {
             "period_start": period_start_dt.isoformat(),
             "period_end": period_end_dt.isoformat(),
             "anomaly": anomaly,
+            "on_progress": on_progress,
+        },
+        {
+            "start_dt": period_start_dt,
+            "end_dt": period_end_dt,
+            "anomaly": anomaly,
+            "on_progress": on_progress,
         },
         {
             "start_dt": period_start_dt,
@@ -312,30 +320,8 @@ def _call_alert_adapter(
     fn: Callable[..., Any],
     *,
     alert_text: str,
-    summary: str,
-    anomaly: Dict[str, Any],
 ) -> Any:
-    attempts = [
-        {
-            "summary_text": alert_text,
-            "summary": summary,
-            "anomaly": anomaly,
-        },
-        {
-            "summary_text": alert_text,
-        },
-        {
-            "message": alert_text,
-        },
-    ]
-    last_error: Optional[Exception] = None
-    for kwargs in attempts:
-        try:
-            return fn(**kwargs)
-        except TypeError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
+    # Single supported signature for alert sender: fn(text: str)
     return fn(alert_text)
 
 
@@ -435,8 +421,11 @@ def process_anomalies(
                     batch_total=TEST_MODE_SUMMARY_BATCHES,
                     logs_per_batch=TEST_MODE_LOGS_PER_BATCH,
                 )
+                total_mock_logs = sum(len(batch.get("batch_logs", [])) for batch in test_batches)
+                processed_mock_logs = 0
                 for batch_idx, batch in enumerate(test_batches):
                     batch_logs = batch.get("batch_logs", [])
+                    processed_mock_logs += len(batch_logs)
                     _emit(
                         "map_batch",
                         {
@@ -448,6 +437,8 @@ def process_anomalies(
                             "batch_summary": batch.get("batch_summary", ""),
                             "batch_logs_count": len(batch_logs),
                             "batch_logs": batch_logs,
+                            "rows_processed": processed_mock_logs,
+                            "rows_total": total_mock_logs,
                         },
                     )
                 _emit(
@@ -457,6 +448,8 @@ def process_anomalies(
                         "timestamp": timestamp_str,
                         "mode": "mock",
                         "batch_total": len(test_batches),
+                        "rows_processed": processed_mock_logs,
+                        "rows_total": total_mock_logs,
                     },
                 )
                 _emit(
@@ -488,6 +481,8 @@ def process_anomalies(
                         "mode": "mock",
                         "summary_len": len(summary),
                         "summary_preview": preview,
+                        "rows_processed": processed_mock_logs,
+                        "rows_total": total_mock_logs,
                     },
                 )
                 _emit(
@@ -549,6 +544,63 @@ def process_anomalies(
                     },
                 )
                 t0 = time.time()
+                live_state: Dict[str, Any] = {
+                    "map_started": False,
+                    "map_done": False,
+                    "reduce_started": False,
+                    "reduce_done": False,
+                    "reduce_summary": None,
+                    "batch_count": 0,
+                    "rows_processed": 0,
+                    "rows_total": None,
+                }
+
+                def _on_summary_progress(event: str, payload: Dict[str, Any]) -> None:
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    if event == "map_start":
+                        live_state["map_started"] = True
+                    elif event == "map_batch":
+                        live_state["map_started"] = True
+                        live_state["batch_count"] = int(live_state["batch_count"]) + 1
+                    elif event == "map_done":
+                        live_state["map_done"] = True
+                    elif event == "reduce_start":
+                        live_state["reduce_started"] = True
+                    elif event == "reduce_done":
+                        live_state["reduce_done"] = True
+                        if payload.get("summary") is not None:
+                            live_state["reduce_summary"] = payload.get("summary")
+
+                    if payload.get("rows_processed") is not None:
+                        live_state["rows_processed"] = payload.get("rows_processed")
+                    if payload.get("rows_total") is not None:
+                        live_state["rows_total"] = payload.get("rows_total")
+
+                    event_payload = {
+                        "index": i,
+                        "timestamp": timestamp_str,
+                        "mode": "real",
+                    }
+                    event_payload.update(payload)
+                    if event in ("map_start", "map_batch", "map_done", "reduce_start"):
+                        _emit(event, event_payload)
+
+                    progress_rows = payload.get("rows_processed")
+                    if progress_rows is None:
+                        progress_rows = payload.get("rows_fetched")
+                    if progress_rows is not None:
+                        _emit(
+                            "summary_progress",
+                            {
+                                "index": i,
+                                "timestamp": timestamp_str,
+                                "mode": "real",
+                                "rows_processed": progress_rows,
+                                "rows_total": payload.get("rows_total"),
+                            },
+                        )
+
                 if SUMMARIZER_CALLABLE:
                     logger.info("Using custom summarizer callable: %s", SUMMARIZER_CALLABLE)
                     summarizer_fn = _load_callable(SUMMARIZER_CALLABLE)
@@ -557,60 +609,90 @@ def process_anomalies(
                         period_start_dt=period_start,
                         period_end_dt=period_end,
                         anomaly=anomaly,
+                        on_progress=_on_summary_progress,
                     )
                 else:
                     summary_result = default_do_summary(
                         start_dt=period_start,
                         end_dt=period_end,
                         anomaly=anomaly,
+                        on_progress=_on_summary_progress,
                     )
                 elapsed = time.time() - t0
 
                 # Извлекаем итоговый summary
-                summary = getattr(summary_result, "summary", str(summary_result))
+                if isinstance(summary_result, dict):
+                    summary = summary_result.get("summary", str(summary_result))
+                    rows_processed_result = summary_result.get("rows_processed")
+                    rows_total_result = summary_result.get("rows_total_estimate")
+                else:
+                    summary = getattr(summary_result, "summary", str(summary_result))
+                    rows_processed_result = getattr(summary_result, "rows_processed", None)
+                    rows_total_result = getattr(summary_result, "rows_total_estimate", None)
+                summary = str(summary)
                 result["summary"] = summary
                 preview = summary[:SUMMARY_LOG_CHARS] if isinstance(summary, str) else str(summary)
                 map_batches = _extract_map_batches(summary_result, preview)
-                _emit(
-                    "map_start",
-                    {
-                        "index": i,
-                        "timestamp": timestamp_str,
-                        "mode": "real",
-                    },
-                )
-                for batch_idx, batch_info in enumerate(map_batches):
-                    batch_logs = batch_info.get("batch_logs", [])
+                if rows_processed_result is None:
+                    rows_processed_result = live_state.get("rows_processed")
+                if rows_total_result is None:
+                    rows_total_result = live_state.get("rows_total")
+
+                processed_rows = int(rows_processed_result or 0)
+                if not live_state.get("map_started"):
                     _emit(
-                        "map_batch",
+                        "map_start",
                         {
                             "index": i,
                             "timestamp": timestamp_str,
                             "mode": "real",
-                            "batch_index": batch_idx,
-                            "batch_total": len(map_batches),
-                            "batch_summary": batch_info.get("batch_summary", ""),
-                            "batch_logs_count": batch_info.get("batch_logs_count", len(batch_logs)),
-                            "batch_logs": batch_logs,
+                            "rows_processed": 0,
+                            "rows_total": rows_total_result,
                         },
                     )
-                _emit(
-                    "map_done",
-                    {
-                        "index": i,
-                        "timestamp": timestamp_str,
-                        "mode": "real",
-                        "batch_total": len(map_batches),
-                    },
-                )
-                _emit(
-                    "reduce_start",
-                    {
-                        "index": i,
-                        "timestamp": timestamp_str,
-                        "mode": "real",
-                    },
-                )
+                if int(live_state.get("batch_count", 0)) == 0:
+                    for batch_idx, batch_info in enumerate(map_batches):
+                        batch_logs = batch_info.get("batch_logs", [])
+                        batch_logs_count = int(batch_info.get("batch_logs_count", len(batch_logs)))
+                        processed_rows += batch_logs_count
+                        _emit(
+                            "map_batch",
+                            {
+                                "index": i,
+                                "timestamp": timestamp_str,
+                                "mode": "real",
+                                "batch_index": batch_idx,
+                                "batch_total": len(map_batches),
+                                "batch_summary": batch_info.get("batch_summary", ""),
+                                "batch_logs_count": batch_logs_count,
+                                "batch_logs": batch_logs,
+                                "rows_processed": processed_rows,
+                                "rows_total": rows_total_result,
+                            },
+                        )
+                if not live_state.get("map_done"):
+                    _emit(
+                        "map_done",
+                        {
+                            "index": i,
+                            "timestamp": timestamp_str,
+                            "mode": "real",
+                            "batch_total": len(map_batches),
+                            "rows_processed": processed_rows,
+                            "rows_total": rows_total_result,
+                        },
+                    )
+                if not live_state.get("reduce_started"):
+                    _emit(
+                        "reduce_start",
+                        {
+                            "index": i,
+                            "timestamp": timestamp_str,
+                            "mode": "real",
+                            "rows_processed": processed_rows,
+                            "rows_total": rows_total_result,
+                        },
+                    )
                 logger.info(
                     "do_summary.done: anomaly_ts=%s, seconds=%.2f, summary_len=%s, preview=%s",
                     timestamp_str,
@@ -627,7 +709,14 @@ def process_anomalies(
                         "elapsed_sec": round(elapsed, 3),
                         "summary_len": len(summary) if isinstance(summary, str) else None,
                         "summary_preview": preview,
+                        "rows_processed": processed_rows,
+                        "rows_total": rows_total_result,
                     },
+                )
+                reduce_summary = (
+                    live_state.get("reduce_summary")
+                    if live_state.get("reduce_summary") is not None
+                    else summary
                 )
                 _emit(
                     "reduce_done",
@@ -635,7 +724,9 @@ def process_anomalies(
                         "index": i,
                         "timestamp": timestamp_str,
                         "mode": "real",
-                        "summary": summary,
+                        "summary": reduce_summary,
+                        "rows_processed": processed_rows,
+                        "rows_total": rows_total_result,
                     },
                 )
                 # Формируем текст алерта с summary и timestamp
@@ -665,8 +756,6 @@ def process_anomalies(
                     alert_result = _call_alert_adapter(
                         alert_fn,
                         alert_text=alert_text,
-                        summary=summary,
-                        anomaly=anomaly,
                     )
                 else:
                     from .alerts import make_alert

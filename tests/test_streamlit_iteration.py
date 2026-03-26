@@ -112,6 +112,70 @@ class TestStreamlitIteration(unittest.TestCase):
         self.assertEqual(stage_errors[0]["stage_name"], "fetch")
         self.assertIn("RuntimeError: fetch failed", stage_errors[0]["error"])
 
+    def test_prometheus_real_mode_uses_last_month_window(self) -> None:
+        actual_df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-03-25T10:00:00Z", "2026-03-25T10:01:00Z"],
+                    utc=True,
+                ),
+                "value": [10.0, 12.0],
+            }
+        )
+        predictions_df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-03-25T10:02:00Z", "2026-03-25T10:03:00Z"],
+                    utc=True,
+                ),
+                "predicted": [11.5, 12.2],
+            }
+        )
+        captured_window = {}
+
+        def _fake_fetch_actual_metrics_df(**kwargs):
+            captured_window["start"] = kwargs["start_time"]
+            captured_window["end"] = kwargs["end_time"]
+            return actual_df
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = Path(tmpdir)
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            with patch.object(streamlit_app, "_ensure_runtime", return_value=None), patch.object(
+                streamlit_app, "LOGS_DIR", logs_dir
+            ), patch.object(
+                streamlit_app, "METRICS_SOURCE", "prometheus"
+            ), patch.object(
+                streamlit_app,
+                "fetch_actual_metrics_df",
+                side_effect=_fake_fetch_actual_metrics_df,
+            ), patch.object(
+                streamlit_app,
+                "fetch_predictions_from_db",
+                return_value=predictions_df,
+            ), patch.object(
+                streamlit_app, "get_anomaly_detector", return_value=_FakeDetector()
+            ), patch.object(
+                streamlit_app, "visualize", return_value=[]
+            ):
+                result = streamlit_app.run_single_iteration(
+                    test_mode=False,
+                    query="up",
+                    detector_name="rolling_iqr",
+                    data_lookback_minutes=60,
+                    prediction_lookahead_minutes=30,
+                    analyze_top_n=1,
+                    process_lookback_minutes=30,
+                    process_alerts=False,
+                )
+
+        self.assertEqual(result["detector"], "fake-detector")
+        self.assertIn("start", captured_window)
+        self.assertIn("end", captured_window)
+        delta = captured_window["end"] - captured_window["start"]
+        self.assertGreaterEqual(delta.total_seconds(), 30 * 24 * 3600 - 5)
+        self.assertLessEqual(delta.total_seconds(), 30 * 24 * 3600 + 5)
+
 
 if __name__ == "__main__":
     unittest.main()

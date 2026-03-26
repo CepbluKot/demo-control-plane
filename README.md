@@ -108,11 +108,9 @@
 - Кастомный путь: `CONTROL_PLANE_ALERT_CALLABLE`.
 - Готовый шаблон для старта: `my_alert.py::send_sre_alert`.
 
-Поддерживаемые сигнатуры:
+Поддерживаемая сигнатура:
 
-- `fn(summary_text: str, summary: str, anomaly: dict)`
-- `fn(summary_text: str)`
-- `fn(message: str)`
+- `fn(text: str)`
 
 ## Запуск
 

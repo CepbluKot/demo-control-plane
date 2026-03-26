@@ -20,6 +20,7 @@ class PeriodSummarizer(Protocol):
         start_dt: datetime,
         end_dt: datetime,
         anomaly: Optional[Dict[str, Any]] = None,
+        on_progress: Optional[Any] = None,
     ) -> Any:
         ...
 
@@ -29,6 +30,7 @@ def do_summary(
     start_dt: datetime,
     end_dt: datetime,
     anomaly: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[Any] = None,
 ) -> Any:
     """
     Дефолтный адаптер: встроенный map-reduce summarizer (`my_summarizer.summarize_logs`).
@@ -47,4 +49,9 @@ def do_summary(
         start_dt.isoformat(),
         end_dt.isoformat(),
     )
-    return summarize_logs(start_dt=start_dt, end_dt=end_dt, anomaly=anomaly)
+    return summarize_logs(
+        start_dt=start_dt,
+        end_dt=end_dt,
+        anomaly=anomaly,
+        on_progress=on_progress,
+    )

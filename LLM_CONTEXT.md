@@ -134,9 +134,7 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 
 Поддерживаемые сигнатуры callable:
 
-- `fn(summary_text: str, summary: str, anomaly: dict)`
-- `fn(summary_text: str)`
-- `fn(message: str)`
+- `fn(text: str)`
 
 ## 6) Runtime-события обработки аномалий
 

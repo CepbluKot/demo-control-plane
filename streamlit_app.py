@@ -21,17 +21,13 @@ from control_plane.config import (
     ANOMALY_ZSCORE,
     ARTIFACTS_DIR,
     CLICKHOUSE_METRICS_HOST,
-    CLICKHOUSE_METRICS_PASSWORD,
     CLICKHOUSE_METRICS_PORT,
     CLICKHOUSE_METRICS_QUERY,
     CLICKHOUSE_METRICS_SECURE,
-    CLICKHOUSE_METRICS_USERNAME,
     CLICKHOUSE_PREDICTIONS_HOST,
-    CLICKHOUSE_PREDICTIONS_PASSWORD,
     CLICKHOUSE_PREDICTIONS_PORT,
     CLICKHOUSE_PREDICTIONS_QUERY,
     CLICKHOUSE_PREDICTIONS_SECURE,
-    CLICKHOUSE_PREDICTIONS_USERNAME,
     DATA_LOOKBACK_MINUTES,
     FORECAST_METRIC_NAME,
     FORECAST_SERVICE,
@@ -44,7 +40,6 @@ from control_plane.config import (
     PREDICTION_KIND,
     PREDICTION_LOOKAHEAD_MINUTES,
     PROM_MAX_POINTS,
-    PROM_PASSWORD,
     PROM_QUERY,
     PROM_SERIES_INDEX,
     PROM_STEP,
@@ -188,6 +183,15 @@ def run_single_iteration(
     _emit("init", 2, {"message": "Инициализация запуска"})
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=data_lookback_minutes)
+    if not test_mode and METRICS_SOURCE == "prometheus":
+        # Requirement: for Prometheus mode always pull full month of points.
+        start_time = end_time - timedelta(days=30)
+        log_event(
+            logger,
+            "run_single_iteration.prometheus_month_window_applied",
+            start=start_time.isoformat(),
+            end=end_time.isoformat(),
+        )
 
     _emit(
         "fetch_start",
@@ -497,6 +501,71 @@ def _build_anomaly_window_figure(
     return fig
 
 
+def _build_predictions_focus_figure(
+    actual_df: Optional[pd.DataFrame],
+    predictions_df: Optional[pd.DataFrame],
+) -> Optional[plt.Figure]:
+    if actual_df is None or predictions_df is None or actual_df.empty or predictions_df.empty:
+        return None
+    if "timestamp" not in actual_df.columns or "value" not in actual_df.columns:
+        return None
+    if "timestamp" not in predictions_df.columns:
+        return None
+
+    pred_col = "predicted" if "predicted" in predictions_df.columns else "value"
+    if pred_col not in predictions_df.columns:
+        return None
+
+    actual = actual_df.copy()
+    actual["timestamp"] = pd.to_datetime(actual["timestamp"], utc=True, errors="coerce")
+    actual["value"] = pd.to_numeric(actual["value"], errors="coerce")
+    actual = actual.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+    if actual.empty:
+        return None
+
+    preds = predictions_df.copy()
+    preds["timestamp"] = pd.to_datetime(preds["timestamp"], utc=True, errors="coerce")
+    preds[pred_col] = pd.to_numeric(preds[pred_col], errors="coerce")
+    preds = preds.dropna(subset=["timestamp", pred_col]).sort_values("timestamp")
+    if preds.empty:
+        return None
+
+    fig, (ax_actual, ax_preds) = plt.subplots(
+        1,
+        2,
+        figsize=(14, 4.2),
+        gridspec_kw={"width_ratios": [2, 1]},
+    )
+    ax_actual.plot(
+        actual["timestamp"],
+        actual["value"],
+        color="#2563eb",
+        linewidth=2,
+        label="actual",
+    )
+    ax_actual.set_title("Исторические значения (2/3)")
+    ax_actual.set_xlabel("timestamp")
+    ax_actual.set_ylabel("value")
+    ax_actual.grid(alpha=0.25)
+    ax_actual.tick_params(axis="x", rotation=30)
+
+    ax_preds.plot(
+        preds["timestamp"],
+        preds[pred_col],
+        color="#ef4444",
+        linewidth=2,
+        linestyle="--",
+        label="predicted",
+    )
+    ax_preds.set_title("Все предикты (1/3)")
+    ax_preds.set_xlabel("timestamp")
+    ax_preds.grid(alpha=0.25)
+    ax_preds.tick_params(axis="x", rotation=30)
+
+    fig.tight_layout()
+    return fig
+
+
 def _render_anomaly_cards(
     container,
     analysis_state: Dict[str, Any],
@@ -555,6 +624,24 @@ def _render_anomaly_cards(
             with st.chat_message("assistant"):
                 status = row.get("status", "queued")
                 st.markdown(f"Статус: **{status_titles.get(status, status)}**")
+                logs_processed = row.get("logs_processed")
+                logs_total = row.get("logs_total")
+                processed_num = pd.to_numeric(logs_processed, errors="coerce")
+                total_num = pd.to_numeric(logs_total, errors="coerce")
+                if not pd.isna(processed_num):
+                    if not pd.isna(total_num) and float(total_num) > 0:
+                        ratio = min(max(float(processed_num) / float(total_num), 0.0), 1.0)
+                        st.progress(
+                            ratio,
+                            text=(
+                                f"Прогресс суммаризации логов: "
+                                f"{int(processed_num)}/{int(total_num)}"
+                            ),
+                        )
+                    else:
+                        st.caption(
+                            f"Прогресс суммаризации логов: обработано {int(processed_num)} строк"
+                        )
 
             batches = row.get("map_batches", [])
             if batches:
@@ -582,7 +669,6 @@ def _render_anomaly_cards(
                                 hide_index=True,
                                 height=LOGS_BATCH_TABLE_HEIGHT,
                             )
-                            st.caption("Скролл: наведите курсор на таблицу и крутите колесо.")
                         else:
                             st.caption("Логи батча не переданы.")
 
@@ -608,9 +694,6 @@ def _render_anomaly_cards(
 
 
 def _ui_runtime_config() -> Dict[str, Any]:
-    masked_password = "***" if bool(PROM_PASSWORD) else ""
-    masked_ch_metrics_password = "***" if bool(CLICKHOUSE_METRICS_PASSWORD) else ""
-    masked_ch_predictions_password = "***" if bool(CLICKHOUSE_PREDICTIONS_PASSWORD) else ""
     ch_query = (
         CLICKHOUSE_METRICS_QUERY
         if len(CLICKHOUSE_METRICS_QUERY) <= 140
@@ -628,13 +711,9 @@ def _ui_runtime_config() -> Dict[str, Any]:
         "CONTROL_PLANE_CLICKHOUSE_METRICS_QUERY": ch_query,
         "CONTROL_PLANE_CLICKHOUSE_METRICS_HOST": CLICKHOUSE_METRICS_HOST,
         "CONTROL_PLANE_CLICKHOUSE_METRICS_PORT": CLICKHOUSE_METRICS_PORT,
-        "CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME": CLICKHOUSE_METRICS_USERNAME,
-        "CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD": masked_ch_metrics_password,
         "CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE": CLICKHOUSE_METRICS_SECURE,
         "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST": CLICKHOUSE_PREDICTIONS_HOST,
         "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PORT": CLICKHOUSE_PREDICTIONS_PORT,
-        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_USERNAME": CLICKHOUSE_PREDICTIONS_USERNAME,
-        "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_PASSWORD": masked_ch_predictions_password,
         "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_SECURE": CLICKHOUSE_PREDICTIONS_SECURE,
         "CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY": ch_predictions_query,
         "CONTROL_PLANE_ANOMALY_DETECTOR": ANOMALY_DETECTOR,
@@ -649,7 +728,6 @@ def _ui_runtime_config() -> Dict[str, Any]:
         "CONTROL_PLANE_FORECAST_METRIC_NAME": FORECAST_METRIC_NAME,
         "CONTROL_PLANE_FORECAST_TYPE": FORECAST_TYPE,
         "CONTROL_PLANE_PREDICTION_KIND": PREDICTION_KIND,
-        "CONTROL_PLANE_PROM_METRICS_PASSWORD": masked_password,
     }
 
 
@@ -678,6 +756,7 @@ def main() -> None:
         "selected_anomalies": {},
         "merged_df": None,
         "predictions_df": None,
+        "predictions_all_df": None,
         "actual_end_ts": None,
         "empty_message": None,
     }
@@ -689,6 +768,7 @@ def main() -> None:
     def _render_graph(
         actual_df: Optional[pd.DataFrame],
         predictions_df: Optional[pd.DataFrame],
+        predictions_all_df: Optional[pd.DataFrame],
         anomalies_df: Optional[pd.DataFrame],
     ) -> None:
         with graph_placeholder.container():
@@ -711,6 +791,18 @@ def main() -> None:
                     st.image(str(fig_path), use_container_width=True)
                 else:
                     st.caption("Файл графика не найден")
+
+                focus_fig = _build_predictions_focus_figure(
+                    actual_df=actual_df,
+                    predictions_df=predictions_all_df if predictions_all_df is not None else predictions_df,
+                )
+                if focus_fig is not None:
+                    st.markdown(
+                        "Дополнительный график: 2/3 история и 1/3 предикты "
+                        "(для детального просмотра всех предиктов)"
+                    )
+                    st.pyplot(focus_fig, use_container_width=True)
+                    plt.close(focus_fig)
             except Exception as exc:
                 st.error(f"Ошибка построения графика: {exc}")
 
@@ -727,7 +819,6 @@ def main() -> None:
                 hide_index=True,
                 height=ANOMALIES_TABLE_HEIGHT,
             )
-            st.caption("Скролл: наведите курсор на таблицу и крутите колесо.")
 
     def _render_analysis_cards() -> None:
         _render_anomaly_cards(
@@ -782,6 +873,8 @@ def main() -> None:
                         "status": "queued",
                         "elapsed_sec": None,
                         "summary_len": None,
+                        "logs_processed": 0,
+                        "logs_total": None,
                         "error": None,
                         "map_batches": [],
                         "final_summary": None,
@@ -802,6 +895,9 @@ def main() -> None:
                 elif event == "map_start":
                     row["status"] = "map"
                     row["map_batches"] = []
+                    row["logs_processed"] = payload.get("rows_processed", 0)
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "map_batch":
                     row["status"] = "map"
                     row.setdefault("map_batches", []).append(
@@ -813,18 +909,43 @@ def main() -> None:
                             "batch_logs": payload.get("batch_logs", []),
                         }
                     )
+                    if payload.get("rows_processed") is not None:
+                        row["logs_processed"] = payload.get("rows_processed")
+                    else:
+                        current_processed = int(row.get("logs_processed") or 0)
+                        current_processed += int(payload.get("batch_logs_count") or 0)
+                        row["logs_processed"] = current_processed
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "map_done":
                     row["status"] = "reduce"
+                    if payload.get("rows_processed") is not None:
+                        row["logs_processed"] = payload.get("rows_processed")
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "reduce_start":
                     row["status"] = "reduce"
+                elif event == "summary_progress":
+                    if payload.get("rows_processed") is not None:
+                        row["logs_processed"] = payload.get("rows_processed")
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "summary_done":
                     row["status"] = "summary_ready"
                     row["elapsed_sec"] = payload.get("elapsed_sec")
                     row["summary_len"] = payload.get("summary_len")
+                    if payload.get("rows_processed") is not None:
+                        row["logs_processed"] = payload.get("rows_processed")
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "reduce_done":
                     row["status"] = "summary_ready"
                     if payload.get("summary"):
                         row["final_summary"] = str(payload.get("summary"))
+                    if payload.get("rows_processed") is not None:
+                        row["logs_processed"] = payload.get("rows_processed")
+                    if payload.get("rows_total") is not None:
+                        row["logs_total"] = payload.get("rows_total")
                 elif event == "notification_ready":
                     row["notification_text"] = payload.get("notification_text")
                 elif event == "alert_start":
@@ -841,7 +962,9 @@ def main() -> None:
 
         if stage == "fetch_done":
             stage_actual_df = payload.get("actual_df")
-            summary_state["predictions_df"] = payload.get("predictions_df")
+            stage_predictions_df = payload.get("predictions_df")
+            summary_state["predictions_all_df"] = stage_predictions_df
+            summary_state["predictions_df"] = stage_predictions_df
             ui_data["actual_df"] = stage_actual_df
             if isinstance(stage_actual_df, pd.DataFrame) and not stage_actual_df.empty:
                 summary_state["actual_end_ts"] = pd.to_datetime(
@@ -863,6 +986,7 @@ def main() -> None:
             _render_graph(
                 ui_data.get("actual_df"),
                 summary_state.get("predictions_df"),
+                summary_state.get("predictions_all_df"),
                 ui_data.get("anomalies_df"),
             )
             _render_anomalies_table(ui_data.get("anomalies_df"))
@@ -903,6 +1027,7 @@ def main() -> None:
     )
     future_predictions_df = _only_future_predictions(result["predictions_df"], actual_end_ts)
     summary_state["actual_end_ts"] = actual_end_ts
+    summary_state["predictions_all_df"] = result["predictions_df"]
     summary_state["predictions_df"] = future_predictions_df
     summary_state["merged_df"] = result["merged_df"]
     ui_data["actual_df"] = result["actual_df"]
@@ -911,6 +1036,7 @@ def main() -> None:
     _render_graph(
         ui_data.get("actual_df"),
         summary_state.get("predictions_df"),
+        summary_state.get("predictions_all_df"),
         ui_data.get("anomalies_df"),
     )
     _render_anomalies_table(ui_data.get("anomalies_df"))
