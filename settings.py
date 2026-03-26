@@ -71,6 +71,13 @@ class Settings(BaseSettings):
             "CONTROL_PLANE_PROM_QUERY",
         ),
     )
+    CONTROL_PLANE_PROM_METRICS_STEP: str = Field(
+        default="1m",
+        validation_alias=AliasChoices(
+            "CONTROL_PLANE_PROM_METRICS_STEP",
+            "CONTROL_PLANE_PROM_STEP",
+        ),
+    )
     CONTROL_PLANE_PROM_METRICS_MAX_POINTS: int = Field(
         default=11000,
         validation_alias=AliasChoices(
@@ -107,6 +114,8 @@ class Settings(BaseSettings):
     CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD: str = ""
     CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY: str = ""
     CONTROL_PLANE_LOGS_PAGE_LIMIT: int = 1000
+    CONTROL_PLANE_LOGS_FETCH_MODE: str = "time_window"
+    CONTROL_PLANE_LOGS_TAIL_LIMIT: int = 1000
 
     # Forecast metadata
     CONTROL_PLANE_FORECAST_SERVICE: str = "demo-service"

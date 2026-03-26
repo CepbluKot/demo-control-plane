@@ -7,6 +7,7 @@ import pandas as pd
 from my_summarizer import (
     _make_llm_call,
     _build_db_fetch_page,
+    _estimate_total_logs,
     _render_logs_query,
     summarize_logs,
 )
@@ -54,7 +55,8 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("{unknown}", query)
 
     def test_summarize_logs_reads_batches(self) -> None:
-        def fake_fetcher(_anomaly):
+        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit):
+            _ = (fetch_mode, tail_limit)
             calls = {"count": 0}
 
             def _fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -102,7 +104,8 @@ class TestMySummarizer(unittest.TestCase):
     def test_summarize_logs_emits_live_progress_events(self) -> None:
         events = []
 
-        def fake_fetcher(_anomaly):
+        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit):
+            _ = (fetch_mode, tail_limit)
             calls = {"count": 0}
 
             def _fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -175,7 +178,11 @@ class TestMySummarizer(unittest.TestCase):
             "my_summarizer._query_logs_df",
             side_effect=_fake_query_df,
         ):
-            fetch_page = _build_db_fetch_page({"service": "svc-a"})
+            fetch_page = _build_db_fetch_page(
+                {"service": "svc-a"},
+                fetch_mode="time_window",
+                tail_limit=1000,
+            )
             first_page = fetch_page(
                 columns=["timestamp", "value"],
                 period_start="2026-03-25T10:00:00+00:00",
@@ -194,6 +201,78 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(len(first_page), 1)
         self.assertEqual(second_page, [])
         self.assertEqual(calls["count"], 1)
+
+    def test_build_db_fetch_page_tail_mode_uses_latest_n_before_anomaly(self) -> None:
+        config_overrides = {
+            "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
+                "SELECT timestamp, value FROM logs_svc_a "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
+            ),
+            "CONTROL_PLANE_LOGS_FETCH_MODE": "tail_n_logs",
+            "CONTROL_PLANE_LOGS_TAIL_LIMIT": 1000,
+        }
+        captured = {"query": ""}
+
+        def _fake_query_df(query: str):
+            captured["query"] = query
+            return pd.DataFrame(
+                [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
+            )
+
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer._query_logs_df",
+            side_effect=_fake_query_df,
+        ):
+            fetch_page = _build_db_fetch_page(
+                {"service": "svc-a"},
+                fetch_mode="tail_n_logs",
+                tail_limit=1000,
+            )
+            page = fetch_page(
+                columns=["timestamp", "value"],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                limit=100,
+                offset=0,
+            )
+
+        self.assertEqual(len(page), 1)
+        self.assertIn("ORDER BY timestamp DESC LIMIT 1000", captured["query"])
+        self.assertIn("ORDER BY timestamp ASC LIMIT 100 OFFSET 0", captured["query"])
+        self.assertIn(
+            "parseDateTimeBestEffort('1970-01-01T00:00:00+00:00')",
+            captured["query"],
+        )
+
+    def test_estimate_total_logs_tail_mode_caps_by_tail_limit(self) -> None:
+        config_overrides = {
+            "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
+                "SELECT timestamp, value FROM logs_svc_a "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
+            ),
+        }
+
+        def _fake_query_df(_query: str):
+            return pd.DataFrame([{"total_rows": 5000}])
+
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer._query_logs_df",
+            side_effect=_fake_query_df,
+        ):
+            total = _estimate_total_logs(
+                anomaly={"service": "svc-a"},
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                page_limit=1000,
+                fetch_mode="tail_n_logs",
+                tail_limit=1000,
+            )
+
+        self.assertEqual(total, 1000)
 
     def test_summarize_logs_requires_service_in_anomaly(self) -> None:
         config_overrides = {

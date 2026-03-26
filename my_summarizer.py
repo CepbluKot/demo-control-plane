@@ -27,6 +27,7 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 )
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
+_EARLIEST_PERIOD_START = "1970-01-01T00:00:00+00:00"
 
 
 class DBPageFetcher(Protocol):
@@ -176,6 +177,62 @@ def _resolve_logs_query_template() -> str:
     )
 
 
+def _resolve_logs_fetch_mode() -> str:
+    raw_mode = str(getattr(settings, "CONTROL_PLANE_LOGS_FETCH_MODE", "time_window")).strip().lower()
+    aliases = {
+        "time_window": "time_window",
+        "window": "time_window",
+        "lookback": "time_window",
+        "tail_n_logs": "tail_n_logs",
+        "tail_n": "tail_n_logs",
+        "last_n_logs": "tail_n_logs",
+    }
+    resolved = aliases.get(raw_mode)
+    if resolved is None:
+        logger.warning(
+            "Unknown CONTROL_PLANE_LOGS_FETCH_MODE=%s; fallback to time_window",
+            raw_mode,
+        )
+        return "time_window"
+    return resolved
+
+
+def _strip_trailing_limit_offset(query: str) -> str:
+    stripped = query.strip().rstrip(";")
+    without_limit_offset = re.sub(
+        r"(?is)\s+LIMIT\s+\d+\s+OFFSET\s+\d+\s*$",
+        "",
+        stripped,
+    )
+    without_limit_only = re.sub(
+        r"(?is)\s+LIMIT\s+\d+\s*$",
+        "",
+        without_limit_offset,
+    )
+    return without_limit_only
+
+
+def _build_tail_paged_query(
+    *,
+    base_query: str,
+    tail_limit: int,
+    limit: int,
+    offset: int,
+) -> str:
+    safe_tail_limit = max(int(tail_limit), 1)
+    safe_limit = max(int(limit), 1)
+    safe_offset = max(int(offset), 0)
+    return (
+        "SELECT * FROM ("
+        "SELECT * FROM ("
+        f"{base_query}"
+        f") AS cp_src ORDER BY timestamp DESC LIMIT {safe_tail_limit}"
+        ") AS cp_tail "
+        "ORDER BY timestamp ASC "
+        f"LIMIT {safe_limit} OFFSET {safe_offset}"
+    )
+
+
 def _render_logs_query(
     *,
     query_template: str,
@@ -229,7 +286,12 @@ def _query_logs_df(query: str) -> pd.DataFrame:
             logger.warning("ClickHouse client close failed for logs query")
 
 
-def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., List[Dict[str, Any]]]:
+def _build_db_fetch_page(
+    anomaly: Optional[Dict[str, Any]],
+    *,
+    fetch_mode: str,
+    tail_limit: int,
+) -> Callable[..., List[Dict[str, Any]]]:
     service = _resolve_service(anomaly)
     query_template = _resolve_logs_query_template()
     has_offset_placeholder = "{offset}" in query_template
@@ -242,16 +304,31 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
         limit: int,
         offset: int,
     ) -> List[Dict[str, Any]]:
-        if offset > 0 and not has_offset_placeholder:
+        if fetch_mode != "tail_n_logs" and offset > 0 and not has_offset_placeholder:
             return []
-        query = _render_logs_query(
+
+        effective_period_start = (
+            _EARLIEST_PERIOD_START if fetch_mode == "tail_n_logs" else period_start
+        )
+        rendered_query = _render_logs_query(
             query_template=query_template,
-            period_start=period_start,
+            period_start=effective_period_start,
             period_end=period_end,
             limit=limit,
             offset=offset,
             service=service,
         )
+        if fetch_mode == "tail_n_logs":
+            base_query = _strip_trailing_limit_offset(rendered_query)
+            query = _build_tail_paged_query(
+                base_query=base_query,
+                tail_limit=tail_limit,
+                limit=limit,
+                offset=offset,
+            )
+        else:
+            query = rendered_query
+
         page_df = _query_logs_df(query)
         if page_df.empty:
             return []
@@ -267,17 +344,7 @@ def _build_db_fetch_page(anomaly: Optional[Dict[str, Any]]) -> Callable[..., Lis
 
 
 def _build_count_query(data_query: str) -> str:
-    stripped = data_query.strip().rstrip(";")
-    without_limit_offset = re.sub(
-        r"(?is)\s+LIMIT\s+\d+\s+OFFSET\s+\d+\s*$",
-        "",
-        stripped,
-    )
-    without_limit_only = re.sub(
-        r"(?is)\s+LIMIT\s+\d+\s*$",
-        "",
-        without_limit_offset,
-    )
+    without_limit_only = _strip_trailing_limit_offset(data_query)
     return f"SELECT count() AS total_rows FROM ({without_limit_only}) AS cp_logs"
 
 
@@ -287,13 +354,17 @@ def _estimate_total_logs(
     period_start: str,
     period_end: str,
     page_limit: int,
+    fetch_mode: str,
+    tail_limit: int,
 ) -> Optional[int]:
     try:
         service = _resolve_service(anomaly)
         query_template = _resolve_logs_query_template()
         sample_query = _render_logs_query(
             query_template=query_template,
-            period_start=period_start,
+            period_start=(
+                _EARLIEST_PERIOD_START if fetch_mode == "tail_n_logs" else period_start
+            ),
             period_end=period_end,
             limit=page_limit,
             offset=0,
@@ -304,8 +375,12 @@ def _estimate_total_logs(
         if df.empty:
             return None
         if "total_rows" in df.columns:
-            return int(df.iloc[0]["total_rows"])
-        return int(df.iloc[0, 0])
+            total_rows = int(df.iloc[0]["total_rows"])
+        else:
+            total_rows = int(df.iloc[0, 0])
+        if fetch_mode == "tail_n_logs":
+            return min(total_rows, max(int(tail_limit), 1))
+        return total_rows
     except Exception as exc:
         logger.warning("Failed to estimate total logs for progress: %s", exc)
         return None
@@ -715,6 +790,8 @@ def summarize_logs(
         start_dt=start_dt,
         end_dt=end_dt,
     )
+    fetch_mode = _resolve_logs_fetch_mode()
+    tail_limit = max(int(getattr(settings, "CONTROL_PLANE_LOGS_TAIL_LIMIT", 1000)), 1)
     service = _resolve_service(anomaly)
     page_limit = int(settings.CONTROL_PLANE_LOGS_PAGE_LIMIT)
     total_rows_estimate = _estimate_total_logs(
@@ -722,9 +799,15 @@ def summarize_logs(
         period_start=start_iso,
         period_end=end_iso,
         page_limit=page_limit,
+        fetch_mode=fetch_mode,
+        tail_limit=tail_limit,
     )
 
-    db_fetch_page = _build_db_fetch_page(anomaly)
+    db_fetch_page = _build_db_fetch_page(
+        anomaly,
+        fetch_mode=fetch_mode,
+        tail_limit=tail_limit,
+    )
     llm_call = _make_llm_call()
     summarizer = PeriodLogSummarizer(
         db_fetch_page=db_fetch_page,
@@ -751,5 +834,7 @@ def summarize_logs(
         "llm_calls": result.llm_calls,
         "reduce_rounds": result.reduce_rounds,
         "rows_total_estimate": total_rows_estimate,
+        "logs_fetch_mode": fetch_mode,
+        "logs_tail_limit": tail_limit,
         "source": "llm_map_reduce",
     }
