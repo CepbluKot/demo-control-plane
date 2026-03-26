@@ -2,10 +2,15 @@ import unittest
 
 import pandas as pd
 
-from control_plane.anomaly_detectors import RollingIQRDetector
+from control_plane.anomaly_detectors import RollingIQRDetector, get_anomaly_detector
 
 
 class TestAnomalyDetectors(unittest.TestCase):
+    def test_registry_includes_library_based_detectors(self) -> None:
+        for name in ("pyod_ecod", "pyod_iforest", "ruptures_pelt"):
+            detector = get_anomaly_detector(name)
+            self.assertEqual(detector.name, name)
+
     def test_rolling_iqr_fallback_on_no_overlap_with_predictions(self) -> None:
         actual_df = pd.DataFrame(
             {

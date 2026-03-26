@@ -30,7 +30,7 @@ Pipeline для SRE-кейса:
   - чтение forecast из БД (`metrics_forecast`)
 - `control_plane/anomaly_detectors.py`
   - интерфейс детектора + реестр
-  - built-ins: `rolling_iqr`, `residual_zscore`
+  - built-ins: `rolling_iqr`, `residual_zscore`, `pyod_ecod`, `pyod_iforest`, `ruptures_pelt`
 - `control_plane/processing.py`
   - orchestration обработки аномалий
   - события map/reduce/alert

@@ -8,3 +8,5 @@ streamlit
 clickhouse-connect
 pydantic
 pydantic-settings
+pyod
+ruptures

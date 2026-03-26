@@ -65,6 +65,7 @@
 - Интерфейс: `AnomalyDetector` в `control_plane/anomaly_detectors.py`.
 - Подключение: `CONTROL_PLANE_ANOMALY_DETECTOR`.
 - По умолчанию: `rolling_iqr`.
+- Доступные варианты: `rolling_iqr`, `residual_zscore`, `pyod_ecod`, `pyod_iforest`, `ruptures_pelt`.
 
 ### Суммаризатор логов
 
