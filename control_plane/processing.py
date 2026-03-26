@@ -1,6 +1,6 @@
 import logging
 import importlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 import time
 
@@ -16,6 +16,58 @@ from .summarizer import do_summary as default_do_summary
 from .trace import log_event
 
 logger = logging.getLogger(__name__)
+
+
+def _to_iso_z(value: datetime) -> str:
+    ts = value
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_log_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_batch_period_from_logs(rows: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    timestamps: List[datetime] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_ts = None
+        for key in ("timestamp", "ts", "time", "datetime"):
+            if row.get(key) is not None:
+                raw_ts = row.get(key)
+                break
+        ts = _parse_log_timestamp(raw_ts)
+        if ts is not None:
+            timestamps.append(ts)
+
+    if not timestamps:
+        return {
+            "batch_period_start": None,
+            "batch_period_end": None,
+        }
+
+    return {
+        "batch_period_start": _to_iso_z(min(timestamps)),
+        "batch_period_end": _to_iso_z(max(timestamps)),
+    }
 
 
 def _build_test_mode_batches(
@@ -82,6 +134,7 @@ def _build_test_mode_batches(
             {
                 "batch_summary": f"[Batch {batch_idx + 1}] {title}",
                 "batch_logs": batch_rows,
+                **_extract_batch_period_from_logs(batch_rows),
             }
         )
     return batches
@@ -176,6 +229,8 @@ def _extract_map_batches(summary_result: Any, fallback_text: str) -> List[Dict[s
                     "batch_summary": item,
                     "batch_logs_count": 0,
                     "batch_logs": [],
+                    "batch_period_start": None,
+                    "batch_period_end": None,
                 }
             )
             continue
@@ -210,11 +265,24 @@ def _extract_map_batches(summary_result: Any, fallback_text: str) -> List[Dict[s
                 logs_count = item.get("rows_count")
             if logs_count is None:
                 logs_count = len(normalized_logs)
+            period_info = _extract_batch_period_from_logs(normalized_logs)
+            batch_period_start = (
+                item.get("batch_period_start")
+                or item.get("period_start")
+                or period_info.get("batch_period_start")
+            )
+            batch_period_end = (
+                item.get("batch_period_end")
+                or item.get("period_end")
+                or period_info.get("batch_period_end")
+            )
             out.append(
                 {
                     "batch_summary": str(summary),
                     "batch_logs_count": int(logs_count),
                     "batch_logs": normalized_logs,
+                    "batch_period_start": batch_period_start,
+                    "batch_period_end": batch_period_end,
                 }
             )
             continue
@@ -222,11 +290,14 @@ def _extract_map_batches(summary_result: Any, fallback_text: str) -> List[Dict[s
         summary = getattr(item, "summary", None) or getattr(item, "text", None) or str(item)
         rows = getattr(item, "rows", None)
         normalized_logs = rows if isinstance(rows, list) else []
+        period_info = _extract_batch_period_from_logs(normalized_logs)
         out.append(
             {
                 "batch_summary": str(summary),
                 "batch_logs_count": len(normalized_logs),
                 "batch_logs": normalized_logs,
+                "batch_period_start": period_info.get("batch_period_start"),
+                "batch_period_end": period_info.get("batch_period_end"),
             }
         )
 
@@ -239,6 +310,8 @@ def _extract_map_batches(summary_result: Any, fallback_text: str) -> List[Dict[s
             "batch_summary": str(text),
             "batch_logs_count": 0,
             "batch_logs": [],
+            "batch_period_start": None,
+            "batch_period_end": None,
         }
         for text in fallback_summaries
     ]
@@ -437,6 +510,8 @@ def process_anomalies(
                             "batch_summary": batch.get("batch_summary", ""),
                             "batch_logs_count": len(batch_logs),
                             "batch_logs": batch_logs,
+                            "batch_period_start": batch.get("batch_period_start"),
+                            "batch_period_end": batch.get("batch_period_end"),
                             "rows_processed": processed_mock_logs,
                             "rows_total": total_mock_logs,
                         },
@@ -666,6 +741,8 @@ def process_anomalies(
                                 "batch_summary": batch_info.get("batch_summary", ""),
                                 "batch_logs_count": batch_logs_count,
                                 "batch_logs": batch_logs,
+                                "batch_period_start": batch_info.get("batch_period_start"),
+                                "batch_period_end": batch_info.get("batch_period_end"),
                                 "rows_processed": processed_rows,
                                 "rows_total": rows_total_result,
                             },

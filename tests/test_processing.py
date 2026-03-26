@@ -45,7 +45,7 @@ class TestProcessing(unittest.TestCase):
             "map_batches": [
                 {
                     "summary": "batch one",
-                    "rows": [{"timestamp": "t1", "message": "m1"}],
+                    "rows": [{"timestamp": "2026-03-25T10:00:00Z", "message": "m1"}],
                 },
                 "batch two",
             ]
@@ -55,6 +55,8 @@ class TestProcessing(unittest.TestCase):
         self.assertEqual(out[0]["batch_summary"], "batch one")
         self.assertEqual(out[0]["batch_logs_count"], 1)
         self.assertEqual(out[0]["batch_logs"][0]["message"], "m1")
+        self.assertEqual(out[0]["batch_period_start"], "2026-03-25T10:00:00Z")
+        self.assertEqual(out[0]["batch_period_end"], "2026-03-25T10:00:00Z")
         self.assertEqual(out[1]["batch_summary"], "batch two")
         self.assertEqual(out[1]["batch_logs_count"], 0)
 
@@ -86,6 +88,8 @@ class TestProcessing(unittest.TestCase):
         self.assertTrue(map_batch_payloads)
         self.assertIn("batch_logs_count", map_batch_payloads[0])
         self.assertIn("batch_logs", map_batch_payloads[0])
+        self.assertIn("batch_period_start", map_batch_payloads[0])
+        self.assertIn("batch_period_end", map_batch_payloads[0])
 
     def test_process_anomalies_real_mode_streams_map_batches_before_summary_done(self) -> None:
         events = []
@@ -105,6 +109,8 @@ class TestProcessing(unittest.TestCase):
                         "batch_summary": "chunk-1",
                         "batch_logs_count": 2,
                         "batch_logs": [{"timestamp": "t1", "message": "m1"}],
+                        "batch_period_start": "2026-03-25T10:00:00Z",
+                        "batch_period_end": "2026-03-25T10:00:30Z",
                         "rows_processed": 2,
                         "rows_total": 4,
                     },
@@ -117,6 +123,8 @@ class TestProcessing(unittest.TestCase):
                         "batch_summary": "chunk-2",
                         "batch_logs_count": 2,
                         "batch_logs": [{"timestamp": "t2", "message": "m2"}],
+                        "batch_period_start": "2026-03-25T10:00:31Z",
+                        "batch_period_end": "2026-03-25T10:01:00Z",
                         "rows_processed": 4,
                         "rows_total": 4,
                     },
@@ -172,6 +180,7 @@ class TestProcessing(unittest.TestCase):
         map_batch_payload = next(payload for name, payload in events if name == "map_batch")
         self.assertIn("batch_logs", map_batch_payload)
         self.assertIn("rows_processed", map_batch_payload)
+        self.assertIn("batch_period_start", map_batch_payload)
 
 
 if __name__ == "__main__":

@@ -112,6 +112,63 @@ class TestStreamlitIteration(unittest.TestCase):
         self.assertEqual(stage_errors[0]["stage_name"], "fetch")
         self.assertIn("RuntimeError: fetch failed", stage_errors[0]["error"])
 
+    def test_non_test_mode_reads_predictions_from_db(self) -> None:
+        actual_df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-03-25T10:00:00Z", "2026-03-25T10:01:00Z"],
+                    utc=True,
+                ),
+                "value": [10.0, 12.0],
+            }
+        )
+        predictions_df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-03-25T10:02:00Z", "2026-03-25T10:03:00Z"],
+                    utc=True,
+                ),
+                "predicted": [11.5, 12.2],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = Path(tmpdir)
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            with patch.object(streamlit_app, "_ensure_runtime", return_value=None), patch.object(
+                streamlit_app, "LOGS_DIR", logs_dir
+            ), patch.object(
+                streamlit_app, "METRICS_SOURCE", "clickhouse"
+            ), patch.object(
+                streamlit_app, "fetch_actual_metrics_df", return_value=actual_df
+            ), patch.object(
+                streamlit_app,
+                "fetch_predictions_from_db",
+                return_value=predictions_df,
+            ) as predictions_fetch_mock, patch.object(
+                streamlit_app, "get_anomaly_detector", return_value=_FakeDetector()
+            ), patch.object(
+                streamlit_app, "visualize", return_value=[]
+            ):
+                result = streamlit_app.run_single_iteration(
+                    test_mode=False,
+                    query="up",
+                    detector_name="rolling_iqr",
+                    data_lookback_minutes=60,
+                    prediction_lookahead_minutes=30,
+                    analyze_top_n=1,
+                    process_lookback_minutes=30,
+                    process_alerts=False,
+                )
+
+        predictions_fetch_mock.assert_called_once()
+        kwargs = predictions_fetch_mock.call_args.kwargs
+        self.assertEqual(kwargs["service"], streamlit_app.FORECAST_SERVICE)
+        self.assertEqual(kwargs["metric_name"], streamlit_app.FORECAST_METRIC_NAME)
+        self.assertIn("start_time", kwargs)
+        self.assertIn("end_time", kwargs)
+        self.assertEqual(result["detector"], "fake-detector")
+
     def test_prometheus_real_mode_uses_last_month_window(self) -> None:
         actual_df = pd.DataFrame(
             {

@@ -95,6 +95,8 @@ class TestMySummarizer(unittest.TestCase):
         self.assertTrue(result["chunk_summaries"])
         self.assertTrue(result["map_batches"])
         self.assertIn("rows", result["map_batches"][0])
+        self.assertIn("batch_period_start", result["map_batches"][0])
+        self.assertIn("batch_period_end", result["map_batches"][0])
         self.assertIn("Сервис: svc-a", result["summary"])
 
     def test_summarize_logs_emits_live_progress_events(self) -> None:
@@ -148,6 +150,8 @@ class TestMySummarizer(unittest.TestCase):
         map_batch_payload = next(payload for name, payload in events if name == "map_batch")
         self.assertIn("batch_logs", map_batch_payload)
         self.assertIn("rows_processed", map_batch_payload)
+        self.assertIn("batch_period_start", map_batch_payload)
+        self.assertIn("batch_period_end", map_batch_payload)
 
     def test_build_db_fetch_page_without_offset_placeholder_single_shot(self) -> None:
         config_overrides = {

@@ -1,6 +1,7 @@
 import json
 import logging
 import html
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -124,6 +125,70 @@ def _render_scrollable_text(value: Any, *, height: int) -> None:
             "Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; "
             "font-size:0.84rem; line-height:1.35;'>"
             f"{safe_text}</pre></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_pretty_summary_text(value: Any, *, height: int) -> None:
+    text = str(value) if value is not None else ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    html_lines: List[str] = []
+    in_list = False
+
+    section_re = re.compile(r"^(?:\d+\s*[\)\.\-:]\s*)?([A-Za-zА-Яа-я][A-Za-zА-Яа-я0-9_ \-]{2,}):?$")
+    bullet_re = re.compile(r"^(?:[-*]|•)\s+(.+)$")
+    numbered_re = re.compile(r"^\d+\s*[\)\.\-:]\s+(.+)$")
+
+    def _close_list_if_needed() -> None:
+        nonlocal in_list
+        if in_list:
+            html_lines.append("</ul>")
+            in_list = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            _close_list_if_needed()
+            html_lines.append("<div style='height:0.35rem;'></div>")
+            continue
+
+        section_match = section_re.match(line)
+        if section_match and len(line) <= 90:
+            _close_list_if_needed()
+            section_title = html.escape(section_match.group(1).replace("_", " "))
+            html_lines.append(
+                (
+                    "<div style='font-weight:700; color:#111827; margin-top:0.25rem; "
+                    "margin-bottom:0.18rem;'>"
+                    f"{section_title}"
+                    "</div>"
+                )
+            )
+            continue
+
+        bullet_match = bullet_re.match(line) or numbered_re.match(line)
+        if bullet_match:
+            if not in_list:
+                html_lines.append(
+                    "<ul style='margin:0.14rem 0 0.38rem 1rem; padding-left:0.52rem;'>"
+                )
+                in_list = True
+            html_lines.append(f"<li style='margin:0.1rem 0;'>{html.escape(bullet_match.group(1))}</li>")
+            continue
+
+        _close_list_if_needed()
+        html_lines.append(f"<div style='margin:0.1rem 0;'>{html.escape(line)}</div>")
+
+    _close_list_if_needed()
+
+    st.markdown(
+        (
+            f"<div style='max-height:{int(height)}px; overflow-y:auto; padding:0.7rem 0.75rem; "
+            "border:1px solid rgba(128,128,128,0.35); border-radius:0.55rem; "
+            "background:rgba(249,250,251,0.95); font-size:0.9rem; line-height:1.5;'>"
+            f"{''.join(html_lines)}"
+            "</div>"
         ),
         unsafe_allow_html=True,
     )
@@ -453,6 +518,40 @@ def _only_future_predictions(
     return out[out["timestamp"] > actual_end_ts].copy()
 
 
+def _infer_batch_period(batch: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    explicit_start = batch.get("batch_period_start")
+    explicit_end = batch.get("batch_period_end")
+    if explicit_start or explicit_end:
+        return (
+            str(explicit_start) if explicit_start else None,
+            str(explicit_end) if explicit_end else None,
+        )
+
+    logs = batch.get("batch_logs", [])
+    if not isinstance(logs, list) or not logs:
+        return None, None
+
+    timestamps: List[pd.Timestamp] = []
+    for row in logs:
+        if not isinstance(row, dict):
+            continue
+        raw_ts = None
+        for key in ("timestamp", "ts", "time", "datetime"):
+            if row.get(key) is not None:
+                raw_ts = row.get(key)
+                break
+        if raw_ts is None:
+            continue
+        ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        timestamps.append(ts)
+
+    if not timestamps:
+        return None, None
+    return to_iso_z(min(timestamps)), to_iso_z(max(timestamps))
+
+
 def _build_anomaly_window_figure(
     merged_df: pd.DataFrame,
     predictions_df: Optional[pd.DataFrame],
@@ -530,26 +629,15 @@ def _build_predictions_focus_figure(
     if preds.empty:
         return None
 
-    fig, (ax_actual, ax_preds) = plt.subplots(
-        1,
-        2,
-        figsize=(14, 4.2),
-        gridspec_kw={"width_ratios": [2, 1]},
-    )
-    ax_actual.plot(
+    fig, ax = plt.subplots(figsize=(14, 4.2))
+    ax.plot(
         actual["timestamp"],
         actual["value"],
         color="#2563eb",
         linewidth=2,
         label="actual",
     )
-    ax_actual.set_title("Исторические значения (2/3)")
-    ax_actual.set_xlabel("timestamp")
-    ax_actual.set_ylabel("value")
-    ax_actual.grid(alpha=0.25)
-    ax_actual.tick_params(axis="x", rotation=30)
-
-    ax_preds.plot(
+    ax.plot(
         preds["timestamp"],
         preds[pred_col],
         color="#ef4444",
@@ -557,10 +645,22 @@ def _build_predictions_focus_figure(
         linestyle="--",
         label="predicted",
     )
-    ax_preds.set_title("Все предикты (1/3)")
-    ax_preds.set_xlabel("timestamp")
-    ax_preds.grid(alpha=0.25)
-    ax_preds.tick_params(axis="x", rotation=30)
+
+    actual_end_ts = actual["timestamp"].max()
+    ax.axvline(
+        actual_end_ts,
+        color="#6b7280",
+        linestyle=":",
+        linewidth=1.2,
+        label="history/prediction boundary",
+    )
+
+    ax.set_title("Фокус-график: история + все предикты (единое полотно)")
+    ax.set_xlabel("timestamp")
+    ax.set_ylabel("value")
+    ax.grid(alpha=0.25)
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend(loc="best")
 
     fig.tight_layout()
     return fig
@@ -654,13 +754,22 @@ def _render_anomaly_cards(
                     batch_logs_count = batch.get("batch_logs_count")
                     if batch_logs_count is None:
                         batch_logs_count = len(batch_logs)
+                    batch_period_start, batch_period_end = _infer_batch_period(batch)
                     with st.chat_message("assistant"):
                         st.markdown(f"Map summary {idx}/{total}")
-                        _render_scrollable_text(
+                        _render_pretty_summary_text(
                             batch.get("batch_summary", ""),
                             height=SUMMARY_TEXT_HEIGHT,
                         )
                         st.caption(f"Логов в батче: {batch_logs_count}")
+                        if batch_period_start and batch_period_end:
+                            st.caption(
+                                f"Период логов батча: `{batch_period_start}` -> `{batch_period_end}`"
+                            )
+                        elif batch_period_start:
+                            st.caption(f"Период логов батча: с `{batch_period_start}`")
+                        elif batch_period_end:
+                            st.caption(f"Период логов батча: до `{batch_period_end}`")
                         if batch_logs:
                             logs_df = pd.DataFrame(batch_logs)
                             st.dataframe(
@@ -675,7 +784,7 @@ def _render_anomaly_cards(
             if row.get("final_summary"):
                 with st.chat_message("assistant"):
                     st.markdown("Итоговый Reduce summary")
-                    _render_scrollable_text(
+                    _render_pretty_summary_text(
                         row["final_summary"],
                         height=FINAL_TEXT_HEIGHT,
                     )
@@ -798,8 +907,8 @@ def main() -> None:
                 )
                 if focus_fig is not None:
                     st.markdown(
-                        "Дополнительный график: 2/3 история и 1/3 предикты "
-                        "(для детального просмотра всех предиктов)"
+                        "Дополнительный единый график: история и все предикты "
+                        "(две линии с разным стилем)"
                     )
                     st.pyplot(focus_fig, use_container_width=True)
                     plt.close(focus_fig)
@@ -907,6 +1016,8 @@ def main() -> None:
                             "batch_summary": payload.get("batch_summary"),
                             "batch_logs_count": payload.get("batch_logs_count"),
                             "batch_logs": payload.get("batch_logs", []),
+                            "batch_period_start": payload.get("batch_period_start"),
+                            "batch_period_end": payload.get("batch_period_end"),
                         }
                     )
                     if payload.get("rows_processed") is not None:

@@ -132,6 +132,31 @@ def _normalize_period(
     raise ValueError("Provide either period_start+period_end or start_dt+end_dt")
 
 
+def _extract_batch_period(rows: Sequence[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    timestamps: List[pd.Timestamp] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_ts = None
+        for key in ("timestamp", "ts", "time", "datetime"):
+            if row.get(key) is not None:
+                raw_ts = row.get(key)
+                break
+        if raw_ts is None:
+            continue
+        ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        timestamps.append(ts)
+
+    if not timestamps:
+        return None, None
+
+    start_ts = min(timestamps).isoformat().replace("+00:00", "Z")
+    end_ts = max(timestamps).isoformat().replace("+00:00", "Z")
+    return start_ts, end_ts
+
+
 def _resolve_service(anomaly: Optional[Dict[str, Any]]) -> str:
     if anomaly and anomaly.get("service"):
         return str(anomaly["service"])
@@ -439,6 +464,7 @@ class PeriodLogSummarizer:
                 if not chunk_summary:
                     chunk_summary = "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
+                batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
                 map_summaries.append(chunk_summary)
                 map_batches.append(
                     {
@@ -446,6 +472,8 @@ class PeriodLogSummarizer:
                         "rows_count": len(ranked_chunk),
                         "rows": [dict(row) for row in ranked_chunk],
                         "summary": chunk_summary,
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
                     }
                 )
                 rows_mapped += len(ranked_chunk)
@@ -462,6 +490,8 @@ class PeriodLogSummarizer:
                         "batch_summary": chunk_summary,
                         "batch_logs_count": len(ranked_chunk),
                         "batch_logs": [dict(row) for row in ranked_chunk],
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
                         "rows_processed": rows_mapped,
                         "rows_total": total_rows_estimate,
                     },
