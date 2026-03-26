@@ -15,6 +15,17 @@ import streamlit as st
 MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
 MAX_LOG_ROWS_PREVIEW = 80
+SUPPRESSED_PROGRESS_EVENTS: set[str] = {
+    "map_start",
+    "page_fetched",
+    "map_batch_start",
+    "map_batch",
+    "map_done",
+    "reduce_start",
+    "reduce_group_start",
+    "reduce_group_done",
+    "reduce_done",
+}
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -586,8 +597,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 period_end_dt=period_end_dt,
                 total_logs=demo_logs_count,
             )
-            if demo_logs:
-                columns = list(demo_logs[0].keys())
             total_rows_estimate = len(demo_logs)
 
         def _db_fetch_page(
@@ -653,17 +662,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if event == "map_start":
                 state["status"] = "map"
-                events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
-                events.append(
-                    f"Страница #{payload.get('page_index')}: {payload.get('page_rows')} строк"
-                )
             elif event == "map_batch_start":
                 state["status"] = "map"
-                idx = int(payload.get("batch_index", 0)) + 1
-                total = payload.get("batch_total")
-                events.append(f"LLM анализирует batch {idx}/{total}" if total else f"LLM анализирует batch {idx}")
             elif event == "map_batch":
                 state["status"] = "map"
                 full_logs = payload.get("batch_logs", [])
@@ -699,31 +701,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 map_batches.append(batch_item)
                 if len(map_batches) > MAX_RENDERED_BATCHES:
                     state["map_batches"] = map_batches[-MAX_RENDERED_BATCHES:]
-
-                idx = int(payload.get("batch_index", 0)) + 1
-                total = payload.get("batch_total")
-                events.append(f"Map summary {idx}/{total}" if total else f"Map summary {idx}")
             elif event == "map_done":
                 state["status"] = "reduce"
-                events.append("Map этап завершен")
             elif event == "reduce_start":
                 state["status"] = "reduce"
-                events.append("Reduce этап запущен")
             elif event == "reduce_group_start":
                 state["status"] = "reduce"
-                round_idx = payload.get("reduce_round")
-                group_index = int(payload.get("group_index", 0)) + 1
-                group_total = payload.get("group_total")
-                events.append(f"Reduce round {round_idx}: группа {group_index}/{group_total}")
             elif event == "reduce_group_done":
                 state["status"] = "reduce"
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
-                events.append("Reduce этап завершен")
             else:
-                events.append(f"Событие: {event}")
+                if event not in SUPPRESSED_PROGRESS_EVENTS:
+                    events.append(f"Событие: {event}")
 
             if len(events) > MAX_EVENT_LINES:
                 state["events"] = events[-MAX_EVENT_LINES:]
