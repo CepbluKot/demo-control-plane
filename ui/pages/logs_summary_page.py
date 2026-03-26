@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 import logging
+from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -29,6 +31,7 @@ class LogsSummaryPageDeps:
     logs_batch_table_height: int
     sql_textarea_height: int
     default_sql_query: str
+    output_dir: Path
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -84,6 +87,71 @@ def _render_query_template(
     for key, value in replacements.items():
         rendered = rendered.replace(key, value)
     return rendered
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    return str(value)
+
+
+def _save_logs_summary_result(
+    *,
+    output_dir: Path,
+    request_payload: Dict[str, Any],
+    result_state: Dict[str, Any],
+) -> Dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    json_path = output_dir / f"logs_summary_result_{stamp}.json"
+    summary_path = output_dir / f"logs_summary_result_{stamp}.md"
+
+    payload = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "request": _json_safe(request_payload),
+        "result": _json_safe(result_state),
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    lines = [
+        "# Logs Summary Result",
+        "",
+        f"- saved_at: `{payload['saved_at']}`",
+        f"- status: `{result_state.get('status')}`",
+        f"- mode: `{result_state.get('mode')}`",
+        f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+        "",
+        "## Final Summary",
+        "",
+        str(result_state.get("final_summary") or "N/A"),
+        "",
+        "## Stats",
+        "",
+        f"- logs_processed: `{result_state.get('logs_processed')}`",
+        f"- logs_total: `{result_state.get('logs_total')}`",
+        f"- stats: `{result_state.get('stats')}`",
+        f"- error: `{result_state.get('error')}`",
+        "",
+        f"JSON dump: `{json_path}`",
+    ]
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return {
+        "json_path": str(json_path),
+        "summary_path": str(summary_path),
+    }
 
 
 def _build_manual_logs_window_query(
@@ -299,6 +367,16 @@ def _render_logs_summary_chat(
             with st.chat_message("assistant"):
                 st.error(f"Ошибка обработки: {state['error']}")
 
+        result_json_path = state.get("result_json_path")
+        result_summary_path = state.get("result_summary_path")
+        if result_json_path or result_summary_path:
+            with st.chat_message("assistant"):
+                st.markdown("Результаты сохранены в файлы")
+                if result_json_path:
+                    st.code(str(result_json_path))
+                if result_summary_path:
+                    st.code(str(result_summary_path))
+
 
 def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     running_key = "logs_summary_running"
@@ -488,6 +566,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     batch_size = max(int(pending_cfg.get("batch_size", deps.batch_size)), 1)
     page_limit = batch_size
     llm_chunk_rows = batch_size
+    request_payload = {
+        "sql_query": sql_query,
+        "user_goal": user_goal,
+        "period_mode": period_mode,
+        "center_dt_text": center_dt_text,
+        "start_dt_text": start_dt_text,
+        "end_dt_text": end_dt_text,
+        "window_minutes": window_minutes,
+        "demo_mode": demo_mode,
+        "demo_logs_count": demo_logs_count,
+        "batch_size": batch_size,
+    }
 
     try:
         if not sql_query:
@@ -534,6 +624,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "final_summary": None,
             "stats": None,
             "error": None,
+            "result_json_path": None,
+            "result_summary_path": None,
         }
         _render_logs_summary_chat(analysis_placeholder, state, deps)
 
@@ -791,9 +883,22 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "final_summary": None,
             "stats": None,
             "error": str(exc),
+            "result_json_path": None,
+            "result_summary_path": None,
         }
         error_placeholder.error(str(exc))
         deps.logger.exception("manual logs summary failed")
+
+    try:
+        saved_paths = _save_logs_summary_result(
+            output_dir=deps.output_dir,
+            request_payload=request_payload,
+            result_state=state,
+        )
+        state["result_json_path"] = saved_paths.get("json_path")
+        state["result_summary_path"] = saved_paths.get("summary_path")
+    except Exception:  # noqa: BLE001
+        deps.logger.exception("failed to save logs summary result artifacts")
 
     _render_logs_summary_chat(analysis_placeholder, state, deps)
     st.session_state[last_state_key] = state

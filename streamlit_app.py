@@ -911,6 +911,7 @@ def _render_logs_summary_page() -> None:
             str(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL).strip()
             or str(settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY).strip()
         ),
+        output_dir=LOGS_DIR,
     )
     render_logs_summary_page(deps)
 
