@@ -89,6 +89,21 @@ def _format_eta_seconds(seconds: float) -> str:
     return f"{secs}с"
 
 
+def _format_attempts_total(total_attempts: Any) -> str:
+    total = pd.to_numeric(total_attempts, errors="coerce")
+    if pd.isna(total):
+        return "?"
+    if int(total) <= 0:
+        return "∞"
+    return str(int(total))
+
+
+def _format_attempts_pair(attempt: Any, total_attempts: Any) -> str:
+    current = pd.to_numeric(attempt, errors="coerce")
+    current_text = "?" if pd.isna(current) else str(int(current))
+    return f"{current_text}/{_format_attempts_total(total_attempts)}"
+
+
 def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
     started_mono = state.get("started_monotonic")
     if started_mono is None:
@@ -208,7 +223,7 @@ class LogsSummaryPageDeps:
     default_metrics_query: str
     output_dir: Path
     map_workers: int = 1
-    max_retries: int = 1
+    max_retries: int = -1
     llm_timeout: int = 60
 
 
@@ -1294,6 +1309,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             )
             period_start_text = _format_datetime_with_tz(state.get("period_start"))
             period_end_text = _format_datetime_with_tz(state.get("period_end"))
+            retries_num_raw = pd.to_numeric(state.get("max_retries", -1), errors="coerce")
+            retries_num = -1 if pd.isna(retries_num_raw) else int(retries_num_raw)
             st.markdown(
                 "\n".join(
                     [
@@ -1305,7 +1322,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                         f"MAP workers: `{state.get('map_workers', 1)}`",
-                        f"Ретраи LLM: `{state.get('max_retries', 1)}`",
+                        ("Ретраи LLM: `∞`" if retries_num < 0 else f"Ретраи LLM: `{retries_num}`"),
                         f"Таймаут LLM: `{state.get('llm_timeout', 60)}s`",
                     ]
                 )
@@ -1547,7 +1564,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
         "logs_sum_parallel_map": False,
         "logs_sum_map_workers": max(int(deps.map_workers), 1),
-        "logs_sum_max_retries": max(int(deps.max_retries), 0),
+        "logs_sum_max_retries": int(deps.max_retries),
         "logs_sum_llm_timeout": max(int(deps.llm_timeout), 10),
         "logs_sum_demo_mode": bool(deps.test_mode),
         "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
@@ -1779,7 +1796,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             )
         st.number_input(
             "Ретраи LLM (при ошибке)",
-            min_value=0,
+            min_value=-1,
             max_value=100,
             step=1,
             key="logs_sum_max_retries",
@@ -1787,7 +1804,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             help=(
                 "Сколько раз повторить вызов LLM при ошибке. "
                 "0 = без ретраев (сразу fallback). "
-                "Пауза между попытками фиксированная и короткая."
+                "-1 = бесконечные ретраи. "
+                "Пауза между попытками фиксированная: 10 секунд."
             ),
         )
         st.number_input(
@@ -1800,7 +1818,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             help=(
                 "Максимальное время ожидания одного LLM-ответа. "
                 "При зависании запрос упадёт по таймауту и уйдёт на retry. "
-                "Итоговое максимальное время батча = timeout × (retries + 1)."
+                "При retries = -1 общее время не ограничено."
             ),
         )
         st.toggle(
@@ -1835,10 +1853,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
     _parallel_map = bool(st.session_state.get("logs_sum_parallel_map", False))
     map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1))) if _parallel_map else 1
-    max_retries = max(
-        int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))),
-        0,
-    )
+    max_retries = int(st.session_state.get("logs_sum_max_retries", int(deps.max_retries)))
     llm_timeout = max(int(st.session_state.get("logs_sum_llm_timeout", max(int(deps.llm_timeout), 10))), 10)
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
     demo_logs_count = int(
@@ -1921,7 +1936,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
-    max_retries = max(int(active_params.get("max_retries", max_retries)), 0)
+    max_retries = int(active_params.get("max_retries", max_retries))
     llm_timeout = max(int(active_params.get("llm_timeout", llm_timeout)), 10)
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
@@ -2202,7 +2217,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if attempt is not None:
                 row["attempt"] = int(attempt)
             if total_attempts is not None:
-                row["total_attempts"] = int(total_attempts)
+                total_int = int(total_attempts)
+                row["total_attempts"] = "∞" if total_int <= 0 else total_int
             if elapsed_sec is not None:
                 row["elapsed_sec"] = round(float(elapsed_sec), 2)
             if status:
@@ -2449,6 +2465,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "map"
                 idx = int(payload.get("batch_index", 0)) + 1
                 total = payload.get("batch_total")
+                retries_label = "∞" if int(max_retries) < 0 else str(max_retries)
                 state["active_step"] = (
                     f"LLM анализирует MAP-batch {idx}/{total}"
                     if total else f"LLM анализирует MAP-batch {idx}"
@@ -2456,10 +2473,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 events.append(
                     (
                         f"LLM анализирует batch {idx}/{total} "
-                        f"(таймаут {llm_timeout}s, ретраи {max_retries})"
+                        f"(таймаут {llm_timeout}s, ретраи {retries_label})"
                     )
                     if total else
-                    f"LLM анализирует batch {idx} (таймаут {llm_timeout}s, ретраи {max_retries})"
+                    f"LLM анализирует batch {idx} (таймаут {llm_timeout}s, ретраи {retries_label})"
                 )
             elif event == "map_batch":
                 state["status"] = "map"
@@ -2573,9 +2590,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         def _on_retry(attempt: int, total: int, exc: Exception) -> None:
             """Called by _make_llm_call before each retry. Thread-safe via GIL."""
-            msg = f"LLM retry {attempt}/{total}: {type(exc).__name__}: {exc}"
+            pair = _format_attempts_pair(attempt, total)
+            msg = f"LLM retry {pair}: {type(exc).__name__}: {exc}"
             state["llm_last_error"] = str(exc)
-            state["active_step"] = f"LLM retry {attempt}/{total}"
+            state["active_step"] = f"LLM retry {pair}"
             _append_llm_timeline(
                 event="retry",
                 attempt=attempt,
@@ -2586,8 +2604,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             _push_live_event(msg, render_now=True)
 
         def _on_llm_attempt(attempt: int, total_attempts: int, timeout_seconds: float) -> None:
+            pair = _format_attempts_pair(attempt, total_attempts)
             state["llm_active"] = True
-            state["llm_last_attempt"] = f"попытка {attempt}/{total_attempts}, timeout={int(timeout_seconds)}s"
+            state["llm_last_attempt"] = f"попытка {pair}, timeout={int(timeout_seconds)}s"
             if attempt == 1:
                 state["llm_calls_started"] = int(state.get("llm_calls_started", 0)) + 1
                 call_no = int(state.get("llm_calls_started", 0))
@@ -2601,11 +2620,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     details=f"timeout={int(timeout_seconds)}s",
                 )
                 _push_live_event(
-                    f"LLM вызов #{call_no}: старт (timeout {int(timeout_seconds)}s, attempts {total_attempts})",
+                    f"LLM вызов #{call_no}: старт (timeout {int(timeout_seconds)}s, attempts {_format_attempts_total(total_attempts)})",
                     render_now=True,
                 )
             else:
-                state["active_step"] = f"LLM повторная попытка {attempt}/{total_attempts}"
+                state["active_step"] = f"LLM повторная попытка {pair}"
                 _append_llm_timeline(
                     event="attempt_start",
                     call_no=int(state.get("llm_calls_started", 0)),
@@ -2615,7 +2634,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     details=f"timeout={int(timeout_seconds)}s",
                 )
                 _push_live_event(
-                    f"LLM: повторная попытка {attempt}/{total_attempts} (timeout {int(timeout_seconds)}s)",
+                    f"LLM: повторная попытка {pair} (timeout {int(timeout_seconds)}s)",
                     render_now=True,
                 )
 
@@ -2655,12 +2674,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     status="error",
                     details=str(error_text or ""),
                 )
-                if attempt < total_attempts:
+                can_retry = total_attempts <= 0 or attempt < total_attempts
+                next_pair = _format_attempts_pair(attempt + 1, total_attempts)
+                if can_retry:
                     state["active_step"] = (
-                        f"LLM ошибка за {elapsed_sec:.1f}s, готовим retry {attempt + 1}/{total_attempts}"
+                        f"LLM ошибка за {elapsed_sec:.1f}s, готовим retry {next_pair}"
                     )
                     _push_live_event(
-                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Готовим retry {attempt + 1}/{total_attempts}",
+                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Готовим retry {next_pair}",
                         render_now=True,
                     )
                 else:
