@@ -401,21 +401,29 @@ def _heuristic_llm_call(prompt: str) -> str:
     hits = [kw for kw in keywords if kw in lowered]
     if not hits:
         return (
-            "TOP_PROBLEMS:\n- Явных критичных ошибок в чанке не найдено.\n"
-            "EVIDENCE:\n- Низкая плотность проблемных сигналов.\n"
-            "HYPOTHESES:\n- Инцидент может быть локальным или вне этого чанка.\n"
-            "ACTIONS:\n- Проверить соседние чанки и инфраструктурные события."
+            "INCIDENT_TIMELINE:\n"
+            "- В текущем фрагменте нет выраженной критичной последовательности событий.\n"
+            "ROOT_CAUSE_HYPOTHESES:\n"
+            "- Причина алертов может быть вне этого батча или в соседних временных окнах.\n"
+            "CAUSAL_CHAIN:\n"
+            "- Подтвержденная цепочка не выявлена в данном фрагменте логов.\n"
+            "SUPPORTING_EVIDENCE:\n"
+            "- Низкая плотность error/timeout/fatal сигналов.\n"
+            "PRIORITY_ACTIONS:\n"
+            "- Проверить соседние батчи и инфраструктурные события в периоде перед алертом."
         )
     top_hits = ", ".join(sorted(set(hits)))
     return (
-        "TOP_PROBLEMS:\n"
-        f"- Найдены проблемные сигналы: {top_hits}.\n"
-        "EVIDENCE:\n"
-        f"- Количество ключевых сигналов в чанке: {len(hits)}.\n"
-        "HYPOTHESES:\n"
-        "- Ошибки связаны с деградацией зависимости или перегрузкой.\n"
-        "ACTIONS:\n"
-        "- Проверить ошибки 5xx/timeout и последние деплои."
+        "INCIDENT_TIMELINE:\n"
+        f"- Зафиксирован рост проблемных событий: {top_hits}.\n"
+        "ROOT_CAUSE_HYPOTHESES:\n"
+        "- Вероятна деградация зависимого сервиса или локальная перегрузка.\n"
+        "CAUSAL_CHAIN:\n"
+        "- Рост ошибок/timeout -> накопление retry/очередей -> срабатывание алертов.\n"
+        "SUPPORTING_EVIDENCE:\n"
+        f"- Количество ключевых проблемных сигналов в батче: {len(hits)}.\n"
+        "PRIORITY_ACTIONS:\n"
+        "- Проверить 5xx/timeout, saturation по ресурсам и последние изменения/деплои."
     )
 
 

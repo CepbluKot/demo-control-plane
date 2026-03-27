@@ -892,7 +892,14 @@ def _ui_runtime_config() -> Dict[str, Any]:
 def _render_logs_summary_page() -> None:
     deps = LogsSummaryPageDeps(
         logger=logger,
-        batch_size=max(int(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_BATCH_SIZE), 1),
+        db_batch_size=max(
+            int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE", settings.CONTROL_PLANE_UI_LOGS_SUMMARY_BATCH_SIZE)),
+            1,
+        ),
+        llm_batch_size=max(
+            int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE", settings.CONTROL_PLANE_UI_LOGS_SUMMARY_BATCH_SIZE)),
+            1,
+        ),
         test_mode=TEST_MODE,
         loopback_minutes=LOOPBACK_MINUTES,
         logs_tail_limit=LOGS_TAIL_LIMIT,
