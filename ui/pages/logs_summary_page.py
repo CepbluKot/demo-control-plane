@@ -15,17 +15,6 @@ import streamlit as st
 MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
 MAX_LOG_ROWS_PREVIEW = 80
-SUPPRESSED_PROGRESS_EVENTS: set[str] = {
-    "map_start",
-    "page_fetched",
-    "map_batch_start",
-    "map_batch",
-    "map_done",
-    "reduce_start",
-    "reduce_group_start",
-    "reduce_group_done",
-    "reduce_done",
-}
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -272,7 +261,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
     }
 
     with container.container():
-        st.subheader("Logs Summarizer")
+        st.markdown("1. Пошаговая Суммаризация Логов")
         if not state:
             return
 
@@ -396,11 +385,6 @@ def _build_config(deps: LogsSummaryPageDeps, batch_size: int) -> Any:
 def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     st.title("Logs Summarizer")
 
-    running_key = "logs_summary_running"
-    if running_key not in st.session_state:
-        st.session_state[running_key] = False
-    is_running = bool(st.session_state[running_key])
-
     default_query = (deps.default_sql_query or "").strip() or (
         "SELECT timestamp, level, message FROM logs_demo_service "
         "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
@@ -408,104 +392,96 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
     )
 
-    sql_query = st.text_area(
-        "SQL запрос логов",
-        value=default_query,
-        height=max(int(deps.sql_textarea_height), 180),
-        help=(
-            "Поддерживаются многострочные SQL. Можно использовать плейсхолдеры: "
-            "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
-        ),
-        disabled=is_running,
-    )
-    user_goal = st.text_area(
-        "Дополнительный контекст для LLM (опционально)",
-        value="",
-        height=140,
-        disabled=is_running,
-    )
-
-    period_mode_label = st.radio(
-        "Режим периода",
-        options=("Окно вокруг даты (±N минут)", "Явный диапазон (start/end)"),
-        index=0,
-        horizontal=True,
-        disabled=is_running,
-    )
-    is_window_mode = period_mode_label.startswith("Окно вокруг")
-
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    center_default = now_utc.isoformat().replace("+00:00", "Z")
-    start_default = (now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))).isoformat().replace(
-        "+00:00", "Z"
-    )
-    end_default = now_utc.isoformat().replace("+00:00", "Z")
-
-    center_dt_text = ""
-    window_minutes = max(int(deps.loopback_minutes), 1)
-    start_dt_text = ""
-    end_dt_text = ""
-    if is_window_mode:
-        center_dt_text = st.text_input(
-            "Целевая дата/время (ISO)",
-            value=center_default,
-            disabled=is_running,
+    with st.sidebar:
+        sql_query = st.text_area(
+            "SQL запрос логов",
+            value=default_query,
+            height=max(int(deps.sql_textarea_height), 180),
+            help=(
+                "Поддерживаются многострочные SQL. Можно использовать плейсхолдеры: "
+                "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
+            ),
         )
-        window_minutes = int(
+        user_goal = st.text_area(
+            "Контекст по алертам/инциденту для LLM (опционально)",
+            value="",
+            height=140,
+        )
+
+        period_mode_label = st.radio(
+            "Режим периода",
+            options=("Окно вокруг даты (±N минут)", "Явный диапазон (start/end)"),
+            index=0,
+            horizontal=False,
+        )
+        is_window_mode = period_mode_label.startswith("Окно вокруг")
+
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        center_default = now_utc.isoformat().replace("+00:00", "Z")
+        start_default = (
+            now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))
+        ).isoformat().replace("+00:00", "Z")
+        end_default = now_utc.isoformat().replace("+00:00", "Z")
+
+        center_dt_text = ""
+        window_minutes = max(int(deps.loopback_minutes), 1)
+        start_dt_text = ""
+        end_dt_text = ""
+        if is_window_mode:
+            center_dt_text = st.text_input(
+                "Целевая дата/время (ISO)",
+                value=center_default,
+            )
+            window_minutes = int(
+                st.number_input(
+                    "Окно анализа (+- N минут)",
+                    min_value=1,
+                    max_value=60 * 24 * 30,
+                    value=max(int(deps.loopback_minutes), 1),
+                    step=1,
+                )
+            )
+        else:
+            start_dt_text = st.text_input(
+                "Дата/время начала (ISO)",
+                value=start_default,
+            )
+            end_dt_text = st.text_input(
+                "Дата/время конца (ISO)",
+                value=end_default,
+            )
+
+        batch_size = int(
             st.number_input(
-                "Окно анализа (+- N минут)",
-                min_value=1,
-                max_value=60 * 24 * 30,
-                value=max(int(deps.loopback_minutes), 1),
-                step=1,
-                disabled=is_running,
+                "Общий размер batch (и для БД, и для LLM)",
+                min_value=10,
+                max_value=5_000,
+                value=max(int(deps.batch_size), 1),
+                step=10,
             )
         )
-    else:
-        start_dt_text = st.text_input(
-            "Дата/время начала (ISO)",
-            value=start_default,
-            disabled=is_running,
+        demo_mode = st.toggle(
+            "Демо режим (без БД)",
+            value=bool(deps.test_mode),
         )
-        end_dt_text = st.text_input(
-            "Дата/время конца (ISO)",
-            value=end_default,
-            disabled=is_running,
+        demo_logs_count = int(
+            st.number_input(
+                "Количество логов в демо режиме",
+                min_value=100,
+                max_value=50_000,
+                value=max(int(deps.logs_tail_limit), 1000),
+                step=100,
+                disabled=not demo_mode,
+            )
         )
 
-    batch_size = int(
-        st.number_input(
-            "Общий размер batch (и для БД, и для LLM)",
-            min_value=10,
-            max_value=5_000,
-            value=max(int(deps.batch_size), 1),
-            step=10,
-            disabled=is_running,
+        run_clicked = st.button(
+            "Запустить Суммаризацию Логов",
+            type="primary",
+            use_container_width=True,
         )
-    )
-    demo_mode = st.toggle(
-        "Демо режим (без БД)",
-        value=bool(deps.test_mode),
-        disabled=is_running,
-    )
-    demo_logs_count = int(
-        st.number_input(
-            "Количество логов в демо режиме",
-            min_value=100,
-            max_value=50_000,
-            value=max(int(deps.logs_tail_limit), 1000),
-            step=100,
-            disabled=is_running or not demo_mode,
-        )
-    )
 
-    run_clicked = st.button(
-        "Запустить Суммаризацию Логов",
-        type="primary",
-        use_container_width=True,
-        disabled=is_running,
-    )
-
+    runtime_error_placeholder = st.empty()
     analysis_placeholder = st.empty()
     if not run_clicked:
         return
@@ -583,7 +559,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "live_batches_path": str(live_batches_path),
     }
 
-    st.session_state[running_key] = True
     try:
         uses_template = _query_uses_any_placeholders(sql_query_clean)
         uses_paging_template = _query_uses_paging_placeholders(sql_query_clean)
@@ -597,6 +572,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 period_end_dt=period_end_dt,
                 total_logs=demo_logs_count,
             )
+            if demo_logs:
+                columns = list(demo_logs[0].keys())
             total_rows_estimate = len(demo_logs)
 
         def _db_fetch_page(
@@ -662,10 +639,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if event == "map_start":
                 state["status"] = "map"
+                events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
+                events.append(
+                    f"Страница #{payload.get('page_index')}: {payload.get('page_rows')} строк"
+                )
             elif event == "map_batch_start":
                 state["status"] = "map"
+                idx = int(payload.get("batch_index", 0)) + 1
+                total = payload.get("batch_total")
+                events.append(f"LLM анализирует batch {idx}/{total}" if total else f"LLM анализирует batch {idx}")
             elif event == "map_batch":
                 state["status"] = "map"
                 full_logs = payload.get("batch_logs", [])
@@ -701,21 +685,31 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 map_batches.append(batch_item)
                 if len(map_batches) > MAX_RENDERED_BATCHES:
                     state["map_batches"] = map_batches[-MAX_RENDERED_BATCHES:]
+
+                idx = int(payload.get("batch_index", 0)) + 1
+                total = payload.get("batch_total")
+                events.append(f"Map summary {idx}/{total}" if total else f"Map summary {idx}")
             elif event == "map_done":
                 state["status"] = "reduce"
+                events.append("Map этап завершен")
             elif event == "reduce_start":
                 state["status"] = "reduce"
+                events.append("Reduce этап запущен")
             elif event == "reduce_group_start":
                 state["status"] = "reduce"
+                round_idx = payload.get("reduce_round")
+                group_index = int(payload.get("group_index", 0)) + 1
+                group_total = payload.get("group_total")
+                events.append(f"Reduce round {round_idx}: группа {group_index}/{group_total}")
             elif event == "reduce_group_done":
                 state["status"] = "reduce"
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
+                events.append("Reduce этап завершен")
             else:
-                if event not in SUPPRESSED_PROGRESS_EVENTS:
-                    events.append(f"Событие: {event}")
+                events.append(f"Событие: {event}")
 
             if len(events) > MAX_EVENT_LINES:
                 state["events"] = events[-MAX_EVENT_LINES:]
@@ -740,9 +734,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             def _llm_call_with_goal(prompt: str) -> str:
                 enriched_prompt = (
-                    "Контекст пользователя для этого summary:\n"
+                    "Контекст по алертам/инциденту от пользователя:\n"
                     f"{goal_text}\n\n"
-                    "Учитывай этот контекст при приоритизации проблем и рекомендаций.\n\n"
+                    "Сфокусируйся на причинно-следственном разборе: почему алерты сработали, "
+                    "какие события этому предшествовали и что стало триггером.\n\n"
                     f"{prompt}"
                 )
                 return base_llm_call(enriched_prompt)
@@ -787,8 +782,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["status"] = "error"
         state["error"] = str(exc)
         deps.logger.exception("logs_summary_page.run_failed")
-    finally:
-        st.session_state[running_key] = False
+        with runtime_error_placeholder.container():
+            st.error(f"Ошибка выполнения: {exc}")
 
     saved = _save_logs_summary_result(
         output_dir=deps.output_dir,
