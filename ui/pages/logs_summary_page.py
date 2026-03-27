@@ -66,37 +66,50 @@ def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) ->
     elapsed = max(now_mono - float(started_mono), 0.001)
     state["elapsed_seconds"] = float(elapsed)
 
-    rows_processed = pd.to_numeric(state.get("logs_processed"), errors="coerce")
-    rows_total = pd.to_numeric(state.get("logs_total"), errors="coerce")
     ratio: Optional[float] = None
     remaining: Optional[float] = None
 
-    if not pd.isna(rows_processed):
-        samples = state.setdefault("progress_samples", [])
-        processed_val = float(rows_processed)
-        if not samples or abs(float(samples[-1][1]) - processed_val) >= 1:
-            samples.append((now_mono, processed_val))
-        if len(samples) > 40:
-            state["progress_samples"] = samples[-40:]
-            samples = state["progress_samples"]
+    # Primary: timestamp-based progress.  Works for both OFFSET and keyset pagination,
+    # doesn't require pre-counting rows.  Rate is measured in "log-seconds per real second".
+    period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
+    period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
+    last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
 
-        if not pd.isna(rows_total) and float(rows_total) > 0 and samples:
-            oldest_t, oldest_rows = samples[0]
-            newest_t, newest_rows = samples[-1]
-            delta_t = float(newest_t) - float(oldest_t)
-            delta_rows = float(newest_rows) - float(oldest_rows)
-            if delta_t > 0 and delta_rows > 0:
-                rate = delta_rows / delta_t  # rows per second
-                state["rows_per_second"] = float(rate)
-                remaining_rows = max(float(rows_total) - processed_val, 0.0)
-                remaining = remaining_rows / rate if rate > 0 else None
-            elif state.get("rows_per_second"):
-                rate = float(state["rows_per_second"])
-                remaining_rows = max(float(rows_total) - processed_val, 0.0)
-                remaining = remaining_rows / rate if rate > 0 else None
+    if (
+        not pd.isna(period_start_ts)
+        and not pd.isna(period_end_ts)
+        and not pd.isna(last_batch_ts)
+    ):
+        total_span = (period_end_ts - period_start_ts).total_seconds()
+        done_span = max((last_batch_ts - period_start_ts).total_seconds(), 0.0)
 
-    if not pd.isna(rows_processed) and not pd.isna(rows_total) and float(rows_total) > 0:
-        ratio = float(rows_processed) / float(rows_total)
+        if total_span > 0:
+            ratio = min(max(done_span / total_span, 0.0), 0.99)
+            remaining_span = max(total_span - done_span, 0.0)
+
+            # Track (real_time, log_seconds_done) samples for rate estimation
+            samples = state.setdefault("progress_samples", [])
+            if not samples or abs(float(samples[-1][1]) - done_span) >= 1.0:
+                samples.append((now_mono, done_span))
+            if len(samples) > 40:
+                state["progress_samples"] = samples[-40:]
+                samples = state["progress_samples"]
+
+            if len(samples) >= 2:
+                oldest_t, oldest_done = samples[0]
+                newest_t, newest_done = samples[-1]
+                delta_t = float(newest_t) - float(oldest_t)
+                delta_done = float(newest_done) - float(oldest_done)
+                if delta_t > 0 and delta_done > 0:
+                    rate = delta_done / delta_t  # log-seconds per real-second
+                    state["log_seconds_per_second"] = float(rate)
+                    remaining = remaining_span / rate
+            if remaining is None and state.get("log_seconds_per_second"):
+                rate = float(state["log_seconds_per_second"])
+                if rate > 0:
+                    remaining = remaining_span / rate
+
+    # Fallback: batch/reduce estimates when last_batch_ts is not yet available
     elif status == "map":
         batch_total = payload.get("batch_total")
         batch_index = payload.get("batch_index")
@@ -791,6 +804,7 @@ def _wrap_with_limit_offset(*, query: str, limit: int, offset: int) -> str:
         "SELECT * FROM ("
         f"{base}"
         ") AS cp_logs_page "
+        "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
 
@@ -808,15 +822,19 @@ def _build_window_query_for_plain_sql(
     base = _normalize_sql_query_text(base_query)
     start_escaped = _escape_sql_literal(period_start_iso)
     end_escaped = _escape_sql_literal(period_end_iso)
+    # Only add ORDER BY to the inner subquery if the user's SQL doesn't already have one.
+    # The outermost ORDER BY is always required for deterministic LIMIT/OFFSET in ClickHouse.
+    inner_order = "" if "order by" in base.lower() else " ORDER BY timestamp ASC"
     return (
         "SELECT * FROM ("
         "SELECT * FROM ("
         f"{base}"
         ") AS cp_src "
         f"WHERE timestamp >= parseDateTimeBestEffort('{start_escaped}') "
-        f"AND timestamp < parseDateTimeBestEffort('{end_escaped}') "
-        "ORDER BY timestamp"
+        f"AND timestamp < parseDateTimeBestEffort('{end_escaped}')"
+        f"{inner_order}"
         ") AS cp_window "
+        "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
 
@@ -1113,11 +1131,24 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         col3.metric("LLM вызовы", f"{llm_calls}")
         col4.metric("Reduce раунды", f"{reduce_rounds}")
 
-        if not pd.isna(rows_total) and float(rows_total) > 0:
-            pct = (rows_processed / float(rows_total)) * 100.0
-            st.caption(f"Покрытие периода: {rows_processed}/{int(rows_total)} (~{pct:.1f}%)")
+        _last_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
+        _p_start = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
+        _p_end = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
+        if (
+            not pd.isna(_last_ts)
+            and not pd.isna(_p_start)
+            and not pd.isna(_p_end)
+            and (_p_end - _p_start).total_seconds() > 0
+        ):
+            _span = (_p_end - _p_start).total_seconds()
+            _done = max((_last_ts - _p_start).total_seconds(), 0.0)
+            _pct = min(_done / _span, 1.0) * 100.0
+            st.caption(
+                f"Покрытие периода по времени: {_pct:.1f}% "
+                f"(лог до {_last_ts.strftime('%H:%M:%S UTC')} | строк: {rows_processed:,})"
+            )
         elif rows_processed > 0:
-            st.caption(f"Обработано логов: {rows_processed}")
+            st.caption(f"Обработано логов: {rows_processed:,}")
         st.caption(
             "Период отчета: "
             f"{_format_datetime_with_tz(state.get('period_start'))} -> "
@@ -1243,32 +1274,43 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         with st.chat_message("assistant"):
             status = str(state.get("status", "queued"))
             st.markdown(f"Статус: **{status_titles.get(status, status)}**")
-            logs_processed = state.get("logs_processed")
-            logs_total = state.get("logs_total")
-            processed_num = pd.to_numeric(logs_processed, errors="coerce")
-            total_num = pd.to_numeric(logs_total, errors="coerce")
-            if not pd.isna(processed_num):
-                progress_pct = None
-                if not pd.isna(total_num) and float(total_num) > 0:
-                    ratio = min(max(float(processed_num) / float(total_num), 0.0), 1.0)
-                    progress_pct = ratio * 100.0
+            # --- Timestamp-based progress bar ---
+            last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
+            period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
+            period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
+
+            ts_ratio: Optional[float] = None
+            if (
+                not pd.isna(last_batch_ts)
+                and not pd.isna(period_start_ts)
+                and not pd.isna(period_end_ts)
+            ):
+                total_span = (period_end_ts - period_start_ts).total_seconds()
+                done_span = max((last_batch_ts - period_start_ts).total_seconds(), 0.0)
+                if total_span > 0:
+                    ts_ratio = min(max(done_span / total_span, 0.0), 1.0)
+                    pct = ts_ratio * 100.0
+                    last_ts_str = last_batch_ts.strftime("%H:%M:%S")
                     st.progress(
-                        ratio,
-                        text=f"Прогресс: {progress_pct:.1f}% ({int(processed_num)}/{int(total_num)})",
+                        ts_ratio,
+                        text=f"Прогресс: {pct:.1f}% | лог до {last_ts_str}",
                     )
-                else:
-                    st.caption(f"Прогресс: обработано {int(processed_num)} строк")
-            else:
-                progress_pct = None
+            elif state.get("logs_processed"):
+                st.caption(f"Обработано строк: {state['logs_processed']}")
+
             eta_left = state.get("eta_seconds_left")
             eta_finish = state.get("eta_finish_at")
             elapsed_seconds = pd.to_numeric(state.get("elapsed_seconds"), errors="coerce")
-            rows_per_second = pd.to_numeric(state.get("rows_per_second"), errors="coerce")
+            log_seconds_per_second = pd.to_numeric(state.get("log_seconds_per_second"), errors="coerce")
             details: List[str] = []
             if not pd.isna(elapsed_seconds):
                 details.append(f"elapsed: {_format_eta_seconds(float(elapsed_seconds))}")
-            if not pd.isna(rows_per_second) and float(rows_per_second) > 0:
-                details.append(f"rate: {float(rows_per_second):.1f} rows/s")
+            if not pd.isna(log_seconds_per_second) and float(log_seconds_per_second) > 0:
+                lsps = float(log_seconds_per_second)
+                if lsps >= 60:
+                    details.append(f"скорость: {lsps / 60:.1f} мин.лога/с")
+                else:
+                    details.append(f"скорость: {lsps:.1f} с.лога/с")
             if details:
                 if eta_left is not None and status not in ("done", "error"):
                     details.append(f"(осталось ~{_format_eta_seconds(float(eta_left))})")
@@ -2201,6 +2243,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
+
+                # Track the timestamp of the last processed batch for timestamp-based
+                # progress bar and ETA — no pre-counting of rows required.
+                batch_period_end = payload.get("batch_period_end")
+                if batch_period_end:
+                    state["last_batch_ts"] = batch_period_end
 
                 _append_jsonl(
                     live_batches_path,

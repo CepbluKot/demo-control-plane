@@ -76,15 +76,17 @@
 - Готовый шаблон для старта: `my_summarizer.py::summarize_logs`.
 - В `my_summarizer.py` реализован map-reduce summarizer:
   - batched-fetch логов из ClickHouse;
-  - MAP: summary по чанкам;
-  - REDUCE: объединение partial summary в итоговый вывод;
-  - финальный дополнительный LLM-отчет в свободном формате (после структурированного reduce-summary);
-  - если LLM недоступна, включается эвристический fallback (pipeline не падает).
+  - MAP: LLM-анализ каждого чанка (хронологический порядок, секции: TIMELINE / FIRST_SYMPTOM / CAUSAL_HINTS / EVIDENCE / OPEN_QUESTIONS);
+  - REDUCE: объединение partial summary в post-mortem отчёт (INCIDENT_TIMELINE / FIRST_SIGNAL / ROOT_CAUSE_HYPOTHESES / CAUSAL_CHAIN / SUPPORTING_EVIDENCE / PRIORITY_ACTIONS);
+  - финальный freeform-нарратив (3-5 абзацев связным текстом для SRE-команды, без секций);
+  - если LLM недоступна, включается эвристический fallback (pipeline не падает);
   - в `.env` задается один полный SQL: `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
   - SQL должен возвращать логовые поля (минимум `timestamp`, остальное опционально);
-  - в SQL можно использовать плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
-  - `anomaly['service']` обязателен (fallback-сервиса больше нет);
-  - если в запросе нет `{offset}`, фетч работает как single-shot (одна страница).
+  - `anomaly['service']` обязателен;
+  - поддерживаются плейсхолдеры: `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
+  - **keyset-пейджинг** (рекомендуется): используй `{last_ts}` вместо `{offset}` — ClickHouse идёт по индексу, не скануирует с начала, нет MEMORY_LIMIT_EXCEEDED на больших объёмах;
+  - если нет ни `{offset}`, ни `{last_ts}` — single-shot (одна страница);
+  - промежуточные батчи не хранятся в RAM (выгружаются через progress callback в JSONL).
 
 ### Ручная страница `Logs Summarizer` (важно)
 
@@ -92,9 +94,14 @@
 - Для нескольких запросов используй разделитель строкой:
   - `-- QUERY --`
 - Запросы исполняются параллельно, результаты объединяются и сортируются по `timestamp` (хронологически).
+- При нескольких источниках каждая строка получает тег `_source` (query_1, query_2...) — LLM видит откуда запись.
+- Перед запуском выполняется `SELECT count()` по каждому шаблону — прогресс-бар и ETA работают с первого батча.
 - Если отдельный ClickHouse-запрос падает, он пропускается, ошибка показывается в UI, общий процесс не прерывается.
+- Метрики-контекст ограничен 50 000 строк (защита от OOM).
 - Во время выполнения параметры формы блокируются и разблокируются после завершения.
 - В UI есть live-прогресс, ETA (экстраполяция по фактической скорости обработки), итоговый красивый отчет и файлы-артефакты.
+- Поддерживаемые плейсхолдеры: `{period_start}`, `{period_end}`, `{limit}`, `{offset}`;
+  - **keyset-пейджинг**: `{last_ts}` вместо `{offset}` — рекомендуется для больших таблиц.
 
 Ожидаемый callable (один из поддерживаемых вариантов сигнатуры):
 
@@ -231,9 +238,14 @@ CONTROL_PLANE_LOGS_CLICKHOUSE_HOST=...
 CONTROL_PLANE_LOGS_CLICKHOUSE_PORT=8123
 CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME=...
 CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD=...
-CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, value FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
+# LIMIT/OFFSET (классика, но на больших объёмах может упасть с MEMORY_LIMIT_EXCEEDED):
+CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
+
+# Keyset-пейджинг (рекомендуется — ClickHouse использует индекс, нет OOM):
+# CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp > parseDateTimeBestEffort('{last_ts}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit}
+
 CONTROL_PLANE_LOGS_PAGE_LIMIT=1000
-CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
+CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp > parseDateTimeBestEffort('{last_ts}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit}
 CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE=1000
 CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE=200
 ```

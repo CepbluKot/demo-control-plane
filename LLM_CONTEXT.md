@@ -107,10 +107,16 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - берёт service из `anomaly['service']` (обязательное поле);
 - использует один полный SQL-шаблон из `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
 - SQL возвращает логовые поля (минимум `timestamp`);
-- поддерживает плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
-- если `{offset}` отсутствует, делает single-shot (одна страница);
-- возвращает `chunk_summaries` для live UI.
-- в промптах ориентирован на incident investigation (timeline + causal chain + root-cause hypotheses).
+- поддерживает плейсхолдеры: `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`, `{last_ts}`;
+- **keyset-пейджинг** (`{last_ts}`): вместо LIMIT/OFFSET курсором служит max(timestamp) предыдущей страницы — ClickHouse использует индекс, нет MEMORY_LIMIT_EXCEEDED; рекомендуется для больших таблиц;
+- если нет ни `{offset}`, ни `{last_ts}` — single-shot (одна страница);
+- ошибки ClickHouse перехватываются: страница пропускается, `on_error` callback, результат содержит `fetch_errors`;
+- `keep_map_batches_in_memory=False` по умолчанию — сырые строки не хранятся в RAM;
+- промпты ориентированы на incident investigation:
+  - MAP: TIMELINE / FIRST_SYMPTOM / CAUSAL_HINTS / EVIDENCE / OPEN_QUESTIONS (хронологический порядок);
+  - REDUCE: post-mortem (INCIDENT_TIMELINE / FIRST_SIGNAL / ROOT_CAUSE_HYPOTHESES / CAUSAL_CHAIN / SUPPORTING_EVIDENCE / PRIORITY_ACTIONS);
+  - freeform-нарратив: 3-5 абзацев связным текстом для SRE-команды (отдельный LLM-вызов после reduce);
+- возвращает словарь с `summary`, `freeform_summary`, `chunk_summaries`, `fetch_errors`, `stats`.
 
 Поддерживаемые сигнатуры callable:
 
@@ -171,23 +177,34 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 
 `streamlit_app.py` ожидает эти события и рендерит live-чат по ним.
 
-Для `Logs Summarizer`-страницы (ручной режим) также используются события `page_fetched`, `map_*`, `reduce_*`.
+Для `Logs Summarizer`-страницы (ручной режим) дополнительно:
+- `page_fetched` — страница загружена из ClickHouse
+- `map_batch_start` / `map_batch` — начало/конец LLM-анализа чанка
+- `map_start` / `map_done`
+- `reduce_start` / `reduce_group_start` / `reduce_group_done` / `reduce_done`
+- `freeform_start` / `freeform_done` — генерация свободного нарратива
+- `fetch_error` — ошибка ClickHouse на отдельной странице (не ломает пайплайн)
 
 ## 7) Ручная страница Logs Summarizer: поведение
 
 - В SQL-поле можно указывать несколько запросов; разделитель между ними:
   - `-- QUERY --`
-- Запросы выполняются параллельно и объединяются в общий поток.
+- Запросы выполняются параллельно и объединяются в общий поток через min-heap по `timestamp`.
+- При нескольких источниках каждая строка получает тег `_source` (query_1, query_2...) — LLM учитывает источник.
 - После объединения строки сортируются по `timestamp` в хронологическом порядке.
-- Ошибка отдельного ClickHouse-запроса не должна ломать весь процесс:
+- Перед запуском выполняется `SELECT count()` по каждому шаблону — прогресс-бар и ETA точны с первого батча.
+- Ошибка отдельного ClickHouse-запроса не ломает весь процесс:
   - запрос пропускается;
-  - ошибка логируется;
-  - ошибка показывается в UI и итоговом отчете.
+  - ошибка логируется и показывается в UI;
+  - в итоговый отчёт попадает список `fetch_errors`.
+- Метрики-контекст ограничен 50 000 строк суммарно (защита от OOM).
 - На время выполнения параметры формы блокируются.
 - После завершения:
-  - появляется структурированный итоговый summary;
-  - дополнительно генерируется свободный итоговый summary (LLM в best-format);
+  - появляется структурированный итоговый summary (post-mortem формат);
+  - дополнительно генерируется freeform-нарратив (3-5 абзацев для SRE-команды);
   - результаты сохраняются в `json/md` + `jsonl` live-артефакты.
+- Поддерживаемые плейсхолдеры в SQL: `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{last_ts}`.
+  - `{last_ts}` — keyset-пейджинг: рекомендуется для больших таблиц во избежание MEMORY_LIMIT_EXCEEDED.
 
 ## 8) UI-инварианты (важно не ломать)
 
@@ -224,6 +241,9 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - В окружениях без writable `~/.config/matplotlib` возможен warning; используйте `MPLCONFIGDIR`.
 - Реальные интеграции суммаризатора/алертов не тестируются в `TEST_MODE`.
 - Для `clickhouse`-source query обязан вернуть корректные `timestamp/value`.
+- Запросы с `LIMIT N OFFSET M` на больших таблицах ClickHouse могут вызывать MEMORY_LIMIT_EXCEEDED (code 241): ClickHouse читает все строки до OFFSET в RAM. Решение — keyset-пейджинг через `{last_ts}`.
+- При keyset-пейджинге дубли строк с одинаковым timestamp на границе страниц теоретически возможны — используй миллисекундную точность в `timestamp`.
+- Метрики-контекст в `Logs Summarizer` ограничен 50 000 строк (константа `MAX_METRICS_ROWS_TOTAL`).
 
 ## 11) Рекомендуемый smoke-check перед merge
 
