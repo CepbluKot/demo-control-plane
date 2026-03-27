@@ -216,10 +216,15 @@ def _strip_trailing_limit_offset(query: str) -> str:
         "",
         stripped,
     )
+    without_offset_only = re.sub(
+        r"(?is)\s+OFFSET\s+\d+\s*$",
+        "",
+        without_limit_offset,
+    )
     without_limit_only = re.sub(
         r"(?is)\s+LIMIT\s+\d+\s*$",
         "",
-        without_limit_offset,
+        without_offset_only,
     )
     return without_limit_only
 
@@ -240,6 +245,23 @@ def _build_tail_paged_query(
         f"{base_query}"
         f") AS cp_src ORDER BY timestamp DESC LIMIT {safe_tail_limit}"
         ") AS cp_tail "
+        "ORDER BY timestamp ASC "
+        f"LIMIT {safe_limit} OFFSET {safe_offset}"
+    )
+
+
+def _wrap_with_limit_offset(
+    *,
+    base_query: str,
+    limit: int,
+    offset: int,
+) -> str:
+    safe_limit = max(int(limit), 1)
+    safe_offset = max(int(offset), 0)
+    return (
+        "SELECT * FROM ("
+        f"{base_query}"
+        ") AS cp_logs_page "
         "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
@@ -311,10 +333,11 @@ def _build_db_fetch_page(
 ) -> Callable[..., List[Dict[str, Any]]]:
     service = _resolve_service(anomaly)
     query_template = _resolve_logs_query_template()
-    has_offset_placeholder = "{offset}" in query_template
+    query_template_lc = query_template.lower()
+    has_offset_placeholder = "{offset}" in query_template_lc
     # Keyset pagination: if template contains {last_ts}, we use timestamp-based pagination
     # instead of LIMIT/OFFSET to avoid ClickHouse MEMORY_LIMIT_EXCEEDED on large offsets.
-    has_last_ts_placeholder = "{last_ts}" in query_template
+    has_last_ts_placeholder = "{last_ts}" in query_template_lc
     # Mutable single-element list so the inner closure can update state between pages
     _keyset_last_ts: List[Optional[str]] = [None]
 
@@ -368,10 +391,7 @@ def _build_db_fetch_page(
                 projected_rows.append({col: row.get(col) for col in columns})
             return projected_rows
 
-        # --- Legacy LIMIT/OFFSET path ---
-        if fetch_mode != "tail_n_logs" and offset > 0 and not has_offset_placeholder:
-            return []
-
+        # --- Legacy path ---
         effective_period_start = (
             _EARLIEST_PERIOD_START if fetch_mode == "tail_n_logs" else period_start
         )
@@ -391,8 +411,19 @@ def _build_db_fetch_page(
                 limit=limit,
                 offset=offset,
             )
-        else:
+        elif has_offset_placeholder:
+            # SQL template already supports paging placeholders.
             query = rendered_query
+        else:
+            # Auto-paging fallback:
+            # if template has no OFFSET placeholder, page it externally to avoid
+            # "first 1000 rows only" behavior when SQL has a fixed LIMIT.
+            base_query = _strip_trailing_limit_offset(rendered_query)
+            query = _wrap_with_limit_offset(
+                base_query=base_query,
+                limit=limit,
+                offset=offset,
+            )
 
         try:
             page_df = _query_logs_df(query)

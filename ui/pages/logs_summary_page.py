@@ -855,7 +855,7 @@ def _build_window_query_for_plain_sql(
 ) -> str:
     safe_limit = max(int(limit), 1)
     safe_offset = max(int(offset), 0)
-    base = _normalize_sql_query_text(base_query)
+    base = _strip_trailing_limit_offset(_normalize_sql_query_text(base_query))
     start_escaped = _escape_sql_literal(period_start_iso)
     end_escaped = _escape_sql_literal(period_end_iso)
     # Only add ORDER BY to the inner subquery if the user's SQL doesn't already have one.
@@ -897,7 +897,12 @@ def _build_query_for_template(
         )
         if uses_paging_template:
             return rendered_query
-        return _wrap_with_limit_offset(query=rendered_query, limit=limit, offset=offset)
+        rendered_without_limit = _strip_trailing_limit_offset(rendered_query)
+        return _wrap_with_limit_offset(
+            query=rendered_without_limit,
+            limit=limit,
+            offset=offset,
+        )
 
     return _build_window_query_for_plain_sql(
         base_query=template,
