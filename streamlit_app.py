@@ -929,6 +929,7 @@ def _render_logs_summary_page() -> None:
             int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE", settings.CONTROL_PLANE_UI_LOGS_SUMMARY_BATCH_SIZE)),
             1,
         ),
+        map_workers=max(int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAP_WORKERS", 1)), 1),
         test_mode=TEST_MODE,
         loopback_minutes=LOOPBACK_MINUTES,
         logs_tail_limit=LOGS_TAIL_LIMIT,

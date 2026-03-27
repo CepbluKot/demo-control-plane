@@ -174,6 +174,7 @@ class LogsSummaryPageDeps:
     default_sql_query: str
     default_metrics_query: str
     output_dir: Path
+    map_workers: int = 1
 
 
 @dataclass
@@ -1089,20 +1090,25 @@ def _build_freeform_summary_prompt(
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
     return (
-        "Сделай финальный отчет по расследованию инцидента в СВОБОДНОМ формате (без фиксированных секций), "
-        "в том виде, который ты считаешь максимально понятным для SRE-команды.\n\n"
-        "Требования к содержанию:\n"
-        "- Что произошло и когда (понятный таймлайн).\n"
-        "- Что на что повлияло (причинно-следственные связи).\n"
-        "- Наиболее вероятная первопричина и альтернативные гипотезы.\n"
-        "- Подтверждающие сигналы из логов.\n"
-        "- Приоритетный план действий (немедленно / далее).\n"
-        "- Если есть неопределенность — явно укажи ее.\n\n"
-        f"Период расследования: [{period_start}, {period_end})\n"
-        f"Контекст пользователя: {goal_block}\n"
-        f"Техническая статистика: {stats}\n\n"
-        f"Контекст по метрикам:\n{metrics_block}\n\n"
-        "Ниже структурированное summary, на основе которого нужно сделать улучшенную финальную версию:\n"
+        "Ты пишешь итоговый отчёт об инциденте для дежурного SRE-инженера.\n\n"
+        f"КОНТЕКСТ ИНЦИДЕНТА:\n{goal_block}\n\n"
+        "Ниже — структурированный анализ логов. На его основе напиши отчёт строго по шаблону:\n\n"
+        "## Что произошло\n"
+        "2-3 предложения: суть инцидента простым языком.\n\n"
+        "## Хронология\n"
+        "Ключевые события с временными метками (только подтверждённые логами).\n\n"
+        "## Объяснение алертов\n"
+        "Для каждого алерта из контекста:\n"
+        "- [Название алерта] — объяснение найдено / частично / не найдено\n"
+        "  Что показывают логи: ...\n\n"
+        "## Первопричина\n"
+        "[ФАКТ] или [ГИПОТЕЗА]: конкретное утверждение с доказательством из логов.\n\n"
+        "## Что делать прямо сейчас\n"
+        "Конкретные шаги (не \"проверить ресурсы\", а \"проверить /var на node-X, т.к. логи показывают...\").\n\n"
+        "Если данных недостаточно для какого-то раздела — прямо напиши об этом.\n\n"
+        f"Период: [{period_start}, {period_end})\n"
+        f"Метрики: {metrics_block}\n\n"
+        "Структурированный анализ логов:\n"
         f"{final_summary}"
     )
 
@@ -1258,6 +1264,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"SQL метрик: `{state.get('metrics_queries_count', 0)}`",
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
+                        f"MAP workers: `{state.get('map_workers', 1)}`",
                     ]
                 )
             )
@@ -1400,13 +1407,14 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     st.code(str(state.get("live_batches_path")))
 
 
-def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size: int) -> Any:
+def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size: int, map_workers: int = 1) -> Any:
     try:
         return deps.summarizer_config_cls(
             page_limit=db_batch_size,
             llm_chunk_rows=llm_batch_size,
             keep_map_batches_in_memory=False,
             keep_map_summaries_in_result=False,
+            map_workers=max(map_workers, 1),
         )
     except TypeError:
         return deps.summarizer_config_cls(
@@ -1452,6 +1460,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_end_dt": end_default,
         "logs_sum_db_batch": max(int(deps.db_batch_size), 1),
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
+        "logs_sum_map_workers": max(int(deps.map_workers), 1),
         "logs_sum_demo_mode": bool(deps.test_mode),
         "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), 1000),
         "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 220),
@@ -1664,6 +1673,20 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             key="logs_sum_llm_batch",
             disabled=is_running,
         )
+        st.number_input(
+            "MAP workers (параллельные LLM вызовы)",
+            min_value=1,
+            max_value=32,
+            step=1,
+            key="logs_sum_map_workers",
+            disabled=is_running,
+            help=(
+                "Сколько MAP-батчей обрабатывается параллельно. "
+                "1 = последовательно (безопасно, порядок гарантирован). "
+                "2–8 = ускоряет суммаризацию при медленном LLM. "
+                "Результаты всегда сохраняются в хронологическом порядке."
+            ),
+        )
         st.toggle(
             "Демо режим (без БД)",
             key="logs_sum_demo_mode",
@@ -1694,6 +1717,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     end_dt_text = str(st.session_state.get("logs_sum_end_dt", end_default))
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
+    map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1)))
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
     demo_logs_count = int(st.session_state.get("logs_sum_demo_logs_count", max(int(deps.logs_tail_limit), 1000)))
 
@@ -1719,6 +1743,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "end_dt_text": end_dt_text,
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
+            "map_workers": map_workers,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1748,6 +1773,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "end_dt_text": end_dt_text,
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
+            "map_workers": map_workers,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1763,6 +1789,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     end_dt_text = str(active_params.get("end_dt_text", end_dt_text))
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
+    map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
 
@@ -1919,6 +1946,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "window_minutes": window_minutes,
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
+        "map_workers": map_workers,
         "logs_processed": 0,
         "logs_total": None,
         "events": (
@@ -2339,18 +2367,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         llm_context_blocks: List[str] = []
         if goal_text:
             llm_context_blocks.append(
-                "Контекст по алертам/инциденту от пользователя:\n"
-                f"{goal_text}"
+                "ИНЦИДЕНТ ДЛЯ РАССЛЕДОВАНИЯ:\n"
+                f"{goal_text}\n\n"
+                "ТВОЯ ЗАДАЧА: найти в логах конкретные события, которые объясняют перечисленные алерты.\n"
+                "Для каждого алерта из контекста: было ли что-то в логах ДО него, что могло его вызвать?\n"
+                "Привязывай каждый вывод к конкретному алерту (по имени/времени/ноде из контекста)."
             )
         if metrics_context_text.strip():
             llm_context_blocks.append(
-                "Контекст по метрикам (агрегированный по сервисам):\n"
+                "МЕТРИКИ (агрегированный контекст по сервисам):\n"
                 f"{metrics_context_text.strip()}"
             )
-        llm_context_blocks.append(
-            "Сфокусируйся на причинно-следственном разборе: почему алерты сработали, "
-            "какие события этому предшествовали и что стало триггером."
-        )
 
         context_prefix = "\n\n".join(llm_context_blocks).strip()
 
@@ -2363,7 +2390,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         summarizer = deps.period_log_summarizer_cls(
             db_fetch_page=_db_fetch_page,
             llm_call=llm_call,
-            config=_build_config(deps, db_batch_size, llm_batch_size),
+            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
             on_progress=_on_progress,
         )
         try:

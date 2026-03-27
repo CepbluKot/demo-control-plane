@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -60,6 +61,11 @@ class SummarizerConfig:
     adaptive_reduce_on_overflow: bool = True
     keep_map_batches_in_memory: bool = False
     keep_map_summaries_in_result: bool = False
+    # Number of parallel LLM workers for the MAP phase.
+    # 1 = sequential (safe default).  Set to 3-5 for a significant speedup when the
+    # LLM endpoint supports concurrent requests — total MAP time becomes roughly
+    # ceil(n_batches / map_workers) × avg_llm_latency instead of n_batches × avg_llm_latency.
+    map_workers: int = 1
 
 
 @dataclass
@@ -454,41 +460,12 @@ def _estimate_total_logs(
 
 
 def _heuristic_llm_call(prompt: str) -> str:
-    lowered = prompt.lower()
-    keywords = (
-        "error",
-        "exception",
-        "timeout",
-        "failed",
-        "fatal",
-        "critical",
-    )
-    hits = [kw for kw in keywords if kw in lowered]
-    if not hits:
-        return (
-            "INCIDENT_TIMELINE:\n"
-            "- В текущем фрагменте нет выраженной критичной последовательности событий.\n"
-            "ROOT_CAUSE_HYPOTHESES:\n"
-            "- Причина алертов может быть вне этого батча или в соседних временных окнах.\n"
-            "CAUSAL_CHAIN:\n"
-            "- Подтвержденная цепочка не выявлена в данном фрагменте логов.\n"
-            "SUPPORTING_EVIDENCE:\n"
-            "- Низкая плотность error/timeout/fatal сигналов.\n"
-            "PRIORITY_ACTIONS:\n"
-            "- Проверить соседние батчи и инфраструктурные события в периоде перед алертом."
-        )
-    top_hits = ", ".join(sorted(set(hits)))
     return (
-        "INCIDENT_TIMELINE:\n"
-        f"- Зафиксирован рост проблемных событий: {top_hits}.\n"
-        "ROOT_CAUSE_HYPOTHESES:\n"
-        "- Вероятна деградация зависимого сервиса или локальная перегрузка.\n"
-        "CAUSAL_CHAIN:\n"
-        "- Рост ошибок/timeout -> накопление retry/очередей -> срабатывание алертов.\n"
-        "SUPPORTING_EVIDENCE:\n"
-        f"- Количество ключевых проблемных сигналов в батче: {len(hits)}.\n"
-        "PRIORITY_ACTIONS:\n"
-        "- Проверить 5xx/timeout, saturation по ресурсам и последние изменения/деплои."
+        "[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
+        "ХРОНОЛОГИЯ: данных нет (LLM не настроена).\n"
+        "ПЕРВОПРИЧИНА: [ГИПОТЕЗА] не определена — требуется настройка LLM.\n"
+        "ОБЪЯСНЕНИЕ АЛЕРТОВ: анализ недоступен.\n"
+        "ПРОБЕЛЫ: настройте OPENAI_API_BASE_DB и OPENAI_API_KEY_DB для получения реального анализа."
     )
 
 
@@ -504,10 +481,12 @@ def _make_llm_call() -> LLMTextCaller:
             response = communicate_with_llm(
                 message=prompt,
                 system_prompt=(
-                    "Ты senior SRE-инженер-расследователь инцидентов. "
-                    "Твоя цель: найти вероятные причины алертов, восстановить "
-                    "последовательность событий (timeline), причинно-следственные связи "
-                    "и выдать практические шаги проверки."
+                    "Ты senior SRE-инженер, специализирующийся на расследовании инцидентов.\n"
+                    "Правила:\n"
+                    "- Каждый вывод основывай на конкретных фактах из логов (цитата, timestamp).\n"
+                    "- Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА].\n"
+                    "- Если данных недостаточно — прямо пиши \"данных недостаточно\".\n"
+                    "- Не генерируй generic выводы (\"возможна деградация\") без подтверждения из логов."
                 ),
             )
             return str(response).strip()
@@ -585,91 +564,177 @@ class PeriodLogSummarizer:
             },
         )
 
-        while True:
-            page = self.db_fetch_page(
-                columns=columns,
-                period_start=period_start,
-                period_end=period_end,
-                limit=self.config.page_limit,
-                offset=offset,
-            )
-            if not page:
-                break
+        # Each pending entry: (Future | None, batch_index, rows_count, bp_start, bp_end, rows_snapshot)
+        # rows_snapshot is kept only for the progress callback; raw rows are not stored otherwise.
+        _PendingItem = Tuple[
+            Optional[Future],  # type: ignore[type-arg]
+            int,               # batch_index
+            int,               # rows_count
+            Optional[str],     # batch_period_start
+            Optional[str],     # batch_period_end
+            List[Dict[str, Any]],  # rows snapshot for progress callback
+        ]
+        pending_items: List[_PendingItem] = []
+        parallel = self.config.map_workers > 1
+        executor = ThreadPoolExecutor(max_workers=self.config.map_workers) if parallel else None
 
-            pages_fetched += 1
-            rows_processed += len(page)
-            offset += len(page)
-            self._emit_progress(
-                "page_fetched",
-                {
-                    "page_index": pages_fetched,
-                    "page_rows": len(page),
-                    "rows_fetched": rows_processed,
-                    "rows_total": total_rows_estimate,
-                },
-            )
+        try:
+            while True:
+                page = self.db_fetch_page(
+                    columns=columns,
+                    period_start=period_start,
+                    period_end=period_end,
+                    limit=self.config.page_limit,
+                    offset=offset,
+                )
+                if not page:
+                    break
 
-            for i in range(0, len(page), self.config.llm_chunk_rows):
-                rows_chunk = page[i : i + self.config.llm_chunk_rows]
-                ranked_chunk = rows_chunk  # keep chronological order; critical rows extracted inside prompt
-                next_batch_index = map_batch_index
-                batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
+                pages_fetched += 1
+                rows_processed += len(page)
+                offset += len(page)
                 self._emit_progress(
-                    "map_batch_start",
+                    "page_fetched",
                     {
-                        "batch_index": next_batch_index,
-                        "batch_total": estimated_batch_total,
-                        "batch_logs_count": len(ranked_chunk),
-                        "batch_period_start": batch_period_start,
-                        "batch_period_end": batch_period_end,
-                        "rows_processed": rows_mapped,
+                        "page_index": pages_fetched,
+                        "page_rows": len(page),
+                        "rows_fetched": rows_processed,
                         "rows_total": total_rows_estimate,
                     },
                 )
-                prompt = self._build_chunk_prompt(
-                    period_start=period_start,
-                    period_end=period_end,
-                    columns=columns,
-                    rows=ranked_chunk,
-                )
-                chunk_summary = self.llm_call(prompt).strip()
-                if not chunk_summary:
-                    chunk_summary = "Пустой ответ LLM на map-этапе."
+
+                for i in range(0, len(page), self.config.llm_chunk_rows):
+                    rows_chunk = page[i : i + self.config.llm_chunk_rows]
+                    next_batch_index = map_batch_index
+                    batch_period_start, batch_period_end = _extract_batch_period(rows_chunk)
+                    self._emit_progress(
+                        "map_batch_start",
+                        {
+                            "batch_index": next_batch_index,
+                            "batch_total": estimated_batch_total,
+                            "batch_logs_count": len(rows_chunk),
+                            "batch_period_start": batch_period_start,
+                            "batch_period_end": batch_period_end,
+                            "rows_processed": rows_mapped,
+                            "rows_total": total_rows_estimate,
+                        },
+                    )
+                    prompt = self._build_chunk_prompt(
+                        period_start=period_start,
+                        period_end=period_end,
+                        columns=columns,
+                        rows=rows_chunk,
+                    )
+                    future: Optional[Future] = None  # type: ignore[type-arg]
+                    if executor is not None:
+                        future = executor.submit(self.llm_call, prompt)
+                    else:
+                        # Sequential: run inline and wrap result as a fake "future"
+                        try:
+                            _result = self.llm_call(prompt)
+                        except Exception:
+                            logger.exception("LLM call failed on batch %s", next_batch_index)
+                            _result = _heuristic_llm_call(prompt)
+                        future = None
+                        # Store result directly — reuse the same pending tuple structure
+                        pending_items.append((
+                            None,
+                            next_batch_index,
+                            len(rows_chunk),
+                            batch_period_start,
+                            batch_period_end,
+                            list(rows_chunk),
+                        ))
+                        # Process immediately in sequential mode (maintains existing progress behaviour)
+                        chunk_summary = (_result or "").strip() or "Пустой ответ LLM на map-этапе."
+                        chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
+                        map_summaries.append(chunk_summary)
+                        if self.config.keep_map_batches_in_memory:
+                            map_batches.append({
+                                "batch_index": next_batch_index,
+                                "rows_count": len(rows_chunk),
+                                "summary": chunk_summary,
+                                "batch_period_start": batch_period_start,
+                                "batch_period_end": batch_period_end,
+                            })
+                        rows_mapped += len(rows_chunk)
+                        self._emit_progress(
+                            "map_batch",
+                            {
+                                "batch_index": next_batch_index,
+                                "batch_total": estimated_batch_total,
+                                "batch_summary": chunk_summary,
+                                "batch_logs_count": len(rows_chunk),
+                                "batch_logs": list(rows_chunk),
+                                "batch_period_start": batch_period_start,
+                                "batch_period_end": batch_period_end,
+                                "rows_processed": rows_mapped,
+                                "rows_total": total_rows_estimate,
+                            },
+                        )
+                        map_batch_index += 1
+                        llm_calls += 1
+                        continue  # skip appending to pending_items again
+
+                    # Parallel mode: store future for later collection
+                    pending_items.append((
+                        future,
+                        next_batch_index,
+                        len(rows_chunk),
+                        batch_period_start,
+                        batch_period_end,
+                        list(rows_chunk),
+                    ))
+                    map_batch_index += 1
+
+                if len(page) < self.config.page_limit:
+                    break
+
+        except Exception:
+            if executor is not None:
+                executor.shutdown(wait=False)
+            raise
+        else:
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+        # --- Parallel mode: collect futures in submission order ---
+        if parallel and pending_items:
+            for fut, batch_idx, nrows, bp_start, bp_end, rows_snap in pending_items:
+                if fut is None:
+                    continue  # sequential items already handled above
+                try:
+                    result_text = fut.result()
+                except Exception:
+                    logger.exception("Parallel LLM call failed on batch %s; using fallback", batch_idx)
+                    result_text = _heuristic_llm_call("")
+                chunk_summary = (result_text or "").strip() or "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
                 if self.config.keep_map_batches_in_memory:
-                    # Store only metadata — raw rows are already sent via progress callback
-                    # and written to disk (JSONL) by the consumer. Keeping rows here
-                    # causes O(rows) memory growth with no benefit.
-                    map_batches.append(
-                        {
-                            "batch_index": next_batch_index,
-                            "rows_count": len(ranked_chunk),
-                            "summary": chunk_summary,
-                            "batch_period_start": batch_period_start,
-                            "batch_period_end": batch_period_end,
-                        }
-                    )
-                rows_mapped += len(ranked_chunk)
+                    map_batches.append({
+                        "batch_index": batch_idx,
+                        "rows_count": nrows,
+                        "summary": chunk_summary,
+                        "batch_period_start": bp_start,
+                        "batch_period_end": bp_end,
+                    })
+                rows_mapped += nrows
+                llm_calls += 1
                 self._emit_progress(
                     "map_batch",
                     {
-                        "batch_index": next_batch_index,
+                        "batch_index": batch_idx,
                         "batch_total": estimated_batch_total,
                         "batch_summary": chunk_summary,
-                        "batch_logs_count": len(ranked_chunk),
-                        "batch_logs": [dict(row) for row in ranked_chunk],
-                        "batch_period_start": batch_period_start,
-                        "batch_period_end": batch_period_end,
+                        "batch_logs_count": nrows,
+                        "batch_logs": rows_snap,
+                        "batch_period_start": bp_start,
+                        "batch_period_end": bp_end,
                         "rows_processed": rows_mapped,
                         "rows_total": total_rows_estimate,
                     },
                 )
-                map_batch_index += 1
-                llm_calls += 1
-
-            if len(page) < self.config.page_limit:
-                break
 
         if not map_summaries:
             self._emit_progress(
@@ -1001,16 +1066,27 @@ class PeriodLogSummarizer:
         critical_rows = [row for row in rows if self._row_problem_score(row, list(columns)) > 0]
 
         lines = [
-            "Ты senior SRE-аналитик. Цель: восстановить последовательность событий и понять, что произошло.",
-            "Это MAP-этап: анализируй только этот кусок логов как часть общего расследования.",
-            "ВАЖНО: строки идут в хронологическом порядке — сохраняй эту последовательность в анализе.",
+            "Это MAP-этап расследования инцидента. Анализируй только этот фрагмент логов.",
+            "ВАЖНО: если выше в запросе есть контекст инцидента/алертов — используй его.",
+            "Твоя задача: найти в этом фрагменте конкретные доказательства, объясняющие инцидент.",
+            "Строки идут в хронологическом порядке — сохраняй эту последовательность.",
+            "",
             "Верни обычный текст (не JSON) со строгими секциями:",
-            "1) TIMELINE (ключевые события по времени, с таймстемпами)",
-            "2) FIRST_SYMPTOM (самый ранний признак проблемы в этом куске)",
-            "3) CAUSAL_HINTS (что могло к чему привести; локальные причинные цепочки)",
-            "4) EVIDENCE (конкретные строки логов, подтверждающие выводы)",
-            "5) OPEN_QUESTIONS (что неясно; что нужно проверить в других периодах или источниках)",
-            "Фокус на деградациях, сбоях, timeouts, error-цепочках. Не теряй хронологию.",
+            "",
+            "СОБЫТИЯ",
+            "  Список реальных событий из логов: [timestamp] компонент: что произошло — строка N (цитата)",
+            "  Только факты из логов, без интерпретации.",
+            "",
+            "ПРИЗНАКИ ИНЦИДЕНТА",
+            "  Строки/события, которые могут объяснять алерты из контекста (если контекст есть).",
+            "  Формат: \"Алерт X (из контекста) ← строка N: [цитата]\"",
+            "  Если контекста нет — что выглядит как причина проблем.",
+            "",
+            "АНОМАЛИИ",
+            "  Что выглядит ненормально или неожиданно в этом фрагменте.",
+            "",
+            "ВОПРОСЫ",
+            "  Что непонятно; что нужно найти в других фрагментах или источниках.",
             "",
             f"Период: [{period_start}, {period_end})",
             f"Строк в куске: {len(rows)}",
@@ -1029,19 +1105,6 @@ class PeriodLogSummarizer:
                 rendered_parts.append(f"{col}={text}")
             lines.append(f"{idx}. " + " | ".join(rendered_parts))
 
-        if critical_rows:
-            lines.append("")
-            lines.append(f"--- Строки с ошибками/проблемами ({len(critical_rows)} шт.) ---")
-            for row in critical_rows[:20]:
-                rendered_parts = []
-                for col in display_columns:
-                    value = row.get(col)
-                    if value is None or value == "":
-                        continue
-                    text = self._truncate(str(value), self.config.max_cell_chars)
-                    rendered_parts.append(f"{col}={text}")
-                lines.append("• " + " | ".join(rendered_parts))
-
         return "\n".join(lines)
 
     def _build_reduce_prompt(
@@ -1053,16 +1116,33 @@ class PeriodLogSummarizer:
         summaries: List[str],
     ) -> str:
         lines = [
-            "Ты senior SRE-аналитик. Это REDUCE-этап map-reduce расследования инцидента.",
-            "Объедини частичные наблюдения в единый хронологический разбор.",
+            "Это REDUCE-этап расследования инцидента.",
+            "ВАЖНО: если выше есть контекст инцидента/алертов — привяжи каждый вывод к конкретным алертам.",
+            "Объедини частичные наблюдения из батчей в единый разбор.",
+            "Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА]. Дубли убирай.",
+            "",
             "Верни обычный текст (не JSON) со строгими секциями:",
-            "1) INCIDENT_TIMELINE (что произошло и когда — хронологически, с таймстемпами где есть)",
-            "2) FIRST_SIGNAL (самый ранний обнаруженный признак проблемы: когда и что именно)",
-            "3) ROOT_CAUSE_HYPOTHESES (ранжируй по вероятности; для каждой — обоснование и почему может быть неверной)",
-            "4) CAUSAL_CHAIN (пошаговая цепочка: событие A → привело к B → вызвало C → сработал алерт)",
-            "5) SUPPORTING_EVIDENCE (конкретные факты/строки из логов, подтверждающие выводы)",
-            "6) PRIORITY_ACTIONS (что проверить прямо сейчас и что сделать дальше)",
-            "Сохраняй хронологию. Убирай дубли. Сомнительные выводы явно помечай как гипотезы.",
+            "",
+            "ХРОНОЛОГИЯ",
+            "  Список событий с реальными timestamp'ами из логов (не сочинёнными).",
+            "  Формат: [timestamp] — событие (источник: batch N)",
+            "",
+            "ПЕРВОПРИЧИНА",
+            "  Одно конкретное утверждение + [ФАКТ] или [ГИПОТЕЗА] + доказательство из логов.",
+            "  Если неизвестна — напиши: \"данных недостаточно для вывода о первопричине\".",
+            "",
+            "ОБЪЯСНЕНИЕ АЛЕРТОВ",
+            "  Для каждого алерта из контекста выше (если контекст есть):",
+            "  - Алерт: [название/время из контекста]",
+            "  - Лог-объяснение: [что нашли] или \"не нашли объяснения в логах\"",
+            "  - Доказательство: [цитата из batch N]",
+            "",
+            "ЦЕПОЧКА СОБЫТИЙ",
+            "  Конкретная цепочка: событие A (timestamp) → B (timestamp) → алерт C.",
+            "  Только если цепочка подтверждена логами.",
+            "",
+            "ПРОБЕЛЫ",
+            "  Что осталось необъяснённым; что нужно проверить дополнительно.",
             "",
             f"Период: [{period_start}, {period_end})",
             f"Reduce round: {reduce_round}",
@@ -1083,11 +1163,12 @@ class PeriodLogSummarizer:
         structured_summary: str,
     ) -> str:
         return "\n".join([
-            "Ты senior SRE-инженер. На основе структурированного анализа инцидента ниже",
-            "напиши понятный нарратив для SRE-команды — 3-5 абзацев без заголовков и секций.",
-            "Включи: что произошло, в какой последовательности, вероятные причины,",
-            "что поможет подтвердить или опровергнуть гипотезы, какие первые шаги.",
-            "Пиши как опытный инженер коллегам — конкретно, без воды, с акцентом на практику.",
+            "На основе структурированного анализа инцидента ниже напиши черновой нарратив.",
+            "Это промежуточный результат для SRE-команды — 3-5 абзацев связным текстом.",
+            "Включи: что произошло, в какой последовательности, вероятные причины с пометками [ФАКТ]/[ГИПОТЕЗА],",
+            "что нужно проверить дополнительно.",
+            "Пиши конкретно — ссылайся на реальные timestamp'ы и цитаты из логов, не генерируй абстракции.",
+            "Если данных недостаточно для какого-то утверждения — прямо напиши об этом.",
             "",
             f"Период: [{period_start}, {period_end})",
             "",
