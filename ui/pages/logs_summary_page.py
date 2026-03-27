@@ -249,7 +249,7 @@ class LogsSummaryPageDeps:
     logs_fetch_mode: str = "time_window"
     map_workers: int = 1
     max_retries: int = -1
-    llm_timeout: int = 60
+    llm_timeout: int = 600
 
 
 @dataclass
@@ -1360,7 +1360,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                         f"MAP workers: `{state.get('map_workers', 1)}`",
                         ("Ретраи LLM: `∞`" if retries_num < 0 else f"Ретраи LLM: `{retries_num}`"),
-                        f"Таймаут LLM: `{state.get('llm_timeout', 60)}s`",
+                        f"Таймаут LLM: `{state.get('llm_timeout', 600)}s`",
                     ]
                 )
             )

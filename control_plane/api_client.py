@@ -5,6 +5,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from settings import settings
 from .trace import log_event
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def fetch_anomalies_from_api(query: str) -> Tuple[List[Dict[str, Any]], Dict[str
             params={"query": query},
             headers={"accept": "application/json"},
             json={},
-            timeout=30,
+            timeout=max(int(getattr(settings, "CONTROL_PLANE_HTTP_TIMEOUT_SECONDS", 600)), 1),
         )
         response.raise_for_status()
         log_event(logger, "fetch_anomalies_from_api.response", status_code=response.status_code)

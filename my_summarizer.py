@@ -100,7 +100,7 @@ def _build_chat_completions_url(api_base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 60.0) -> str:
+def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 600.0) -> str:
     if not has_required_env():
         raise RuntimeError("OPENAI_API_BASE_DB and OPENAI_API_KEY_DB are required")
 
@@ -520,7 +520,7 @@ def _make_llm_call(
     on_retry: Optional[Callable[[int, int, Exception], None]] = None,
     on_attempt: Optional[Callable[[int, int, float], None]] = None,
     on_result: Optional[Callable[[int, int, bool, float, Optional[str]], None]] = None,
-    llm_timeout: float = 60.0,
+    llm_timeout: float = 600.0,
 ) -> LLMTextCaller:
     if not has_required_env():
         logger.warning(
