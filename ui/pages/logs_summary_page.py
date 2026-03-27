@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import math
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -18,6 +22,7 @@ MAX_LOG_ROWS_PREVIEW = 80
 LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
 RUNNING_SESSION_KEY = "logs_summary_running"
 RUN_PARAMS_SESSION_KEY = "logs_summary_run_params"
+FORM_ERROR_SESSION_KEY = "logs_summary_form_error"
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -144,6 +149,7 @@ class LogsSummaryPageDeps:
     summarizer_config_cls: Any
     make_llm_call: Callable[[], Callable[[str], str]]
     query_logs_df: Callable[[str], pd.DataFrame]
+    query_metrics_df: Callable[[str], pd.DataFrame]
     render_scrollable_text: Callable[..., None]
     render_pretty_summary_text: Callable[..., None]
     infer_batch_period: Callable[[Dict[str, Any]], tuple[Optional[str], Optional[str]]]
@@ -152,6 +158,7 @@ class LogsSummaryPageDeps:
     logs_batch_table_height: int
     sql_textarea_height: int
     default_sql_query: str
+    default_metrics_query: str
     output_dir: Path
 
 
@@ -164,6 +171,65 @@ def _normalize_sql_query_text(query: str) -> str:
     while normalized.endswith(";"):
         normalized = normalized[:-1].rstrip()
     return normalized
+
+
+def _split_query_templates(raw_query: str) -> List[str]:
+    normalized = str(raw_query).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    # Preferred explicit delimiter between multiple SQL templates.
+    by_marker = re.split(r"(?im)^\s*(?:--\s*QUERY\s*--|/\*\s*QUERY\s*\*/|---)\s*$", normalized)
+    marker_parts = [_normalize_sql_query_text(part) for part in by_marker if part and part.strip()]
+    if len(marker_parts) > 1:
+        return marker_parts
+
+    # Fallback: split by semicolon terminators.
+    by_semicolon = [p.strip() for p in re.split(r";\s*(?:\n|$)", normalized) if p.strip()]
+    if len(by_semicolon) > 1:
+        return [_normalize_sql_query_text(part) for part in by_semicolon]
+
+    return [_normalize_sql_query_text(normalized)]
+
+
+def _new_query_item(text: str = "") -> Dict[str, str]:
+    return {"id": uuid4().hex, "text": str(text)}
+
+
+def _normalize_query_items(
+    raw_items: Any,
+    *,
+    default_value: str,
+    min_items: int,
+) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if isinstance(item, dict):
+                item_id = str(item.get("id") or uuid4().hex)
+                item_text = str(item.get("text") or "")
+                items.append({"id": item_id, "text": item_text})
+            elif isinstance(item, str):
+                items.append(_new_query_item(item))
+
+    if min_items > 0:
+        while len(items) < min_items:
+            items.append(_new_query_item(default_value if not items else ""))
+    return items
+
+
+def _extract_queries_from_items(raw_items: Any) -> List[str]:
+    if not isinstance(raw_items, list):
+        return []
+    queries: List[str] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            text = str(item.get("text") or "")
+        else:
+            text = str(item or "")
+        if text.strip():
+            queries.append(text)
+    return queries
 
 
 def _query_uses_any_placeholders(base_query: str) -> bool:
@@ -206,6 +272,218 @@ def _choose_summary_columns(available_columns: List[str]) -> List[str]:
 
     # If preferred columns are absent, keep a stable subset of source columns.
     return normalized[: min(len(normalized), 12)]
+
+
+def _column_set(df: pd.DataFrame) -> set[str]:
+    return {str(col).strip().lower() for col in df.columns if str(col).strip()}
+
+
+def _validate_logs_merge_schema(previews: List[Dict[str, Any]]) -> List[str]:
+    if not previews:
+        return []
+
+    errors: List[str] = []
+    first_df = previews[0].get("df")
+    if first_df is None or not isinstance(first_df, pd.DataFrame):
+        return ["Не удалось валидировать логи: preview первого запроса отсутствует."]
+
+    base_cols = _column_set(first_df)
+    if "timestamp" not in base_cols:
+        errors.append("Логи: в первом SQL отсутствует обязательная колонка `timestamp`.")
+
+    for item in previews:
+        idx = int(item.get("idx", 0)) + 1
+        df = item.get("df")
+        if df is None or not isinstance(df, pd.DataFrame):
+            errors.append(f"Логи: запрос #{idx} не вернул preview-таблицу.")
+            continue
+        cols = _column_set(df)
+        if "timestamp" not in cols:
+            errors.append(f"Логи: запрос #{idx} не содержит колонку `timestamp`.")
+        if cols != base_cols:
+            missing = sorted(base_cols - cols)
+            extra = sorted(cols - base_cols)
+            errors.append(
+                "Логи: запрос #{idx} имеет несовместимую схему. "
+                "missing={missing}; extra={extra}".format(
+                    idx=idx,
+                    missing=missing,
+                    extra=extra,
+                )
+            )
+    return errors
+
+
+def _has_metrics_value_column(df: pd.DataFrame) -> bool:
+    cols_lower = {str(c).lower(): str(c) for c in df.columns}
+    for candidate in ("value", "metric_value", "predicted"):
+        if candidate in cols_lower:
+            return True
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if col_lower in {"timestamp", "service", "metric_service"}:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return True
+    return False
+
+
+def _validate_metrics_merge_schema(previews: List[Dict[str, Any]]) -> List[str]:
+    if not previews:
+        return []
+
+    errors: List[str] = []
+    for item in previews:
+        idx = int(item.get("idx", 0)) + 1
+        df = item.get("df")
+        if df is None or not isinstance(df, pd.DataFrame):
+            errors.append(f"Метрики: запрос #{idx} не вернул preview-таблицу.")
+            continue
+        cols = _column_set(df)
+        if "timestamp" not in cols:
+            errors.append(f"Метрики: запрос #{idx} не содержит колонку `timestamp`.")
+        if not _has_metrics_value_column(df):
+            errors.append(
+                f"Метрики: запрос #{idx} не содержит числовую value-колонку "
+                "(ожидается `value`/`metric_value`/`predicted` или любой numeric столбец)."
+            )
+    return errors
+
+
+def _sort_df_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "timestamp" not in df.columns:
+        return df
+    out = df.copy()
+    out["__cp_ts"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["__cp_ts"]).sort_values("__cp_ts", kind="mergesort")
+    return out.drop(columns=["__cp_ts"]).reset_index(drop=True)
+
+
+def _normalize_metrics_df(chunk: pd.DataFrame, *, default_service: str) -> pd.DataFrame:
+    if chunk is None or chunk.empty:
+        return pd.DataFrame(columns=["timestamp", "value", "service"])
+    if "timestamp" not in chunk.columns:
+        return pd.DataFrame(columns=["timestamp", "value", "service"])
+
+    out = chunk.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["timestamp"])
+    if out.empty:
+        return pd.DataFrame(columns=["timestamp", "value", "service"])
+
+    value_col: Optional[str] = None
+    for candidate in ("value", "metric_value", "predicted"):
+        if candidate in out.columns:
+            value_col = candidate
+            break
+    if value_col is None:
+        numeric_candidates = [
+            c
+            for c in out.columns
+            if c != "timestamp" and pd.api.types.is_numeric_dtype(out[c])
+        ]
+        if numeric_candidates:
+            value_col = numeric_candidates[0]
+    if value_col is None:
+        return pd.DataFrame(columns=["timestamp", "value", "service"])
+
+    out["value"] = pd.to_numeric(out[value_col], errors="coerce")
+    out = out.dropna(subset=["value"])
+    if out.empty:
+        return pd.DataFrame(columns=["timestamp", "value", "service"])
+
+    if "service" in out.columns:
+        out["service"] = out["service"].astype(str).replace("", default_service)
+    elif "metric_service" in out.columns:
+        out["service"] = out["metric_service"].astype(str).replace("", default_service)
+    else:
+        out["service"] = default_service
+
+    out = out[["timestamp", "value", "service"]].copy()
+    return _sort_df_by_timestamp(out)
+
+
+def _build_metrics_context(metrics_df: pd.DataFrame, *, max_services: int = 12) -> str:
+    if metrics_df is None or metrics_df.empty:
+        return ""
+    if "timestamp" not in metrics_df.columns or "value" not in metrics_df.columns:
+        return ""
+
+    normalized = metrics_df.copy()
+    normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+    normalized["value"] = pd.to_numeric(normalized["value"], errors="coerce")
+    if "service" not in normalized.columns:
+        normalized["service"] = "unknown-service"
+    normalized["service"] = normalized["service"].astype(str)
+    normalized = normalized.dropna(subset=["timestamp", "value"])
+    if normalized.empty:
+        return ""
+
+    lines: List[str] = [
+        "METRICS CONTEXT:",
+        (
+            f"Total metric rows: {len(normalized)}; "
+            f"services: {normalized['service'].nunique()}."
+        ),
+    ]
+
+    grouped = normalized.groupby("service", sort=True)
+    for idx, (service, group) in enumerate(grouped):
+        if idx >= max_services:
+            lines.append(f"... truncated services after {max_services}")
+            break
+        g = group.sort_values("timestamp")
+        first_ts = _format_datetime_with_tz(g["timestamp"].iloc[0])
+        last_ts = _format_datetime_with_tz(g["timestamp"].iloc[-1])
+        first_val = float(g["value"].iloc[0])
+        last_val = float(g["value"].iloc[-1])
+        delta = last_val - first_val
+        lines.append(
+            (
+                f"[{service}] rows={len(g)} period={first_ts}->{last_ts} "
+                f"min={g['value'].min():.3f} max={g['value'].max():.3f} "
+                f"mean={g['value'].mean():.3f} last={last_val:.3f} delta={delta:+.3f}"
+            )
+        )
+
+        diffs = g["value"].diff().abs().fillna(0.0)
+        top_jumps = diffs.nlargest(min(2, len(diffs)))
+        for j in top_jumps.index:
+            jump_ts = _format_datetime_with_tz(g.loc[j, "timestamp"])
+            jump_val = float(g.loc[j, "value"])
+            jump_diff = float(diffs.loc[j])
+            lines.append(
+                f"  jump@{jump_ts}: value={jump_val:.3f}, abs_delta={jump_diff:.3f}"
+            )
+
+    return "\n".join(lines)
+
+
+def _build_demo_metrics_for_window(
+    *,
+    period_start_dt: datetime,
+    period_end_dt: datetime,
+    service_label: str,
+    total_points: int = 180,
+) -> pd.DataFrame:
+    safe_points = max(int(total_points), 20)
+    window_seconds = max(int((period_end_dt - period_start_dt).total_seconds()), safe_points + 1)
+    rows: List[Dict[str, Any]] = []
+    seed_phase = (abs(hash(service_label)) % 17) / 7.0
+    for i in range(safe_points):
+        sec_offset = int((i + 1) * window_seconds / (safe_points + 1))
+        ts = period_start_dt + timedelta(seconds=sec_offset)
+        base = 100.0 + 5.0 * math.sin((i / 8.0) + seed_phase) + 0.08 * i
+        if i % 57 == 0:
+            base += 12.0
+        rows.append(
+            {
+                "timestamp": ts.isoformat(),
+                "value": float(base),
+                "service": service_label,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _render_query_template(
@@ -281,6 +559,37 @@ def _build_window_query_for_plain_sql(
         "ORDER BY timestamp"
         ") AS cp_window "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
+    )
+
+
+def _build_query_for_template(
+    *,
+    template: str,
+    uses_template: bool,
+    uses_paging_template: bool,
+    period_start_iso: str,
+    period_end_iso: str,
+    limit: int,
+    offset: int,
+) -> str:
+    if uses_template:
+        rendered_query = _render_query_template(
+            query_template=template,
+            period_start_iso=period_start_iso,
+            period_end_iso=period_end_iso,
+            limit=limit,
+            offset=offset,
+        )
+        if uses_paging_template:
+            return rendered_query
+        return _wrap_with_limit_offset(query=rendered_query, limit=limit, offset=offset)
+
+    return _build_window_query_for_plain_sql(
+        base_query=template,
+        period_start_iso=period_start_iso,
+        period_end_iso=period_end_iso,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -409,8 +718,10 @@ def _build_freeform_summary_prompt(
     period_start: str,
     period_end: str,
     stats: Dict[str, Any],
+    metrics_context: str,
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
+    metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
     return (
         "Сделай финальный отчет по расследованию инцидента в СВОБОДНОМ формате (без фиксированных секций), "
         "в том виде, который ты считаешь максимально понятным для SRE-команды.\n\n"
@@ -424,6 +735,7 @@ def _build_freeform_summary_prompt(
         f"Период расследования: [{period_start}, {period_end})\n"
         f"Контекст пользователя: {goal_block}\n"
         f"Техническая статистика: {stats}\n\n"
+        f"Контекст по метрикам:\n{metrics_block}\n\n"
         "Ниже структурированное summary, на основе которого нужно сделать улучшенную финальную версию:\n"
         f"{final_summary}"
     )
@@ -438,7 +750,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         st.markdown("2. Итоговый Отчет")
         final_height = max(
             int(st.session_state.get("logs_sum_llm_final_height", deps.final_text_height)),
-            180,
+            320,
         )
 
         stats = state.get("stats") or {}
@@ -463,6 +775,12 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             f"{_format_datetime_with_tz(state.get('period_start'))} -> "
             f"{_format_datetime_with_tz(state.get('period_end'))}"
         )
+        metrics_rows = int(pd.to_numeric(state.get("metrics_rows"), errors="coerce") or 0)
+        metrics_services = state.get("metrics_services") or []
+        if metrics_rows > 0:
+            st.caption(
+                f"Метрики в контексте: rows={metrics_rows}, services={', '.join(map(str, metrics_services))}"
+            )
 
         final_summary = str(state.get("final_summary") or "").strip()
         if final_summary:
@@ -476,6 +794,12 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 freeform_summary,
                 height=max(final_height, 320),
             )
+
+        query_errors = state.get("query_errors", [])
+        if isinstance(query_errors, list) and query_errors:
+            with st.expander("Ошибки ClickHouse (запросы, которые были пропущены)", expanded=False):
+                for err in query_errors:
+                    st.warning(str(err))
 
         artifacts_col, download_col = st.columns([2, 1])
         with artifacts_col:
@@ -526,11 +850,11 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         st.markdown("1. Пошаговая Суммаризация Логов")
         summary_height = max(
             int(st.session_state.get("logs_sum_llm_summary_height", deps.summary_text_height)),
-            140,
+            220,
         )
         final_height = max(
             int(st.session_state.get("logs_sum_llm_final_height", deps.final_text_height)),
-            180,
+            320,
         )
         if not state:
             return
@@ -550,12 +874,18 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"Режим: `{state.get('mode', 'db')}`",
                         f"Период: `{period_start_text}` -> `{period_end_text}`",
                         period_desc,
+                        f"SQL запросов: `{state.get('queries_count', 1)}`",
+                        f"SQL метрик: `{state.get('metrics_queries_count', 0)}`",
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                     ]
                 )
             )
             deps.render_scrollable_text(state.get("query", ""), height=130)
+            metrics_query_text = str(state.get("metrics_query", "")).strip()
+            if metrics_query_text:
+                st.markdown("SQL метрик")
+                deps.render_scrollable_text(metrics_query_text, height=110)
             goal = str(state.get("user_goal", "")).strip()
             if goal:
                 st.markdown("Контекст пользователя")
@@ -591,6 +921,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             if not pd.isna(rows_per_second) and float(rows_per_second) > 0:
                 details.append(f"rate: {float(rows_per_second):.1f} rows/s")
             if details:
+                if eta_left is not None and status not in ("done", "error"):
+                    details.append(f"(осталось ~{_format_eta_seconds(float(eta_left))})")
                 st.caption(" | ".join(details))
             if eta_left is not None and status not in ("done", "error"):
                 if eta_finish:
@@ -612,6 +944,10 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         )
             for line in state.get("events", [])[-10:]:
                 st.caption(str(line))
+
+            query_errors = state.get("query_errors", [])
+            if isinstance(query_errors, list) and query_errors:
+                st.warning(f"Ошибок ClickHouse: {len(query_errors)} (часть запросов пропущена)")
 
         batches = state.get("map_batches", [])
         for batch in batches:
@@ -690,6 +1026,9 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
 
 def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     st.title("Logs Summarizer")
+    pending_form_error = st.session_state.pop(FORM_ERROR_SESSION_KEY, None)
+    if pending_form_error:
+        st.error(str(pending_form_error))
     if RUNNING_SESSION_KEY not in st.session_state:
         st.session_state[RUNNING_SESSION_KEY] = False
     is_running = bool(st.session_state.get(RUNNING_SESSION_KEY, False))
@@ -711,9 +1050,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))
     ).isoformat().replace("+00:00", "Z")
     end_default = now_utc.isoformat().replace("+00:00", "Z")
+    default_metrics_query = str(deps.default_metrics_query or "").strip()
 
     widget_defaults: Dict[str, Any] = {
-        "logs_sum_sql_query": default_query,
         "logs_sum_user_goal": "",
         "logs_sum_period_mode": "Явный диапазон (start/end)",
         "logs_sum_center_dt": center_default,
@@ -724,41 +1063,156 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
         "logs_sum_demo_mode": bool(deps.test_mode),
         "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), 1000),
-        "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 140),
-        "logs_sum_llm_final_height": max(int(deps.final_text_height), 180),
+        "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 220),
+        "logs_sum_llm_final_height": max(int(deps.final_text_height), 320),
     }
     for key, value in widget_defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
     # Keep critical fields prefilled even if they were accidentally cleared.
-    for key in ("logs_sum_sql_query", "logs_sum_center_dt", "logs_sum_start_dt", "logs_sum_end_dt"):
+    for key in ("logs_sum_center_dt", "logs_sum_start_dt", "logs_sum_end_dt"):
         current = st.session_state.get(key)
         if not isinstance(current, str) or not current.strip():
             st.session_state[key] = widget_defaults[key]
-    with st.sidebar:
-        st.text_area(
-            "SQL запрос логов",
-            key="logs_sum_sql_query",
-            height=max(int(deps.sql_textarea_height), 180),
-            placeholder=(
-                "SELECT timestamp, message FROM logs_table\n"
-                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
-                "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
-                "ORDER BY timestamp\n"
-                "LIMIT {limit} OFFSET {offset}"
-            ),
-            help=(
-                "Поддерживаются многострочные SQL. Можно использовать плейсхолдеры: "
-                "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
-            ),
-            disabled=is_running,
+
+    # Query editors state (multiple boxes with + button).
+    logs_queries_state_key = "logs_sum_log_queries_items"
+    metrics_queries_state_key = "logs_sum_metrics_queries_items"
+    if logs_queries_state_key not in st.session_state:
+        legacy_query = str(st.session_state.get("logs_sum_sql_query", "")).strip()
+        initial_logs_query = legacy_query or default_query
+        st.session_state[logs_queries_state_key] = [_new_query_item(initial_logs_query)]
+    st.session_state[logs_queries_state_key] = _normalize_query_items(
+        st.session_state.get(logs_queries_state_key),
+        default_value=default_query,
+        min_items=1,
+    )
+    if metrics_queries_state_key not in st.session_state:
+        legacy_metrics_query = str(st.session_state.get("logs_sum_metrics_query", "")).strip()
+        initial_metrics_query = legacy_metrics_query or default_metrics_query
+        st.session_state[metrics_queries_state_key] = (
+            [_new_query_item(initial_metrics_query)] if initial_metrics_query else []
         )
+    st.session_state[metrics_queries_state_key] = _normalize_query_items(
+        st.session_state.get(metrics_queries_state_key),
+        default_value=default_metrics_query,
+        min_items=0,
+    )
+
+    with st.sidebar:
+        st.markdown("SQL Запросы Логов")
+        if st.button(
+            "+ Добавить запрос логов",
+            key="logs_sum_add_log_query",
+            use_container_width=True,
+            disabled=is_running,
+        ):
+            st.session_state[logs_queries_state_key].append(_new_query_item(""))
+            st.rerun()
+
+        remove_log_query_id: Optional[str] = None
+        for idx, item in enumerate(st.session_state[logs_queries_state_key], start=1):
+            item_id = str(item.get("id"))
+            query_key = f"logs_sum_log_query_text_{item_id}"
+            if query_key not in st.session_state:
+                st.session_state[query_key] = str(item.get("text", ""))
+            col_query, col_remove = st.columns([10, 2])
+            with col_query:
+                st.text_area(
+                    f"SQL логов #{idx}",
+                    key=query_key,
+                    height=max(int(deps.sql_textarea_height), 180),
+                    placeholder=(
+                        "SELECT timestamp, message FROM logs_table\n"
+                        "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
+                        "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
+                        "ORDER BY timestamp\n"
+                        "LIMIT {limit} OFFSET {offset}"
+                    ),
+                    help=(
+                        "Поддерживаются плейсхолдеры: "
+                        "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
+                    ),
+                    disabled=is_running,
+                )
+            with col_remove:
+                can_remove = len(st.session_state[logs_queries_state_key]) > 1
+                if st.button(
+                    "Убрать",
+                    key=f"logs_sum_remove_log_query_{item_id}",
+                    disabled=is_running or not can_remove,
+                    help="Удалить этот SQL-блок",
+                    use_container_width=True,
+                ):
+                    remove_log_query_id = item_id
+            item["text"] = str(st.session_state.get(query_key, ""))
+
+        if remove_log_query_id:
+            st.session_state[logs_queries_state_key] = [
+                item for item in st.session_state[logs_queries_state_key]
+                if str(item.get("id")) != remove_log_query_id
+            ]
+            st.rerun()
+
         st.text_area(
             "Контекст по алертам/инциденту для LLM (опционально)",
             key="logs_sum_user_goal",
             height=140,
             disabled=is_running,
         )
+
+        st.markdown("SQL Запросы Метрик (Опционально)")
+        if st.button(
+            "+ Добавить запрос метрик",
+            key="logs_sum_add_metrics_query",
+            use_container_width=True,
+            disabled=is_running,
+        ):
+            st.session_state[metrics_queries_state_key].append(_new_query_item(""))
+            st.rerun()
+
+        remove_metrics_query_id: Optional[str] = None
+        for idx, item in enumerate(st.session_state[metrics_queries_state_key], start=1):
+            item_id = str(item.get("id"))
+            query_key = f"logs_sum_metrics_query_text_{item_id}"
+            if query_key not in st.session_state:
+                st.session_state[query_key] = str(item.get("text", ""))
+            col_query, col_remove = st.columns([10, 2])
+            with col_query:
+                st.text_area(
+                    f"SQL метрик #{idx}",
+                    key=query_key,
+                    height=140,
+                    placeholder=(
+                        "SELECT timestamp, value, service FROM metrics_table\n"
+                        "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
+                        "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
+                        "ORDER BY timestamp\n"
+                        "LIMIT {limit} OFFSET {offset}"
+                    ),
+                    help=(
+                        "Ожидаются колонки timestamp и числовая value "
+                        "(service опционально)."
+                    ),
+                    disabled=is_running,
+                )
+            with col_remove:
+                if st.button(
+                    "Убрать",
+                    key=f"logs_sum_remove_metrics_query_{item_id}",
+                    disabled=is_running,
+                    help="Удалить этот SQL-блок",
+                    use_container_width=True,
+                ):
+                    remove_metrics_query_id = item_id
+            item["text"] = str(st.session_state.get(query_key, ""))
+
+        if remove_metrics_query_id:
+            st.session_state[metrics_queries_state_key] = [
+                item for item in st.session_state[metrics_queries_state_key]
+                if str(item.get("id")) != remove_metrics_query_id
+            ]
+            st.rerun()
 
         period_mode_label = st.radio(
             "Режим периода",
@@ -831,24 +1285,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             disabled=is_running or not bool(st.session_state.get("logs_sum_demo_mode", False)),
         )
 
-        st.markdown("Отображение LLM")
-        st.slider(
-            "Высота map summary (px)",
-            min_value=140,
-            max_value=1200,
-            step=20,
-            key="logs_sum_llm_summary_height",
-            disabled=is_running,
-        )
-        st.slider(
-            "Высота итогового summary (px)",
-            min_value=180,
-            max_value=1800,
-            step=20,
-            key="logs_sum_llm_final_height",
-            disabled=is_running,
-        )
-
         run_clicked = st.button(
             "Запустить Суммаризацию Логов",
             type="primary",
@@ -856,7 +1292,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             disabled=is_running,
         )
 
-    sql_query = str(st.session_state.get("logs_sum_sql_query", ""))
+    logs_queries = _extract_queries_from_items(st.session_state.get(logs_queries_state_key))
+    metrics_queries = _extract_queries_from_items(st.session_state.get(metrics_queries_state_key))
     user_goal = str(st.session_state.get("logs_sum_user_goal", ""))
     window_minutes = int(st.session_state.get("logs_sum_window_minutes", max(int(deps.loopback_minutes), 1)))
     center_dt_text = str(st.session_state.get("logs_sum_center_dt", center_default))
@@ -870,9 +1307,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     runtime_error_placeholder = st.empty()
     analysis_placeholder = st.empty()
     final_report_placeholder = st.empty()
+
+    def _unlock_with_form_error(message: str) -> None:
+        st.session_state[FORM_ERROR_SESSION_KEY] = str(message)
+        st.session_state[RUNNING_SESSION_KEY] = False
+        st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
+        st.rerun()
+
     if run_clicked and not is_running:
         st.session_state[RUN_PARAMS_SESSION_KEY] = {
-            "sql_query": sql_query,
+            "logs_queries": list(logs_queries),
+            "metrics_queries": list(metrics_queries),
             "user_goal": user_goal,
             "period_mode": str(st.session_state.get("logs_sum_period_mode", "Явный диапазон (start/end)")),
             "window_minutes": window_minutes,
@@ -900,7 +1345,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         return
     else:
         active_params = {
-            "sql_query": sql_query,
+            "logs_queries": list(logs_queries),
+            "metrics_queries": list(metrics_queries),
             "user_goal": user_goal,
             "period_mode": str(st.session_state.get("logs_sum_period_mode", "Явный диапазон (start/end)")),
             "window_minutes": window_minutes,
@@ -913,7 +1359,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "demo_logs_count": demo_logs_count,
         }
 
-    sql_query = str(active_params.get("sql_query", ""))
+    logs_queries = list(active_params.get("logs_queries", []))
+    metrics_queries = list(active_params.get("metrics_queries", []))
     user_goal = str(active_params.get("user_goal", ""))
     period_mode_label = str(active_params.get("period_mode", "Явный диапазон (start/end)"))
     period_mode = "window" if period_mode_label.startswith("Окно вокруг") else "start_end"
@@ -926,11 +1373,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
 
-    if not sql_query.strip():
-        st.error("SQL запрос не должен быть пустым.")
-        st.session_state[RUNNING_SESSION_KEY] = False
-        st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
-        return
+    logs_queries = [str(q) for q in logs_queries if str(q).strip()]
+    metrics_queries = [str(q) for q in metrics_queries if str(q).strip()]
+
+    if not logs_queries:
+        _unlock_with_form_error("Добавь хотя бы один SQL запрос логов.")
 
     try:
         if period_mode == "window":
@@ -950,55 +1397,114 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if period_end_dt <= period_start_dt:
                 raise ValueError("Дата конца должна быть больше даты начала.")
     except Exception as exc:  # noqa: BLE001
-        st.error(str(exc))
-        st.session_state[RUNNING_SESSION_KEY] = False
-        st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
-        return
+        _unlock_with_form_error(str(exc))
 
     period_start_iso = period_start_dt.isoformat()
     period_end_iso = period_end_dt.isoformat()
-    sql_query_clean = _normalize_sql_query_text(sql_query)
-    if not sql_query_clean:
-        st.error("SQL запрос не должен быть пустым.")
-        st.session_state[RUNNING_SESSION_KEY] = False
-        st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
-        return
+    query_templates: List[str] = []
+    for raw_query in logs_queries:
+        query_templates.extend(_split_query_templates(raw_query))
+    if not query_templates:
+        _unlock_with_form_error("Не удалось распознать SQL запросы логов.")
 
-    uses_template = _query_uses_any_placeholders(sql_query_clean)
-    uses_paging_template = _query_uses_paging_placeholders(sql_query_clean)
+    metrics_templates: List[str] = []
+    for raw_query in metrics_queries:
+        metrics_templates.extend(_split_query_templates(raw_query))
+
+    sql_query_clean = "\n\n-- QUERY --\n\n".join(query_templates)
+    metrics_query_clean = "\n\n-- QUERY --\n\n".join(metrics_templates)
+    query_specs: List[Dict[str, Any]] = [
+        {
+            "template": tpl,
+            "uses_template": _query_uses_any_placeholders(tpl),
+            "uses_paging_template": _query_uses_paging_placeholders(tpl),
+        }
+        for tpl in query_templates
+    ]
+    multi_query_mode = len(query_specs) > 1
+    metrics_query_specs: List[Dict[str, Any]] = [
+        {
+            "template": tpl,
+            "uses_template": _query_uses_any_placeholders(tpl),
+            "uses_paging_template": _query_uses_paging_placeholders(tpl),
+        }
+        for tpl in metrics_templates
+    ]
     preview_available_columns: Optional[List[str]] = None
+    preview_query_errors: List[str] = []
+    preview_metrics_errors: List[str] = []
+    logs_preview_frames: List[Dict[str, Any]] = []
+    metrics_preview_frames: List[Dict[str, Any]] = []
+    schema_errors: List[str] = []
 
     # Fail fast: validate that formatted/multiline SQL compiles and runs in DB mode.
     if not demo_mode:
-        try:
-            if uses_template:
-                rendered_preview = _render_query_template(
-                    query_template=sql_query_clean,
+        all_columns: List[str] = []
+        for idx, spec in enumerate(query_specs):
+            try:
+                preview_query = _build_query_for_template(
+                    template=str(spec["template"]),
+                    uses_template=bool(spec["uses_template"]),
+                    uses_paging_template=bool(spec["uses_paging_template"]),
                     period_start_iso=period_start_iso,
                     period_end_iso=period_end_iso,
                     limit=1,
                     offset=0,
                 )
-                preview_query = (
-                    rendered_preview
-                    if uses_paging_template
-                    else _wrap_with_limit_offset(query=rendered_preview, limit=1, offset=0)
-                )
-            else:
-                preview_query = _build_window_query_for_plain_sql(
-                    base_query=sql_query_clean,
+                preview_df = deps.query_logs_df(preview_query)
+                all_columns.extend([str(col) for col in preview_df.columns])
+                logs_preview_frames.append({"idx": idx, "df": preview_df})
+            except Exception as exc:  # noqa: BLE001
+                err = f"Preview запроса #{idx + 1} завершился ошибкой: {exc}"
+                preview_query_errors.append(err)
+                deps.logger.warning("logs_summary_page.preview_query_failed[%s]: %s", idx + 1, exc)
+        for idx, spec in enumerate(metrics_query_specs):
+            try:
+                preview_query = _build_query_for_template(
+                    template=str(spec["template"]),
+                    uses_template=bool(spec["uses_template"]),
+                    uses_paging_template=bool(spec["uses_paging_template"]),
                     period_start_iso=period_start_iso,
                     period_end_iso=period_end_iso,
                     limit=1,
                     offset=0,
                 )
-            preview_df = deps.query_logs_df(preview_query)
-            preview_available_columns = [str(col) for col in preview_df.columns]
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"SQL не прошел предварительную проверку: {exc}")
-            st.session_state[RUNNING_SESSION_KEY] = False
-            st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
-            return
+                preview_df = deps.query_metrics_df(preview_query)
+                metrics_preview_frames.append({"idx": idx, "df": preview_df})
+            except Exception as exc:  # noqa: BLE001
+                err = f"Preview метрик #{idx + 1} завершился ошибкой: {exc}"
+                preview_metrics_errors.append(err)
+                deps.logger.warning("logs_summary_page.preview_metrics_failed[%s]: %s", idx + 1, exc)
+        # stable unique
+        seen: set[str] = set()
+        preview_available_columns = []
+        for col in all_columns:
+            key = col.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            preview_available_columns.append(col)
+
+        schema_errors.extend(_validate_logs_merge_schema(logs_preview_frames))
+        schema_errors.extend(_validate_metrics_merge_schema(metrics_preview_frames))
+        if preview_query_errors:
+            schema_errors.extend(
+                [f"Логи: не удалось провалидировать запрос: {err}" for err in preview_query_errors]
+            )
+        if preview_metrics_errors:
+            schema_errors.extend(
+                [f"Метрики: не удалось провалидировать запрос: {err}" for err in preview_metrics_errors]
+            )
+        if not logs_preview_frames:
+            schema_errors.append("Логи: ни один SQL не дал preview-результат для проверки merge-схемы.")
+
+    if schema_errors:
+        joined = "\n".join([str(err) for err in schema_errors[:12]])
+        if len(schema_errors) > 12:
+            joined += f"\n... и еще {len(schema_errors) - 12} ошибок."
+        _unlock_with_form_error(
+            "Формат SQL-результатов несовместим для merge в единые DataFrame.\n" + joined
+        )
 
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     run_dir = deps.output_dir / "logs_summary_live" / f"run_{run_stamp}"
@@ -1009,6 +1515,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "status": "queued",
         "mode": "demo" if demo_mode else "db",
         "query": sql_query_clean,
+        "metrics_query": metrics_query_clean,
+        "queries_count": len(query_specs),
+        "metrics_queries_count": len(metrics_query_specs),
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
@@ -1018,10 +1527,20 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_batch_size": llm_batch_size,
         "logs_processed": 0,
         "logs_total": None,
-        "events": [],
+        "events": (
+            [
+                f"Предварительных ошибок ClickHouse: {len(preview_query_errors) + len(preview_metrics_errors)}"
+            ]
+            if (preview_query_errors or preview_metrics_errors)
+            else []
+        ),
+        "query_errors": list(preview_query_errors) + list(preview_metrics_errors),
         "map_batches": [],
         "final_summary": None,
         "freeform_final_summary": None,
+        "metrics_rows": 0,
+        "metrics_services": [],
+        "metrics_context_text": "",
         "stats": None,
         "error": None,
         "result_json_path": None,
@@ -1040,6 +1559,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     request_payload = {
         "sql_query": sql_query_clean,
+        "sql_queries_count": len(query_specs),
+        "metrics_query": metrics_query_clean,
+        "metrics_queries_count": len(metrics_query_specs),
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
@@ -1057,6 +1579,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         demo_logs: List[Dict[str, Any]] = []
         total_rows_estimate: Optional[int] = None
         columns = list(DEFAULT_SUMMARY_COLUMNS)
+        multi_query_buffers: List[pd.DataFrame] = [pd.DataFrame() for _ in query_specs]
         if demo_mode:
             demo_logs = _build_demo_logs_for_window(
                 period_start_dt=period_start_dt,
@@ -1068,6 +1591,108 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             total_rows_estimate = len(demo_logs)
         elif preview_available_columns:
             columns = _choose_summary_columns(preview_available_columns)
+        query_error_seen: set[str] = set(str(item) for item in state.get("query_errors", []))
+
+        def _register_query_error(message: str) -> None:
+            text = str(message)
+            if text in query_error_seen:
+                return
+            query_error_seen.add(text)
+            query_errors = state.setdefault("query_errors", [])
+            if isinstance(query_errors, list):
+                query_errors.append(text)
+            events = state.setdefault("events", [])
+            if isinstance(events, list):
+                events.append(f"ClickHouse error: {text}")
+
+        metrics_df = pd.DataFrame(columns=["timestamp", "value", "service"])
+        if metrics_query_specs:
+            metrics_frames: List[pd.DataFrame] = []
+            if demo_mode:
+                for idx, _spec in enumerate(metrics_query_specs):
+                    service_label = f"metrics_query_{idx + 1}"
+                    demo_chunk = _build_demo_metrics_for_window(
+                        period_start_dt=period_start_dt,
+                        period_end_dt=period_end_dt,
+                        service_label=service_label,
+                        total_points=min(max(db_batch_size, 120), 2000),
+                    )
+                    normalized_chunk = _normalize_metrics_df(
+                        demo_chunk,
+                        default_service=service_label,
+                    )
+                    if not normalized_chunk.empty:
+                        metrics_frames.append(normalized_chunk)
+            else:
+                safe_metrics_page_limit = max(int(db_batch_size), 10)
+                for idx, spec in enumerate(metrics_query_specs):
+                    service_label = f"metrics_query_{idx + 1}"
+                    metrics_offset = 0
+                    max_pages = 2_000
+                    for _page_idx in range(max_pages):
+                        metrics_query = _build_query_for_template(
+                            template=str(spec["template"]),
+                            uses_template=bool(spec["uses_template"]),
+                            uses_paging_template=bool(spec["uses_paging_template"]),
+                            period_start_iso=period_start_iso,
+                            period_end_iso=period_end_iso,
+                            limit=safe_metrics_page_limit,
+                            offset=metrics_offset,
+                        )
+                        try:
+                            chunk_df = deps.query_metrics_df(metrics_query)
+                        except Exception as exc:  # noqa: BLE001
+                            _register_query_error(
+                                f"Metrics query #{idx + 1} page(offset={metrics_offset}, "
+                                f"limit={safe_metrics_page_limit}) упал: {exc}"
+                            )
+                            deps.logger.warning(
+                                "logs_summary_page.metrics_query_failed[%s]: offset=%s limit=%s err=%s",
+                                idx + 1,
+                                metrics_offset,
+                                safe_metrics_page_limit,
+                                exc,
+                            )
+                            break
+
+                        if chunk_df is None or chunk_df.empty:
+                            break
+
+                        normalized_chunk = _normalize_metrics_df(
+                            chunk_df,
+                            default_service=service_label,
+                        )
+                        if not normalized_chunk.empty:
+                            metrics_frames.append(normalized_chunk)
+
+                        page_rows = len(chunk_df)
+                        metrics_offset += page_rows
+                        if page_rows < safe_metrics_page_limit:
+                            break
+                    else:
+                        _register_query_error(
+                            f"Metrics query #{idx + 1} прерван после {max_pages} страниц "
+                            f"(возможен цикл из-за нестабильного SQL-пейджинга)"
+                        )
+
+            if metrics_frames:
+                metrics_df = pd.concat(metrics_frames, ignore_index=True)
+                metrics_df = _sort_df_by_timestamp(metrics_df)
+
+        metrics_context_text = _build_metrics_context(metrics_df)
+        state["metrics_rows"] = int(len(metrics_df))
+        state["metrics_services"] = (
+            sorted({str(s) for s in metrics_df.get("service", pd.Series(dtype=str)).dropna().tolist()})
+            if not metrics_df.empty and "service" in metrics_df.columns
+            else []
+        )
+        state["metrics_context_text"] = metrics_context_text
+        if metrics_query_specs:
+            state.setdefault("events", []).append(
+                "Контекст метрик: "
+                f"{state['metrics_rows']} строк, сервисов {len(state['metrics_services'])}"
+            )
+            _render_logs_summary_chat(analysis_placeholder, state, deps)
 
         def _db_fetch_page(
             *,
@@ -1081,32 +1706,96 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 rows = demo_logs[offset : offset + max(int(limit), 1)]
                 return [dict(row) for row in rows]
 
-            if uses_template:
-                rendered_query = _render_query_template(
-                    query_template=sql_query_clean,
-                    period_start_iso=period_start,
-                    period_end_iso=period_end,
-                    limit=limit,
-                    offset=offset,
-                )
-                query = (
-                    rendered_query
-                    if uses_paging_template
-                    else _wrap_with_limit_offset(query=rendered_query, limit=limit, offset=offset)
-                )
-            else:
-                query = _build_window_query_for_plain_sql(
-                    base_query=sql_query_clean,
-                    period_start_iso=period_start,
-                    period_end_iso=period_end,
-                    limit=limit,
-                    offset=offset,
-                )
+            safe_limit = max(int(limit), 1)
+            safe_offset = max(int(offset), 0)
 
-            df = deps.query_logs_df(query)
-            if df.empty:
+            if not multi_query_mode:
+                spec = query_specs[0]
+                query = _build_query_for_template(
+                    template=str(spec["template"]),
+                    uses_template=bool(spec["uses_template"]),
+                    uses_paging_template=bool(spec["uses_paging_template"]),
+                    period_start_iso=period_start,
+                    period_end_iso=period_end,
+                    limit=safe_limit,
+                    offset=safe_offset,
+                )
+                try:
+                    df = deps.query_logs_df(query)
+                except Exception as exc:  # noqa: BLE001
+                    _register_query_error(
+                        f"Запрос #1 page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
+                    )
+                    deps.logger.warning(
+                        "logs_summary_page.query_failed[single]: offset=%s limit=%s err=%s",
+                        safe_offset,
+                        safe_limit,
+                        exc,
+                    )
+                    return []
+                if df.empty:
+                    return []
+                df = _sort_df_by_timestamp(df)
+                return [dict(row) for row in df.to_dict(orient="records")]
+
+            # Multi-query mode:
+            # fetch pages from all queries, merge by timestamp, return global page slice.
+            target_size = safe_offset + safe_limit
+            pending_fetches: List[tuple[int, Any]] = []
+            with ThreadPoolExecutor(max_workers=min(len(query_specs), 8)) as pool:
+                for idx, spec in enumerate(query_specs):
+                    loaded_df = multi_query_buffers[idx]
+                    loaded_count = len(loaded_df)
+                    need_rows = target_size - loaded_count
+                    if need_rows <= 0:
+                        continue
+                    query = _build_query_for_template(
+                        template=str(spec["template"]),
+                        uses_template=bool(spec["uses_template"]),
+                        uses_paging_template=bool(spec["uses_paging_template"]),
+                        period_start_iso=period_start,
+                        period_end_iso=period_end,
+                        limit=need_rows,
+                        offset=loaded_count,
+                    )
+                    pending_fetches.append((idx, pool.submit(deps.query_logs_df, query)))
+
+                for idx, future in pending_fetches:
+                    try:
+                        chunk_df = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        _register_query_error(
+                            f"Запрос #{idx + 1} page(offset={len(multi_query_buffers[idx])}, "
+                            f"limit={max(target_size - len(multi_query_buffers[idx]), 1)}) упал: {exc}"
+                        )
+                        deps.logger.warning(
+                            "logs_summary_page.query_failed[multi:%s]: err=%s",
+                            idx + 1,
+                            exc,
+                        )
+                        continue
+                    if chunk_df is None or chunk_df.empty:
+                        continue
+                    if multi_query_buffers[idx].empty:
+                        multi_query_buffers[idx] = chunk_df.copy()
+                    else:
+                        multi_query_buffers[idx] = pd.concat(
+                            [multi_query_buffers[idx], chunk_df],
+                            ignore_index=True,
+                        )
+
+            available = [df for df in multi_query_buffers if not df.empty]
+            if not available:
                 return []
-            return [dict(row) for row in df.to_dict(orient="records")]
+            merged = pd.concat(available, ignore_index=True)
+            merged = _sort_df_by_timestamp(merged)
+            if merged.empty:
+                return []
+
+            page_df = merged.iloc[safe_offset : safe_offset + safe_limit].copy()
+            if page_df.empty:
+                return []
+            return [dict(row) for row in page_df.to_dict(orient="records")]
 
         def _on_progress(event: str, payload: Dict[str, Any]) -> None:
             if not isinstance(payload, dict):
@@ -1224,21 +1913,29 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         base_llm_call = deps.make_llm_call()
         goal_text = user_goal.strip()
+        llm_context_blocks: List[str] = []
         if goal_text:
+            llm_context_blocks.append(
+                "Контекст по алертам/инциденту от пользователя:\n"
+                f"{goal_text}"
+            )
+        if metrics_context_text.strip():
+            llm_context_blocks.append(
+                "Контекст по метрикам (агрегированный по сервисам):\n"
+                f"{metrics_context_text.strip()}"
+            )
+        llm_context_blocks.append(
+            "Сфокусируйся на причинно-следственном разборе: почему алерты сработали, "
+            "какие события этому предшествовали и что стало триггером."
+        )
 
-            def _llm_call_with_goal(prompt: str) -> str:
-                enriched_prompt = (
-                    "Контекст по алертам/инциденту от пользователя:\n"
-                    f"{goal_text}\n\n"
-                    "Сфокусируйся на причинно-следственном разборе: почему алерты сработали, "
-                    "какие события этому предшествовали и что стало триггером.\n\n"
-                    f"{prompt}"
-                )
-                return base_llm_call(enriched_prompt)
+        context_prefix = "\n\n".join(llm_context_blocks).strip()
 
-            llm_call = _llm_call_with_goal
-        else:
-            llm_call = base_llm_call
+        def _llm_call_with_context(prompt: str) -> str:
+            enriched_prompt = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
+            return base_llm_call(enriched_prompt)
+
+        llm_call = _llm_call_with_context
 
         summarizer = deps.period_log_summarizer_cls(
             db_fetch_page=_db_fetch_page,
@@ -1283,6 +1980,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     period_start=period_start_iso,
                     period_end=period_end_iso,
                     stats=state.get("stats") or {},
+                    metrics_context=metrics_context_text,
                 )
                 freeform_summary = str(base_llm_call(freeform_prompt)).strip()
                 if freeform_summary:

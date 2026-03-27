@@ -84,6 +84,35 @@ def _ensure_runtime() -> None:
     configure_logging()
 
 
+def _query_metrics_df(query: str) -> pd.DataFrame:
+    try:
+        import clickhouse_connect
+    except Exception as exc:
+        raise ImportError("Для запросов метрик нужен пакет clickhouse-connect") from exc
+
+    host = str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_HOST).strip()
+    if not host:
+        raise ValueError(
+            "Укажи CONTROL_PLANE_CLICKHOUSE_METRICS_HOST в .env "
+            "для SQL-запросов метрик на странице Logs Summarizer"
+        )
+
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=int(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_PORT),
+        username=str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_USERNAME).strip() or None,
+        password=str(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_PASSWORD).strip() or None,
+        secure=bool(settings.CONTROL_PLANE_CLICKHOUSE_METRICS_SECURE),
+    )
+    try:
+        return client.query_df(query)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.warning("ClickHouse client close failed for metrics query")
+
+
 def _apply_large_text_forms_style() -> None:
     st.markdown(
         """
@@ -907,6 +936,7 @@ def _render_logs_summary_page() -> None:
         summarizer_config_cls=SummarizerConfig,
         make_llm_call=_make_llm_call,
         query_logs_df=_query_logs_df,
+        query_metrics_df=_query_metrics_df,
         render_scrollable_text=_render_scrollable_text,
         render_pretty_summary_text=_render_pretty_summary_text,
         infer_batch_period=_infer_batch_period,
@@ -918,6 +948,9 @@ def _render_logs_summary_page() -> None:
             str(settings.CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL).strip()
             or str(settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY).strip()
         ),
+        default_metrics_query=str(
+            getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_METRICS_SQL", "")
+        ).strip(),
         output_dir=LOGS_DIR,
     )
     render_logs_summary_page(deps)

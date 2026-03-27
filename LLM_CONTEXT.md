@@ -17,6 +17,9 @@ Pipeline для SRE-кейса:
 
 - CLI loop: `control-plane.py` -> `control_plane.pipeline.main()`.
 - Streamlit: `streamlit_app.py`.
+- Streamlit содержит 2 страницы:
+  - `Control Plane` (основной end-to-end pipeline по аномалиям).
+  - `Logs Summarizer` (ручной map-reduce анализ логов).
 
 ## 3) Основные модули
 
@@ -34,6 +37,10 @@ Pipeline для SRE-кейса:
 - `control_plane/processing.py`
   - orchestration обработки аномалий
   - события map/reduce/alert
+- `ui/pages/logs_summary_page.py`
+  - ручной интерактивный map-reduce UI
+  - поддержка нескольких SQL-шаблонов, объединение результатов
+  - live-прогресс, ETA, итоговый отчет и сохранение артефактов
 - `control_plane/summarizer.py`
   - дефолтный адаптер к `my_summarizer.summarize_logs`
 - `control_plane/alerts.py`
@@ -103,6 +110,7 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - поддерживает плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
 - если `{offset}` отсутствует, делает single-shot (одна страница);
 - возвращает `chunk_summaries` для live UI.
+- в промптах ориентирован на incident investigation (timeline + causal chain + root-cause hypotheses).
 
 Поддерживаемые сигнатуры callable:
 
@@ -146,9 +154,12 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - `anomaly_start`
 - `summary_start`
 - `map_start`
+- `map_batch_start`
 - `map_batch`
 - `map_done`
 - `reduce_start`
+- `reduce_group_start`
+- `reduce_group_done`
 - `summary_done`
 - `reduce_done`
 - `notification_ready`
@@ -160,7 +171,25 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 
 `streamlit_app.py` ожидает эти события и рендерит live-чат по ним.
 
-## 7) UI-инварианты (важно не ломать)
+Для `Logs Summarizer`-страницы (ручной режим) также используются события `page_fetched`, `map_*`, `reduce_*`.
+
+## 7) Ручная страница Logs Summarizer: поведение
+
+- В SQL-поле можно указывать несколько запросов; разделитель между ними:
+  - `-- QUERY --`
+- Запросы выполняются параллельно и объединяются в общий поток.
+- После объединения строки сортируются по `timestamp` в хронологическом порядке.
+- Ошибка отдельного ClickHouse-запроса не должна ломать весь процесс:
+  - запрос пропускается;
+  - ошибка логируется;
+  - ошибка показывается в UI и итоговом отчете.
+- На время выполнения параметры формы блокируются.
+- После завершения:
+  - появляется структурированный итоговый summary;
+  - дополнительно генерируется свободный итоговый summary (LLM в best-format);
+  - результаты сохраняются в `json/md` + `jsonl` live-артефакты.
+
+## 8) UI-инварианты (важно не ломать)
 
 На странице в main-area должен быть порядок:
 
@@ -174,7 +203,7 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - никаких лишних блоков в main-area;
 - предикт на графиках должен быть только в будущем (после последней actual-точки).
 
-## 8) Конфиг, который критичен для интеграции
+## 9) Конфиг, который критичен для интеграции
 
 - `CONTROL_PLANE_METRICS_SOURCE=prometheus|clickhouse`
 - `CONTROL_PLANE_CLICKHOUSE_METRICS_HOST|PORT|USERNAME|PASSWORD|SECURE|QUERY` (если source=clickhouse)
@@ -186,14 +215,17 @@ def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> 
 - `CONTROL_PLANE_LOGS_CLICKHOUSE_HOST|PORT|USERNAME|PASSWORD`
 - `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`
 - `CONTROL_PLANE_LOGS_PAGE_LIMIT`
+- `CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL`
+- `CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE`
+- `CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE`
 
-## 9) Ограничения/риски
+## 10) Ограничения/риски
 
 - В окружениях без writable `~/.config/matplotlib` возможен warning; используйте `MPLCONFIGDIR`.
 - Реальные интеграции суммаризатора/алертов не тестируются в `TEST_MODE`.
 - Для `clickhouse`-source query обязан вернуть корректные `timestamp/value`.
 
-## 10) Рекомендуемый smoke-check перед merge
+## 11) Рекомендуемый smoke-check перед merge
 
 ```bash
 python -m py_compile control-plane.py streamlit_app.py control_plane/*.py

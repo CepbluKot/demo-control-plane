@@ -11,6 +11,8 @@
 5. Генерирует текст уведомления.
 6. Показывает результат в Streamlit UI (в том числе live-этапы обработки).
 
+Дополнительно есть отдельная UI-страница `Logs Summarizer` для ручного запуска map-reduce по логам (без аномалий main-pipeline).
+
 ## Источники данных
 
 ### 1) Фактические метрики (`actual`)
@@ -76,12 +78,23 @@
   - batched-fetch логов из ClickHouse;
   - MAP: summary по чанкам;
   - REDUCE: объединение partial summary в итоговый вывод;
+  - финальный дополнительный LLM-отчет в свободном формате (после структурированного reduce-summary);
   - если LLM недоступна, включается эвристический fallback (pipeline не падает).
   - в `.env` задается один полный SQL: `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY`;
   - SQL должен возвращать логовые поля (минимум `timestamp`, остальное опционально);
   - в SQL можно использовать плейсхолдеры `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{service}`;
   - `anomaly['service']` обязателен (fallback-сервиса больше нет);
   - если в запросе нет `{offset}`, фетч работает как single-shot (одна страница).
+
+### Ручная страница `Logs Summarizer` (важно)
+
+- Поддерживает один или несколько SQL-шаблонов.
+- Для нескольких запросов используй разделитель строкой:
+  - `-- QUERY --`
+- Запросы исполняются параллельно, результаты объединяются и сортируются по `timestamp` (хронологически).
+- Если отдельный ClickHouse-запрос падает, он пропускается, ошибка показывается в UI, общий процесс не прерывается.
+- Во время выполнения параметры формы блокируются и разблокируются после завершения.
+- В UI есть live-прогресс, ETA (экстраполяция по фактической скорости обработки), итоговый красивый отчет и файлы-артефакты.
 
 Ожидаемый callable (один из поддерживаемых вариантов сигнатуры):
 
@@ -169,7 +182,7 @@ CONTROL_PLANE_PROCESS_ALERTS=true
 
 ## UI: что отображается
 
-Строго в таком порядке:
+На странице `Control Plane` строго в таком порядке:
 
 1. График прошлое + будущее с отмеченными аномалиями.
 2. Табличка с найденными аномалиями.
@@ -179,6 +192,11 @@ CONTROL_PLANE_PROCESS_ALERTS=true
 
 - карточки аномалий в пункте 3 появляются последовательно, по факту обработки;
 - предикт на графиках показывается только в будущем (после последней actual-точки).
+
+На странице `Logs Summarizer`:
+
+1. Пошаговый интерактивный чат map/reduce.
+2. Итоговый отчет (структурированный summary + свободный summary + метрики/артефакты).
 
 ## Полезные переменные .env
 
@@ -215,6 +233,9 @@ CONTROL_PLANE_LOGS_CLICKHOUSE_USERNAME=...
 CONTROL_PLANE_LOGS_CLICKHOUSE_PASSWORD=...
 CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, value FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
 CONTROL_PLANE_LOGS_PAGE_LIMIT=1000
+CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp >= parseDateTimeBestEffort('{period_start}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit} OFFSET {offset}
+CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE=1000
+CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE=200
 ```
 
 ## Диагностика
