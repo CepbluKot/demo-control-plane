@@ -1547,7 +1547,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
         "logs_sum_parallel_map": False,
         "logs_sum_map_workers": max(int(deps.map_workers), 1),
-        "logs_sum_max_retries": min(max(int(deps.max_retries), 0), 3),
+        "logs_sum_max_retries": max(int(deps.max_retries), 0),
         "logs_sum_llm_timeout": max(int(deps.llm_timeout), 10),
         "logs_sum_demo_mode": bool(deps.test_mode),
         "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
@@ -1780,7 +1780,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         st.number_input(
             "Ретраи LLM (при ошибке)",
             min_value=0,
-            max_value=3,
+            max_value=100,
             step=1,
             key="logs_sum_max_retries",
             disabled=is_running,
@@ -1835,9 +1835,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
     _parallel_map = bool(st.session_state.get("logs_sum_parallel_map", False))
     map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1))) if _parallel_map else 1
-    max_retries = min(
-        max(int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))), 0),
-        3,
+    max_retries = max(
+        int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))),
+        0,
     )
     llm_timeout = max(int(st.session_state.get("logs_sum_llm_timeout", max(int(deps.llm_timeout), 10))), 10)
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
@@ -1921,7 +1921,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
-    max_retries = min(max(int(active_params.get("max_retries", max_retries)), 0), 3)
+    max_retries = max(int(active_params.get("max_retries", max_retries)), 0)
     llm_timeout = max(int(active_params.get("llm_timeout", llm_timeout)), 10)
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))

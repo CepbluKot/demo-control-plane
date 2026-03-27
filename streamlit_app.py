@@ -930,7 +930,7 @@ def _render_logs_summary_page() -> None:
             1,
         ),
         map_workers=max(int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAP_WORKERS", 1)), 1),
-        max_retries=min(max(int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES", 1)), 0), 3),
+        max_retries=max(int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES", 1)), 0),
         llm_timeout=max(int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 60)), 10),
         test_mode=TEST_MODE,
         loopback_minutes=LOOPBACK_MINUTES,
