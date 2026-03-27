@@ -16,8 +16,6 @@ MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
 MAX_LOG_ROWS_PREVIEW = 80
 LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
-RUNNING_SESSION_KEY = "logs_summary_running"
-PENDING_RUN_SESSION_KEY = "logs_summary_pending_run"
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -29,6 +27,13 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "cluster",
     "value",
 )
+
+
+def _format_datetime_with_tz(value: Any) -> str:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return str(value)
+    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _format_eta_seconds(seconds: float) -> str:
@@ -415,6 +420,11 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             st.caption(f"Покрытие периода: {rows_processed}/{int(rows_total)} (~{pct:.1f}%)")
         elif rows_processed > 0:
             st.caption(f"Обработано логов: {rows_processed}")
+        st.caption(
+            "Период отчета: "
+            f"{_format_datetime_with_tz(state.get('period_start'))} -> "
+            f"{_format_datetime_with_tz(state.get('period_end'))}"
+        )
 
         final_summary = str(state.get("final_summary") or "").strip()
         if final_summary:
@@ -486,11 +496,13 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if period_mode == "window"
                 else "Режим: `start/end диапазон`"
             )
+            period_start_text = _format_datetime_with_tz(state.get("period_start"))
+            period_end_text = _format_datetime_with_tz(state.get("period_end"))
             st.markdown(
                 "\n".join(
                     [
                         f"Режим: `{state.get('mode', 'db')}`",
-                        f"Период: `{state.get('period_start')}` -> `{state.get('period_end')}`",
+                        f"Период: `{period_start_text}` -> `{period_end_text}`",
                         period_desc,
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
@@ -619,9 +631,6 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
 
 def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     st.title("Logs Summarizer")
-    if RUNNING_SESSION_KEY not in st.session_state:
-        st.session_state[RUNNING_SESSION_KEY] = False
-    is_running = bool(st.session_state.get(RUNNING_SESSION_KEY, False))
 
     default_query = (deps.default_sql_query or "").strip() or (
         "SELECT timestamp, level, message FROM logs_demo_service "
@@ -630,164 +639,159 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
     )
 
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    center_default = now_utc.isoformat().replace("+00:00", "Z")
+    start_default = (
+        now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))
+    ).isoformat().replace("+00:00", "Z")
+    end_default = now_utc.isoformat().replace("+00:00", "Z")
+
+    widget_defaults: Dict[str, Any] = {
+        "logs_sum_sql_query": default_query,
+        "logs_sum_user_goal": "",
+        "logs_sum_period_mode": "Явный диапазон (start/end)",
+        "logs_sum_center_dt": center_default,
+        "logs_sum_window_minutes": max(int(deps.loopback_minutes), 1),
+        "logs_sum_start_dt": start_default,
+        "logs_sum_end_dt": end_default,
+        "logs_sum_db_batch": max(int(deps.db_batch_size), 1),
+        "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
+        "logs_sum_demo_mode": bool(deps.test_mode),
+        "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), 1000),
+    }
+    for key, value in widget_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    # Keep critical fields prefilled even if they were accidentally cleared.
+    for key in ("logs_sum_sql_query", "logs_sum_center_dt", "logs_sum_start_dt", "logs_sum_end_dt"):
+        current = st.session_state.get(key)
+        if not isinstance(current, str) or not current.strip():
+            st.session_state[key] = widget_defaults[key]
+    # Ensure start/end are always prefilled with valid datetime values.
+    for key in ("logs_sum_start_dt", "logs_sum_end_dt"):
+        current = st.session_state.get(key)
+        parsed = pd.to_datetime(current, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            st.session_state[key] = widget_defaults[key]
+
     with st.sidebar:
-        sql_query = st.text_area(
+        st.text_area(
             "SQL запрос логов",
-            value=default_query,
+            key="logs_sum_sql_query",
             height=max(int(deps.sql_textarea_height), 180),
+            placeholder=(
+                "SELECT timestamp, message FROM logs_table\n"
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
+                "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
+                "ORDER BY timestamp\n"
+                "LIMIT {limit} OFFSET {offset}"
+            ),
             help=(
                 "Поддерживаются многострочные SQL. Можно использовать плейсхолдеры: "
                 "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
             ),
-            disabled=is_running,
         )
-        user_goal = st.text_area(
+        st.text_area(
             "Контекст по алертам/инциденту для LLM (опционально)",
-            value="",
+            key="logs_sum_user_goal",
             height=140,
-            disabled=is_running,
         )
 
         period_mode_label = st.radio(
             "Режим периода",
             options=("Окно вокруг даты (±N минут)", "Явный диапазон (start/end)"),
-            index=0,
             horizontal=False,
-            disabled=is_running,
+            key="logs_sum_period_mode",
         )
         is_window_mode = period_mode_label.startswith("Окно вокруг")
 
-        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-        center_default = now_utc.isoformat().replace("+00:00", "Z")
-        start_default = (
-            now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))
-        ).isoformat().replace("+00:00", "Z")
-        end_default = now_utc.isoformat().replace("+00:00", "Z")
-
-        center_dt_text = ""
-        window_minutes = max(int(deps.loopback_minutes), 1)
-        start_dt_text = ""
-        end_dt_text = ""
         if is_window_mode:
-            center_dt_text = st.text_input(
+            st.text_input(
                 "Целевая дата/время (ISO)",
-                value=center_default,
-                disabled=is_running,
+                key="logs_sum_center_dt",
+                placeholder="Например: 2026-03-27T14:30:00+03:00",
+                help="Указывай дату/время с часовым поясом: `+03:00` или `Z`.",
             )
-            window_minutes = int(
-                st.number_input(
-                    "Окно анализа (+- N минут)",
-                    min_value=1,
-                    max_value=60 * 24 * 30,
-                    value=max(int(deps.loopback_minutes), 1),
-                    step=1,
-                    disabled=is_running,
-                )
+            st.number_input(
+                "Окно анализа (+- N минут)",
+                min_value=1,
+                max_value=60 * 24 * 30,
+                step=1,
+                key="logs_sum_window_minutes",
             )
         else:
-            start_dt_text = st.text_input(
+            st.text_input(
                 "Дата/время начала (ISO)",
-                value=start_default,
-                disabled=is_running,
+                key="logs_sum_start_dt",
+                placeholder="Например: 2026-03-27T10:00:00+03:00",
+                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (или `Z` для UTC).",
             )
-            end_dt_text = st.text_input(
+            st.text_input(
                 "Дата/время конца (ISO)",
-                value=end_default,
-                disabled=is_running,
+                key="logs_sum_end_dt",
+                placeholder="Например: 2026-03-27T12:00:00+03:00",
+                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (или `Z` для UTC).",
             )
 
-        db_batch_size = int(
-            st.number_input(
-                "Размер DB batch (выгрузка из БД)",
-                min_value=10,
-                max_value=100_000,
-                value=max(int(deps.db_batch_size), 1),
-                step=100,
-                disabled=is_running,
-            )
+        st.number_input(
+            "Размер DB batch (выгрузка из БД)",
+            min_value=10,
+            max_value=100_000,
+            step=100,
+            key="logs_sum_db_batch",
         )
-        llm_batch_size = int(
-            st.number_input(
-                "Размер LLM batch (строк в один MAP prompt)",
-                min_value=10,
-                max_value=10_000,
-                value=max(int(deps.llm_batch_size), 1),
-                step=10,
-                disabled=is_running,
-            )
+        st.number_input(
+            "Размер LLM batch (строк в один MAP prompt)",
+            min_value=10,
+            max_value=10_000,
+            step=10,
+            key="logs_sum_llm_batch",
         )
-        demo_mode = st.toggle(
+        st.toggle(
             "Демо режим (без БД)",
-            value=bool(deps.test_mode),
-            disabled=is_running,
+            key="logs_sum_demo_mode",
         )
-        demo_logs_count = int(
-            st.number_input(
-                "Количество логов в демо режиме",
-                min_value=100,
-                max_value=50_000,
-                value=max(int(deps.logs_tail_limit), 1000),
-                step=100,
-                disabled=is_running or not demo_mode,
-            )
+        st.number_input(
+            "Количество логов в демо режиме",
+            min_value=100,
+            max_value=50_000,
+            step=100,
+            key="logs_sum_demo_logs_count",
+            disabled=not bool(st.session_state.get("logs_sum_demo_mode", False)),
         )
 
         run_clicked = st.button(
             "Запустить Суммаризацию Логов",
             type="primary",
             use_container_width=True,
-            disabled=is_running,
         )
+
+    sql_query = str(st.session_state.get("logs_sum_sql_query", ""))
+    user_goal = str(st.session_state.get("logs_sum_user_goal", ""))
+    window_minutes = int(st.session_state.get("logs_sum_window_minutes", max(int(deps.loopback_minutes), 1)))
+    center_dt_text = str(st.session_state.get("logs_sum_center_dt", center_default))
+    start_dt_text = str(st.session_state.get("logs_sum_start_dt", start_default))
+    end_dt_text = str(st.session_state.get("logs_sum_end_dt", end_default))
+    db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
+    llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
+    demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
+    demo_logs_count = int(st.session_state.get("logs_sum_demo_logs_count", max(int(deps.logs_tail_limit), 1000)))
 
     runtime_error_placeholder = st.empty()
     analysis_placeholder = st.empty()
     final_report_placeholder = st.empty()
-    if run_clicked and not is_running:
-        st.session_state[PENDING_RUN_SESSION_KEY] = {
-            "sql_query": sql_query,
-            "user_goal": user_goal,
-            "period_mode": "window" if is_window_mode else "start_end",
-            "center_dt_text": center_dt_text,
-            "window_minutes": window_minutes,
-            "start_dt_text": start_dt_text,
-            "end_dt_text": end_dt_text,
-            "db_batch_size": db_batch_size,
-            "llm_batch_size": llm_batch_size,
-            "demo_mode": demo_mode,
-            "demo_logs_count": demo_logs_count,
-        }
-        st.session_state[RUNNING_SESSION_KEY] = True
-        st.rerun()
-
-    pending_run = st.session_state.get(PENDING_RUN_SESSION_KEY)
-    if not isinstance(pending_run, dict):
+    if not run_clicked:
         last_state = st.session_state.get(LAST_STATE_SESSION_KEY)
         if isinstance(last_state, dict) and last_state:
             _render_logs_summary_chat(analysis_placeholder, last_state, deps)
             _render_final_report(final_report_placeholder, last_state, deps)
         return
 
-    sql_query = str(pending_run.get("sql_query", ""))
-    user_goal = str(pending_run.get("user_goal", ""))
-    period_mode = str(pending_run.get("period_mode", "window"))
-    center_dt_text = str(pending_run.get("center_dt_text", ""))
-    window_minutes = int(pending_run.get("window_minutes", deps.loopback_minutes))
-    start_dt_text = str(pending_run.get("start_dt_text", ""))
-    end_dt_text = str(pending_run.get("end_dt_text", ""))
-    db_batch_size = int(pending_run.get("db_batch_size", deps.db_batch_size))
-    llm_batch_size = int(pending_run.get("llm_batch_size", deps.llm_batch_size))
-    demo_mode = bool(pending_run.get("demo_mode", deps.test_mode))
-    demo_logs_count = int(pending_run.get("demo_logs_count", deps.logs_tail_limit))
-
-    def _unlock_controls() -> None:
-        st.session_state[RUNNING_SESSION_KEY] = False
-        st.session_state.pop(PENDING_RUN_SESSION_KEY, None)
-
     if not sql_query.strip():
         st.error("SQL запрос не должен быть пустым.")
-        _unlock_controls()
         return
 
+    period_mode = "window" if is_window_mode else "start_end"
     try:
         if period_mode == "window":
             parsed_center = pd.to_datetime(center_dt_text, utc=True, errors="coerce")
@@ -807,7 +811,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 raise ValueError("Дата конца должна быть больше даты начала.")
     except Exception as exc:  # noqa: BLE001
         st.error(str(exc))
-        _unlock_controls()
         return
 
     period_start_iso = period_start_dt.isoformat()
@@ -815,7 +818,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     sql_query_clean = _normalize_sql_query_text(sql_query)
     if not sql_query_clean:
         st.error("SQL запрос не должен быть пустым.")
-        _unlock_controls()
         return
 
     uses_template = _query_uses_any_placeholders(sql_query_clean)
@@ -850,7 +852,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             preview_available_columns = [str(col) for col in preview_df.columns]
         except Exception as exc:  # noqa: BLE001
             st.error(f"SQL не прошел предварительную проверку: {exc}")
-            _unlock_controls()
             return
 
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -1163,6 +1164,5 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     state["result_json_path"] = saved.get("json_path")
     state["result_summary_path"] = saved.get("summary_path")
     st.session_state[LAST_STATE_SESSION_KEY] = state
-    _unlock_controls()
     _render_logs_summary_chat(analysis_placeholder, state, deps)
     _render_final_report(final_report_placeholder, state, deps)
