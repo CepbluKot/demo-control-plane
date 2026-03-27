@@ -95,12 +95,13 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         col_name = str(col).strip().lower()
         if col_name not in timestamp_like and "timestamp" not in col_name:
             continue
-        parsed = pd.to_datetime(out[col], utc=True, errors="coerce")
-        mask = parsed.notna()
-        if not bool(mask.any()):
-            continue
-        formatted = parsed.dt.tz_convert(MSK).dt.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
-        out.loc[mask, col] = formatted.loc[mask]
+        def _fmt(value: Any) -> str:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return str(value)
+            return ts.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+
+        out[col] = out[col].apply(_fmt).astype(str)
     return out
 
 
