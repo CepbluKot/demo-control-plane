@@ -19,6 +19,7 @@ import streamlit as st
 MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
 MAX_LOG_ROWS_PREVIEW = 80
+MAX_METRICS_ROWS_TOTAL = 50_000  # cap across all metric queries to avoid OOM
 LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
 RUNNING_SESSION_KEY = "logs_summary_running"
 RUN_PARAMS_SESSION_KEY = "logs_summary_run_params"
@@ -173,6 +174,9 @@ class _StreamingQueryCursor:
     exhausted: bool = False
     failed: bool = False
     row_seq: int = 0
+    # Keyset pagination state: max timestamp seen in the last fetched page.
+    # None means "not yet fetched" — first page uses period_start as last_ts.
+    last_ts: Optional[str] = None
 
 
 class _StreamingLogsMerger:
@@ -220,27 +224,37 @@ class _StreamingLogsMerger:
             cursor.exhausted = True
             return False
 
+        template = str(cursor.spec["template"])
+        uses_keyset = "{last_ts}" in template.lower()
+
         # In rare cases page can contain only bad timestamps after normalization.
         # Continue fetching until we get at least one valid row or source is exhausted.
         for _ in range(20):
             query = _build_query_for_template(
-                template=str(cursor.spec["template"]),
+                template=template,
                 uses_template=bool(cursor.spec["uses_template"]),
                 uses_paging_template=bool(cursor.spec["uses_paging_template"]),
                 period_start_iso=period_start,
                 period_end_iso=period_end,
                 limit=fetch_limit,
                 offset=cursor.next_offset,
+                last_ts=cursor.last_ts,  # None on first page → defaults to period_start
             )
             try:
                 df = self._query_logs_df(query)
             except Exception as exc:  # noqa: BLE001
                 cursor.failed = True
                 cursor.exhausted = True
-                self._register_query_error(
-                    f"Запрос #{cursor.query_index + 1} page(offset={cursor.next_offset}, "
-                    f"limit={fetch_limit}) упал: {exc}"
-                )
+                if uses_keyset:
+                    self._register_query_error(
+                        f"Запрос #{cursor.query_index + 1} page(last_ts={cursor.last_ts}, "
+                        f"limit={fetch_limit}) упал: {exc}"
+                    )
+                else:
+                    self._register_query_error(
+                        f"Запрос #{cursor.query_index + 1} page(offset={cursor.next_offset}, "
+                        f"limit={fetch_limit}) упал: {exc}"
+                    )
                 self._logger.warning(
                     "logs_summary_page.query_failed[stream:%s]: offset=%s limit=%s err=%s",
                     cursor.query_index + 1,
@@ -251,7 +265,12 @@ class _StreamingLogsMerger:
                 return False
 
             raw_rows = int(len(df))
-            cursor.next_offset += raw_rows
+            if uses_keyset:
+                # In keyset mode offset tracking is not used for queries,
+                # but we still increment it to detect empty pages / has_more correctly.
+                cursor.next_offset += raw_rows
+            else:
+                cursor.next_offset += raw_rows
             cursor.has_more = raw_rows >= fetch_limit
             if raw_rows == 0:
                 cursor.exhausted = True
@@ -259,6 +278,13 @@ class _StreamingLogsMerger:
 
             sorted_df = _sort_df_by_timestamp(df)
             if not sorted_df.empty:
+                # Advance keyset cursor to last timestamp in the fetched page
+                if uses_keyset and "timestamp" in sorted_df.columns:
+                    max_ts = pd.to_datetime(
+                        sorted_df["timestamp"], utc=True, errors="coerce"
+                    ).max()
+                    if not pd.isna(max_ts):
+                        cursor.last_ts = max_ts.isoformat()
                 cursor.page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
                 cursor.page_pos = 0
                 return True
@@ -367,10 +393,14 @@ class _StreamingLogsMerger:
             if self._global_emitted != safe_offset:
                 return []
 
+        multi_source = len(self._cursors) > 1
         out: List[Dict[str, Any]] = []
         while len(out) < safe_limit and self._heap:
             _, cursor_idx, _, row = heapq.heappop(self._heap)
-            out.append(dict(row))
+            row_out = dict(row)
+            if multi_source:
+                row_out["_source"] = str(self._cursors[cursor_idx].spec.get("label", f"query_{cursor_idx + 1}"))
+            out.append(row_out)
             self._global_emitted += 1
             self._push_next_row(
                 self._cursors[cursor_idx],
@@ -458,6 +488,7 @@ def _query_uses_any_placeholders(base_query: str) -> bool:
         for token in (
             "{period_start}",
             "{period_end}",
+            "{last_ts}",
             "{start}",
             "{end}",
             "{start_iso}",
@@ -470,6 +501,9 @@ def _query_uses_any_placeholders(base_query: str) -> bool:
 
 def _query_uses_paging_placeholders(base_query: str) -> bool:
     lowered = base_query.lower()
+    # Keyset pagination via {last_ts} also means the template manages its own paging
+    if "{last_ts}" in lowered:
+        return True
     return "{limit}" in lowered and "{offset}" in lowered
 
 
@@ -712,11 +746,15 @@ def _render_query_template(
     period_end_iso: str,
     limit: int,
     offset: int,
+    last_ts: Optional[str] = None,
 ) -> str:
     safe_limit = max(int(limit), 1)
     safe_offset = max(int(offset), 0)
     safe_start = _escape_sql_literal(period_start_iso)
     safe_end = _escape_sql_literal(period_end_iso)
+    # For keyset pagination: last_ts defaults to period_start so the first page
+    # returns rows from the beginning of the requested window.
+    safe_last_ts = _escape_sql_literal(last_ts if last_ts is not None else period_start_iso)
     rendered = _normalize_sql_query_text(query_template)
     replacements = {
         "{period_start}": safe_start,
@@ -728,6 +766,7 @@ def _render_query_template(
         "{limit}": str(safe_limit),
         "{offset}": str(safe_offset),
         "{page_limit}": str(safe_limit),
+        "{last_ts}": safe_last_ts,
         "{PERIOD_START}": safe_start,
         "{PERIOD_END}": safe_end,
         "{START}": safe_start,
@@ -737,6 +776,7 @@ def _render_query_template(
         "{LIMIT}": str(safe_limit),
         "{OFFSET}": str(safe_offset),
         "{PAGE_LIMIT}": str(safe_limit),
+        "{LAST_TS}": safe_last_ts,
     }
     for key, value in replacements.items():
         rendered = rendered.replace(key, value)
@@ -790,6 +830,7 @@ def _build_query_for_template(
     period_end_iso: str,
     limit: int,
     offset: int,
+    last_ts: Optional[str] = None,
 ) -> str:
     if uses_template:
         rendered_query = _render_query_template(
@@ -798,6 +839,7 @@ def _build_query_for_template(
             period_end_iso=period_end_iso,
             limit=limit,
             offset=offset,
+            last_ts=last_ts,
         )
         if uses_paging_template:
             return rendered_query
@@ -810,6 +852,93 @@ def _build_query_for_template(
         limit=limit,
         offset=offset,
     )
+
+
+def _strip_trailing_limit_offset(query: str) -> str:
+    stripped = query.strip().rstrip(";")
+    stripped = re.sub(r"(?is)\s+OFFSET\s+\d+\s*$", "", stripped)
+    stripped = re.sub(r"(?is)\s+LIMIT\s+\d+\s*$", "", stripped)
+    return stripped
+
+
+def _build_count_query_for_spec(
+    *,
+    spec: Dict[str, Any],
+    period_start_iso: str,
+    period_end_iso: str,
+) -> str:
+    template = str(spec["template"])
+    uses_template = bool(spec["uses_template"])
+    uses_paging_template = bool(spec["uses_paging_template"])
+
+    if uses_template and uses_paging_template:
+        # Template controls its own paging: render with dummy values, strip trailing LIMIT/OFFSET.
+        # For keyset templates, pass period_start as last_ts so the rendered query covers
+        # the full window (same as "start from the very beginning").
+        rendered = _render_query_template(
+            query_template=template,
+            period_start_iso=period_start_iso,
+            period_end_iso=period_end_iso,
+            limit=1,
+            offset=0,
+            last_ts=period_start_iso,
+        )
+        base = _strip_trailing_limit_offset(rendered)
+    elif uses_template:
+        # Template has time placeholders but not paging
+        base = _render_query_template(
+            query_template=template,
+            period_start_iso=period_start_iso,
+            period_end_iso=period_end_iso,
+            limit=1,
+            offset=0,
+            last_ts=period_start_iso,
+        )
+    else:
+        # Plain SQL: apply time window filter without LIMIT/OFFSET
+        base_sql = _normalize_sql_query_text(template)
+        start_escaped = _escape_sql_literal(period_start_iso)
+        end_escaped = _escape_sql_literal(period_end_iso)
+        base = (
+            "SELECT * FROM ("
+            f"{base_sql}"
+            ") AS cp_src "
+            f"WHERE timestamp >= parseDateTimeBestEffort('{start_escaped}') "
+            f"AND timestamp < parseDateTimeBestEffort('{end_escaped}')"
+        )
+
+    return f"SELECT count() AS total_rows FROM ({base}) AS cp_count"
+
+
+def _precount_rows(
+    *,
+    query_specs: List[Dict[str, Any]],
+    query_logs_df: Callable[[str], pd.DataFrame],
+    period_start_iso: str,
+    period_end_iso: str,
+    logger: logging.Logger,
+    on_error: Optional[Callable[[str], None]] = None,
+) -> Optional[int]:
+    total = 0
+    for idx, spec in enumerate(query_specs):
+        try:
+            count_query = _build_count_query_for_spec(
+                spec=spec,
+                period_start_iso=period_start_iso,
+                period_end_iso=period_end_iso,
+            )
+            df = query_logs_df(count_query)
+            if df.empty:
+                continue
+            val = int(df["total_rows"].iloc[0] if "total_rows" in df.columns else df.iloc[0, 0])
+            total += val
+        except Exception as exc:
+            msg = f"Подсчёт строк запроса #{idx + 1} не удался: {exc}"
+            logger.warning("precount_rows[%s]: %s", idx + 1, exc)
+            if on_error:
+                on_error(msg)
+            return None
+    return total
 
 
 def _build_demo_logs_for_window(
@@ -1057,6 +1186,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
 def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummaryPageDeps) -> None:
     status_titles = {
         "queued": "В очереди",
+        "counting": "Подсчёт строк",
         "summarizing": "Подготовка summary",
         "map": "Map этап",
         "reduce": "Reduce этап",
@@ -1350,7 +1480,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     ),
                     help=(
                         "Поддерживаются плейсхолдеры: "
-                        "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}."
+                        "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}. "
+                        "Для keyset-пейджинга (без OFFSET) используйте {last_ts} вместо {offset}: "
+                        "WHERE timestamp > '{last_ts}' AND timestamp < '{period_end}' ORDER BY timestamp LIMIT {limit}"
                     ),
                     disabled=is_running,
                 )
@@ -1637,8 +1769,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "template": tpl,
             "uses_template": _query_uses_any_placeholders(tpl),
             "uses_paging_template": _query_uses_paging_placeholders(tpl),
+            "label": f"query_{idx + 1}",
         }
-        for tpl in query_templates
+        for idx, tpl in enumerate(query_templates)
     ]
     multi_query_mode = len(query_specs) > 1
     metrics_query_specs: List[Dict[str, Any]] = [
@@ -1852,18 +1985,33 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         metrics_frames.append(normalized_chunk)
             else:
                 safe_metrics_page_limit = max(int(db_batch_size), 10)
+                total_metrics_fetched = 0
                 for idx, spec in enumerate(metrics_query_specs):
+                    if total_metrics_fetched >= MAX_METRICS_ROWS_TOTAL:
+                        _register_query_error(
+                            f"Metrics query #{idx + 1} пропущен: достигнут лимит "
+                            f"{MAX_METRICS_ROWS_TOTAL:,} строк метрик"
+                        )
+                        break
                     service_label = f"metrics_query_{idx + 1}"
                     metrics_offset = 0
                     max_pages = 2_000
                     for _page_idx in range(max_pages):
+                        remaining_cap = MAX_METRICS_ROWS_TOTAL - total_metrics_fetched
+                        if remaining_cap <= 0:
+                            _register_query_error(
+                                f"Metrics query #{idx + 1} прерван: достигнут лимит "
+                                f"{MAX_METRICS_ROWS_TOTAL:,} строк метрик"
+                            )
+                            break
+                        page_limit = min(safe_metrics_page_limit, remaining_cap)
                         metrics_query = _build_query_for_template(
                             template=str(spec["template"]),
                             uses_template=bool(spec["uses_template"]),
                             uses_paging_template=bool(spec["uses_paging_template"]),
                             period_start_iso=period_start_iso,
                             period_end_iso=period_end_iso,
-                            limit=safe_metrics_page_limit,
+                            limit=page_limit,
                             offset=metrics_offset,
                         )
                         try:
@@ -1871,13 +2019,13 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         except Exception as exc:  # noqa: BLE001
                             _register_query_error(
                                 f"Metrics query #{idx + 1} page(offset={metrics_offset}, "
-                                f"limit={safe_metrics_page_limit}) упал: {exc}"
+                                f"limit={page_limit}) упал: {exc}"
                             )
                             deps.logger.warning(
                                 "logs_summary_page.metrics_query_failed[%s]: offset=%s limit=%s err=%s",
                                 idx + 1,
                                 metrics_offset,
-                                safe_metrics_page_limit,
+                                page_limit,
                                 exc,
                             )
                             break
@@ -1894,7 +2042,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
                         page_rows = len(chunk_df)
                         metrics_offset += page_rows
-                        if page_rows < safe_metrics_page_limit:
+                        total_metrics_fetched += page_rows
+                        if page_rows < page_limit:
                             break
                     else:
                         _register_query_error(
@@ -1921,6 +2070,29 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             )
             _render_logs_summary_chat(analysis_placeholder, state, deps)
 
+        # Pre-count total rows so the progress bar and ETA are accurate from the first batch
+        if not demo_mode and total_rows_estimate is None:
+            state["status"] = "counting"
+            state.setdefault("events", []).append("Подсчёт строк в базе...")
+            _render_logs_summary_chat(analysis_placeholder, state, deps)
+            counted = _precount_rows(
+                query_specs=query_specs,
+                query_logs_df=deps.query_logs_df,
+                period_start_iso=period_start_iso,
+                period_end_iso=period_end_iso,
+                logger=deps.logger,
+                on_error=_register_query_error,
+            )
+            if counted is not None:
+                total_rows_estimate = counted
+                state["logs_total"] = counted
+                state.setdefault("events", []).append(f"Найдено строк: {counted:,}")
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+
+        # Keyset pagination state for the single-query (non-streaming) path.
+        # Mutable list so the closure can update the value between calls.
+        _single_query_last_ts: List[Optional[str]] = [None]
+
         def _db_fetch_page(
             *,
             columns: List[str],
@@ -1938,21 +2110,30 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             if not multi_query_mode:
                 spec = query_specs[0]
+                template = str(spec["template"])
+                uses_keyset = "{last_ts}" in template.lower()
                 query = _build_query_for_template(
-                    template=str(spec["template"]),
+                    template=template,
                     uses_template=bool(spec["uses_template"]),
                     uses_paging_template=bool(spec["uses_paging_template"]),
                     period_start_iso=period_start,
                     period_end_iso=period_end,
                     limit=safe_limit,
                     offset=safe_offset,
+                    last_ts=_single_query_last_ts[0],  # None → period_start on first page
                 )
                 try:
                     df = deps.query_logs_df(query)
                 except Exception as exc:  # noqa: BLE001
-                    _register_query_error(
-                        f"Запрос #1 page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
-                    )
+                    if uses_keyset:
+                        _register_query_error(
+                            f"Запрос #1 page(last_ts={_single_query_last_ts[0]}, "
+                            f"limit={safe_limit}) упал: {exc}"
+                        )
+                    else:
+                        _register_query_error(
+                            f"Запрос #1 page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
+                        )
                     deps.logger.warning(
                         "logs_summary_page.query_failed[single]: offset=%s limit=%s err=%s",
                         safe_offset,
@@ -1963,6 +2144,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 if df.empty:
                     return []
                 df = _sort_df_by_timestamp(df)
+                # Advance keyset cursor so the next call fetches the next page
+                if uses_keyset and "timestamp" in df.columns:
+                    max_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").max()
+                    if not pd.isna(max_ts):
+                        _single_query_last_ts[0] = max_ts.isoformat()
                 return [dict(row) for row in df.to_dict(orient="records")]
 
             # Multi-query mode:
@@ -2068,6 +2254,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
                 events.append("Reduce этап завершен")
+            elif event == "fetch_error":
+                error_msg = str(payload.get("error", "ClickHouse query failed"))
+                _register_query_error(error_msg)
+                events.append(f"ClickHouse error: {error_msg}")
+            elif event == "freeform_start":
+                events.append("Генерация финального нарратива...")
+            elif event == "freeform_done":
+                freeform = payload.get("freeform_summary")
+                if freeform:
+                    state["freeform_final_summary"] = str(freeform)
+                events.append("Нарратив готов")
             else:
                 events.append(f"Событие: {event}")
 

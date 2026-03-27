@@ -58,8 +58,8 @@ class SummarizerConfig:
     max_summary_chars: int = 10_000
     reduce_prompt_max_chars: int = 120_000
     adaptive_reduce_on_overflow: bool = True
-    keep_map_batches_in_memory: bool = True
-    keep_map_summaries_in_result: bool = True
+    keep_map_batches_in_memory: bool = False
+    keep_map_summaries_in_result: bool = False
 
 
 @dataclass
@@ -72,6 +72,7 @@ class SummarizationResult:
     reduce_rounds: int
     map_summaries: List[str]
     map_batches: List[Dict[str, Any]]
+    freeform_summary: str = ""
 
 
 class _SafeFormatDict(dict):
@@ -245,9 +246,12 @@ def _render_logs_query(
     limit: int,
     offset: int,
     service: str,
+    last_ts: Optional[str] = None,
 ) -> str:
     safe_limit = max(int(limit), 1)
     safe_offset = max(int(offset), 0)
+    # last_ts defaults to period_start so keyset queries work correctly on the first page
+    effective_last_ts = last_ts if last_ts is not None else period_start
     params = _SafeFormatDict(
         period_start=period_start,
         period_end=period_end,
@@ -259,6 +263,7 @@ def _render_logs_query(
         page_limit=safe_limit,
         offset=safe_offset,
         service=service,
+        last_ts=effective_last_ts,
     )
     return query_template.strip().rstrip(";").format_map(params)
 
@@ -295,10 +300,16 @@ def _build_db_fetch_page(
     *,
     fetch_mode: str,
     tail_limit: int,
+    on_error: Optional[Callable[[str], None]] = None,
 ) -> Callable[..., List[Dict[str, Any]]]:
     service = _resolve_service(anomaly)
     query_template = _resolve_logs_query_template()
     has_offset_placeholder = "{offset}" in query_template
+    # Keyset pagination: if template contains {last_ts}, we use timestamp-based pagination
+    # instead of LIMIT/OFFSET to avoid ClickHouse MEMORY_LIMIT_EXCEEDED on large offsets.
+    has_last_ts_placeholder = "{last_ts}" in query_template
+    # Mutable single-element list so the inner closure can update state between pages
+    _keyset_last_ts: List[Optional[str]] = [None]
 
     def _db_fetch_page(
         *,
@@ -308,6 +319,49 @@ def _build_db_fetch_page(
         limit: int,
         offset: int,
     ) -> List[Dict[str, Any]]:
+        if has_last_ts_placeholder:
+            # Keyset mode: ignore `offset`, track last_ts across calls.
+            # On the very first call _keyset_last_ts[0] is None, so _render_logs_query
+            # defaults last_ts to period_start (= fetch everything from the start).
+            rendered_query = _render_logs_query(
+                query_template=query_template,
+                period_start=period_start,
+                period_end=period_end,
+                limit=limit,
+                offset=0,
+                service=service,
+                last_ts=_keyset_last_ts[0],
+            )
+            try:
+                page_df = _query_logs_df(rendered_query)
+            except Exception as exc:
+                msg = (
+                    f"ClickHouse keyset query failed "
+                    f"(service={service}, last_ts={_keyset_last_ts[0]}): {exc}"
+                )
+                logger.warning(msg)
+                if on_error:
+                    on_error(msg)
+                return []
+
+            if page_df.empty:
+                return []
+
+            # Advance last_ts to the maximum timestamp in this page
+            if "timestamp" in page_df.columns:
+                max_ts = pd.to_datetime(page_df["timestamp"], utc=True, errors="coerce").max()
+                if not pd.isna(max_ts):
+                    _keyset_last_ts[0] = max_ts.isoformat()
+
+            records = page_df.to_dict(orient="records")
+            if not columns:
+                return [dict(row) for row in records]
+            projected_rows: List[Dict[str, Any]] = []
+            for row in records:
+                projected_rows.append({col: row.get(col) for col in columns})
+            return projected_rows
+
+        # --- Legacy LIMIT/OFFSET path ---
         if fetch_mode != "tail_n_logs" and offset > 0 and not has_offset_placeholder:
             return []
 
@@ -333,7 +387,15 @@ def _build_db_fetch_page(
         else:
             query = rendered_query
 
-        page_df = _query_logs_df(query)
+        try:
+            page_df = _query_logs_df(query)
+        except Exception as exc:
+            msg = f"ClickHouse query failed (service={service}, offset={offset}): {exc}"
+            logger.warning(msg)
+            if on_error:
+                on_error(msg)
+            return []
+
         if page_df.empty:
             return []
         records = page_df.to_dict(orient="records")
@@ -373,6 +435,7 @@ def _estimate_total_logs(
             limit=page_limit,
             offset=0,
             service=service,
+            last_ts=period_start,  # keyset: count from period start
         )
         count_query = _build_count_query(sample_query)
         df = _query_logs_df(count_query)
@@ -548,7 +611,7 @@ class PeriodLogSummarizer:
 
             for i in range(0, len(page), self.config.llm_chunk_rows):
                 rows_chunk = page[i : i + self.config.llm_chunk_rows]
-                ranked_chunk = self._rank_rows_by_problem_signal(rows_chunk, columns)
+                ranked_chunk = rows_chunk  # keep chronological order; critical rows extracted inside prompt
                 next_batch_index = map_batch_index
                 batch_period_start, batch_period_end = _extract_batch_period(ranked_chunk)
                 self._emit_progress(
@@ -575,11 +638,13 @@ class PeriodLogSummarizer:
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
                 if self.config.keep_map_batches_in_memory:
+                    # Store only metadata — raw rows are already sent via progress callback
+                    # and written to disk (JSONL) by the consumer. Keeping rows here
+                    # causes O(rows) memory growth with no benefit.
                     map_batches.append(
                         {
                             "batch_index": next_batch_index,
                             "rows_count": len(ranked_chunk),
-                            "rows": [dict(row) for row in ranked_chunk],
                             "summary": chunk_summary,
                             "batch_period_start": batch_period_start,
                             "batch_period_end": batch_period_end,
@@ -656,9 +721,27 @@ class PeriodLogSummarizer:
             },
         )
         llm_calls += reduce_calls
+
+        # Freeform narrative: one more LLM pass to produce a human-readable story for SRE team
+        freeform_summary = ""
+        if final_summary and final_summary != "Нет логов за указанный период.":
+            self._emit_progress("freeform_start", {"rows_processed": rows_mapped})
+            try:
+                freeform_prompt = self._build_freeform_prompt(
+                    period_start=period_start,
+                    period_end=period_end,
+                    structured_summary=final_summary,
+                )
+                freeform_summary = self.llm_call(freeform_prompt).strip()
+                llm_calls += 1
+            except Exception:
+                logger.warning("Freeform narrative generation failed, skipping")
+            self._emit_progress("freeform_done", {"freeform_summary": freeform_summary})
+
         result_map_summaries = map_summaries if self.config.keep_map_summaries_in_result else []
         return SummarizationResult(
             summary=final_summary,
+            freeform_summary=freeform_summary,
             pages_fetched=pages_fetched,
             rows_processed=rows_processed,
             llm_calls=llm_calls,
@@ -910,32 +993,55 @@ class PeriodLogSummarizer:
         columns: Sequence[str],
         rows: List[Dict[str, Any]],
     ) -> str:
-        problem_rows = sum(1 for row in rows if self._row_problem_score(row, columns) > 0)
+        # Determine display columns: put _source first if present
+        has_source = any(row.get("_source") for row in rows)
+        base_columns = [c for c in columns if c != "_source"]
+        display_columns: List[str] = (["_source"] + base_columns) if has_source else list(base_columns)
+
+        critical_rows = [row for row in rows if self._row_problem_score(row, list(columns)) > 0]
+
         lines = [
-            "Ты senior SRE-аналитик. Цель: понять, почему сработали алерты.",
-            "Это MAP-этап: анализируй только этот кусок логов как часть расследования.",
+            "Ты senior SRE-аналитик. Цель: восстановить последовательность событий и понять, что произошло.",
+            "Это MAP-этап: анализируй только этот кусок логов как часть общего расследования.",
+            "ВАЖНО: строки идут в хронологическом порядке — сохраняй эту последовательность в анализе.",
             "Верни обычный текст (не JSON) со строгими секциями:",
-            "1) TIMELINE (ключевые события по времени в этом куске)",
-            "2) ALERT_SIGNALS (симптомы, похожие на причины срабатывания алертов)",
+            "1) TIMELINE (ключевые события по времени, с таймстемпами)",
+            "2) FIRST_SYMPTOM (самый ранний признак проблемы в этом куске)",
             "3) CAUSAL_HINTS (что могло к чему привести; локальные причинные цепочки)",
-            "4) EVIDENCE (короткие факты/строки логов, подтверждающие выводы)",
-            "5) CHECKS (что проверить в первую очередь)",
-            "Не делай общий обзор, фокус только на деградациях, сбоях, timeouts, error-цепочках.",
+            "4) EVIDENCE (конкретные строки логов, подтверждающие выводы)",
+            "5) OPEN_QUESTIONS (что неясно; что нужно проверить в других периодах или источниках)",
+            "Фокус на деградациях, сбоях, timeouts, error-цепочках. Не теряй хронологию.",
             "",
             f"Период: [{period_start}, {period_end})",
-            f"Строк в этом куске: {len(rows)}",
-            f"Строк с problem-сигналами: {problem_rows}",
-            f"Колонки: {', '.join(columns)}",
+            f"Строк в куске: {len(rows)}",
+            f"Строк с problem-сигналами: {len(critical_rows)}",
+            f"Колонки: {', '.join(display_columns)}",
             "",
-            "Логи:",
+            "Логи (хронологический порядок):",
         ]
         for idx, row in enumerate(rows, start=1):
             rendered_parts: List[str] = []
-            for col in columns:
-                value = row.get(col, "")
+            for col in display_columns:
+                value = row.get(col)
+                if value is None or value == "":
+                    continue
                 text = self._truncate(str(value), self.config.max_cell_chars)
                 rendered_parts.append(f"{col}={text}")
             lines.append(f"{idx}. " + " | ".join(rendered_parts))
+
+        if critical_rows:
+            lines.append("")
+            lines.append(f"--- Строки с ошибками/проблемами ({len(critical_rows)} шт.) ---")
+            for row in critical_rows[:20]:
+                rendered_parts = []
+                for col in display_columns:
+                    value = row.get(col)
+                    if value is None or value == "":
+                        continue
+                    text = self._truncate(str(value), self.config.max_cell_chars)
+                    rendered_parts.append(f"{col}={text}")
+                lines.append("• " + " | ".join(rendered_parts))
+
         return "\n".join(lines)
 
     def _build_reduce_prompt(
@@ -947,26 +1053,47 @@ class PeriodLogSummarizer:
         summaries: List[str],
     ) -> str:
         lines = [
-            "Ты senior SRE-аналитик. Это REDUCE-этап map-reduce расследования алертов.",
-            "Объедини частичные summary в единый разбор причин инцидента.",
-            "Верни обычный текст (не JSON) с секциями:",
-            "1) INCIDENT_TIMELINE (что и когда произошло)",
-            "2) ROOT_CAUSE_HYPOTHESES (ранжируй по вероятности с кратким обоснованием)",
-            "3) CAUSAL_CHAIN (какая последовательность событий привела к алертам)",
-            "4) SUPPORTING_EVIDENCE (ключевые факты из логов)",
-            "5) PRIORITY_ACTIONS (немедленные действия + следующие шаги)",
-            "Не теряй критичные сигналы, убирай дубли и помечай сомнительные места как гипотезы.",
+            "Ты senior SRE-аналитик. Это REDUCE-этап map-reduce расследования инцидента.",
+            "Объедини частичные наблюдения в единый хронологический разбор.",
+            "Верни обычный текст (не JSON) со строгими секциями:",
+            "1) INCIDENT_TIMELINE (что произошло и когда — хронологически, с таймстемпами где есть)",
+            "2) FIRST_SIGNAL (самый ранний обнаруженный признак проблемы: когда и что именно)",
+            "3) ROOT_CAUSE_HYPOTHESES (ранжируй по вероятности; для каждой — обоснование и почему может быть неверной)",
+            "4) CAUSAL_CHAIN (пошаговая цепочка: событие A → привело к B → вызвало C → сработал алерт)",
+            "5) SUPPORTING_EVIDENCE (конкретные факты/строки из логов, подтверждающие выводы)",
+            "6) PRIORITY_ACTIONS (что проверить прямо сейчас и что сделать дальше)",
+            "Сохраняй хронологию. Убирай дубли. Сомнительные выводы явно помечай как гипотезы.",
             "",
             f"Период: [{period_start}, {period_end})",
             f"Reduce round: {reduce_round}",
             "",
-            "Частичные summary:",
+            "Частичные наблюдения:",
         ]
         for idx, text in enumerate(summaries, start=1):
-            lines.append(f"[SUMMARY {idx}]")
+            lines.append(f"[BATCH {idx}]")
             lines.append(text)
             lines.append("")
         return "\n".join(lines).strip()
+
+    def _build_freeform_prompt(
+        self,
+        *,
+        period_start: str,
+        period_end: str,
+        structured_summary: str,
+    ) -> str:
+        return "\n".join([
+            "Ты senior SRE-инженер. На основе структурированного анализа инцидента ниже",
+            "напиши понятный нарратив для SRE-команды — 3-5 абзацев без заголовков и секций.",
+            "Включи: что произошло, в какой последовательности, вероятные причины,",
+            "что поможет подтвердить или опровергнуть гипотезы, какие первые шаги.",
+            "Пиши как опытный инженер коллегам — конкретно, без воды, с акцентом на практику.",
+            "",
+            f"Период: [{period_start}, {period_end})",
+            "",
+            "Структурированный анализ:",
+            structured_summary,
+        ])
 
     def _rank_rows_by_problem_signal(
         self,
@@ -1036,10 +1163,18 @@ def summarize_logs(
         tail_limit=tail_limit,
     )
 
+    fetch_errors: List[str] = []
+
+    def _on_fetch_error(msg: str) -> None:
+        fetch_errors.append(msg)
+        if on_progress:
+            on_progress("fetch_error", {"error": msg})
+
     db_fetch_page = _build_db_fetch_page(
         anomaly,
         fetch_mode=fetch_mode,
         tail_limit=tail_limit,
+        on_error=_on_fetch_error,
     )
     llm_call = _make_llm_call()
     summarizer = PeriodLogSummarizer(
@@ -1060,6 +1195,8 @@ def summarize_logs(
 
     return {
         "summary": summary_text,
+        "freeform_summary": result.freeform_summary,
+        "fetch_errors": fetch_errors,
         "chunk_summaries": result.map_summaries,
         "map_batches": result.map_batches,
         "pages_fetched": result.pages_fetched,
