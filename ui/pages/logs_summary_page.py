@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+MSK = timezone(timedelta(hours=3))
 import heapq
 import json
 import logging
 import math
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -41,7 +44,7 @@ def _format_datetime_with_tz(value: Any) -> str:
     ts = pd.to_datetime(value, utc=True, errors="coerce")
     if pd.isna(ts):
         return str(value)
-    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+    return ts.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
 def _format_eta_seconds(seconds: float) -> str:
@@ -161,7 +164,7 @@ class LogsSummaryPageDeps:
     logs_tail_limit: int
     period_log_summarizer_cls: Any
     summarizer_config_cls: Any
-    make_llm_call: Callable[[], Callable[[str], str]]
+    make_llm_call: Callable[..., Callable[[str], str]]
     query_logs_df: Callable[[str], pd.DataFrame]
     query_metrics_df: Callable[[str], pd.DataFrame]
     render_scrollable_text: Callable[..., None]
@@ -175,6 +178,7 @@ class LogsSummaryPageDeps:
     default_metrics_query: str
     output_dir: Path
     map_workers: int = 1
+    max_retries: int = 3
 
 
 @dataclass
@@ -1151,7 +1155,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             _pct = min(_done / _span, 1.0) * 100.0
             st.caption(
                 f"Покрытие периода по времени: {_pct:.1f}% "
-                f"(лог до {_last_ts.strftime('%H:%M:%S UTC')} | строк: {rows_processed:,})"
+                f"(лог до {_last_ts.tz_convert(MSK).strftime('%H:%M:%S MSK')} | строк: {rows_processed:,})"
             )
         elif rows_processed > 0:
             st.caption(f"Обработано логов: {rows_processed:,}")
@@ -1265,6 +1269,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                         f"MAP workers: `{state.get('map_workers', 1)}`",
+                        f"Ретраи LLM: `{state.get('max_retries', 3)}`",
                     ]
                 )
             )
@@ -1297,7 +1302,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if total_span > 0:
                     ts_ratio = min(max(done_span / total_span, 0.0), 1.0)
                     pct = ts_ratio * 100.0
-                    last_ts_str = last_batch_ts.strftime("%H:%M:%S")
+                    last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
                     st.progress(
                         ts_ratio,
                         text=f"Прогресс: {pct:.1f}% | лог до {last_ts_str}",
@@ -1327,7 +1332,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     try:
                         eta_finish_dt = pd.to_datetime(eta_finish, utc=True, errors="coerce")
                         if not pd.isna(eta_finish_dt):
-                            finish_text = eta_finish_dt.strftime("%H:%M:%S UTC")
+                            finish_text = eta_finish_dt.tz_convert(MSK).strftime("%H:%M:%S MSK")
                             st.caption(
                                 f"Ориентировочно завершится в {finish_text} "
                                 f"(через ~{_format_eta_seconds(float(eta_left))})"
@@ -1443,12 +1448,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
     )
 
-    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
-    center_default = now_utc.isoformat().replace("+00:00", "Z")
-    start_default = (
-        now_utc - timedelta(minutes=max(int(deps.loopback_minutes), 1))
-    ).isoformat().replace("+00:00", "Z")
-    end_default = now_utc.isoformat().replace("+00:00", "Z")
+    now_msk = datetime.now(MSK).replace(microsecond=0)
+    center_default = now_msk.isoformat()
+    start_default = (now_msk - timedelta(minutes=max(int(deps.loopback_minutes), 1))).isoformat()
+    end_default = now_msk.isoformat()
     default_metrics_query = str(deps.default_metrics_query or "").strip()
 
     widget_defaults: Dict[str, Any] = {
@@ -1461,6 +1464,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_db_batch": max(int(deps.db_batch_size), 1),
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
         "logs_sum_map_workers": max(int(deps.map_workers), 1),
+        "logs_sum_max_retries": max(int(deps.max_retries), 0),
         "logs_sum_demo_mode": bool(deps.test_mode),
         "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), 1000),
         "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 220),
@@ -1687,6 +1691,19 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "Результаты всегда сохраняются в хронологическом порядке."
             ),
         )
+        st.number_input(
+            "Ретраи LLM (при ошибке)",
+            min_value=0,
+            max_value=10,
+            step=1,
+            key="logs_sum_max_retries",
+            disabled=is_running,
+            help=(
+                "Сколько раз повторить вызов LLM при ошибке. "
+                "0 = без ретраев (сразу fallback). "
+                "Задержка между попытками удваивается: 2s, 4s, 8s..."
+            ),
+        )
         st.toggle(
             "Демо режим (без БД)",
             key="logs_sum_demo_mode",
@@ -1718,6 +1735,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
     map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1)))
+    max_retries = max(int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))), 0)
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
     demo_logs_count = int(st.session_state.get("logs_sum_demo_logs_count", max(int(deps.logs_tail_limit), 1000)))
 
@@ -1744,6 +1762,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "map_workers": map_workers,
+            "max_retries": max_retries,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1774,6 +1793,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "map_workers": map_workers,
+            "max_retries": max_retries,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1790,6 +1810,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
+    max_retries = max(int(active_params.get("max_retries", max_retries)), 0)
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
 
@@ -1947,6 +1968,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
         "map_workers": map_workers,
+        "max_retries": max_retries,
         "logs_processed": 0,
         "logs_total": None,
         "events": (
@@ -2026,14 +2048,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if isinstance(events, list):
                 events.append(f"ClickHouse error: {text}")
 
+        # Two-level summarization: multi-query mode uses per-source summarizers (no merged stream).
         streaming_logs_merger: Optional[_StreamingLogsMerger] = None
-        if (not demo_mode) and multi_query_mode:
-            streaming_logs_merger = _StreamingLogsMerger(
-                query_specs=query_specs,
-                query_logs_df=deps.query_logs_df,
-                register_query_error=_register_query_error,
-                logger=deps.logger,
-            )
 
         metrics_df = pd.DataFrame(columns=["timestamp", "value", "service"])
         if metrics_query_specs:
@@ -2362,7 +2378,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["status"] = "summarizing"
         _render_logs_summary_chat(analysis_placeholder, state, deps)
 
-        base_llm_call = deps.make_llm_call()
+        def _on_retry(attempt: int, total: int, exc: Exception) -> None:
+            """Called by _make_llm_call before each retry. Thread-safe via GIL."""
+            msg = f"LLM retry {attempt}/{total}: {type(exc).__name__}: {exc}"
+            state.setdefault("events", []).append(msg)
+            # Only call Streamlit from the main thread (sequential mode).
+            # In parallel mode the call is in a worker thread — skip rendering.
+            if threading.current_thread() is threading.main_thread():
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+                time.sleep(0.05)
+
+        base_llm_call = deps.make_llm_call(max_retries=max_retries, on_retry=_on_retry)
         goal_text = user_goal.strip()
         llm_context_blocks: List[str] = []
         if goal_text:
@@ -2387,37 +2413,180 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         llm_call = _llm_call_with_context
 
-        summarizer = deps.period_log_summarizer_cls(
-            db_fetch_page=_db_fetch_page,
-            llm_call=llm_call,
-            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
-            on_progress=_on_progress,
-        )
-        try:
-            result = summarizer.summarize_period(
-                period_start=period_start_iso,
-                period_end=period_end_iso,
-                columns=columns,
-                total_rows_estimate=total_rows_estimate,
-            )
-        except TypeError:
-            result = summarizer.summarize_period(
-                period_start=period_start_iso,
-                period_end=period_end_iso,
-                columns=columns,
-            )
+        if multi_query_mode and not demo_mode:
+            # ---------------------------------------------------------------
+            # Two-level summarization:
+            #   1. For each source: independent MAP→REDUCE (own fetch, own summarizer).
+            #   2. One cross-source REDUCE LLM call over per-source summaries.
+            # MAP workers within each source still run in parallel (ThreadPoolExecutor
+            # inside PeriodLogSummarizer). Sources are processed sequentially so there
+            # are no concurrent thread pools running simultaneously.
+            # ---------------------------------------------------------------
+            from my_summarizer import build_cross_source_reduce_prompt  # noqa: PLC0415
 
-        state["status"] = "done"
-        state["final_summary"] = str(result.summary)
-        state["stats"] = {
-            "pages_fetched": result.pages_fetched,
-            "rows_processed": result.rows_processed,
-            "llm_calls": result.llm_calls,
-            "reduce_rounds": result.reduce_rounds,
-        }
-        state["logs_processed"] = int(result.rows_processed)
-        if state.get("logs_total") is None and total_rows_estimate is not None:
-            state["logs_total"] = int(total_rows_estimate)
+            def _make_source_fetch_page(spec: Dict[str, Any], label: str) -> Callable:
+                """Create an independent paged-fetch closure for a single query spec."""
+                _last_ts: List[Optional[str]] = [None]
+                _tmpl = str(spec["template"])
+                _uses_keyset = "{last_ts}" in _tmpl.lower()
+                _uses_tpl = bool(spec["uses_template"])
+                _uses_paging_tpl = bool(spec["uses_paging_template"])
+
+                def _fetch(
+                    *,
+                    columns: List[str],
+                    period_start: str,
+                    period_end: str,
+                    limit: int,
+                    offset: int,
+                ) -> List[Dict[str, Any]]:
+                    safe_limit = max(int(limit), 1)
+                    safe_offset = max(int(offset), 0)
+                    query = _build_query_for_template(
+                        template=_tmpl,
+                        uses_template=_uses_tpl,
+                        uses_paging_template=_uses_paging_tpl,
+                        period_start_iso=period_start,
+                        period_end_iso=period_end,
+                        limit=safe_limit,
+                        offset=safe_offset,
+                        last_ts=_last_ts[0],
+                    )
+                    try:
+                        df = deps.query_logs_df(query)
+                    except Exception as exc:  # noqa: BLE001
+                        if _uses_keyset:
+                            _register_query_error(
+                                f"{label} page(last_ts={_last_ts[0]}, limit={safe_limit}) упал: {exc}"
+                            )
+                        else:
+                            _register_query_error(
+                                f"{label} page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
+                            )
+                        deps.logger.warning(
+                            "logs_summary_page.per_source_fetch_failed[%s]: offset=%s limit=%s err=%s",
+                            label, safe_offset, safe_limit, exc,
+                        )
+                        return []
+                    if df is None or df.empty:
+                        return []
+                    df = _sort_df_by_timestamp(df)
+                    if _uses_keyset and "timestamp" in df.columns:
+                        max_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").max()
+                        if not pd.isna(max_ts):
+                            _last_ts[0] = max_ts.isoformat()
+                    return [dict(row) for row in df.to_dict(orient="records")]
+
+                return _fetch
+
+            per_source_summaries: Dict[str, str] = {}
+            agg_pages = agg_rows = agg_llm = agg_reduce = 0
+
+            for src_idx, spec in enumerate(query_specs):
+                src_label = str(spec.get("label", f"query_{src_idx + 1}"))
+                state.setdefault("events", []).append(
+                    f"--- Источник: {src_label} ({src_idx + 1}/{len(query_specs)}) ---"
+                )
+                state.pop("last_batch_ts", None)  # reset timestamp progress for each source
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+
+                src_summarizer = deps.period_log_summarizer_cls(
+                    db_fetch_page=_make_source_fetch_page(spec, src_label),
+                    llm_call=llm_call,
+                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                    on_progress=_on_progress,
+                )
+                try:
+                    src_result = src_summarizer.summarize_period(
+                        period_start=period_start_iso,
+                        period_end=period_end_iso,
+                        columns=columns,
+                        total_rows_estimate=None,
+                    )
+                except TypeError:
+                    src_result = src_summarizer.summarize_period(
+                        period_start=period_start_iso,
+                        period_end=period_end_iso,
+                        columns=columns,
+                    )
+
+                src_summary = (src_result.summary or "").strip()
+                if src_summary and src_summary != "Нет логов за указанный период.":
+                    per_source_summaries[src_label] = src_summary
+                agg_pages += src_result.pages_fetched
+                agg_rows += src_result.rows_processed
+                agg_llm += src_result.llm_calls
+                agg_reduce += src_result.reduce_rounds
+
+            # Cross-source REDUCE: merge per-source summaries into a single report
+            if len(per_source_summaries) > 1:
+                state.setdefault("events", []).append("Кросс-источниковый анализ (финальный REDUCE)...")
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+                cross_prompt = build_cross_source_reduce_prompt(
+                    summaries_by_source=per_source_summaries,
+                    period_start=period_start_iso,
+                    period_end=period_end_iso,
+                )
+                enriched_cross = f"{context_prefix}\n\n{cross_prompt}" if context_prefix else cross_prompt
+                try:
+                    cross_summary = llm_call(enriched_cross).strip()
+                    agg_llm += 1
+                    final_summary_text = cross_summary or "\n\n---\n\n".join(
+                        f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
+                    )
+                except Exception as cross_exc:  # noqa: BLE001
+                    deps.logger.warning("Cross-source reduce failed: %s", cross_exc)
+                    final_summary_text = "\n\n---\n\n".join(
+                        f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
+                    )
+                state.setdefault("events", []).append("Кросс-источниковый анализ завершён")
+            elif per_source_summaries:
+                final_summary_text = next(iter(per_source_summaries.values()))
+            else:
+                final_summary_text = "Нет логов за указанный период."
+
+            state["status"] = "done"
+            state["final_summary"] = final_summary_text
+            state["stats"] = {
+                "pages_fetched": agg_pages,
+                "rows_processed": agg_rows,
+                "llm_calls": agg_llm,
+                "reduce_rounds": agg_reduce,
+            }
+            state["logs_processed"] = agg_rows
+        else:
+            # Single-query or demo mode: use _db_fetch_page directly
+            summarizer = deps.period_log_summarizer_cls(
+                db_fetch_page=_db_fetch_page,
+                llm_call=llm_call,
+                config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                on_progress=_on_progress,
+            )
+            try:
+                result = summarizer.summarize_period(
+                    period_start=period_start_iso,
+                    period_end=period_end_iso,
+                    columns=columns,
+                    total_rows_estimate=total_rows_estimate,
+                )
+            except TypeError:
+                result = summarizer.summarize_period(
+                    period_start=period_start_iso,
+                    period_end=period_end_iso,
+                    columns=columns,
+                )
+
+            state["status"] = "done"
+            state["final_summary"] = str(result.summary)
+            state["stats"] = {
+                "pages_fetched": result.pages_fetched,
+                "rows_processed": result.rows_processed,
+                "llm_calls": result.llm_calls,
+                "reduce_rounds": result.reduce_rounds,
+            }
+            state["logs_processed"] = int(result.rows_processed)
+            if state.get("logs_total") is None and total_rows_estimate is not None:
+                state["logs_total"] = int(total_rows_estimate)
 
         if state.get("final_summary"):
             try:

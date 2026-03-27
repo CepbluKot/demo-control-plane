@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -459,40 +460,61 @@ def _estimate_total_logs(
         return None
 
 
-def _heuristic_llm_call(prompt: str) -> str:
+def _heuristic_llm_call(prompt: str, error: Optional[str] = None) -> str:
+    error_line = f"ОШИБКА: {error}" if error else "LLM не настроена (OPENAI_API_BASE_DB / OPENAI_API_KEY_DB)."
     return (
-        "[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
-        "ХРОНОЛОГИЯ: данных нет (LLM не настроена).\n"
-        "ПЕРВОПРИЧИНА: [ГИПОТЕЗА] не определена — требуется настройка LLM.\n"
+        f"[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
+        f"{error_line}\n\n"
+        "ХРОНОЛОГИЯ: данных нет.\n"
+        "ПЕРВОПРИЧИНА: [ГИПОТЕЗА] не определена.\n"
         "ОБЪЯСНЕНИЕ АЛЕРТОВ: анализ недоступен.\n"
-        "ПРОБЕЛЫ: настройте OPENAI_API_BASE_DB и OPENAI_API_KEY_DB для получения реального анализа."
+        "ПРОБЕЛЫ: см. ошибку выше."
     )
 
 
-def _make_llm_call() -> LLMTextCaller:
+def _make_llm_call(
+    max_retries: int = 3,
+    retry_base_delay: float = 2.0,
+    on_retry: Optional[Callable[[int, int, Exception], None]] = None,
+) -> LLMTextCaller:
     if not has_required_env():
         logger.warning(
             "OPENAI_API_BASE_DB/OPENAI_API_KEY_DB не заданы; использую fallback summarizer"
         )
         return _heuristic_llm_call
 
+    _system_prompt = (
+        "Ты senior SRE-инженер, специализирующийся на расследовании инцидентов.\n"
+        "Правила:\n"
+        "- Каждый вывод основывай на конкретных фактах из логов (цитата, timestamp).\n"
+        "- Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА].\n"
+        "- Если данных недостаточно — прямо пиши \"данных недостаточно\".\n"
+        "- Не генерируй generic выводы (\"возможна деградация\") без подтверждения из логов."
+    )
+
     def _llm_call(prompt: str) -> str:
-        try:
-            response = communicate_with_llm(
-                message=prompt,
-                system_prompt=(
-                    "Ты senior SRE-инженер, специализирующийся на расследовании инцидентов.\n"
-                    "Правила:\n"
-                    "- Каждый вывод основывай на конкретных фактах из логов (цитата, timestamp).\n"
-                    "- Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА].\n"
-                    "- Если данных недостаточно — прямо пиши \"данных недостаточно\".\n"
-                    "- Не генерируй generic выводы (\"возможна деградация\") без подтверждения из логов."
-                ),
-            )
-            return str(response).strip()
-        except Exception:
-            logger.exception("Ошибка вызова communicate_with_llm; использую fallback на этот чанк")
-            return _heuristic_llm_call(prompt)
+        last_exc: Optional[Exception] = None
+        for attempt in range(max(max_retries, 0) + 1):
+            try:
+                response = communicate_with_llm(message=prompt, system_prompt=_system_prompt)
+                return str(response).strip()
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    logger.warning(
+                        "LLM retry %d/%d after error: %s", attempt + 1, max_retries, exc
+                    )
+                    if on_retry is not None:
+                        try:
+                            on_retry(attempt + 1, max_retries, exc)
+                        except Exception:
+                            pass
+                    time.sleep(retry_base_delay * (2.0 ** attempt))
+                else:
+                    logger.exception(
+                        "LLM все %d попытки исчерпаны; использую fallback", max_retries + 1
+                    )
+        return _heuristic_llm_call(prompt, error=str(last_exc))
 
     return _llm_call
 
@@ -552,10 +574,7 @@ class PeriodLogSummarizer:
         map_batch_index = 0
         rows_mapped = 0
         estimated_batch_total: Optional[int] = None
-        if total_rows_estimate and total_rows_estimate > 0:
-            estimated_batch_total = int(
-                math.ceil(total_rows_estimate / max(self.config.llm_chunk_rows, 1))
-            )
+        seen_sources: List[str] = []  # ordered unique sources seen across all pages
         self._emit_progress(
             "map_start",
             {
@@ -593,6 +612,10 @@ class PeriodLogSummarizer:
                 pages_fetched += 1
                 rows_processed += len(page)
                 offset += len(page)
+                for _row in page:
+                    _src = str(_row.get("_source") or "")
+                    if _src and _src not in seen_sources:
+                        seen_sources.append(_src)
                 self._emit_progress(
                     "page_fetched",
                     {
@@ -632,9 +655,9 @@ class PeriodLogSummarizer:
                         # Sequential: run inline and wrap result as a fake "future"
                         try:
                             _result = self.llm_call(prompt)
-                        except Exception:
+                        except Exception as exc:
                             logger.exception("LLM call failed on batch %s", next_batch_index)
-                            _result = _heuristic_llm_call(prompt)
+                            _result = _heuristic_llm_call(prompt, error=str(exc))
                         future = None
                         # Store result directly — reuse the same pending tuple structure
                         pending_items.append((
@@ -705,9 +728,9 @@ class PeriodLogSummarizer:
                     continue  # sequential items already handled above
                 try:
                     result_text = fut.result()
-                except Exception:
+                except Exception as exc:
                     logger.exception("Parallel LLM call failed on batch %s; using fallback", batch_idx)
-                    result_text = _heuristic_llm_call("")
+                    result_text = _heuristic_llm_call("", error=str(exc))
                 chunk_summary = (result_text or "").strip() or "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
@@ -776,6 +799,7 @@ class PeriodLogSummarizer:
             chunk_summaries=map_summaries,
             period_start=period_start,
             period_end=period_end,
+            sources=seen_sources or None,
         )
         self._emit_progress(
             "reduce_done",
@@ -822,6 +846,7 @@ class PeriodLogSummarizer:
         chunk_summaries: List[str],
         period_start: str,
         period_end: str,
+        sources: Optional[List[str]] = None,
     ) -> tuple[str, int, int]:
         if len(chunk_summaries) == 1:
             return chunk_summaries[0], 0, 0
@@ -830,6 +855,7 @@ class PeriodLogSummarizer:
                 chunk_summaries=chunk_summaries,
                 period_start=period_start,
                 period_end=period_end,
+                sources=sources,
             )
 
         # 1) Try single-pass reduce over all map batches first.
@@ -842,6 +868,7 @@ class PeriodLogSummarizer:
             period_end=period_end,
             reduce_round=first_round,
             summaries=current,
+            sources=sources,
         )
         full_fits = self._prompt_fits_budget(full_prompt)
         if full_fits:
@@ -921,6 +948,7 @@ class PeriodLogSummarizer:
                         period_end=period_end,
                         reduce_round=round_idx,
                         summaries=group,
+                        sources=sources,
                     )
                     if not self._prompt_fits_budget(prompt):
                         used_size -= 1
@@ -986,6 +1014,7 @@ class PeriodLogSummarizer:
         chunk_summaries: List[str],
         period_start: str,
         period_end: str,
+        sources: Optional[List[str]] = None,
     ) -> tuple[str, int, int]:
         round_idx = 0
         current = chunk_summaries
@@ -1012,6 +1041,7 @@ class PeriodLogSummarizer:
                     period_end=period_end,
                     reduce_round=round_idx,
                     summaries=group,
+                    sources=sources,
                 )
                 merged = self.llm_call(prompt).strip()
                 if not merged:
@@ -1092,6 +1122,21 @@ class PeriodLogSummarizer:
             f"Строк в куске: {len(rows)}",
             f"Строк с problem-сигналами: {len(critical_rows)}",
             f"Колонки: {', '.join(display_columns)}",
+        ]
+        if has_source:
+            source_counts: Dict[str, int] = {}
+            for row in rows:
+                src = str(row.get("_source") or "unknown")
+                source_counts[src] = source_counts.get(src, 0) + 1
+            source_stat = ", ".join(
+                f"{src}={cnt}" for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])
+            )
+            lines.append(f"Распределение по источникам: {source_stat}")
+            lines.append(
+                "ВАЖНО: при анализе учитывай источник каждой строки (_source). "
+                "Ищи причинно-следственные связи МЕЖДУ источниками по времени."
+            )
+        lines += [
             "",
             "Логи (хронологический порядок):",
         ]
@@ -1114,10 +1159,17 @@ class PeriodLogSummarizer:
         period_end: str,
         reduce_round: int,
         summaries: List[str],
+        sources: Optional[List[str]] = None,
     ) -> str:
+        sources_line = (
+            f"Источники данных: {', '.join(sources)}. "
+            "Ищи причинно-следственные связи МЕЖДУ источниками."
+            if sources else ""
+        )
         lines = [
             "Это REDUCE-этап расследования инцидента.",
             "ВАЖНО: если выше есть контекст инцидента/алертов — привяжи каждый вывод к конкретным алертам.",
+            *(([sources_line]) if sources_line else []),
             "Объедини частичные наблюдения из батчей в единый разбор.",
             "Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА]. Дубли убирай.",
             "",
@@ -1210,6 +1262,59 @@ class PeriodLogSummarizer:
         if len(value) <= max_chars:
             return value
         return value[: max_chars - 3] + "..."
+
+
+def build_cross_source_reduce_prompt(
+    summaries_by_source: Dict[str, str],
+    period_start: str,
+    period_end: str,
+) -> str:
+    """Build a cross-source REDUCE prompt that merges per-source MAP→REDUCE results.
+
+    Used in the two-level summarization algorithm for multi-query mode:
+      1. Per-source MAP→REDUCE (independent summaries per query).
+      2. One cross-source REDUCE LLM call using this prompt.
+    """
+    sources = list(summaries_by_source.keys())
+    lines = [
+        "Это финальный CROSS-SOURCE REDUCE — объединение результатов из нескольких независимых источников данных.",
+        "ВАЖНО: если выше есть контекст инцидента/алертов — привяжи каждый вывод к конкретным алертам.",
+        f"Источники данных: {', '.join(sources)}.",
+        "Найди причинно-следственные связи МЕЖДУ источниками по времени.",
+        "Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА]. Дубли убирай.",
+        "",
+        "Верни обычный текст (не JSON) со строгими секциями:",
+        "",
+        "ХРОНОЛОГИЯ",
+        "  Единая хронология событий из всех источников с реальными timestamp'ами.",
+        "  Формат: [timestamp] — событие (источник: query_N)",
+        "",
+        "ПЕРВОПРИЧИНА",
+        "  Одно конкретное утверждение + [ФАКТ] или [ГИПОТЕЗА] + доказательство.",
+        "  Если неизвестна — напиши: \"данных недостаточно для вывода о первопричине\".",
+        "",
+        "ОБЪЯСНЕНИЕ АЛЕРТОВ",
+        "  Для каждого алерта из контекста выше (если контекст есть):",
+        "  - Алерт: [название/время из контекста]",
+        "  - Объяснение: [что нашли в каком источнике] или \"не нашли объяснения\"",
+        "  - Доказательство: [цитата]",
+        "",
+        "ЦЕПОЧКА СОБЫТИЙ",
+        "  Конкретная цепочка через источники: A (timestamp, источник) → B (timestamp, источник) → алерт C.",
+        "  Только если цепочка подтверждена данными.",
+        "",
+        "ПРОБЕЛЫ",
+        "  Что осталось необъяснённым; противоречия между источниками; что нужно проверить дополнительно.",
+        "",
+        f"Период: [{period_start}, {period_end})",
+        "",
+        "Результаты анализа по источникам:",
+    ]
+    for source, summary in summaries_by_source.items():
+        lines.append(f"\n=== {source} ===")
+        lines.append(summary)
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def summarize_logs(
