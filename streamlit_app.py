@@ -577,6 +577,32 @@ def _read_log_tail(path: Path, lines: int = 120) -> str:
     return "".join(content[-lines:])
 
 
+def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    timestamp_like = {
+        "timestamp",
+        "ts",
+        "time",
+        "datetime",
+        "period_start",
+        "period_end",
+        "start",
+        "end",
+    }
+    for col in out.columns:
+        col_name = str(col).strip().lower()
+        if col_name not in timestamp_like and "timestamp" not in col_name:
+            continue
+        parsed = pd.to_datetime(out[col], utc=True, errors="coerce")
+        mask = parsed.notna()
+        if not bool(mask.any()):
+            continue
+        out.loc[mask, col] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S.%f UTC").loc[mask]
+    return out
+
+
 def _only_future_predictions(
     predictions_df: Optional[pd.DataFrame],
     actual_end_ts: Optional[pd.Timestamp],
@@ -844,7 +870,7 @@ def _render_anomaly_cards(
                         if batch_logs:
                             logs_df = pd.DataFrame(batch_logs)
                             st.dataframe(
-                                logs_df,
+                                _format_table_timestamps(logs_df),
                                 use_container_width=True,
                                 hide_index=True,
                                 height=LOGS_BATCH_TABLE_HEIGHT,

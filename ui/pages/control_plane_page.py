@@ -10,6 +10,32 @@ import pandas as pd
 import streamlit as st
 
 
+def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    timestamp_like = {
+        "timestamp",
+        "ts",
+        "time",
+        "datetime",
+        "period_start",
+        "period_end",
+        "start",
+        "end",
+    }
+    for col in out.columns:
+        col_name = str(col).strip().lower()
+        if col_name not in timestamp_like and "timestamp" not in col_name:
+            continue
+        parsed = pd.to_datetime(out[col], utc=True, errors="coerce")
+        mask = parsed.notna()
+        if not bool(mask.any()):
+            continue
+        out.loc[mask, col] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S.%f UTC").loc[mask]
+    return out
+
+
 @dataclass(frozen=True)
 class ControlPlanePageDeps:
     logger: logging.Logger
@@ -108,7 +134,7 @@ def render_control_plane_page(deps: ControlPlanePageDeps) -> None:
                 return
             anomaly_columns = [c for c in ["timestamp", "value", "source"] if c in anomalies_df.columns]
             st.dataframe(
-                anomalies_df[anomaly_columns],
+                _format_table_timestamps(anomalies_df[anomaly_columns]),
                 use_container_width=True,
                 hide_index=True,
                 height=deps.anomalies_table_height,

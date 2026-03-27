@@ -77,6 +77,33 @@ def _format_datetime_with_tz(value: Any) -> str:
     return ts.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
 
 
+def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    timestamp_like = {
+        "timestamp",
+        "ts",
+        "time",
+        "datetime",
+        "period_start",
+        "period_end",
+        "start",
+        "end",
+    }
+    for col in out.columns:
+        col_name = str(col).strip().lower()
+        if col_name not in timestamp_like and "timestamp" not in col_name:
+            continue
+        parsed = pd.to_datetime(out[col], utc=True, errors="coerce")
+        mask = parsed.notna()
+        if not bool(mask.any()):
+            continue
+        formatted = parsed.dt.tz_convert(MSK).dt.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+        out.loc[mask, col] = formatted.loc[mask]
+    return out
+
+
 def _format_eta_seconds(seconds: float) -> str:
     safe = max(int(seconds), 0)
     hours = safe // 3600
@@ -1430,7 +1457,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             llm_timeline = state.get("llm_timeline", [])
             if isinstance(llm_timeline, list) and llm_timeline:
                 with st.expander("LLM Activity Timeline", expanded=False):
-                    df_tl = pd.DataFrame(llm_timeline[-200:])
+                    df_tl = _format_table_timestamps(pd.DataFrame(llm_timeline[-200:]))
                     if not df_tl.empty:
                         preferred_cols = [
                             "time",
@@ -1539,7 +1566,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     st.caption(f"Период логов батча: `{period_start}` -> `{period_end}`")
                 if batch_logs:
                     st.dataframe(
-                        pd.DataFrame(batch_logs),
+                        _format_table_timestamps(pd.DataFrame(batch_logs)),
                         use_container_width=True,
                         hide_index=True,
                         height=deps.logs_batch_table_height,
@@ -2299,7 +2326,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if not isinstance(rows, list):
                 rows = []
             row = {
-                "time": datetime.now(MSK).strftime("%H:%M:%S"),
+                "time": datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S.%f MSK"),
                 "event": str(event),
             }
             if call_no is not None:
