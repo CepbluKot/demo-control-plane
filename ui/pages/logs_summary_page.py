@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import heapq
 import json
 import logging
 import math
@@ -160,6 +160,225 @@ class LogsSummaryPageDeps:
     default_sql_query: str
     default_metrics_query: str
     output_dir: Path
+
+
+@dataclass
+class _StreamingQueryCursor:
+    query_index: int
+    spec: Dict[str, Any]
+    next_offset: int = 0
+    page_records: List[Dict[str, Any]] = field(default_factory=list)
+    page_pos: int = 0
+    has_more: bool = True
+    exhausted: bool = False
+    failed: bool = False
+    row_seq: int = 0
+
+
+class _StreamingLogsMerger:
+    def __init__(
+        self,
+        *,
+        query_specs: List[Dict[str, Any]],
+        query_logs_df: Callable[[str], pd.DataFrame],
+        register_query_error: Callable[[str], None],
+        logger: logging.Logger,
+    ) -> None:
+        self._query_logs_df = query_logs_df
+        self._register_query_error = register_query_error
+        self._logger = logger
+        self._cursors: List[_StreamingQueryCursor] = [
+            _StreamingQueryCursor(query_index=idx, spec=spec)
+            for idx, spec in enumerate(query_specs)
+        ]
+        self._heap: List[tuple[int, int, int, Dict[str, Any]]] = []
+        self._started = False
+        self._period_key: Optional[tuple[str, str]] = None
+        self._global_emitted = 0
+
+    def _reset(self, *, period_start: str, period_end: str) -> None:
+        self._heap = []
+        self._global_emitted = 0
+        self._period_key = (period_start, period_end)
+        self._started = True
+        self._cursors = [
+            _StreamingQueryCursor(query_index=idx, spec=cursor.spec)
+            for idx, cursor in enumerate(self._cursors)
+        ]
+
+    def _load_next_page(
+        self,
+        cursor: _StreamingQueryCursor,
+        *,
+        period_start: str,
+        period_end: str,
+        fetch_limit: int,
+    ) -> bool:
+        if cursor.exhausted or cursor.failed:
+            return False
+        if not cursor.has_more:
+            cursor.exhausted = True
+            return False
+
+        # In rare cases page can contain only bad timestamps after normalization.
+        # Continue fetching until we get at least one valid row or source is exhausted.
+        for _ in range(20):
+            query = _build_query_for_template(
+                template=str(cursor.spec["template"]),
+                uses_template=bool(cursor.spec["uses_template"]),
+                uses_paging_template=bool(cursor.spec["uses_paging_template"]),
+                period_start_iso=period_start,
+                period_end_iso=period_end,
+                limit=fetch_limit,
+                offset=cursor.next_offset,
+            )
+            try:
+                df = self._query_logs_df(query)
+            except Exception as exc:  # noqa: BLE001
+                cursor.failed = True
+                cursor.exhausted = True
+                self._register_query_error(
+                    f"Запрос #{cursor.query_index + 1} page(offset={cursor.next_offset}, "
+                    f"limit={fetch_limit}) упал: {exc}"
+                )
+                self._logger.warning(
+                    "logs_summary_page.query_failed[stream:%s]: offset=%s limit=%s err=%s",
+                    cursor.query_index + 1,
+                    cursor.next_offset,
+                    fetch_limit,
+                    exc,
+                )
+                return False
+
+            raw_rows = int(len(df))
+            cursor.next_offset += raw_rows
+            cursor.has_more = raw_rows >= fetch_limit
+            if raw_rows == 0:
+                cursor.exhausted = True
+                return False
+
+            sorted_df = _sort_df_by_timestamp(df)
+            if not sorted_df.empty:
+                cursor.page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
+                cursor.page_pos = 0
+                return True
+
+            if not cursor.has_more:
+                cursor.exhausted = True
+                return False
+
+        self._register_query_error(
+            f"Запрос #{cursor.query_index + 1} пропущен: слишком много страниц без валидного timestamp"
+        )
+        cursor.exhausted = True
+        return False
+
+    def _push_next_row(
+        self,
+        cursor: _StreamingQueryCursor,
+        *,
+        period_start: str,
+        period_end: str,
+        fetch_limit: int,
+    ) -> None:
+        while True:
+            if cursor.exhausted or cursor.failed:
+                return
+
+            if cursor.page_pos >= len(cursor.page_records):
+                loaded = self._load_next_page(
+                    cursor,
+                    period_start=period_start,
+                    period_end=period_end,
+                    fetch_limit=fetch_limit,
+                )
+                if not loaded:
+                    return
+
+            row = cursor.page_records[cursor.page_pos]
+            cursor.page_pos += 1
+            ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+            if pd.isna(ts):
+                continue
+            cursor.row_seq += 1
+            heapq.heappush(
+                self._heap,
+                (int(ts.value), cursor.query_index, cursor.row_seq, row),
+            )
+            return
+
+    def _ensure_started(
+        self,
+        *,
+        period_start: str,
+        period_end: str,
+        fetch_limit: int,
+    ) -> None:
+        if (not self._started) or self._period_key != (period_start, period_end):
+            self._reset(period_start=period_start, period_end=period_end)
+            for cursor in self._cursors:
+                self._push_next_row(
+                    cursor,
+                    period_start=period_start,
+                    period_end=period_end,
+                    fetch_limit=fetch_limit,
+                )
+
+    def next_page(
+        self,
+        *,
+        period_start: str,
+        period_end: str,
+        limit: int,
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(int(limit), 1)
+        safe_offset = max(int(offset), 0)
+        self._ensure_started(
+            period_start=period_start,
+            period_end=period_end,
+            fetch_limit=safe_limit,
+        )
+
+        if safe_offset != self._global_emitted:
+            self._logger.warning(
+                "logs_summary_page.streaming_offset_mismatch: expected=%s got=%s; resyncing stream",
+                self._global_emitted,
+                safe_offset,
+            )
+            if safe_offset < self._global_emitted:
+                self._reset(period_start=period_start, period_end=period_end)
+                for cursor in self._cursors:
+                    self._push_next_row(
+                        cursor,
+                        period_start=period_start,
+                        period_end=period_end,
+                        fetch_limit=safe_limit,
+                    )
+            while self._global_emitted < safe_offset and self._heap:
+                _, cursor_idx, _, _ = heapq.heappop(self._heap)
+                self._global_emitted += 1
+                self._push_next_row(
+                    self._cursors[cursor_idx],
+                    period_start=period_start,
+                    period_end=period_end,
+                    fetch_limit=safe_limit,
+                )
+            if self._global_emitted != safe_offset:
+                return []
+
+        out: List[Dict[str, Any]] = []
+        while len(out) < safe_limit and self._heap:
+            _, cursor_idx, _, row = heapq.heappop(self._heap)
+            out.append(dict(row))
+            self._global_emitted += 1
+            self._push_next_row(
+                self._cursors[cursor_idx],
+                period_start=period_start,
+                period_end=period_end,
+                fetch_limit=safe_limit,
+            )
+        return out
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -1579,7 +1798,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         demo_logs: List[Dict[str, Any]] = []
         total_rows_estimate: Optional[int] = None
         columns = list(DEFAULT_SUMMARY_COLUMNS)
-        multi_query_buffers: List[pd.DataFrame] = [pd.DataFrame() for _ in query_specs]
         if demo_mode:
             demo_logs = _build_demo_logs_for_window(
                 period_start_dt=period_start_dt,
@@ -1604,6 +1822,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if isinstance(events, list):
                 events.append(f"ClickHouse error: {text}")
+
+        streaming_logs_merger: Optional[_StreamingLogsMerger] = None
+        if (not demo_mode) and multi_query_mode:
+            streaming_logs_merger = _StreamingLogsMerger(
+                query_specs=query_specs,
+                query_logs_df=deps.query_logs_df,
+                register_query_error=_register_query_error,
+                logger=deps.logger,
+            )
 
         metrics_df = pd.DataFrame(columns=["timestamp", "value", "service"])
         if metrics_query_specs:
@@ -1739,63 +1966,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 return [dict(row) for row in df.to_dict(orient="records")]
 
             # Multi-query mode:
-            # fetch pages from all queries, merge by timestamp, return global page slice.
-            target_size = safe_offset + safe_limit
-            pending_fetches: List[tuple[int, Any]] = []
-            with ThreadPoolExecutor(max_workers=min(len(query_specs), 8)) as pool:
-                for idx, spec in enumerate(query_specs):
-                    loaded_df = multi_query_buffers[idx]
-                    loaded_count = len(loaded_df)
-                    need_rows = target_size - loaded_count
-                    if need_rows <= 0:
-                        continue
-                    query = _build_query_for_template(
-                        template=str(spec["template"]),
-                        uses_template=bool(spec["uses_template"]),
-                        uses_paging_template=bool(spec["uses_paging_template"]),
-                        period_start_iso=period_start,
-                        period_end_iso=period_end,
-                        limit=need_rows,
-                        offset=loaded_count,
-                    )
-                    pending_fetches.append((idx, pool.submit(deps.query_logs_df, query)))
-
-                for idx, future in pending_fetches:
-                    try:
-                        chunk_df = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        _register_query_error(
-                            f"Запрос #{idx + 1} page(offset={len(multi_query_buffers[idx])}, "
-                            f"limit={max(target_size - len(multi_query_buffers[idx]), 1)}) упал: {exc}"
-                        )
-                        deps.logger.warning(
-                            "logs_summary_page.query_failed[multi:%s]: err=%s",
-                            idx + 1,
-                            exc,
-                        )
-                        continue
-                    if chunk_df is None or chunk_df.empty:
-                        continue
-                    if multi_query_buffers[idx].empty:
-                        multi_query_buffers[idx] = chunk_df.copy()
-                    else:
-                        multi_query_buffers[idx] = pd.concat(
-                            [multi_query_buffers[idx], chunk_df],
-                            ignore_index=True,
-                        )
-
-            available = [df for df in multi_query_buffers if not df.empty]
-            if not available:
+            if streaming_logs_merger is None:
                 return []
-            merged = pd.concat(available, ignore_index=True)
-            merged = _sort_df_by_timestamp(merged)
-            if merged.empty:
-                return []
-
-            page_df = merged.iloc[safe_offset : safe_offset + safe_limit].copy()
-            if page_df.empty:
-                return []
-            return [dict(row) for row in page_df.to_dict(orient="records")]
+            return streaming_logs_merger.next_page(
+                period_start=period_start,
+                period_end=period_end,
+                limit=safe_limit,
+                offset=safe_offset,
+            )
 
         def _on_progress(event: str, payload: Dict[str, Any]) -> None:
             if not isinstance(payload, dict):

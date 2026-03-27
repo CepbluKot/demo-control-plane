@@ -56,6 +56,8 @@ class SummarizerConfig:
     max_reduce_rounds: int = 12
     max_cell_chars: int = 500
     max_summary_chars: int = 10_000
+    reduce_prompt_max_chars: int = 120_000
+    adaptive_reduce_on_overflow: bool = True
     keep_map_batches_in_memory: bool = True
     keep_map_summaries_in_result: bool = True
 
@@ -675,7 +677,168 @@ class PeriodLogSummarizer:
     ) -> tuple[str, int, int]:
         if len(chunk_summaries) == 1:
             return chunk_summaries[0], 0, 0
+        if not self.config.adaptive_reduce_on_overflow:
+            return self._reduce_summaries_fixed_groups(
+                chunk_summaries=chunk_summaries,
+                period_start=period_start,
+                period_end=period_end,
+            )
 
+        # 1) Try single-pass reduce over all map batches first.
+        # 2) Only if it does not fit context (or context-overflow error), switch to adaptive shrinking.
+        current = list(chunk_summaries)
+        llm_calls = 0
+        first_round = 1
+        full_prompt = self._build_reduce_prompt(
+            period_start=period_start,
+            period_end=period_end,
+            reduce_round=first_round,
+            summaries=current,
+        )
+        full_fits = self._prompt_fits_budget(full_prompt)
+        if full_fits:
+            self._emit_progress(
+                "reduce_group_start",
+                {
+                    "reduce_round": first_round,
+                    "group_index": 0,
+                    "group_total": 1,
+                },
+            )
+            try:
+                merged = self.llm_call(full_prompt).strip()
+                llm_calls += 1
+                if not merged:
+                    merged = "Пустой ответ LLM на reduce-этапе."
+                self._emit_progress(
+                    "reduce_group_done",
+                    {
+                        "reduce_round": first_round,
+                        "group_index": 0,
+                        "group_total": 1,
+                    },
+                )
+                return self._truncate(merged, self.config.max_summary_chars), llm_calls, 1
+            except Exception as exc:  # noqa: BLE001
+                if not self._is_context_overflow_error(exc):
+                    raise
+                logger.warning("reduce full-merge overflow, fallback to adaptive mode: %s", exc)
+                self._emit_progress(
+                    "reduce_context_fallback",
+                    {
+                        "reduce_round": first_round,
+                        "reason": str(exc),
+                    },
+                )
+        else:
+            self._emit_progress(
+                "reduce_context_fallback",
+                {
+                    "reduce_round": first_round,
+                    "reason": (
+                        "full reduce prompt exceeds reduce_prompt_max_chars="
+                        f"{self.config.reduce_prompt_max_chars}"
+                    ),
+                },
+            )
+
+        # Adaptive mode: for each round try to merge the largest possible group.
+        round_idx = 0
+        while len(current) > 1:
+            round_idx += 1
+            if round_idx > self.config.max_reduce_rounds:
+                raise RuntimeError("Exceeded max reduce rounds")
+
+            next_level: List[str] = []
+            cursor = 0
+            group_index = 0
+            previous_len = len(current)
+            while cursor < len(current):
+                remaining = len(current) - cursor
+                used_size = remaining
+                merged_text: Optional[str] = None
+
+                while used_size >= 1:
+                    group = current[cursor : cursor + used_size]
+                    if used_size == 1:
+                        # Single summary cannot be reduced further; pass through.
+                        merged_text = self._truncate(
+                            str(group[0]),
+                            self.config.max_summary_chars,
+                        )
+                        break
+
+                    prompt = self._build_reduce_prompt(
+                        period_start=period_start,
+                        period_end=period_end,
+                        reduce_round=round_idx,
+                        summaries=group,
+                    )
+                    if not self._prompt_fits_budget(prompt):
+                        used_size -= 1
+                        continue
+
+                    self._emit_progress(
+                        "reduce_group_start",
+                        {
+                            "reduce_round": round_idx,
+                            "group_index": group_index,
+                            "group_total": previous_len,
+                            "group_size": used_size,
+                        },
+                    )
+                    try:
+                        merged = self.llm_call(prompt).strip()
+                        llm_calls += 1
+                        if not merged:
+                            merged = "Пустой ответ LLM на reduce-этапе."
+                        merged_text = self._truncate(merged, self.config.max_summary_chars)
+                        self._emit_progress(
+                            "reduce_group_done",
+                            {
+                                "reduce_round": round_idx,
+                                "group_index": group_index,
+                                "group_total": previous_len,
+                                "group_size": used_size,
+                            },
+                        )
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        if self._is_context_overflow_error(exc) and used_size > 2:
+                            used_size -= 1
+                            continue
+                        raise
+
+                if merged_text is None:
+                    # Safety net: force progress in pathological edge-cases.
+                    used_size = min(2, remaining)
+                    forced = "\n\n".join(str(x) for x in current[cursor : cursor + used_size])
+                    merged_text = self._truncate(forced, self.config.max_summary_chars)
+
+                next_level.append(merged_text)
+                cursor += max(used_size, 1)
+                group_index += 1
+
+            if len(next_level) >= previous_len:
+                # Guarantee convergence to a single summary.
+                compressed: List[str] = []
+                for i in range(0, len(next_level), 2):
+                    pair = next_level[i : i + 2]
+                    compressed.append(
+                        self._truncate("\n\n".join(pair), self.config.max_summary_chars)
+                    )
+                next_level = compressed
+            current = next_level
+
+        return current[0], llm_calls, round_idx
+
+    def _reduce_summaries_fixed_groups(
+        self,
+        *,
+        chunk_summaries: List[str],
+        period_start: str,
+        period_end: str,
+    ) -> tuple[str, int, int]:
         round_idx = 0
         current = chunk_summaries
         llm_calls = 0
@@ -717,6 +880,27 @@ class PeriodLogSummarizer:
                 llm_calls += 1
             current = next_level
         return current[0], llm_calls, round_idx
+
+    def _prompt_fits_budget(self, prompt: str) -> bool:
+        max_chars = max(int(getattr(self.config, "reduce_prompt_max_chars", 0)), 0)
+        if max_chars <= 0:
+            return True
+        return len(prompt) <= max_chars
+
+    @staticmethod
+    def _is_context_overflow_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        markers = (
+            "maximum context length",
+            "context length",
+            "too many tokens",
+            "token limit",
+            "prompt is too long",
+            "request too large",
+            "input is too long",
+            "413",
+        )
+        return any(marker in text for marker in markers)
 
     def _build_chunk_prompt(
         self,
