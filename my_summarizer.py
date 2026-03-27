@@ -100,7 +100,7 @@ def _build_chat_completions_url(api_base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
-def communicate_with_llm(message: str, system_prompt: str = "") -> str:
+def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 60.0) -> str:
     if not has_required_env():
         raise RuntimeError("OPENAI_API_BASE_DB and OPENAI_API_KEY_DB are required")
 
@@ -119,7 +119,7 @@ def communicate_with_llm(message: str, system_prompt: str = "") -> str:
         "temperature": 0.1,
     }
 
-    response = requests.post(url, json=payload, headers=headers, timeout=120)
+    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
     response.raise_for_status()
     data = response.json()
     choices = data.get("choices") if isinstance(data, dict) else None
@@ -473,9 +473,12 @@ def _heuristic_llm_call(prompt: str, error: Optional[str] = None) -> str:
 
 
 def _make_llm_call(
-    max_retries: int = 3,
-    retry_base_delay: float = 2.0,
+    max_retries: int = 1,
+    retry_delay: float = 0.8,
     on_retry: Optional[Callable[[int, int, Exception], None]] = None,
+    on_attempt: Optional[Callable[[int, int, float], None]] = None,
+    on_result: Optional[Callable[[int, int, bool, float, Optional[str]], None]] = None,
+    llm_timeout: float = 60.0,
 ) -> LLMTextCaller:
     if not has_required_env():
         logger.warning(
@@ -494,22 +497,44 @@ def _make_llm_call(
 
     def _llm_call(prompt: str) -> str:
         last_exc: Optional[Exception] = None
-        for attempt in range(max(max_retries, 0) + 1):
+        total_attempts = max(max_retries, 0) + 1
+        for attempt in range(total_attempts):
+            attempt_no = attempt + 1
+            if on_attempt is not None:
+                try:
+                    on_attempt(attempt_no, total_attempts, llm_timeout)
+                except Exception:
+                    pass
+            started = time.monotonic()
             try:
-                response = communicate_with_llm(message=prompt, system_prompt=_system_prompt)
+                response = communicate_with_llm(message=prompt, system_prompt=_system_prompt, timeout=llm_timeout)
+                elapsed = max(time.monotonic() - started, 0.0)
+                if on_result is not None:
+                    try:
+                        on_result(attempt_no, total_attempts, True, elapsed, None)
+                    except Exception:
+                        pass
                 return str(response).strip()
             except Exception as exc:
                 last_exc = exc
+                elapsed = max(time.monotonic() - started, 0.0)
+                if on_result is not None:
+                    try:
+                        on_result(attempt_no, total_attempts, False, elapsed, str(exc))
+                    except Exception:
+                        pass
                 if attempt < max_retries:
                     logger.warning(
-                        "LLM retry %d/%d after error: %s", attempt + 1, max_retries, exc
+                        "LLM retry %d/%d after error: %s", attempt_no + 1, total_attempts, exc
                     )
                     if on_retry is not None:
                         try:
-                            on_retry(attempt + 1, max_retries, exc)
+                            on_retry(attempt_no, total_attempts, exc)
                         except Exception:
                             pass
-                    time.sleep(retry_base_delay * (2.0 ** attempt))
+                    # Constant small wait between retries (no exponential backoff).
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
                 else:
                     logger.exception(
                         "LLM все %d попытки исчерпаны; использую fallback", max_retries + 1

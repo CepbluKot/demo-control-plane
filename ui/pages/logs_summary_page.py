@@ -23,6 +23,7 @@ MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
 MAX_LOG_ROWS_PREVIEW = 80
 MAX_METRICS_ROWS_TOTAL = 50_000  # cap across all metric queries to avoid OOM
+MAX_LLM_TIMELINE_ROWS = 400
 LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
 RUNNING_SESSION_KEY = "logs_summary_running"
 RUN_PARAMS_SESSION_KEY = "logs_summary_run_params"
@@ -38,6 +39,35 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "cluster",
     "value",
 )
+
+
+def _timeline_row_color(status: str) -> str:
+    normalized = status.strip().lower()
+    if normalized == "ok":
+        return "#e8f7ee"
+    if normalized in ("error", "failed", "fail"):
+        return "#fdecec"
+    if normalized in ("retry", "retrying"):
+        return "#fff4e5"
+    if normalized == "started":
+        return "#eaf2ff"
+    return ""
+
+
+def _style_llm_timeline(df: pd.DataFrame) -> Optional[Any]:
+    if df.empty or "status" not in df.columns:
+        return None
+
+    def _row_style(row: pd.Series) -> List[str]:
+        color = _timeline_row_color(str(row.get("status", "")))
+        if not color:
+            return ["" for _ in row]
+        return [f"background-color: {color}" for _ in row]
+
+    try:
+        return df.style.apply(_row_style, axis=1)
+    except Exception:
+        return None
 
 
 def _format_datetime_with_tz(value: Any) -> str:
@@ -178,7 +208,8 @@ class LogsSummaryPageDeps:
     default_metrics_query: str
     output_dir: Path
     map_workers: int = 1
-    max_retries: int = 3
+    max_retries: int = 1
+    llm_timeout: int = 60
 
 
 @dataclass
@@ -1269,7 +1300,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                         f"MAP workers: `{state.get('map_workers', 1)}`",
-                        f"Ретраи LLM: `{state.get('max_retries', 3)}`",
+                        f"Ретраи LLM: `{state.get('max_retries', 1)}`",
+                        f"Таймаут LLM: `{state.get('llm_timeout', 60)}s`",
                     ]
                 )
             )
@@ -1286,6 +1318,51 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         with st.chat_message("assistant"):
             status = str(state.get("status", "queued"))
             st.markdown(f"Статус: **{status_titles.get(status, status)}**")
+            active_step = str(state.get("active_step", "")).strip()
+            if active_step:
+                st.caption(f"Сейчас: {active_step}")
+            llm_started = int(pd.to_numeric(state.get("llm_calls_started"), errors="coerce") or 0)
+            llm_ok = int(pd.to_numeric(state.get("llm_calls_succeeded"), errors="coerce") or 0)
+            llm_fail = int(pd.to_numeric(state.get("llm_calls_failed"), errors="coerce") or 0)
+            llm_last_dur = pd.to_numeric(state.get("llm_last_duration_sec"), errors="coerce")
+            llm_active = bool(state.get("llm_active", False))
+            llm_attempt = str(state.get("llm_last_attempt", "") or "")
+            llm_error = str(state.get("llm_last_error", "") or "")
+            if llm_started > 0:
+                parts = [f"LLM вызовы: start={llm_started}, ok={llm_ok}, fail={llm_fail}"]
+                if not pd.isna(llm_last_dur):
+                    parts.append(f"last={float(llm_last_dur):.1f}s")
+                st.caption(" | ".join(parts))
+            if llm_active:
+                wait_text = f"Ждём ответ LLM ({llm_attempt})..."
+                st.info(wait_text)
+            elif llm_error:
+                st.warning(f"Последняя ошибка LLM: {llm_error}")
+            llm_timeline = state.get("llm_timeline", [])
+            if isinstance(llm_timeline, list) and llm_timeline:
+                with st.expander("LLM Activity Timeline", expanded=False):
+                    df_tl = pd.DataFrame(llm_timeline[-200:])
+                    if not df_tl.empty:
+                        preferred_cols = [
+                            "time",
+                            "event",
+                            "call_no",
+                            "attempt",
+                            "total_attempts",
+                            "elapsed_sec",
+                            "status",
+                            "details",
+                        ]
+                        cols = [c for c in preferred_cols if c in df_tl.columns]
+                        if cols:
+                            df_tl = df_tl[cols]
+                        styled_tl = _style_llm_timeline(df_tl)
+                        st.dataframe(
+                            styled_tl if styled_tl is not None else df_tl,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=220,
+                        )
             # --- Timestamp-based progress bar ---
             last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
             period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
@@ -1463,10 +1540,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_end_dt": end_default,
         "logs_sum_db_batch": max(int(deps.db_batch_size), 1),
         "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
+        "logs_sum_parallel_map": False,
         "logs_sum_map_workers": max(int(deps.map_workers), 1),
-        "logs_sum_max_retries": max(int(deps.max_retries), 0),
+        "logs_sum_max_retries": min(max(int(deps.max_retries), 0), 3),
+        "logs_sum_llm_timeout": max(int(deps.llm_timeout), 10),
         "logs_sum_demo_mode": bool(deps.test_mode),
-        "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), 1000),
+        "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
         "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 220),
         "logs_sum_llm_final_height": max(int(deps.final_text_height), 320),
     }
@@ -1677,31 +1756,46 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             key="logs_sum_llm_batch",
             disabled=is_running,
         )
-        st.number_input(
-            "MAP workers (параллельные LLM вызовы)",
-            min_value=1,
-            max_value=32,
-            step=1,
-            key="logs_sum_map_workers",
+        st.checkbox(
+            "Параллельные LLM вызовы (MAP workers)",
+            key="logs_sum_parallel_map",
             disabled=is_running,
-            help=(
-                "Сколько MAP-батчей обрабатывается параллельно. "
-                "1 = последовательно (безопасно, порядок гарантирован). "
-                "2–8 = ускоряет суммаризацию при медленном LLM. "
-                "Результаты всегда сохраняются в хронологическом порядке."
-            ),
+            help="Включить параллельную обработку MAP-батчей. По умолчанию выключено — один батч за раз (меньше нагрузки на LLM).",
         )
+        if st.session_state.get("logs_sum_parallel_map"):
+            st.number_input(
+                "MAP workers",
+                min_value=2,
+                max_value=32,
+                step=1,
+                key="logs_sum_map_workers",
+                disabled=is_running,
+                help="Сколько MAP-батчей обрабатывается параллельно. 2–8 = ускоряет суммаризацию при медленном LLM.",
+            )
         st.number_input(
             "Ретраи LLM (при ошибке)",
             min_value=0,
-            max_value=10,
+            max_value=3,
             step=1,
             key="logs_sum_max_retries",
             disabled=is_running,
             help=(
                 "Сколько раз повторить вызов LLM при ошибке. "
                 "0 = без ретраев (сразу fallback). "
-                "Задержка между попытками удваивается: 2s, 4s, 8s..."
+                "Пауза между попытками фиксированная и короткая."
+            ),
+        )
+        st.number_input(
+            "Таймаут LLM (сек)",
+            min_value=10,
+            max_value=600,
+            step=10,
+            key="logs_sum_llm_timeout",
+            disabled=is_running,
+            help=(
+                "Максимальное время ожидания одного LLM-ответа. "
+                "При зависании запрос упадёт по таймауту и уйдёт на retry. "
+                "Итоговое максимальное время батча = timeout × (retries + 1)."
             ),
         )
         st.toggle(
@@ -1734,10 +1828,20 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     end_dt_text = str(st.session_state.get("logs_sum_end_dt", end_default))
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
-    map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1)))
-    max_retries = max(int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))), 0)
+    _parallel_map = bool(st.session_state.get("logs_sum_parallel_map", False))
+    map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1))) if _parallel_map else 1
+    max_retries = min(
+        max(int(st.session_state.get("logs_sum_max_retries", max(int(deps.max_retries), 0))), 0),
+        3,
+    )
+    llm_timeout = max(int(st.session_state.get("logs_sum_llm_timeout", max(int(deps.llm_timeout), 10))), 10)
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
-    demo_logs_count = int(st.session_state.get("logs_sum_demo_logs_count", max(int(deps.logs_tail_limit), 1000)))
+    demo_logs_count = int(
+        st.session_state.get(
+            "logs_sum_demo_logs_count",
+            max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
+        )
+    )
 
     runtime_error_placeholder = st.empty()
     analysis_placeholder = st.empty()
@@ -1763,6 +1867,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "llm_batch_size": llm_batch_size,
             "map_workers": map_workers,
             "max_retries": max_retries,
+            "llm_timeout": llm_timeout,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1794,6 +1899,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "llm_batch_size": llm_batch_size,
             "map_workers": map_workers,
             "max_retries": max_retries,
+            "llm_timeout": llm_timeout,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -1810,7 +1916,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
-    max_retries = max(int(active_params.get("max_retries", max_retries)), 0)
+    max_retries = min(max(int(active_params.get("max_retries", max_retries)), 0), 3)
+    llm_timeout = max(int(active_params.get("llm_timeout", llm_timeout)), 10)
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
 
@@ -1969,6 +2076,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_batch_size": llm_batch_size,
         "map_workers": map_workers,
         "max_retries": max_retries,
+        "llm_timeout": llm_timeout,
         "logs_processed": 0,
         "logs_total": None,
         "events": (
@@ -1994,6 +2102,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "started_monotonic": time.monotonic(),
         "elapsed_seconds": 0.0,
+        "active_step": "Инициализация пайплайна",
+        "llm_active": False,
+        "llm_calls_started": 0,
+        "llm_calls_succeeded": 0,
+        "llm_calls_failed": 0,
+        "llm_last_duration_sec": None,
+        "llm_last_error": None,
+        "llm_last_attempt": None,
+        "llm_timeline": [],
         "rows_per_second": None,
         "progress_samples": [],
         "eta_seconds_left": None,
@@ -2047,6 +2164,50 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if isinstance(events, list):
                 events.append(f"ClickHouse error: {text}")
+
+        def _push_live_event(message: str, *, render_now: bool = False) -> None:
+            events = state.setdefault("events", [])
+            if isinstance(events, list):
+                events.append(str(message))
+                if len(events) > MAX_EVENT_LINES:
+                    state["events"] = events[-MAX_EVENT_LINES:]
+            if render_now and threading.current_thread() is threading.main_thread():
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+                time.sleep(0.02)
+
+        def _append_llm_timeline(
+            *,
+            event: str,
+            call_no: Optional[int] = None,
+            attempt: Optional[int] = None,
+            total_attempts: Optional[int] = None,
+            elapsed_sec: Optional[float] = None,
+            status: Optional[str] = None,
+            details: Optional[str] = None,
+        ) -> None:
+            rows = state.setdefault("llm_timeline", [])
+            if not isinstance(rows, list):
+                rows = []
+            row = {
+                "time": datetime.now(MSK).strftime("%H:%M:%S"),
+                "event": str(event),
+            }
+            if call_no is not None:
+                row["call_no"] = int(call_no)
+            if attempt is not None:
+                row["attempt"] = int(attempt)
+            if total_attempts is not None:
+                row["total_attempts"] = int(total_attempts)
+            if elapsed_sec is not None:
+                row["elapsed_sec"] = round(float(elapsed_sec), 2)
+            if status:
+                row["status"] = str(status)
+            if details:
+                row["details"] = str(details)
+            rows.append(row)
+            if len(rows) > MAX_LLM_TIMELINE_ROWS:
+                rows = rows[-MAX_LLM_TIMELINE_ROWS:]
+            state["llm_timeline"] = rows
 
         # Two-level summarization: multi-query mode uses per-source summarizers (no merged stream).
         streaming_logs_merger: Optional[_StreamingLogsMerger] = None
@@ -2271,9 +2432,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if event == "map_start":
                 state["status"] = "map"
+                state["active_step"] = "Читаем логи и готовим MAP-батчи"
                 events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
+                state["active_step"] = "Выгружаем страницу логов из БД"
                 events.append(
                     f"Страница #{payload.get('page_index')}: {payload.get('page_rows')} строк"
                 )
@@ -2281,9 +2444,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "map"
                 idx = int(payload.get("batch_index", 0)) + 1
                 total = payload.get("batch_total")
-                events.append(f"LLM анализирует batch {idx}/{total}" if total else f"LLM анализирует batch {idx}")
+                state["active_step"] = (
+                    f"LLM анализирует MAP-batch {idx}/{total}"
+                    if total else f"LLM анализирует MAP-batch {idx}"
+                )
+                events.append(
+                    (
+                        f"LLM анализирует batch {idx}/{total} "
+                        f"(таймаут {llm_timeout}s, ретраи {max_retries})"
+                    )
+                    if total else
+                    f"LLM анализирует batch {idx} (таймаут {llm_timeout}s, ретраи {max_retries})"
+                )
             elif event == "map_batch":
                 state["status"] = "map"
+                state["active_step"] = "MAP-batch обработан, обновляем промежуточный результат"
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
@@ -2329,20 +2504,30 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 events.append(f"Map summary {idx}/{total}" if total else f"Map summary {idx}")
             elif event == "map_done":
                 state["status"] = "reduce"
+                state["active_step"] = "MAP завершён, готовим REDUCE"
                 events.append("Map этап завершен")
+                # Warn if processing stopped early due to DB errors
+                if state.get("query_errors"):
+                    events.append(
+                        "⚠️ ВНИМАНИЕ: часть данных не получена из БД — суммаризация неполная. "
+                        "Проверьте ошибки ClickHouse ниже."
+                    )
             elif event == "reduce_start":
                 state["status"] = "reduce"
+                state["active_step"] = "REDUCE: объединяем промежуточные summary"
                 events.append("Reduce этап запущен")
             elif event == "reduce_group_start":
                 state["status"] = "reduce"
                 round_idx = payload.get("reduce_round")
                 group_index = int(payload.get("group_index", 0)) + 1
                 group_total = payload.get("group_total")
+                state["active_step"] = f"REDUCE round {round_idx}, группа {group_index}/{group_total}"
                 events.append(f"Reduce round {round_idx}: группа {group_index}/{group_total}")
             elif event == "reduce_group_done":
                 state["status"] = "reduce"
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
+                state["active_step"] = "REDUCE завершён, собираем финальный отчёт"
                 if payload.get("summary") is not None:
                     state["final_summary"] = str(payload.get("summary"))
                 events.append("Reduce этап завершен")
@@ -2351,8 +2536,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 _register_query_error(error_msg)
                 events.append(f"ClickHouse error: {error_msg}")
             elif event == "freeform_start":
+                state["active_step"] = "LLM пишет финальный narrative-отчёт"
                 events.append("Генерация финального нарратива...")
             elif event == "freeform_done":
+                state["active_step"] = "Финальный narrative-отчёт готов"
                 freeform = payload.get("freeform_summary")
                 if freeform:
                     state["freeform_final_summary"] = str(freeform)
@@ -2376,19 +2563,115 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             time.sleep(0.01)
 
         state["status"] = "summarizing"
+        state["active_step"] = "Подготовка LLM-контекста и запуск суммаризации"
         _render_logs_summary_chat(analysis_placeholder, state, deps)
 
         def _on_retry(attempt: int, total: int, exc: Exception) -> None:
             """Called by _make_llm_call before each retry. Thread-safe via GIL."""
             msg = f"LLM retry {attempt}/{total}: {type(exc).__name__}: {exc}"
-            state.setdefault("events", []).append(msg)
-            # Only call Streamlit from the main thread (sequential mode).
-            # In parallel mode the call is in a worker thread — skip rendering.
-            if threading.current_thread() is threading.main_thread():
-                _render_logs_summary_chat(analysis_placeholder, state, deps)
-                time.sleep(0.05)
+            state["llm_last_error"] = str(exc)
+            state["active_step"] = f"LLM retry {attempt}/{total}"
+            _append_llm_timeline(
+                event="retry",
+                attempt=attempt,
+                total_attempts=total,
+                status="retry",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+            _push_live_event(msg, render_now=True)
 
-        base_llm_call = deps.make_llm_call(max_retries=max_retries, on_retry=_on_retry)
+        def _on_llm_attempt(attempt: int, total_attempts: int, timeout_seconds: float) -> None:
+            state["llm_active"] = True
+            state["llm_last_attempt"] = f"попытка {attempt}/{total_attempts}, timeout={int(timeout_seconds)}s"
+            if attempt == 1:
+                state["llm_calls_started"] = int(state.get("llm_calls_started", 0)) + 1
+                call_no = int(state.get("llm_calls_started", 0))
+                state["active_step"] = f"LLM вызов #{call_no}: отправили prompt, ждём ответ"
+                _append_llm_timeline(
+                    event="call_start",
+                    call_no=call_no,
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    status="started",
+                    details=f"timeout={int(timeout_seconds)}s",
+                )
+                _push_live_event(
+                    f"LLM вызов #{call_no}: старт (timeout {int(timeout_seconds)}s, attempts {total_attempts})",
+                    render_now=True,
+                )
+            else:
+                state["active_step"] = f"LLM повторная попытка {attempt}/{total_attempts}"
+                _append_llm_timeline(
+                    event="attempt_start",
+                    call_no=int(state.get("llm_calls_started", 0)),
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    status="retrying",
+                    details=f"timeout={int(timeout_seconds)}s",
+                )
+                _push_live_event(
+                    f"LLM: повторная попытка {attempt}/{total_attempts} (timeout {int(timeout_seconds)}s)",
+                    render_now=True,
+                )
+
+        def _on_llm_result(
+            attempt: int,
+            total_attempts: int,
+            success: bool,
+            elapsed_sec: float,
+            error_text: Optional[str],
+        ) -> None:
+            state["llm_last_duration_sec"] = float(elapsed_sec)
+            state["llm_active"] = False
+            current_call_no = int(state.get("llm_calls_started", 0))
+            if success:
+                state["llm_calls_succeeded"] = int(state.get("llm_calls_succeeded", 0)) + 1
+                state["llm_last_error"] = None
+                state["active_step"] = f"LLM ответ получен за {elapsed_sec:.1f}s"
+                _append_llm_timeline(
+                    event="call_done",
+                    call_no=current_call_no,
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    elapsed_sec=elapsed_sec,
+                    status="ok",
+                    details="response received",
+                )
+                _push_live_event(f"LLM ответ получен ({elapsed_sec:.1f}s)", render_now=True)
+            else:
+                state["llm_calls_failed"] = int(state.get("llm_calls_failed", 0)) + 1
+                state["llm_last_error"] = str(error_text or "")
+                _append_llm_timeline(
+                    event="call_failed",
+                    call_no=current_call_no,
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    elapsed_sec=elapsed_sec,
+                    status="error",
+                    details=str(error_text or ""),
+                )
+                if attempt < total_attempts:
+                    state["active_step"] = (
+                        f"LLM ошибка за {elapsed_sec:.1f}s, готовим retry {attempt + 1}/{total_attempts}"
+                    )
+                    _push_live_event(
+                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Готовим retry {attempt + 1}/{total_attempts}",
+                        render_now=True,
+                    )
+                else:
+                    state["active_step"] = "LLM попытки исчерпаны, используем fallback"
+                    _push_live_event(
+                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Попытки исчерпаны, fallback.",
+                        render_now=True,
+                    )
+
+        base_llm_call = deps.make_llm_call(
+            max_retries=max_retries,
+            on_retry=_on_retry,
+            on_attempt=_on_llm_attempt,
+            on_result=_on_llm_result,
+            llm_timeout=llm_timeout,
+        )
         goal_text = user_goal.strip()
         llm_context_blocks: List[str] = []
         if goal_text:
@@ -2546,6 +2829,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 final_summary_text = "Нет логов за указанный период."
 
             state["status"] = "done"
+            state["active_step"] = "Суммаризация завершена"
             state["final_summary"] = final_summary_text
             state["stats"] = {
                 "pages_fetched": agg_pages,
@@ -2577,6 +2861,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
 
             state["status"] = "done"
+            state["active_step"] = "Суммаризация завершена"
             state["final_summary"] = str(result.summary)
             state["stats"] = {
                 "pages_fetched": result.pages_fetched,
@@ -2616,6 +2901,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     except Exception as exc:  # noqa: BLE001
         state["status"] = "error"
+        state["active_step"] = "Ошибка выполнения"
         state["error"] = str(exc)
         _estimate_eta(state, "error", {})
         deps.logger.exception("logs_summary_page.run_failed")
