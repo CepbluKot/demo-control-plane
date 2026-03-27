@@ -955,6 +955,7 @@ def _render_logs_summary_page() -> None:
             getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_METRICS_SQL", "")
         ).strip(),
         output_dir=LOGS_DIR,
+        logs_fetch_mode=LOGS_FETCH_MODE,
     )
     render_logs_summary_page(deps)
 
@@ -979,6 +980,8 @@ def _render_control_plane_page() -> None:
         prediction_lookahead_minutes=PREDICTION_LOOKAHEAD_MINUTES,
         analyze_top_n=ANALYZE_TOP_N_ANOMALIES,
         process_alerts=PROCESS_ALERTS,
+        logs_fetch_mode=LOGS_FETCH_MODE,
+        logs_tail_limit=LOGS_TAIL_LIMIT,
     )
     render_control_plane_page(deps)
 

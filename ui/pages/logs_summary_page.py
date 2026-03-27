@@ -104,6 +104,30 @@ def _format_attempts_pair(attempt: Any, total_attempts: Any) -> str:
     return f"{current_text}/{_format_attempts_total(total_attempts)}"
 
 
+def _is_read_timeout_error(error_text: Any) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "read timed out" in text
+        or "read timeout" in text
+        or "readtimeout" in text
+    )
+
+
+def _normalize_logs_fetch_mode(value: Any) -> str:
+    raw = str(value or "time_window").strip().lower()
+    aliases = {
+        "time_window": "time_window",
+        "window": "time_window",
+        "lookback": "time_window",
+        "tail_n_logs": "tail_n_logs",
+        "tail_n": "tail_n_logs",
+        "last_n_logs": "tail_n_logs",
+    }
+    return aliases.get(raw, "time_window")
+
+
 def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
     started_mono = state.get("started_monotonic")
     if started_mono is None:
@@ -222,6 +246,7 @@ class LogsSummaryPageDeps:
     default_sql_query: str
     default_metrics_query: str
     output_dir: Path
+    logs_fetch_mode: str = "time_window"
     map_workers: int = 1
     max_retries: int = -1
     llm_timeout: int = 60
@@ -1307,6 +1332,17 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if period_mode == "window"
                 else "Режим: `start/end диапазон`"
             )
+            logs_fetch_mode = _normalize_logs_fetch_mode(state.get("logs_fetch_mode", "time_window"))
+            if str(state.get("mode", "db")) == "demo":
+                logs_fetch_desc = (
+                    f"Выборка логов: `по количеству` (demo, synthetic rows={state.get('demo_logs_count')})"
+                )
+            elif logs_fetch_mode == "tail_n_logs":
+                logs_fetch_desc = (
+                    f"Выборка логов: `по количеству` (tail_n_logs, limit={state.get('logs_tail_limit')})"
+                )
+            else:
+                logs_fetch_desc = "Выборка логов: `по датам` (time_window)"
             period_start_text = _format_datetime_with_tz(state.get("period_start"))
             period_end_text = _format_datetime_with_tz(state.get("period_end"))
             retries_num_raw = pd.to_numeric(state.get("max_retries", -1), errors="coerce")
@@ -1319,6 +1355,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         period_desc,
                         f"SQL запросов: `{state.get('queries_count', 1)}`",
                         f"SQL метрик: `{state.get('metrics_queries_count', 0)}`",
+                        logs_fetch_desc,
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
                         f"MAP workers: `{state.get('map_workers', 1)}`",
@@ -1360,6 +1397,36 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 st.info(wait_text)
             elif llm_error:
                 st.warning(f"Последняя ошибка LLM: {llm_error}")
+            read_timeout_active = bool(state.get("read_timeout_active", False))
+            read_timeout_started_at = state.get("read_timeout_started_at")
+            read_timeout_count = int(
+                pd.to_numeric(state.get("read_timeout_count"), errors="coerce") or 0
+            )
+            if read_timeout_active and read_timeout_started_at:
+                st.warning(
+                    "ReadTimeout серия активна: "
+                    f"с `{_format_datetime_with_tz(read_timeout_started_at)}`, "
+                    f"ошибок `{read_timeout_count}`."
+                )
+            last_rt = state.get("read_timeout_last_episode")
+            if isinstance(last_rt, dict):
+                rt_start = last_rt.get("start")
+                rt_end = last_rt.get("end")
+                rt_count = last_rt.get("count")
+                rt_resolution = str(last_rt.get("resolution") or "")
+                rt_duration = pd.to_numeric(last_rt.get("duration_sec"), errors="coerce")
+                if rt_start and rt_end:
+                    duration_text = (
+                        _format_eta_seconds(float(rt_duration))
+                        if not pd.isna(rt_duration)
+                        else "n/a"
+                    )
+                    st.caption(
+                        "Последняя серия ReadTimeout: "
+                        f"{_format_datetime_with_tz(rt_start)} -> "
+                        f"{_format_datetime_with_tz(rt_end)} | "
+                        f"ошибок={rt_count} | итог={rt_resolution} | длительность={duration_text}"
+                    )
             llm_timeline = state.get("llm_timeline", [])
             if isinstance(llm_timeline, list) and llm_timeline:
                 with st.expander("LLM Activity Timeline", expanded=False):
@@ -1818,7 +1885,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             help=(
                 "Максимальное время ожидания одного LLM-ответа. "
                 "При зависании запрос упадёт по таймауту и уйдёт на retry. "
-                "При retries = -1 общее время не ограничено."
+                "Для ReadTimeout таймаут растёт прогрессивно (+base timeout на каждую ошибку), "
+                "повторы идут бесконечно."
             ),
         )
         st.toggle(
@@ -2079,10 +2147,31 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     run_dir = deps.output_dir / "logs_summary_live" / f"run_{run_stamp}"
     live_events_path = run_dir / "events.jsonl"
     live_batches_path = run_dir / "batches.jsonl"
+    logs_fetch_mode = _normalize_logs_fetch_mode(deps.logs_fetch_mode)
+    initial_events: List[str] = []
+    if preview_query_errors or preview_metrics_errors:
+        initial_events.append(
+            f"Предварительных ошибок ClickHouse: {len(preview_query_errors) + len(preview_metrics_errors)}"
+        )
+    if demo_mode:
+        initial_events.append(
+            f"Старт: режим выборки логов по количеству (demo synthetic, rows={demo_logs_count})."
+        )
+    elif logs_fetch_mode == "tail_n_logs":
+        initial_events.append(
+            f"Старт: режим выборки логов по количеству (tail_n_logs, limit={deps.logs_tail_limit})."
+        )
+    else:
+        initial_events.append(
+            f"Старт: режим выборки логов по датам ({period_start_iso} -> {period_end_iso})."
+        )
 
     state: Dict[str, Any] = {
         "status": "queued",
         "mode": "demo" if demo_mode else "db",
+        "logs_fetch_mode": logs_fetch_mode,
+        "logs_tail_limit": int(deps.logs_tail_limit),
+        "demo_logs_count": int(demo_logs_count),
         "query": sql_query_clean,
         "metrics_query": metrics_query_clean,
         "queries_count": len(query_specs),
@@ -2099,13 +2188,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_timeout": llm_timeout,
         "logs_processed": 0,
         "logs_total": None,
-        "events": (
-            [
-                f"Предварительных ошибок ClickHouse: {len(preview_query_errors) + len(preview_metrics_errors)}"
-            ]
-            if (preview_query_errors or preview_metrics_errors)
-            else []
-        ),
+        "events": initial_events,
         "query_errors": list(preview_query_errors) + list(preview_metrics_errors),
         "map_batches": [],
         "final_summary": None,
@@ -2131,6 +2214,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_last_error": None,
         "llm_last_attempt": None,
         "llm_timeline": [],
+        "read_timeout_active": False,
+        "read_timeout_started_at": None,
+        "read_timeout_last_at": None,
+        "read_timeout_count": 0,
+        "read_timeout_last_episode": None,
         "rows_per_second": None,
         "progress_samples": [],
         "eta_seconds_left": None,
@@ -2143,6 +2231,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "sql_queries_count": len(query_specs),
         "metrics_query": metrics_query_clean,
         "metrics_queries_count": len(metrics_query_specs),
+        "logs_fetch_mode": logs_fetch_mode,
+        "logs_tail_limit": int(deps.logs_tail_limit),
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
@@ -2229,6 +2319,89 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if len(rows) > MAX_LLM_TIMELINE_ROWS:
                 rows = rows[-MAX_LLM_TIMELINE_ROWS:]
             state["llm_timeline"] = rows
+
+        def _start_read_timeout_episode(
+            *,
+            attempt: int,
+            total_attempts: int,
+            elapsed_sec: float,
+            error_text: str,
+        ) -> None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if not bool(state.get("read_timeout_active", False)):
+                state["read_timeout_active"] = True
+                state["read_timeout_started_at"] = now_iso
+                state["read_timeout_last_at"] = now_iso
+                state["read_timeout_count"] = 1
+                pair = _format_attempts_pair(attempt, total_attempts)
+                state["active_step"] = f"Поймали ReadTimeout, запускаем ретраи ({pair})"
+                _append_llm_timeline(
+                    event="read_timeout_start",
+                    call_no=int(state.get("llm_calls_started", 0)),
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    elapsed_sec=elapsed_sec,
+                    status="error",
+                    details=str(error_text or ""),
+                )
+                _push_live_event(
+                    (
+                        "ReadTimeout: начался период повторных ошибок. "
+                        f"Старт: {_format_datetime_with_tz(now_iso)}."
+                    ),
+                    render_now=True,
+                )
+                return
+
+            current_count = int(pd.to_numeric(state.get("read_timeout_count"), errors="coerce") or 0)
+            state["read_timeout_count"] = current_count + 1
+            state["read_timeout_last_at"] = now_iso
+
+        def _finish_read_timeout_episode(*, resolution: str) -> None:
+            if not bool(state.get("read_timeout_active", False)):
+                return
+
+            start_iso = state.get("read_timeout_started_at")
+            end_iso = datetime.now(timezone.utc).isoformat()
+            errors_count = int(pd.to_numeric(state.get("read_timeout_count"), errors="coerce") or 0)
+            start_ts = pd.to_datetime(start_iso, utc=True, errors="coerce")
+            end_ts = pd.to_datetime(end_iso, utc=True, errors="coerce")
+            duration_sec: Optional[float] = None
+            if not pd.isna(start_ts) and not pd.isna(end_ts):
+                duration_sec = max((end_ts - start_ts).total_seconds(), 0.0)
+
+            state["read_timeout_active"] = False
+            state["read_timeout_started_at"] = None
+            state["read_timeout_last_at"] = end_iso
+            state["read_timeout_count"] = 0
+            state["read_timeout_last_episode"] = {
+                "start": start_iso,
+                "end": end_iso,
+                "count": errors_count,
+                "resolution": resolution,
+                "duration_sec": round(duration_sec, 2) if duration_sec is not None else None,
+            }
+            _append_llm_timeline(
+                event="read_timeout_end",
+                call_no=int(state.get("llm_calls_started", 0)),
+                elapsed_sec=duration_sec,
+                status="ok" if resolution == "success" else "error",
+                details=f"resolution={resolution}, count={errors_count}",
+            )
+            duration_text = (
+                _format_eta_seconds(duration_sec)
+                if duration_sec is not None
+                else "n/a"
+            )
+            _push_live_event(
+                (
+                    "ReadTimeout: серия завершилась. "
+                    f"Финиш: {_format_datetime_with_tz(end_iso)}; "
+                    f"ошибок: {errors_count}; итог: {resolution}; "
+                    f"длительность: {duration_text}."
+                ),
+                render_now=True,
+            )
 
         # Two-level summarization: multi-query mode uses per-source summarizers (no merged stream).
         streaming_logs_merger: Optional[_StreamingLogsMerger] = None
@@ -2649,6 +2822,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state["llm_active"] = False
             current_call_no = int(state.get("llm_calls_started", 0))
             if success:
+                _finish_read_timeout_episode(resolution="success")
                 state["llm_calls_succeeded"] = int(state.get("llm_calls_succeeded", 0)) + 1
                 state["llm_last_error"] = None
                 state["active_step"] = f"LLM ответ получен за {elapsed_sec:.1f}s"
@@ -2663,6 +2837,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
                 _push_live_event(f"LLM ответ получен ({elapsed_sec:.1f}s)", render_now=True)
             else:
+                is_read_timeout = _is_read_timeout_error(error_text)
+                if is_read_timeout:
+                    _start_read_timeout_episode(
+                        attempt=attempt,
+                        total_attempts=total_attempts,
+                        elapsed_sec=elapsed_sec,
+                        error_text=str(error_text or ""),
+                    )
+                elif bool(state.get("read_timeout_active", False)):
+                    _finish_read_timeout_episode(resolution="other_error")
                 state["llm_calls_failed"] = int(state.get("llm_calls_failed", 0)) + 1
                 state["llm_last_error"] = str(error_text or "")
                 _append_llm_timeline(
@@ -2685,6 +2869,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         render_now=True,
                     )
                 else:
+                    if is_read_timeout:
+                        _finish_read_timeout_episode(resolution="fallback")
                     state["active_step"] = "LLM попытки исчерпаны, используем fallback"
                     _push_live_event(
                         f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Попытки исчерпаны, fallback.",

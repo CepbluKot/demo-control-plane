@@ -503,6 +503,17 @@ def _heuristic_llm_call(prompt: str, error: Optional[str] = None) -> str:
     )
 
 
+def _is_read_timeout_exception(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return True
+    text = str(exc).strip().lower()
+    return (
+        "read timed out" in text
+        or "read timeout" in text
+        or "readtimeout" in text
+    )
+
+
 def _make_llm_call(
     max_retries: int = -1,
     retry_delay: float = 10.0,
@@ -530,36 +541,67 @@ def _make_llm_call(
         last_exc: Optional[Exception] = None
         retries = int(max_retries)
         infinite_retries = retries < 0
-        total_attempts = -1 if infinite_retries else (max(retries, 0) + 1)
+        configured_total_attempts = -1 if infinite_retries else (max(retries, 0) + 1)
+        effective_total_attempts = configured_total_attempts
+        base_timeout = max(float(llm_timeout), 1.0)
+        current_timeout = base_timeout
         attempt_no = 0
         while True:
             attempt_no += 1
             if on_attempt is not None:
                 try:
-                    on_attempt(attempt_no, total_attempts, llm_timeout)
+                    on_attempt(attempt_no, effective_total_attempts, current_timeout)
                 except Exception:
                     pass
             started = time.monotonic()
             try:
-                response = communicate_with_llm(message=prompt, system_prompt=_system_prompt, timeout=llm_timeout)
+                response = communicate_with_llm(
+                    message=prompt,
+                    system_prompt=_system_prompt,
+                    timeout=current_timeout,
+                )
                 elapsed = max(time.monotonic() - started, 0.0)
                 if on_result is not None:
                     try:
-                        on_result(attempt_no, total_attempts, True, elapsed, None)
+                        on_result(attempt_no, effective_total_attempts, True, elapsed, None)
                     except Exception:
                         pass
                 return str(response).strip()
             except Exception as exc:
                 last_exc = exc
                 elapsed = max(time.monotonic() - started, 0.0)
+                is_read_timeout = _is_read_timeout_exception(exc)
+                if is_read_timeout:
+                    # For ReadTimeout we keep waiting indefinitely and progressively
+                    # increase the request timeout on each occurrence.
+                    effective_total_attempts = -1
                 if on_result is not None:
                     try:
-                        on_result(attempt_no, total_attempts, False, elapsed, str(exc))
+                        on_result(
+                            attempt_no,
+                            effective_total_attempts,
+                            False,
+                            elapsed,
+                            str(exc),
+                        )
                     except Exception:
                         pass
-                can_retry = infinite_retries or attempt_no <= max(retries, 0)
+                can_retry = (
+                    is_read_timeout
+                    or infinite_retries
+                    or attempt_no <= max(retries, 0)
+                )
                 if can_retry:
-                    if infinite_retries:
+                    if is_read_timeout:
+                        next_timeout = current_timeout + base_timeout
+                        logger.warning(
+                            "LLM ReadTimeout on attempt %d; next timeout %.1fs (prev %.1fs)",
+                            attempt_no,
+                            next_timeout,
+                            current_timeout,
+                        )
+                        current_timeout = next_timeout
+                    elif infinite_retries:
                         logger.warning(
                             "LLM retry %d/∞ after error: %s",
                             attempt_no + 1,
@@ -569,12 +611,12 @@ def _make_llm_call(
                         logger.warning(
                             "LLM retry %d/%d after error: %s",
                             attempt_no + 1,
-                            total_attempts,
+                            configured_total_attempts,
                             exc,
                         )
                     if on_retry is not None:
                         try:
-                            on_retry(attempt_no, total_attempts, exc)
+                            on_retry(attempt_no, effective_total_attempts, exc)
                         except Exception:
                             pass
                     # Fixed wait between retries (no exponential backoff).
@@ -583,7 +625,7 @@ def _make_llm_call(
                 else:
                     logger.exception(
                         "LLM все %d попытки исчерпаны; использую fallback",
-                        total_attempts,
+                        configured_total_attempts,
                     )
                     break
         return _heuristic_llm_call(prompt, error=str(last_exc))

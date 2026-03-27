@@ -30,12 +30,15 @@ class ControlPlanePageDeps:
     prediction_lookahead_minutes: int
     analyze_top_n: int
     process_alerts: bool
+    logs_fetch_mode: str
+    logs_tail_limit: int
 
 
 def render_control_plane_page(deps: ControlPlanePageDeps) -> None:
     with st.sidebar:
         run_clicked = st.button("Запустить 1 итерацию", type="primary", use_container_width=True)
 
+    mode_notice_placeholder = st.empty()
     runtime_error_placeholder = st.empty()
     graph_placeholder = st.empty()
     anomalies_table_placeholder = st.empty()
@@ -123,6 +126,22 @@ def render_control_plane_page(deps: ControlPlanePageDeps) -> None:
 
     if not run_clicked:
         return
+
+    logs_fetch_mode = str(deps.logs_fetch_mode or "time_window").strip().lower()
+    if logs_fetch_mode in ("tail_n_logs", "tail_n", "last_n_logs"):
+        with mode_notice_placeholder.container():
+            st.info(
+                "Режим суммаризации логов: по количеству. "
+                f"Для каждой аномалии берём последние `{int(deps.logs_tail_limit)}` логов "
+                "(tail_n_logs)."
+            )
+    else:
+        with mode_notice_placeholder.container():
+            st.info(
+                "Режим суммаризации логов: по датам. "
+                f"Для каждой аномалии берём окно `±{int(deps.loopback_minutes)}` минут "
+                "(time_window)."
+            )
 
     def _on_stage(stage: str, progress: int, payload: Dict[str, Any]) -> None:
         nonlocal had_stage_error
