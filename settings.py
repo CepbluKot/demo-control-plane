@@ -160,6 +160,8 @@ class Settings(BaseSettings):
     OPENAI_API_BASE_DB: str = ""
     OPENAI_API_KEY_DB: str = ""
     LLM_MODEL_ID: str = "PNX.QWEN3 235b a22b instruct"
+    CONTROL_PLANE_LLM_SYSTEM_PROMPT: str = ""
+    CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT: str = ""
 
 
 settings = Settings()

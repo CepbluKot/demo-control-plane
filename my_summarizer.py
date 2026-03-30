@@ -18,7 +18,21 @@ from settings import settings
 LOGS_SQL_COLUMNS: tuple[str, ...] = ("timestamp", "value")
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
+    "start_time",
+    "end_time",
+    "cnt",
+    "log",
     "message",
+    "time",
+    "logtag",
+    "ext_ClusterEnv",
+    "ext_ClusterEventType",
+    "ext_ClusterName",
+    "kubernetes_pod_name",
+    "kubernetes_namespace_name",
+    "kubernetes_container_name",
+    "kubernetes_docker_id",
+    "kubernetes_container_image",
     "container",
     "pod",
     "node",
@@ -151,7 +165,7 @@ def _extract_batch_period(rows: Sequence[Dict[str, Any]]) -> Tuple[Optional[str]
         if not isinstance(row, dict):
             continue
         raw_ts = None
-        for key in ("timestamp", "ts", "time", "datetime"):
+        for key in ("timestamp", "start_time", "end_time", "ts", "time", "datetime"):
             if row.get(key) is not None:
                 raw_ts = row.get(key)
                 break
@@ -528,7 +542,7 @@ def _make_llm_call(
         )
         return _heuristic_llm_call
 
-    _system_prompt = (
+    default_system_prompt = (
         "Ты senior SRE-инженер, специализирующийся на расследовании инцидентов.\n"
         "Правила:\n"
         "- Каждый вывод основывай на конкретных фактах из логов (цитата, timestamp).\n"
@@ -536,6 +550,8 @@ def _make_llm_call(
         "- Если данных недостаточно — прямо пиши \"данных недостаточно\".\n"
         "- Не генерируй generic выводы (\"возможна деградация\") без подтверждения из логов."
     )
+    custom_system_prompt = str(getattr(settings, "CONTROL_PLANE_LLM_SYSTEM_PROMPT", "")).strip()
+    _system_prompt = custom_system_prompt or default_system_prompt
 
     def _llm_call(prompt: str) -> str:
         last_exc: Optional[Exception] = None
@@ -1237,6 +1253,15 @@ class PeriodLogSummarizer:
             f"Строк с problem-сигналами: {len(critical_rows)}",
             f"Колонки: {', '.join(display_columns)}",
         ]
+        extra_prompt_context = str(
+            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
+        ).strip()
+        if extra_prompt_context:
+            lines += [
+                "",
+                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
+                extra_prompt_context,
+            ]
         if has_source:
             source_counts: Dict[str, int] = {}
             for row in rows:
@@ -1315,6 +1340,15 @@ class PeriodLogSummarizer:
             "",
             "Частичные наблюдения:",
         ]
+        extra_prompt_context = str(
+            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
+        ).strip()
+        if extra_prompt_context:
+            lines += [
+                "",
+                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
+                extra_prompt_context,
+            ]
         for idx, text in enumerate(summaries, start=1):
             lines.append(f"[BATCH {idx}]")
             lines.append(text)
@@ -1328,6 +1362,9 @@ class PeriodLogSummarizer:
         period_end: str,
         structured_summary: str,
     ) -> str:
+        extra_prompt_context = str(
+            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
+        ).strip()
         return "\n".join([
             "На основе структурированного анализа инцидента ниже напиши черновой нарратив.",
             "Это промежуточный результат для SRE-команды — 3-5 абзацев связным текстом.",
@@ -1335,6 +1372,7 @@ class PeriodLogSummarizer:
             "что нужно проверить дополнительно.",
             "Пиши конкретно — ссылайся на реальные timestamp'ы и цитаты из логов, не генерируй абстракции.",
             "Если данных недостаточно для какого-то утверждения — прямо напиши об этом.",
+            *((["", "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:", extra_prompt_context]) if extra_prompt_context else []),
             "",
             f"Период: [{period_start}, {period_end})",
             "",

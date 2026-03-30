@@ -635,7 +635,7 @@ def _infer_batch_period(batch: Dict[str, Any]) -> tuple[Optional[str], Optional[
         if not isinstance(row, dict):
             continue
         raw_ts = None
-        for key in ("timestamp", "ts", "time", "datetime"):
+        for key in ("timestamp", "start_time", "end_time", "ts", "time", "datetime"):
             if row.get(key) is not None:
                 raw_ts = row.get(key)
                 break

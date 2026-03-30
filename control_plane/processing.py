@@ -50,7 +50,7 @@ def _extract_batch_period_from_logs(rows: List[Dict[str, Any]]) -> Dict[str, Opt
         if not isinstance(row, dict):
             continue
         raw_ts = None
-        for key in ("timestamp", "ts", "time", "datetime"):
+        for key in ("timestamp", "start_time", "end_time", "ts", "time", "datetime"):
             if row.get(key) is not None:
                 raw_ts = row.get(key)
                 break
