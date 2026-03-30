@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 MSK = timezone(timedelta(hours=3))
+from collections import deque
 import heapq
 import json
 import logging
@@ -30,6 +31,9 @@ LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
 RUNNING_SESSION_KEY = "logs_summary_running"
 RUN_PARAMS_SESSION_KEY = "logs_summary_run_params"
 FORM_ERROR_SESSION_KEY = "logs_summary_form_error"
+RESUME_SELECTED_SESSION_KEY = "logs_summary_resume_selected"
+RESUME_BANNER_DISMISSED_SESSION_KEY = "logs_summary_resume_banner_dismissed_session"
+PENDING_PREFILL_SESSION_KEY = "logs_summary_pending_prefill_params"
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -1219,6 +1223,256 @@ def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
         f.write(json.dumps(_json_safe(payload), ensure_ascii=False) + "\n")
 
 
+def _write_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(text), encoding="utf-8")
+
+
+def _safe_filename(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(value or "").strip())
+    normalized = normalized.strip("._")
+    return normalized or "item"
+
+
+def _load_map_summaries_from_jsonl(path: str) -> List[str]:
+    p = Path(str(path or ""))
+    if not p.exists() or not p.is_file():
+        return []
+    summaries: List[str] = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = str(line).strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            summary_text = _normalize_summary_text(payload.get("batch_summary"))
+            if summary_text:
+                summaries.append(summary_text)
+    return summaries
+
+
+def _load_recent_batches_from_jsonl(
+    path: str,
+    *,
+    max_items: int = MAX_RENDERED_BATCHES,
+    max_logs_preview: int = MAX_LOG_ROWS_PREVIEW,
+) -> List[Dict[str, Any]]:
+    p = Path(str(path or ""))
+    if not p.exists() or not p.is_file():
+        return []
+    recent: deque[Dict[str, Any]] = deque(maxlen=max(int(max_items), 1))
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = str(line).strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    continue
+                if str(payload.get("event", "map_batch")) != "map_batch":
+                    continue
+                batch_logs = payload.get("batch_logs", [])
+                if not isinstance(batch_logs, list):
+                    batch_logs = []
+                recent.append(
+                    {
+                        "batch_index": payload.get("batch_index"),
+                        "batch_total": payload.get("batch_total"),
+                        "batch_summary": payload.get("batch_summary"),
+                        "batch_logs_count": payload.get("batch_logs_count"),
+                        "batch_period_start": payload.get("batch_period_start"),
+                        "batch_period_end": payload.get("batch_period_end"),
+                        "batch_logs": batch_logs[: max(int(max_logs_preview), 1)],
+                    }
+                )
+    except Exception:
+        return []
+    return list(recent)
+
+
+def _extract_last_batch_ts_from_run_dir(run_dir: Path) -> str:
+    candidates = [
+        run_dir / "summaries" / "map_summaries.jsonl",
+        run_dir / "batches.jsonl",
+    ]
+    latest_ts: Optional[pd.Timestamp] = None
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = str(line).strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        continue
+                    ts_value = payload.get("batch_period_end")
+                    ts_parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
+                    if pd.isna(ts_parsed):
+                        continue
+                    if latest_ts is None or ts_parsed > latest_ts:
+                        latest_ts = ts_parsed
+        except Exception:
+            continue
+    if latest_ts is None:
+        return ""
+    return latest_ts.to_pydatetime().isoformat()
+
+
+def _form_values_from_saved_params(
+    *,
+    saved_params: Dict[str, Any],
+    default_query: str,
+) -> Dict[str, Any]:
+    def _to_int(value: Any, default: int) -> int:
+        parsed = pd.to_numeric(value, errors="coerce")
+        if pd.isna(parsed):
+            return int(default)
+        return int(parsed)
+
+    logs_queries = [str(q) for q in saved_params.get("logs_queries", []) if str(q).strip()]
+    if not logs_queries:
+        logs_queries = [default_query]
+    metrics_queries = [
+        str(q) for q in saved_params.get("metrics_queries", []) if str(q).strip()
+    ]
+    map_workers = max(_to_int(saved_params.get("map_workers", 1), 1), 1)
+    return {
+        "logs_queries": logs_queries,
+        "metrics_queries": metrics_queries,
+        "logs_sum_user_goal": str(saved_params.get("user_goal", "")),
+        "logs_sum_period_mode": str(
+            saved_params.get("period_mode", "Явный диапазон (start/end)")
+        ),
+        "logs_sum_window_minutes": _to_int(saved_params.get("window_minutes", 30), 30),
+        "logs_sum_center_dt": str(saved_params.get("center_dt_text", "")),
+        "logs_sum_start_dt": str(saved_params.get("start_dt_text", "")),
+        "logs_sum_end_dt": str(saved_params.get("end_dt_text", "")),
+        "logs_sum_db_batch": _to_int(saved_params.get("db_batch_size", 1000), 1000),
+        "logs_sum_llm_batch": _to_int(saved_params.get("llm_batch_size", 200), 200),
+        "logs_sum_parallel_map": bool(map_workers > 1),
+        "logs_sum_map_workers": map_workers,
+        "logs_sum_max_retries": _to_int(saved_params.get("max_retries", -1), -1),
+        "logs_sum_llm_timeout": _to_int(saved_params.get("llm_timeout", 600), 600),
+        "logs_sum_demo_mode": bool(saved_params.get("demo_mode", False)),
+        "logs_sum_demo_logs_count": _to_int(saved_params.get("demo_logs_count", 4000), 4000),
+        "logs_sum_enable_no_logs_hypothesis": bool(
+            saved_params.get("enable_no_logs_hypothesis", False)
+        ),
+    }
+
+
+def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2)
+
+
+def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "status",
+        "mode",
+        "period_mode",
+        "period_start",
+        "period_end",
+        "window_minutes",
+        "queries_count",
+        "metrics_queries_count",
+        "logs_processed",
+        "logs_total",
+        "last_batch_ts",
+        "resume_rows_offset",
+        "active_step",
+        "error",
+        "started_at",
+        "elapsed_seconds",
+        "log_seconds_per_second",
+        "eta_seconds_left",
+        "eta_finish_at",
+        "progress_samples",
+        "stats",
+        "map_batches",
+        "resume_batch_offset",
+        "resume_stats_offset",
+        "final_summary",
+        "freeform_final_summary",
+        "llm_calls_started",
+        "llm_calls_succeeded",
+        "llm_calls_failed",
+        "llm_last_error",
+        "llm_timeline",
+        "events",
+        "query_errors",
+    )
+    return {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "state": {k: _json_safe(state.get(k)) for k in keys},
+    }
+
+
+def _persist_checkpoint(path: Path, state: Dict[str, Any]) -> None:
+    _write_json_file(path, _checkpoint_payload_from_state(state))
+
+
+def _discover_resume_sessions(output_dir: Path) -> List[Dict[str, Any]]:
+    sessions_root = output_dir / "logs_summary_live"
+    if not sessions_root.exists() or not sessions_root.is_dir():
+        return []
+    sessions: List[Dict[str, Any]] = []
+    for run_dir in sorted(sessions_root.glob("run_*"), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        run_params_path = run_dir / "run_params.json"
+        checkpoint_path = run_dir / "checkpoint.json"
+        if not run_params_path.exists():
+            continue
+        checkpoint = _read_json_file(checkpoint_path) or {}
+        checkpoint_state = checkpoint.get("state", {}) if isinstance(checkpoint, dict) else {}
+        status = str(checkpoint_state.get("status", "unknown"))
+        saved_at = str(checkpoint.get("saved_at", ""))
+        try:
+            parsed_saved = pd.to_datetime(saved_at, utc=True, errors="coerce")
+            saved_text = (
+                parsed_saved.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+                if not pd.isna(parsed_saved)
+                else "n/a"
+            )
+        except Exception:
+            saved_text = "n/a"
+        sessions.append(
+            {
+                "id": run_dir.name,
+                "run_dir": str(run_dir),
+                "run_params_path": str(run_params_path),
+                "checkpoint_path": str(checkpoint_path),
+                "request_path": str(run_dir / "request.json"),
+                "status": status,
+                "saved_at_text": saved_text,
+                "label": f"{run_dir.name} | status={status} | saved={saved_text}",
+            }
+        )
+    return sessions
+
+
 def _save_logs_summary_result(
     *,
     output_dir: Path,
@@ -1229,6 +1483,8 @@ def _save_logs_summary_result(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"logs_summary_result_{stamp}.json"
     summary_path = output_dir / f"logs_summary_result_{stamp}.md"
+    structured_md_path = output_dir / f"logs_summary_structured_{stamp}.md"
+    freeform_md_path = output_dir / f"logs_summary_freeform_{stamp}.md"
     structured_txt_path = output_dir / f"logs_summary_structured_{stamp}.txt"
     freeform_txt_path = output_dir / f"logs_summary_freeform_{stamp}.txt"
 
@@ -1242,6 +1498,38 @@ def _save_logs_summary_result(
 
     structured_summary = str(result_state.get("final_summary") or "").strip()
     freeform_summary = str(result_state.get("freeform_final_summary") or "").strip()
+    if structured_summary:
+        _write_text_file(
+            structured_md_path,
+            "\n".join(
+                [
+                    "# Итоговое расследование",
+                    "",
+                    f"- saved_at: `{payload['saved_at']}`",
+                    f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    "",
+                    "```text",
+                    structured_summary,
+                    "```",
+                ]
+            ),
+        )
+    if freeform_summary:
+        _write_text_file(
+            freeform_md_path,
+            "\n".join(
+                [
+                    "# Итоговое расследование в свободном формате",
+                    "",
+                    f"- saved_at: `{payload['saved_at']}`",
+                    f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    "",
+                    "```text",
+                    freeform_summary,
+                    "```",
+                ]
+            ),
+        )
     if structured_summary:
         structured_txt_path.write_text(structured_summary, encoding="utf-8")
     if freeform_summary:
@@ -1273,8 +1561,16 @@ def _save_logs_summary_result(
         f"- logs_total: `{result_state.get('logs_total')}`",
         f"- stats: `{result_state.get('stats')}`",
         f"- error: `{result_state.get('error')}`",
+        f"- map_summaries_jsonl: `{result_state.get('map_summaries_jsonl_path')}`",
+        f"- reduce_summaries_jsonl: `{result_state.get('reduce_summaries_jsonl_path')}`",
+        f"- llm_calls_jsonl: `{result_state.get('llm_calls_jsonl_path')}`",
+        f"- run_params_path: `{result_state.get('run_params_path')}`",
+        f"- request_path: `{result_state.get('request_path')}`",
+        f"- checkpoint_path: `{result_state.get('checkpoint_path')}`",
         "",
         f"JSON dump: `{json_path}`",
+        (f"- structured md: `{structured_md_path}`" if structured_summary else ""),
+        (f"- freeform md: `{freeform_md_path}`" if freeform_summary else ""),
         (f"- structured txt: `{structured_txt_path}`" if structured_summary else ""),
         (f"- freeform txt: `{freeform_txt_path}`" if freeform_summary else ""),
     ]
@@ -1282,6 +1578,10 @@ def _save_logs_summary_result(
         f.write("\n".join(lines))
 
     result = {"json_path": str(json_path), "summary_path": str(summary_path)}
+    if structured_summary:
+        result["structured_md_path"] = str(structured_md_path)
+    if freeform_summary:
+        result["freeform_md_path"] = str(freeform_md_path)
     if structured_summary:
         result["structured_txt_path"] = str(structured_txt_path)
     if freeform_summary:
@@ -1489,6 +1789,88 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             with st.expander("Полный текст свободного отчета (без форматирования)", expanded=False):
                 deps.render_scrollable_text(freeform_summary, height=max(final_height, 620))
 
+        map_summaries_path = str(state.get("map_summaries_jsonl_path") or "").strip()
+        if map_summaries_path:
+            st.markdown("Переиспользование Summary")
+            if st.button(
+                "Пересобрать итоговый Reduce summary из сохранённых MAP summary",
+                key=f"logs_sum_rereduce_{str(state.get('started_at') or 'na')}",
+                use_container_width=True,
+            ):
+                try:
+                    cached_map_summaries = _load_map_summaries_from_jsonl(map_summaries_path)
+                    if not cached_map_summaries:
+                        st.warning("В файле MAP summary нет данных для пересборки.")
+                    else:
+                        with st.spinner("Пересобираем финальный REDUCE из сохранённых MAP summary..."):
+                            from my_summarizer import (  # noqa: PLC0415
+                                regenerate_reduce_summary_from_map_summaries,
+                            )
+
+                            retries_raw = pd.to_numeric(
+                                state.get("max_retries"), errors="coerce"
+                            )
+                            retries_value = -1 if pd.isna(retries_raw) else int(retries_raw)
+                            timeout_raw = pd.to_numeric(
+                                state.get("llm_timeout"), errors="coerce"
+                            )
+                            timeout_value = (
+                                int(deps.llm_timeout)
+                                if pd.isna(timeout_raw)
+                                else int(timeout_raw)
+                            )
+                            llm_call = deps.make_llm_call(
+                                max_retries=retries_value,
+                                llm_timeout=max(timeout_value, 10),
+                            )
+                            rebuilt_summary = regenerate_reduce_summary_from_map_summaries(
+                                map_summaries=cached_map_summaries,
+                                period_start=str(state.get("period_start") or ""),
+                                period_end=str(state.get("period_end") or ""),
+                                llm_call=llm_call,
+                                prompt_context={
+                                    "incident_start": str(state.get("period_start") or ""),
+                                    "incident_end": str(state.get("period_end") or ""),
+                                    "incident_description": str(state.get("user_goal") or ""),
+                                    "alerts_list": str(state.get("user_goal") or ""),
+                                    "metrics_context": str(state.get("metrics_context_text") or ""),
+                                    "source_name": "cached_map_summaries",
+                                    "sql_query": str(state.get("query") or ""),
+                                    "time_column": str(state.get("logs_timestamp_column") or "timestamp"),
+                                    "data_type": "",
+                                },
+                            )
+                        rebuilt_summary = _normalize_summary_text(rebuilt_summary)
+                        if rebuilt_summary:
+                            state["final_summary"] = rebuilt_summary
+                            state.setdefault("events", []).append(
+                                "Итоговый Reduce summary пересобран из сохранённых MAP summary"
+                            )
+                            rebuild_path = (
+                                Path(map_summaries_path).parent
+                                / f"rebuild_reduce_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.md"
+                            )
+                            _write_text_file(
+                                rebuild_path,
+                                "\n".join(
+                                    [
+                                        "# Rebuilt Reduce Summary",
+                                        f"- rebuilt_at: `{datetime.now(timezone.utc).isoformat()}`",
+                                        f"- map_summaries: `{len(cached_map_summaries)}`",
+                                        "",
+                                        rebuilt_summary,
+                                    ]
+                                ),
+                            )
+                            state["rebuild_reduce_path"] = str(rebuild_path)
+                            st.session_state[LAST_STATE_SESSION_KEY] = state
+                            st.success("Пересборка завершена. Обновили итоговый summary.")
+                            st.rerun()
+                        else:
+                            st.warning("LLM вернул пустой результат при пересборке.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Не удалось пересобрать итог: {exc}")
+
         query_errors = state.get("query_errors", [])
         if isinstance(query_errors, list) and query_errors:
             with st.expander("Ошибки ClickHouse (запросы, которые были пропущены)", expanded=False):
@@ -1502,6 +1884,10 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 st.code(str(state.get("result_json_path")))
             if state.get("result_summary_path"):
                 st.code(str(state.get("result_summary_path")))
+            if state.get("result_structured_md_path"):
+                st.code(str(state.get("result_structured_md_path")))
+            if state.get("result_freeform_md_path"):
+                st.code(str(state.get("result_freeform_md_path")))
             if state.get("result_structured_txt_path"):
                 st.code(str(state.get("result_structured_txt_path")))
             if state.get("result_freeform_txt_path"):
@@ -1510,13 +1896,36 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 st.code(str(state.get("live_events_path")))
             if state.get("live_batches_path"):
                 st.code(str(state.get("live_batches_path")))
+            if state.get("run_params_path"):
+                st.code(str(state.get("run_params_path")))
+            if state.get("request_path"):
+                st.code(str(state.get("request_path")))
+            if state.get("checkpoint_path"):
+                st.code(str(state.get("checkpoint_path")))
+            if state.get("map_summaries_jsonl_path"):
+                st.code(str(state.get("map_summaries_jsonl_path")))
+            if state.get("reduce_summaries_jsonl_path"):
+                st.code(str(state.get("reduce_summaries_jsonl_path")))
+            if state.get("llm_calls_jsonl_path"):
+                st.code(str(state.get("llm_calls_jsonl_path")))
+            if state.get("rebuild_reduce_path"):
+                st.code(str(state.get("rebuild_reduce_path")))
 
         with download_col:
             st.markdown("Скачать")
             json_bytes = _read_file_bytes(state.get("result_json_path"))
             md_bytes = _read_file_bytes(state.get("result_summary_path"))
+            structured_md_bytes = _read_file_bytes(state.get("result_structured_md_path"))
+            freeform_md_bytes = _read_file_bytes(state.get("result_freeform_md_path"))
             structured_txt_bytes = _read_file_bytes(state.get("result_structured_txt_path"))
             freeform_txt_bytes = _read_file_bytes(state.get("result_freeform_txt_path"))
+            map_jsonl_bytes = _read_file_bytes(state.get("map_summaries_jsonl_path"))
+            reduce_jsonl_bytes = _read_file_bytes(state.get("reduce_summaries_jsonl_path"))
+            llm_jsonl_bytes = _read_file_bytes(state.get("llm_calls_jsonl_path"))
+            rebuild_md_bytes = _read_file_bytes(state.get("rebuild_reduce_path"))
+            run_params_bytes = _read_file_bytes(state.get("run_params_path"))
+            request_bytes = _read_file_bytes(state.get("request_path"))
+            checkpoint_bytes = _read_file_bytes(state.get("checkpoint_path"))
             if json_bytes is not None and state.get("result_json_path"):
                 st.download_button(
                     label="JSON отчет",
@@ -1525,11 +1934,28 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     mime="application/json",
                     use_container_width=True,
                 )
+            st.caption("Markdown файлы")
             if md_bytes is not None and state.get("result_summary_path"):
                 st.download_button(
-                    label="Markdown отчет",
+                    label="MD: Общий отчет",
                     data=md_bytes,
                     file_name=Path(str(state.get("result_summary_path"))).name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            if structured_md_bytes is not None and state.get("result_structured_md_path"):
+                st.download_button(
+                    label="MD: Структурированное расследование",
+                    data=structured_md_bytes,
+                    file_name=Path(str(state.get("result_structured_md_path"))).name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            if freeform_md_bytes is not None and state.get("result_freeform_md_path"):
+                st.download_button(
+                    label="MD: Свободный отчет",
+                    data=freeform_md_bytes,
+                    file_name=Path(str(state.get("result_freeform_md_path"))).name,
                     mime="text/markdown",
                     use_container_width=True,
                 )
@@ -1547,6 +1973,62 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     data=freeform_txt_bytes,
                     file_name=Path(str(state.get("result_freeform_txt_path"))).name,
                     mime="text/plain",
+                    use_container_width=True,
+                )
+            if map_jsonl_bytes is not None and state.get("map_summaries_jsonl_path"):
+                st.download_button(
+                    label="MAP summaries JSONL",
+                    data=map_jsonl_bytes,
+                    file_name=Path(str(state.get("map_summaries_jsonl_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if reduce_jsonl_bytes is not None and state.get("reduce_summaries_jsonl_path"):
+                st.download_button(
+                    label="REDUCE summaries JSONL",
+                    data=reduce_jsonl_bytes,
+                    file_name=Path(str(state.get("reduce_summaries_jsonl_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if llm_jsonl_bytes is not None and state.get("llm_calls_jsonl_path"):
+                st.download_button(
+                    label="LLM calls JSONL",
+                    data=llm_jsonl_bytes,
+                    file_name=Path(str(state.get("llm_calls_jsonl_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if rebuild_md_bytes is not None and state.get("rebuild_reduce_path"):
+                st.download_button(
+                    label="MD: Пересобранный Reduce",
+                    data=rebuild_md_bytes,
+                    file_name=Path(str(state.get("rebuild_reduce_path"))).name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            if run_params_bytes is not None and state.get("run_params_path"):
+                st.download_button(
+                    label="Run Params JSON",
+                    data=run_params_bytes,
+                    file_name=Path(str(state.get("run_params_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if request_bytes is not None and state.get("request_path"):
+                st.download_button(
+                    label="Request JSON",
+                    data=request_bytes,
+                    file_name=Path(str(state.get("request_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if checkpoint_bytes is not None and state.get("checkpoint_path"):
+                st.download_button(
+                    label="Checkpoint JSON",
+                    data=checkpoint_bytes,
+                    file_name=Path(str(state.get("checkpoint_path"))).name,
+                    mime="application/json",
                     use_container_width=True,
                 )
 
@@ -1617,6 +2099,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             "Нет логов -> гипотезы: `вкл`"
                             if bool(state.get("enable_no_logs_hypothesis", False))
                             else "Нет логов -> гипотезы: `выкл`"
+                        ),
+                        f"Режим сессии: `{state.get('resume_mode', 'new')}`",
+                        (
+                            f"Продолжение с ts: `{state.get('resume_from_ts')}`"
+                            if str(state.get("resume_mode", "new")) == "continue"
+                            else "Продолжение с ts: `-`"
                         ),
                     ]
                 )
@@ -1709,7 +2197,13 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             hide_index=True,
                             height=220,
                         )
-            # --- Timestamp-based progress bar ---
+            # --- Progress bar (rows + timestamp, choose the most stable ratio) ---
+            row_ratio: Optional[float] = None
+            rows_processed_num = pd.to_numeric(state.get("logs_processed"), errors="coerce")
+            rows_total_num = pd.to_numeric(state.get("logs_total"), errors="coerce")
+            if not pd.isna(rows_processed_num) and not pd.isna(rows_total_num) and float(rows_total_num) > 0:
+                row_ratio = min(max(float(rows_processed_num) / float(rows_total_num), 0.0), 1.0)
+
             last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
             period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
             period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
@@ -1724,12 +2218,29 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 done_span = max((last_batch_ts - period_start_ts).total_seconds(), 0.0)
                 if total_span > 0:
                     ts_ratio = min(max(done_span / total_span, 0.0), 1.0)
-                    pct = ts_ratio * 100.0
-                    last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
-                    st.progress(
-                        ts_ratio,
-                        text=f"Прогресс: {pct:.1f}% | лог до {last_ts_str}",
-                    )
+            display_ratio: Optional[float] = None
+            progress_text = "Прогресс"
+            if row_ratio is not None and ts_ratio is not None:
+                display_ratio = max(row_ratio, ts_ratio)
+                last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
+                progress_text = (
+                    f"Прогресс: {display_ratio * 100.0:.1f}% | "
+                    f"строки: {int(rows_processed_num):,}/{int(rows_total_num):,} | "
+                    f"лог до {last_ts_str}"
+                )
+            elif row_ratio is not None:
+                display_ratio = row_ratio
+                progress_text = (
+                    f"Прогресс: {display_ratio * 100.0:.1f}% | "
+                    f"строки: {int(rows_processed_num):,}/{int(rows_total_num):,}"
+                )
+            elif ts_ratio is not None:
+                display_ratio = ts_ratio
+                last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
+                progress_text = f"Прогресс: {display_ratio * 100.0:.1f}% | лог до {last_ts_str}"
+
+            if display_ratio is not None:
+                st.progress(display_ratio, text=progress_text)
             elif state.get("logs_processed"):
                 st.caption(f"Обработано строк: {state['logs_processed']}")
 
@@ -1832,13 +2343,22 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             with st.chat_message("assistant"):
                 st.error(f"Ошибка: {state['error']}")
 
-        if state.get("result_json_path") or state.get("result_summary_path"):
+        if (
+            state.get("result_json_path")
+            or state.get("result_summary_path")
+            or state.get("result_structured_md_path")
+            or state.get("result_freeform_md_path")
+        ):
             with st.chat_message("assistant"):
                 st.markdown("Результаты сохранены")
                 if state.get("result_json_path"):
                     st.code(str(state.get("result_json_path")))
                 if state.get("result_summary_path"):
                     st.code(str(state.get("result_summary_path")))
+                if state.get("result_structured_md_path"):
+                    st.code(str(state.get("result_structured_md_path")))
+                if state.get("result_freeform_md_path"):
+                    st.code(str(state.get("result_freeform_md_path")))
                 if state.get("result_structured_txt_path"):
                     st.code(str(state.get("result_structured_txt_path")))
                 if state.get("result_freeform_txt_path"):
@@ -1847,6 +2367,20 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     st.code(str(state.get("live_events_path")))
                 if state.get("live_batches_path"):
                     st.code(str(state.get("live_batches_path")))
+                if state.get("run_params_path"):
+                    st.code(str(state.get("run_params_path")))
+                if state.get("request_path"):
+                    st.code(str(state.get("request_path")))
+                if state.get("checkpoint_path"):
+                    st.code(str(state.get("checkpoint_path")))
+                if state.get("map_summaries_jsonl_path"):
+                    st.code(str(state.get("map_summaries_jsonl_path")))
+                if state.get("reduce_summaries_jsonl_path"):
+                    st.code(str(state.get("reduce_summaries_jsonl_path")))
+                if state.get("llm_calls_jsonl_path"):
+                    st.code(str(state.get("llm_calls_jsonl_path")))
+                if state.get("rebuild_reduce_path"):
+                    st.code(str(state.get("rebuild_reduce_path")))
 
 
 def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size: int, map_workers: int = 1) -> Any:
@@ -1890,6 +2424,92 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     start_default = (now_msk - timedelta(minutes=max(int(deps.loopback_minutes), 1))).isoformat()
     end_default = now_msk.isoformat()
     default_metrics_query = str(deps.default_metrics_query or "").strip()
+    resume_sessions = _discover_resume_sessions(deps.output_dir)
+    latest_unfinished_session = next(
+        (item for item in resume_sessions if str(item.get("status", "")).strip().lower() != "done"),
+        None,
+    )
+
+    def _queue_resume_session(selected_session: Dict[str, Any], *, continue_mode: bool) -> Optional[str]:
+        loaded_params = _read_json_file(Path(str(selected_session["run_params_path"])))
+        if not isinstance(loaded_params, dict):
+            return "Не удалось загрузить параметры выбранной сессии."
+        loaded_params = dict(loaded_params)
+        if continue_mode:
+            checkpoint_payload = _read_json_file(Path(str(selected_session["checkpoint_path"]))) or {}
+            checkpoint_state = (
+                checkpoint_payload.get("state", {})
+                if isinstance(checkpoint_payload, dict)
+                else {}
+            )
+            resume_ts = str(checkpoint_state.get("last_batch_ts") or "").strip()
+            if not resume_ts:
+                resume_ts = _extract_last_batch_ts_from_run_dir(Path(str(selected_session["run_dir"])))
+            loaded_params["resume_mode"] = "continue"
+            loaded_params["resume_session_dir"] = str(selected_session["run_dir"])
+            loaded_params["resume_from_ts"] = resume_ts
+            loaded_params["resume_ts_missing"] = not bool(resume_ts)
+        else:
+            loaded_params["resume_mode"] = "restart"
+            loaded_params["resume_session_dir"] = ""
+            loaded_params["resume_from_ts"] = ""
+            loaded_params["resume_ts_missing"] = False
+        # Keep the form in sync with the resumed session config on next rerun.
+        st.session_state[PENDING_PREFILL_SESSION_KEY] = dict(loaded_params)
+        st.session_state[RUN_PARAMS_SESSION_KEY] = loaded_params
+        st.session_state[RUNNING_SESSION_KEY] = True
+        return None
+
+    dismissed_resume_id = str(
+        st.session_state.get(RESUME_BANNER_DISMISSED_SESSION_KEY, "") or ""
+    )
+    if (
+        not is_running
+        and latest_unfinished_session is not None
+        and dismissed_resume_id != str(latest_unfinished_session.get("id", ""))
+    ):
+        with st.container():
+            st.info(
+                "Найдена незавершённая сессия. "
+                "Можно продолжить с последней точки или запустить заново."
+            )
+            st.caption(str(latest_unfinished_session.get("label", "")))
+            auto_col_continue, auto_col_restart, auto_col_hide = st.columns(3)
+            with auto_col_continue:
+                auto_continue_clicked = st.button(
+                    "Продолжить Последнюю",
+                    key="logs_sum_auto_resume_continue",
+                    use_container_width=True,
+                )
+            with auto_col_restart:
+                auto_restart_clicked = st.button(
+                    "Заново По Параметрам",
+                    key="logs_sum_auto_resume_restart",
+                    use_container_width=True,
+                )
+            with auto_col_hide:
+                auto_hide_clicked = st.button(
+                    "Скрыть Подсказку",
+                    key="logs_sum_auto_resume_hide",
+                    use_container_width=True,
+                )
+            if auto_continue_clicked:
+                err = _queue_resume_session(latest_unfinished_session, continue_mode=True)
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+            if auto_restart_clicked:
+                err = _queue_resume_session(latest_unfinished_session, continue_mode=False)
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+            if auto_hide_clicked:
+                st.session_state[RESUME_BANNER_DISMISSED_SESSION_KEY] = str(
+                    latest_unfinished_session.get("id", "")
+                )
+                st.rerun()
 
     widget_defaults: Dict[str, Any] = {
         "logs_sum_user_goal": "",
@@ -1942,7 +2562,97 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         min_items=0,
     )
 
+    def _apply_saved_params_to_form(saved_params: Dict[str, Any]) -> None:
+        mapped = _form_values_from_saved_params(
+            saved_params=saved_params,
+            default_query=default_query,
+        )
+        st.session_state["logs_sum_user_goal"] = mapped["logs_sum_user_goal"]
+        st.session_state["logs_sum_period_mode"] = mapped["logs_sum_period_mode"]
+        st.session_state["logs_sum_window_minutes"] = max(int(mapped["logs_sum_window_minutes"]), 1)
+        st.session_state["logs_sum_center_dt"] = mapped["logs_sum_center_dt"] or center_default
+        st.session_state["logs_sum_start_dt"] = mapped["logs_sum_start_dt"] or start_default
+        st.session_state["logs_sum_end_dt"] = mapped["logs_sum_end_dt"] or end_default
+        st.session_state["logs_sum_db_batch"] = max(int(mapped["logs_sum_db_batch"]), 1)
+        st.session_state["logs_sum_llm_batch"] = max(int(mapped["logs_sum_llm_batch"]), 1)
+        st.session_state["logs_sum_parallel_map"] = bool(mapped["logs_sum_parallel_map"])
+        st.session_state["logs_sum_map_workers"] = max(int(mapped["logs_sum_map_workers"]), 1)
+        st.session_state["logs_sum_max_retries"] = int(mapped["logs_sum_max_retries"])
+        st.session_state["logs_sum_llm_timeout"] = max(int(mapped["logs_sum_llm_timeout"]), 10)
+        st.session_state["logs_sum_demo_mode"] = bool(mapped["logs_sum_demo_mode"])
+        st.session_state["logs_sum_demo_logs_count"] = max(
+            int(mapped["logs_sum_demo_logs_count"]),
+            100,
+        )
+        st.session_state["logs_sum_enable_no_logs_hypothesis"] = bool(
+            mapped["logs_sum_enable_no_logs_hypothesis"]
+        )
+
+        st.session_state[logs_queries_state_key] = [
+            _new_query_item(text) for text in mapped["logs_queries"]
+        ]
+        st.session_state[metrics_queries_state_key] = [
+            _new_query_item(text) for text in mapped["metrics_queries"]
+        ]
+
+    pending_prefill_params = st.session_state.pop(PENDING_PREFILL_SESSION_KEY, None)
+    if isinstance(pending_prefill_params, dict):
+        _apply_saved_params_to_form(dict(pending_prefill_params))
+
     with st.sidebar:
+        st.markdown("Восстановление Сессии")
+        if resume_sessions:
+            if RESUME_SELECTED_SESSION_KEY not in st.session_state:
+                st.session_state[RESUME_SELECTED_SESSION_KEY] = 0
+            selected_session_idx = st.selectbox(
+                "Сохранённая сессия",
+                options=list(range(len(resume_sessions))),
+                format_func=lambda idx: str(resume_sessions[int(idx)]["label"]),
+                key=RESUME_SELECTED_SESSION_KEY,
+                disabled=is_running,
+            )
+            selected_session = resume_sessions[int(selected_session_idx)]
+            col_resume, col_restart, col_fill = st.columns(3)
+            with col_resume:
+                resume_clicked = st.button(
+                    "Продолжить",
+                    key="logs_sum_resume_continue",
+                    disabled=is_running,
+                    use_container_width=True,
+                )
+            with col_restart:
+                restart_clicked = st.button(
+                    "Заново",
+                    key="logs_sum_resume_restart",
+                    disabled=is_running,
+                    use_container_width=True,
+                )
+            with col_fill:
+                fill_form_clicked = st.button(
+                    "В Форму",
+                    key="logs_sum_resume_fill_form",
+                    disabled=is_running,
+                    use_container_width=True,
+                    help="Подставить параметры выбранной сессии в поля формы без запуска.",
+                )
+            if fill_form_clicked and not is_running:
+                loaded_params = _read_json_file(Path(str(selected_session["run_params_path"])))
+                if not isinstance(loaded_params, dict):
+                    st.error("Не удалось загрузить параметры выбранной сессии.")
+                else:
+                    _apply_saved_params_to_form(dict(loaded_params))
+                    st.success("Параметры сессии подставлены в форму.")
+                    st.rerun()
+            if (resume_clicked or restart_clicked) and not is_running:
+                err = _queue_resume_session(selected_session, continue_mode=bool(resume_clicked))
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+        else:
+            st.caption("Сохранённых сессий пока нет.")
+
+        st.markdown("---")
         st.markdown("SQL Запросы Логов")
         if st.button(
             "+ Добавить запрос логов",
@@ -2246,6 +2956,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
+            "resume_mode": "new",
+            "resume_session_dir": "",
+            "resume_from_ts": "",
         }
         st.session_state[RUNNING_SESSION_KEY] = True
         st.rerun()
@@ -2280,6 +2993,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
+            "resume_mode": "new",
+            "resume_session_dir": "",
+            "resume_from_ts": "",
         }
 
     logs_queries = list(active_params.get("logs_queries", []))
@@ -2304,6 +3020,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     )
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
+    resume_mode = str(active_params.get("resume_mode", "new")).strip().lower()
+    resume_session_dir = str(active_params.get("resume_session_dir", "")).strip()
+    resume_from_ts = str(active_params.get("resume_from_ts", "")).strip()
+    resume_ts_missing = bool(active_params.get("resume_ts_missing", False))
 
     logs_queries = [str(q) for q in logs_queries if str(q).strip()]
     metrics_queries = [str(q) for q in metrics_queries if str(q).strip()]
@@ -2333,6 +3053,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     period_start_iso = period_start_dt.isoformat()
     period_end_iso = period_end_dt.isoformat()
+    effective_period_start_iso = period_start_iso
+    if resume_mode == "continue" and resume_from_ts:
+        parsed_resume_ts = pd.to_datetime(resume_from_ts, utc=True, errors="coerce")
+        parsed_end_ts = pd.to_datetime(period_end_iso, utc=True, errors="coerce")
+        if not pd.isna(parsed_resume_ts) and not pd.isna(parsed_end_ts) and parsed_resume_ts < parsed_end_ts:
+            effective_period_start_iso = (
+                parsed_resume_ts.to_pydatetime() + timedelta(microseconds=1)
+            ).isoformat()
     query_templates: List[str] = []
     for raw_query in logs_queries:
         query_templates.extend(_split_query_templates(raw_query))
@@ -2448,14 +3176,41 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     run_dir = deps.output_dir / "logs_summary_live" / f"run_{run_stamp}"
+    is_resume_continue = False
+    if resume_mode == "continue" and resume_session_dir:
+        candidate = Path(resume_session_dir)
+        if candidate.exists() and candidate.is_dir():
+            run_dir = candidate
+            is_resume_continue = True
     live_events_path = run_dir / "events.jsonl"
     live_batches_path = run_dir / "batches.jsonl"
+    run_params_path = run_dir / "run_params.json"
+    request_path = run_dir / "request.json"
+    session_checkpoint_path = run_dir / "checkpoint.json"
+    summaries_dir = run_dir / "summaries"
+    map_summaries_dir = summaries_dir / "map"
+    reduce_summaries_dir = summaries_dir / "reduce"
+    final_summaries_dir = summaries_dir / "final"
+    llm_calls_dir = summaries_dir / "llm_calls"
+    map_summaries_jsonl_path = summaries_dir / "map_summaries.jsonl"
+    reduce_summaries_jsonl_path = summaries_dir / "reduce_summaries.jsonl"
+    llm_calls_jsonl_path = summaries_dir / "llm_calls.jsonl"
     logs_fetch_mode = _normalize_logs_fetch_mode(deps.logs_fetch_mode)
     initial_events: List[str] = []
     if preview_query_errors or preview_metrics_errors:
         initial_events.append(
             f"Предварительных ошибок ClickHouse: {len(preview_query_errors) + len(preview_metrics_errors)}"
         )
+    if is_resume_continue:
+        initial_events.append(
+            "РЕЖИМ ВОССТАНОВЛЕНИЯ: продолжаем с сохранённой сессии "
+            f"({run_dir.name})"
+        )
+        if resume_ts_missing:
+            initial_events.append(
+                "Resume warning: не нашли last_batch_ts в checkpoint, "
+                "продолжение может начаться с начала периода."
+            )
     if demo_mode:
         initial_events.append(
             f"Старт: режим выборки логов по количеству (demo synthetic, rows={demo_logs_count})."
@@ -2466,7 +3221,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         )
     else:
         initial_events.append(
-            f"Старт: режим выборки логов по датам ({period_start_iso} -> {period_end_iso})."
+            f"Старт: режим выборки логов по датам ({effective_period_start_iso} -> {period_end_iso})."
         )
     initial_events.append(f"Колонка времени логов: `{logs_timestamp_column}`")
 
@@ -2481,10 +3236,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "metrics_query": metrics_query_clean,
         "queries_count": len(query_specs),
         "metrics_queries_count": len(metrics_query_specs),
+        "active_source_label": "query_1",
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
+        "effective_period_start": effective_period_start_iso,
         "period_end": period_end_iso,
+        "resume_mode": "continue" if is_resume_continue else ("restart" if resume_mode == "restart" else "new"),
+        "resume_from_ts": resume_from_ts,
+        "resume_session_dir": str(run_dir) if is_resume_continue else "",
         "window_minutes": window_minutes,
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
@@ -2494,6 +3254,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "logs_processed": 0,
         "logs_total": None,
+        "resume_rows_offset": 0,
+        "resume_batch_offset": 0,
+        "source_rows_base": 0,
+        "source_batch_base": 0,
+        "total_batches_processed": 0,
+        "resume_stats_offset": {
+            "pages_fetched": 0,
+            "rows_processed": 0,
+            "llm_calls": 0,
+            "reduce_rounds": 0,
+        },
         "events": initial_events,
         "query_errors": list(preview_query_errors) + list(preview_metrics_errors),
         "map_batches": [],
@@ -2506,10 +3277,19 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "error": None,
         "result_json_path": None,
         "result_summary_path": None,
+        "result_structured_md_path": None,
+        "result_freeform_md_path": None,
         "result_structured_txt_path": None,
         "result_freeform_txt_path": None,
+        "rebuild_reduce_path": None,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
+        "run_params_path": str(run_params_path),
+        "request_path": str(request_path),
+        "checkpoint_path": str(session_checkpoint_path),
+        "map_summaries_jsonl_path": str(map_summaries_jsonl_path),
+        "reduce_summaries_jsonl_path": str(reduce_summaries_jsonl_path),
+        "llm_calls_jsonl_path": str(llm_calls_jsonl_path),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "started_monotonic": time.monotonic(),
         "elapsed_seconds": 0.0,
@@ -2521,6 +3301,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_last_duration_sec": None,
         "llm_last_error": None,
         "llm_last_attempt": None,
+        "llm_phase_hint": "map",
         "llm_timeline": [],
         "read_timeout_active": False,
         "read_timeout_started_at": None,
@@ -2532,6 +3313,79 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "eta_seconds_left": None,
         "eta_finish_at": None,
     }
+
+    if is_resume_continue:
+        checkpoint_payload = _read_json_file(session_checkpoint_path) or {}
+        checkpoint_state = (
+            checkpoint_payload.get("state", {})
+            if isinstance(checkpoint_payload, dict)
+            else {}
+        )
+        if isinstance(checkpoint_state, dict):
+            for key in (
+                "logs_processed",
+                "logs_total",
+                "last_batch_ts",
+                "stats",
+                "elapsed_seconds",
+                "log_seconds_per_second",
+                "eta_seconds_left",
+                "eta_finish_at",
+                "llm_calls_started",
+                "llm_calls_succeeded",
+                "llm_calls_failed",
+                "llm_last_error",
+                "llm_timeline",
+                "final_summary",
+                "freeform_final_summary",
+            ):
+                if checkpoint_state.get(key) is not None:
+                    state[key] = checkpoint_state.get(key)
+            prev_events = checkpoint_state.get("events")
+            if isinstance(prev_events, list) and prev_events:
+                merged_events = [str(item) for item in prev_events[-MAX_EVENT_LINES:]]
+                merged_events.extend(initial_events)
+                state["events"] = merged_events[-MAX_EVENT_LINES:]
+            prev_map_batches = checkpoint_state.get("map_batches")
+            if isinstance(prev_map_batches, list) and prev_map_batches:
+                state["map_batches"] = prev_map_batches[-MAX_RENDERED_BATCHES:]
+            elif live_batches_path.exists():
+                loaded_batches = _load_recent_batches_from_jsonl(str(live_batches_path))
+                if loaded_batches:
+                    state["map_batches"] = loaded_batches[-MAX_RENDERED_BATCHES:]
+            saved_rows = int(pd.to_numeric(checkpoint_state.get("logs_processed"), errors="coerce") or 0)
+            state["resume_rows_offset"] = max(saved_rows, 0)
+            state["logs_processed"] = max(saved_rows, int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0))
+            saved_stats = checkpoint_state.get("stats")
+            if isinstance(saved_stats, dict):
+                state["resume_stats_offset"] = {
+                    "pages_fetched": int(pd.to_numeric(saved_stats.get("pages_fetched"), errors="coerce") or 0),
+                    "rows_processed": int(pd.to_numeric(saved_stats.get("rows_processed"), errors="coerce") or 0),
+                    "llm_calls": int(pd.to_numeric(saved_stats.get("llm_calls"), errors="coerce") or 0),
+                    "reduce_rounds": int(pd.to_numeric(saved_stats.get("reduce_rounds"), errors="coerce") or 0),
+                }
+            else:
+                state["resume_stats_offset"] = {
+                    "pages_fetched": 0,
+                    "rows_processed": saved_rows,
+                    "llm_calls": int(pd.to_numeric(checkpoint_state.get("llm_calls_started"), errors="coerce") or 0),
+                    "reduce_rounds": 0,
+                }
+            saved_elapsed = pd.to_numeric(checkpoint_state.get("elapsed_seconds"), errors="coerce")
+            if not pd.isna(saved_elapsed) and float(saved_elapsed) > 0:
+                state["elapsed_seconds"] = float(saved_elapsed)
+                state["started_monotonic"] = time.monotonic() - float(saved_elapsed)
+
+        state["resume_batch_offset"] = len(
+            _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
+        )
+        state["total_batches_processed"] = int(state["resume_batch_offset"])
+        state["source_rows_base"] = int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0)
+        state["source_batch_base"] = int(state["resume_batch_offset"])
+        state["active_step"] = (
+            f"Восстановление с прогресса: last_ts={state.get('last_batch_ts') or 'n/a'}"
+        )
+
     _render_logs_summary_chat(analysis_placeholder, state, deps)
 
     request_payload = {
@@ -2545,7 +3399,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
+        "effective_period_start": effective_period_start_iso,
         "period_end": period_end_iso,
+        "resume_mode": "continue" if is_resume_continue else ("restart" if resume_mode == "restart" else "new"),
+        "resume_from_ts": resume_from_ts,
+        "resume_session_dir": str(run_dir) if is_resume_continue else "",
         "window_minutes": window_minutes,
         "demo_mode": demo_mode,
         "demo_logs_count": demo_logs_count,
@@ -2554,7 +3412,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
+        "map_summaries_jsonl_path": str(map_summaries_jsonl_path),
+        "reduce_summaries_jsonl_path": str(reduce_summaries_jsonl_path),
+        "llm_calls_jsonl_path": str(llm_calls_jsonl_path),
     }
+
+    # Persist run metadata immediately so the session can be resumed after crash.
+    _write_json_file(run_params_path, dict(active_params))
+    _write_json_file(request_path, dict(request_payload))
+    _persist_checkpoint(session_checkpoint_path, state)
 
     try:
         demo_logs: List[Dict[str, Any]] = []
@@ -2941,7 +3807,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             events = state.setdefault("events", [])
             if event == "map_start":
                 state["status"] = "map"
+                state["llm_phase_hint"] = "map"
                 state["active_step"] = "Читаем логи и готовим MAP-батчи"
+                if state.get("source_rows_base") is None:
+                    state["source_rows_base"] = int(
+                        pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0
+                    )
+                if state.get("source_batch_base") is None:
+                    state["source_batch_base"] = int(
+                        pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
+                        or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
+                        or 0
+                    )
                 events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
@@ -2951,7 +3828,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
             elif event == "map_batch_start":
                 state["status"] = "map"
-                idx = int(payload.get("batch_index", 0)) + 1
+                state["llm_phase_hint"] = "map"
+                source_batch_base = int(
+                    pd.to_numeric(state.get("source_batch_base"), errors="coerce")
+                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
+                    or 0
+                )
+                local_batch_index = int(payload.get("batch_index", 0))
+                idx = source_batch_base + local_batch_index + 1
                 total = payload.get("batch_total")
                 retries_label = "∞" if int(max_retries) < 0 else str(max_retries)
                 state["active_step"] = (
@@ -2968,10 +3852,23 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
             elif event == "map_batch":
                 state["status"] = "map"
+                state["llm_phase_hint"] = "map"
                 state["active_step"] = "MAP-batch обработан, обновляем промежуточный результат"
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
+                source_batch_base = int(
+                    pd.to_numeric(state.get("source_batch_base"), errors="coerce")
+                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
+                    or 0
+                )
+                local_batch_index = int(payload.get("batch_index", 0))
+                global_batch_index_zero = source_batch_base + local_batch_index
+                global_batch_index_one = global_batch_index_zero + 1
+                state["total_batches_processed"] = max(
+                    int(pd.to_numeric(state.get("total_batches_processed"), errors="coerce") or 0),
+                    global_batch_index_one,
+                )
 
                 # Track the timestamp of the last processed batch for timestamp-based
                 # progress bar and ETA — no pre-counting of rows required.
@@ -2984,8 +3881,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "event": "map_batch",
-                        "batch_index": payload.get("batch_index"),
+                        "batch_index": global_batch_index_zero,
                         "batch_total": payload.get("batch_total"),
+                        "batch_index_local": local_batch_index,
                         "batch_summary": payload.get("batch_summary"),
                         "batch_logs_count": payload.get("batch_logs_count"),
                         "batch_period_start": payload.get("batch_period_start"),
@@ -2994,10 +3892,43 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     },
                 )
 
+                src_label = str(state.get("active_source_label") or "query_1")
+                src_file_label = _safe_filename(src_label)
+                batch_summary_text = _normalize_summary_text(payload.get("batch_summary"))
+                if batch_summary_text:
+                    _append_jsonl(
+                        map_summaries_jsonl_path,
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "source_name": src_label,
+                            "batch_index": global_batch_index_one,
+                            "batch_total": payload.get("batch_total"),
+                            "batch_index_local": local_batch_index + 1,
+                            "batch_period_start": payload.get("batch_period_start"),
+                            "batch_period_end": payload.get("batch_period_end"),
+                            "batch_logs_count": payload.get("batch_logs_count"),
+                            "batch_summary": batch_summary_text,
+                        },
+                    )
+                    _write_text_file(
+                        map_summaries_dir / f"{src_file_label}_map_{global_batch_index_one:04d}.md",
+                        "\n".join(
+                            [
+                                f"# MAP Summary #{global_batch_index_one}",
+                                f"- source: `{src_label}`",
+                                f"- period: `{payload.get('batch_period_start')}` -> `{payload.get('batch_period_end')}`",
+                                f"- logs_count: `{payload.get('batch_logs_count')}`",
+                                "",
+                                batch_summary_text,
+                            ]
+                        ),
+                    )
+
                 preview_logs = full_logs[:MAX_LOG_ROWS_PREVIEW]
                 batch_item = {
-                    "batch_index": payload.get("batch_index"),
+                    "batch_index": global_batch_index_zero,
                     "batch_total": payload.get("batch_total"),
+                    "batch_index_local": local_batch_index,
                     "batch_summary": payload.get("batch_summary"),
                     "batch_logs_count": payload.get("batch_logs_count"),
                     "batch_period_start": payload.get("batch_period_start"),
@@ -3009,11 +3940,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 if len(map_batches) > MAX_RENDERED_BATCHES:
                     state["map_batches"] = map_batches[-MAX_RENDERED_BATCHES:]
 
-                idx = int(payload.get("batch_index", 0)) + 1
                 total = payload.get("batch_total")
-                events.append(f"Map summary {idx}/{total}" if total else f"Map summary {idx}")
+                events.append(
+                    f"Map summary {global_batch_index_one}/{total}"
+                    if total else f"Map summary {global_batch_index_one}"
+                )
             elif event == "map_done":
                 state["status"] = "reduce"
+                state["llm_phase_hint"] = "reduce"
                 state["active_step"] = "MAP завершён, готовим REDUCE"
                 events.append("Map этап завершен")
                 # Warn if processing stopped early due to DB errors
@@ -3024,10 +3958,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
             elif event == "reduce_start":
                 state["status"] = "reduce"
+                state["llm_phase_hint"] = "reduce"
                 state["active_step"] = "REDUCE: объединяем промежуточные summary"
                 events.append("Reduce этап запущен")
             elif event == "reduce_group_start":
                 state["status"] = "reduce"
+                state["llm_phase_hint"] = "reduce"
                 round_idx = payload.get("reduce_round")
                 group_index = int(payload.get("group_index", 0)) + 1
                 group_total = payload.get("group_total")
@@ -3037,24 +3973,61 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "reduce"
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
+                state["llm_phase_hint"] = "freeform"
                 state["active_step"] = "REDUCE завершён, собираем финальный отчёт"
                 final_from_payload = _normalize_summary_text(payload.get("summary"))
                 if final_from_payload:
                     state["final_summary"] = final_from_payload
+                    src_label = str(state.get("active_source_label") or "query_1")
+                    src_file_label = _safe_filename(src_label)
+                    _append_jsonl(
+                        reduce_summaries_jsonl_path,
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "source_name": src_label,
+                            "reduce_round": payload.get("reduce_round"),
+                            "summary": final_from_payload,
+                        },
+                    )
+                    _write_text_file(
+                        reduce_summaries_dir / f"{src_file_label}_reduce_final.md",
+                        "\n".join(
+                            [
+                                "# REDUCE Final Summary",
+                                f"- source: `{src_label}`",
+                                f"- period: `{state.get('period_start')}` -> `{state.get('period_end')}`",
+                                "",
+                                final_from_payload,
+                            ]
+                        ),
+                    )
                 events.append("Reduce этап завершен")
             elif event == "fetch_error":
                 error_msg = str(payload.get("error", "ClickHouse query failed"))
                 _register_query_error(error_msg)
                 events.append(f"ClickHouse error: {error_msg}")
             elif event == "freeform_start":
+                state["llm_phase_hint"] = "freeform"
                 state["active_step"] = "LLM пишет финальный narrative-отчёт"
                 events.append("Генерация финального нарратива...")
             elif event == "freeform_done":
+                state["llm_phase_hint"] = "freeform"
                 state["active_step"] = "Финальный narrative-отчёт готов"
                 freeform = payload.get("freeform_summary")
                 freeform_text = _normalize_summary_text(freeform)
                 if freeform_text:
                     state["freeform_final_summary"] = freeform_text
+                    _write_text_file(
+                        final_summaries_dir / "final_freeform.md",
+                        "\n".join(
+                            [
+                                "# Final Freeform Summary",
+                                f"- period: `{state.get('period_start')}` -> `{state.get('period_end')}`",
+                                "",
+                                freeform_text,
+                            ]
+                        ),
+                    )
                 events.append("Нарратив готов")
             else:
                 events.append(f"Событие: {event}")
@@ -3066,12 +4039,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if progress_rows is None:
                 progress_rows = payload.get("rows_fetched")
             if progress_rows is not None:
-                state["logs_processed"] = int(progress_rows)
+                source_rows_base = int(
+                    pd.to_numeric(state.get("source_rows_base"), errors="coerce")
+                    or pd.to_numeric(state.get("resume_rows_offset"), errors="coerce")
+                    or 0
+                )
+                state["logs_processed"] = max(int(progress_rows) + source_rows_base, 0)
             if payload.get("rows_total") is not None:
                 state["logs_total"] = int(payload.get("rows_total"))
 
             _estimate_eta(state, event, payload)
             _render_logs_summary_chat(analysis_placeholder, state, deps)
+            _persist_checkpoint(session_checkpoint_path, state)
             time.sleep(0.01)
 
         state["status"] = "summarizing"
@@ -3193,6 +4172,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Попытки исчерпаны, fallback.",
                         render_now=True,
                     )
+            _persist_checkpoint(session_checkpoint_path, state)
 
         base_llm_call = deps.make_llm_call(
             max_retries=max_retries,
@@ -3201,6 +4181,48 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             on_result=_on_llm_result,
             llm_timeout=llm_timeout,
         )
+        llm_call_counter = {"value": 0}
+
+        def _trace_llm_call(
+            *,
+            phase: str,
+            prompt_text: str,
+            response_text: Optional[str],
+            error_text: Optional[str] = None,
+        ) -> None:
+            llm_call_counter["value"] = int(llm_call_counter["value"]) + 1
+            call_idx = int(llm_call_counter["value"])
+            safe_phase = _safe_filename(phase or "unknown")
+            call_dir = llm_calls_dir / safe_phase
+            prompt_path = call_dir / f"call_{call_idx:04d}_prompt.txt"
+            response_path = call_dir / f"call_{call_idx:04d}_response.txt"
+            _write_text_file(prompt_path, prompt_text)
+            if response_text is not None:
+                _write_text_file(response_path, str(response_text))
+            _append_jsonl(
+                llm_calls_jsonl_path,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "call_index": call_idx,
+                    "phase": phase or "unknown",
+                    "prompt_path": str(prompt_path),
+                    "response_path": str(response_path) if response_text is not None else None,
+                    "error": error_text,
+                    "source_name": state.get("active_source_label"),
+                    "status": "error" if error_text else "ok",
+                },
+            )
+            _persist_checkpoint(session_checkpoint_path, state)
+
+        def _infer_phase_hint() -> str:
+            hint = str(state.get("llm_phase_hint") or "").strip().lower()
+            if hint:
+                return hint
+            status_hint = str(state.get("status") or "").strip().lower()
+            if status_hint in {"map", "reduce", "summary_ready"}:
+                return status_hint
+            return "unknown"
+
         goal_text = user_goal.strip()
         llm_context_blocks: List[str] = []
         if goal_text:
@@ -3221,7 +4243,24 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         def _llm_call_with_context(prompt: str) -> str:
             enriched_prompt = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
-            return base_llm_call(enriched_prompt)
+            phase = _infer_phase_hint()
+            try:
+                response = base_llm_call(enriched_prompt)
+                _trace_llm_call(
+                    phase=phase,
+                    prompt_text=enriched_prompt,
+                    response_text=response,
+                    error_text=None,
+                )
+                return response
+            except Exception as exc:  # noqa: BLE001
+                _trace_llm_call(
+                    phase=phase,
+                    prompt_text=enriched_prompt,
+                    response_text=None,
+                    error_text=str(exc),
+                )
+                raise
 
         llm_call = _llm_call_with_context
 
@@ -3235,6 +4274,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if isinstance(events, list):
                 events.append("Логи не найдены: запускаем LLM-гипотезы по контексту инцидента")
             state["active_step"] = "Нет логов: формируем осторожные гипотезы"
+            state["llm_phase_hint"] = "no_logs_hypothesis"
+            state["active_source_label"] = "no_logs_hypothesis"
             _render_logs_summary_chat(analysis_placeholder, state, deps)
             hypothesis_prompt = _build_no_logs_hypothesis_prompt(
                 period_start=period_start_iso,
@@ -3246,7 +4287,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 logs_queries_count=max(int(len(query_specs)), 1),
             )
             try:
-                hypothesis_text = _normalize_summary_text(base_llm_call(hypothesis_prompt))
+                hypothesis_text = _normalize_summary_text(llm_call(hypothesis_prompt))
                 stats = state.get("stats")
                 if isinstance(stats, dict):
                     stats["llm_calls"] = int(pd.to_numeric(stats.get("llm_calls", 0), errors="coerce") or 0) + 1
@@ -3344,6 +4385,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             for src_idx, spec in enumerate(query_specs):
                 src_label = str(spec.get("label", f"query_{src_idx + 1}"))
+                state["active_source_label"] = src_label
+                state["source_rows_base"] = int(
+                    pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0
+                )
+                state["source_batch_base"] = int(
+                    pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
+                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
+                    or 0
+                )
                 state.setdefault("events", []).append(
                     f"--- Источник: {src_label} ({src_idx + 1}/{len(query_specs)}) ---"
                 )
@@ -3378,14 +4428,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
                 try:
                     src_result = src_summarizer.summarize_period(
-                        period_start=period_start_iso,
+                        period_start=effective_period_start_iso,
                         period_end=period_end_iso,
                         columns=columns,
                         total_rows_estimate=None,
                     )
                 except TypeError:
                     src_result = src_summarizer.summarize_period(
-                        period_start=period_start_iso,
+                        period_start=effective_period_start_iso,
                         period_end=period_end_iso,
                         columns=columns,
                     )
@@ -3401,6 +4451,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             # Cross-source REDUCE: merge per-source summaries into a single report
             if len(per_source_summaries) > 1:
                 state.setdefault("events", []).append("Кросс-источниковый анализ (финальный REDUCE)...")
+                state["llm_phase_hint"] = "cross_reduce"
+                state["active_source_label"] = "cross_source"
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
                 cross_prompt = build_cross_source_reduce_prompt(
                     summaries_by_source=per_source_summaries,
@@ -3418,9 +4470,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "data_type": "",
                     },
                 )
-                enriched_cross = f"{context_prefix}\n\n{cross_prompt}" if context_prefix else cross_prompt
                 try:
-                    cross_summary = llm_call(enriched_cross).strip()
+                    cross_summary = llm_call(cross_prompt).strip()
                     agg_llm += 1
                     final_summary_text = _normalize_summary_text(cross_summary) or "\n\n---\n\n".join(
                         f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
@@ -3436,19 +4487,59 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             else:
                 final_summary_text = "Нет логов за указанный период."
 
+            normalized_multi_final = _normalize_summary_text(final_summary_text)
+            if normalized_multi_final:
+                _append_jsonl(
+                    reduce_summaries_jsonl_path,
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "source_name": "cross_source" if len(per_source_summaries) > 1 else "query_1",
+                        "summary": normalized_multi_final,
+                    },
+                )
+                _write_text_file(
+                    reduce_summaries_dir / "cross_source_reduce_final.md",
+                    "\n".join(
+                        [
+                            "# Cross-source REDUCE Final Summary",
+                            f"- period: `{period_start_iso}` -> `{period_end_iso}`",
+                            f"- sources: `{len(per_source_summaries)}`",
+                            "",
+                            normalized_multi_final,
+                        ]
+                    ),
+                )
+
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
             state["final_summary"] = _normalize_summary_text(final_summary_text) or "Нет логов за указанный период."
+            stats_offset = state.get("resume_stats_offset") if isinstance(state.get("resume_stats_offset"), dict) else {}
+            pages_offset = int(pd.to_numeric((stats_offset or {}).get("pages_fetched"), errors="coerce") or 0)
+            rows_offset_stats = int(pd.to_numeric((stats_offset or {}).get("rows_processed"), errors="coerce") or 0)
+            llm_offset = int(pd.to_numeric((stats_offset or {}).get("llm_calls"), errors="coerce") or 0)
+            reduce_offset = int(pd.to_numeric((stats_offset or {}).get("reduce_rounds"), errors="coerce") or 0)
             state["stats"] = {
-                "pages_fetched": agg_pages,
-                "rows_processed": agg_rows,
-                "llm_calls": agg_llm,
-                "reduce_rounds": agg_reduce,
+                "pages_fetched": pages_offset + agg_pages,
+                "rows_processed": rows_offset_stats + agg_rows,
+                "llm_calls": llm_offset + agg_llm,
+                "reduce_rounds": reduce_offset + agg_reduce,
             }
             _enrich_stats_with_elapsed(state)
-            state["logs_processed"] = agg_rows
+            resume_rows_offset = int(pd.to_numeric(state.get("resume_rows_offset"), errors="coerce") or 0)
+            state["logs_processed"] = max(int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0), resume_rows_offset + agg_rows)
         else:
             # Single-query or demo mode: use _db_fetch_page directly
+            state["active_source_label"] = "query_1"
+            state["source_rows_base"] = int(
+                pd.to_numeric(state.get("logs_processed"), errors="coerce")
+                or pd.to_numeric(state.get("resume_rows_offset"), errors="coerce")
+                or 0
+            )
+            state["source_batch_base"] = int(
+                pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
+                or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
+                or 0
+            )
             _single_prompt_context = {
                 "incident_start": period_start_iso,
                 "incident_end": period_end_iso,
@@ -3477,14 +4568,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
             try:
                 result = summarizer.summarize_period(
-                    period_start=period_start_iso,
+                    period_start=effective_period_start_iso,
                     period_end=period_end_iso,
                     columns=columns,
                     total_rows_estimate=total_rows_estimate,
                 )
             except TypeError:
                 result = summarizer.summarize_period(
-                    period_start=period_start_iso,
+                    period_start=effective_period_start_iso,
                     period_end=period_end_iso,
                     columns=columns,
                 )
@@ -3493,24 +4584,100 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state["active_step"] = "Суммаризация завершена"
             normalized_final_summary = _normalize_summary_text(getattr(result, "summary", None))
             state["final_summary"] = normalized_final_summary or "Нет логов за указанный период."
+            stats_offset = state.get("resume_stats_offset") if isinstance(state.get("resume_stats_offset"), dict) else {}
+            pages_offset = int(pd.to_numeric((stats_offset or {}).get("pages_fetched"), errors="coerce") or 0)
+            rows_offset_stats = int(pd.to_numeric((stats_offset or {}).get("rows_processed"), errors="coerce") or 0)
+            llm_offset = int(pd.to_numeric((stats_offset or {}).get("llm_calls"), errors="coerce") or 0)
+            reduce_offset = int(pd.to_numeric((stats_offset or {}).get("reduce_rounds"), errors="coerce") or 0)
             state["stats"] = {
-                "pages_fetched": result.pages_fetched,
-                "rows_processed": result.rows_processed,
-                "llm_calls": result.llm_calls,
-                "reduce_rounds": result.reduce_rounds,
+                "pages_fetched": pages_offset + int(result.pages_fetched),
+                "rows_processed": rows_offset_stats + int(result.rows_processed),
+                "llm_calls": llm_offset + int(result.llm_calls),
+                "reduce_rounds": reduce_offset + int(result.reduce_rounds),
             }
             _enrich_stats_with_elapsed(state)
-            state["logs_processed"] = int(result.rows_processed)
+            resume_rows_offset = int(pd.to_numeric(state.get("resume_rows_offset"), errors="coerce") or 0)
+            state["logs_processed"] = max(
+                int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0),
+                resume_rows_offset + int(result.rows_processed),
+            )
             if state.get("logs_total") is None and total_rows_estimate is not None:
                 state["logs_total"] = int(total_rows_estimate)
 
         _maybe_generate_no_logs_hypothesis()
+
+        if is_resume_continue:
+            try:
+                cached_map_summaries = _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
+                if cached_map_summaries:
+                    state.setdefault("events", []).append(
+                        f"Восстановление: пересобираем итог по {len(cached_map_summaries)} сохранённым MAP summary"
+                    )
+                    state["llm_phase_hint"] = "resume_rereduce"
+                    state["active_source_label"] = "resume_rereduce"
+                    _render_logs_summary_chat(analysis_placeholder, state, deps)
+                    from my_summarizer import (  # noqa: PLC0415
+                        regenerate_reduce_summary_from_map_summaries,
+                    )
+
+                    rebuilt_from_resume = _normalize_summary_text(
+                        regenerate_reduce_summary_from_map_summaries(
+                            map_summaries=cached_map_summaries,
+                            period_start=period_start_iso,
+                            period_end=period_end_iso,
+                            llm_call=llm_call,
+                            prompt_context={
+                                "incident_start": period_start_iso,
+                                "incident_end": period_end_iso,
+                                "incident_description": goal_text,
+                                "alerts_list": goal_text,
+                                "metrics_context": metrics_context_text,
+                                "source_name": "resume_rereduce",
+                                "sql_query": sql_query_clean,
+                                "time_column": logs_timestamp_column,
+                                "data_type": "",
+                            },
+                        )
+                    )
+                    if rebuilt_from_resume:
+                        state["final_summary"] = rebuilt_from_resume
+                        state.setdefault("events", []).append(
+                            "Восстановление: итоговый Reduce summary пересобран успешно"
+                        )
+                        stats_payload = state.get("stats")
+                        if isinstance(stats_payload, dict):
+                            stats_payload["llm_calls"] = int(
+                                pd.to_numeric(stats_payload.get("llm_calls", 0), errors="coerce") or 0
+                            ) + 1
+                        _write_text_file(
+                            reduce_summaries_dir / "resume_rebuild_reduce_final.md",
+                            "\n".join(
+                                [
+                                    "# Resume Rebuilt REDUCE Final Summary",
+                                    f"- rebuilt_at: `{datetime.now(timezone.utc).isoformat()}`",
+                                    f"- map_summaries_count: `{len(cached_map_summaries)}`",
+                                    "",
+                                    rebuilt_from_resume,
+                                ]
+                            ),
+                        )
+                else:
+                    state.setdefault("events", []).append(
+                        "Восстановление: нет сохранённых MAP summary, пересборка пропущена"
+                    )
+            except Exception as resume_exc:  # noqa: BLE001
+                deps.logger.warning("resume re-reduce failed: %s", resume_exc)
+                state.setdefault("events", []).append(
+                    f"Восстановление: пересборка итога не удалась ({str(resume_exc)[:160]})"
+                )
 
         final_summary_for_report = _normalize_summary_text(state.get("final_summary"))
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
                 events = state.setdefault("events", [])
                 events.append("Готовим расширенный финальный отчет в свободном формате")
+                state["llm_phase_hint"] = "final_freeform"
+                state["active_source_label"] = "final_freeform"
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
                 freeform_prompt = _build_freeform_summary_prompt(
                     final_summary=final_summary_for_report,
@@ -3520,7 +4687,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     stats=state.get("stats") or {},
                     metrics_context=metrics_context_text,
                 )
-                freeform_summary = _normalize_summary_text(base_llm_call(freeform_prompt))
+                freeform_summary = _normalize_summary_text(llm_call(freeform_prompt))
                 if freeform_summary:
                     state["freeform_final_summary"] = freeform_summary
                     events.append("Свободный финальный отчет готов")
@@ -3531,8 +4698,37 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state.setdefault("events", []).append(
                     "Не удалось сгенерировать свободный финальный отчет"
                 )
+
+        final_structured_now = _normalize_summary_text(state.get("final_summary"))
+        if final_structured_now:
+            _write_text_file(
+                final_summaries_dir / "final_structured.md",
+                "\n".join(
+                    [
+                        "# Final Structured Summary",
+                        f"- period: `{state.get('period_start')}` -> `{state.get('period_end')}`",
+                        f"- queries_count: `{state.get('queries_count')}`",
+                        "",
+                        final_structured_now,
+                    ]
+                ),
+            )
+        final_freeform_now = _normalize_summary_text(state.get("freeform_final_summary"))
+        if final_freeform_now:
+            _write_text_file(
+                final_summaries_dir / "final_freeform.md",
+                "\n".join(
+                    [
+                        "# Final Freeform Summary",
+                        f"- period: `{state.get('period_start')}` -> `{state.get('period_end')}`",
+                        "",
+                        final_freeform_now,
+                    ]
+                ),
+            )
         _estimate_eta(state, "done", {})
         _enrich_stats_with_elapsed(state)
+        _persist_checkpoint(session_checkpoint_path, state)
 
     except Exception as exc:  # noqa: BLE001
         state["status"] = "error"
@@ -3540,6 +4736,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["error"] = str(exc)
         _estimate_eta(state, "error", {})
         _enrich_stats_with_elapsed(state)
+        _persist_checkpoint(session_checkpoint_path, state)
         deps.logger.exception("logs_summary_page.run_failed")
         with runtime_error_placeholder.container():
             st.error(f"Ошибка выполнения: {exc}")
@@ -3551,8 +4748,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     )
     state["result_json_path"] = saved.get("json_path")
     state["result_summary_path"] = saved.get("summary_path")
+    state["result_structured_md_path"] = saved.get("structured_md_path")
+    state["result_freeform_md_path"] = saved.get("freeform_md_path")
     state["result_structured_txt_path"] = saved.get("structured_txt_path")
     state["result_freeform_txt_path"] = saved.get("freeform_txt_path")
+    _persist_checkpoint(session_checkpoint_path, state)
     st.session_state[LAST_STATE_SESSION_KEY] = state
     st.session_state[RUNNING_SESSION_KEY] = False
     st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)

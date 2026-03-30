@@ -11,6 +11,7 @@ from my_summarizer import (
     _estimate_total_logs,
     _render_logs_query,
     build_cross_source_reduce_prompt,
+    regenerate_reduce_summary_from_map_summaries,
     summarize_logs,
 )
 from settings import settings
@@ -339,6 +340,37 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("CUSTOM MAP", prompt)
         self.assertIn("type=aggregated", prompt)
         self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА", prompt)
+
+    def test_regenerate_reduce_summary_from_map_summaries(self) -> None:
+        out = regenerate_reduce_summary_from_map_summaries(
+            map_summaries=["batch-1 summary", "batch-2 summary"],
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            llm_call=lambda _prompt: "MERGED SUMMARY",
+        )
+        self.assertIn("MERGED SUMMARY", out)
+
+    def test_regenerate_reduce_summary_from_map_summaries_empty(self) -> None:
+        out = regenerate_reduce_summary_from_map_summaries(
+            map_summaries=[],
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            llm_call=lambda _prompt: "SHOULD NOT BE USED",
+        )
+        self.assertIn("Нет map-summary", out)
+
+    def test_regenerate_reduce_summary_from_map_summaries_emits_progress(self) -> None:
+        events = []
+        out = regenerate_reduce_summary_from_map_summaries(
+            map_summaries=["batch-1 summary", "batch-2 summary"],
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            llm_call=lambda _prompt: "MERGED SUMMARY",
+            on_progress=lambda event, payload: events.append((event, payload)),
+        )
+        self.assertIn("MERGED SUMMARY", out)
+        event_names = [name for name, _ in events]
+        self.assertIn("reduce_group_start", event_names)
 
 
 if __name__ == "__main__":

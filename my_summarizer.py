@@ -223,6 +223,13 @@ def _ctx_value(ctx: Optional[Dict[str, Any]], key: str, default: Any = "") -> st
     return str(value)
 
 
+def _normalize_summary_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"none", "null", "nan"}:
+        return ""
+    return text
+
+
 def has_required_env() -> bool:
     return bool(str(settings.OPENAI_API_BASE_DB).strip()) and bool(str(settings.OPENAI_API_KEY_DB).strip())
 
@@ -1721,6 +1728,41 @@ def build_cross_source_reduce_prompt(
         source_summaries_text,
     ]
     return _append_chain_requirement("\n".join(lines).strip(), "cross")
+
+
+def regenerate_reduce_summary_from_map_summaries(
+    *,
+    map_summaries: Sequence[str],
+    period_start: str,
+    period_end: str,
+    llm_call: LLMTextCaller,
+    prompt_context: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[ProgressCallback] = None,
+    config: Optional[SummarizerConfig] = None,
+) -> str:
+    """
+    Rebuild final REDUCE summary from already prepared MAP summaries.
+    Useful for "rerun final summary" without refetching logs.
+    """
+    prepared = [_normalize_summary_text(item) for item in map_summaries]
+    prepared = [item for item in prepared if item]
+    if not prepared:
+        return "Нет map-summary для повторного REDUCE."
+
+    reducer = PeriodLogSummarizer(
+        db_fetch_page=lambda **_: [],
+        llm_call=llm_call,
+        config=config or SummarizerConfig(),
+        on_progress=on_progress,
+        prompt_context=prompt_context or {},
+    )
+    final_summary, _, _ = reducer._reduce_summaries(
+        chunk_summaries=list(prepared),
+        period_start=period_start,
+        period_end=period_end,
+        sources=None,
+    )
+    return _normalize_summary_text(final_summary) or "Пустой итог повторного REDUCE."
 
 
 def summarize_logs(
