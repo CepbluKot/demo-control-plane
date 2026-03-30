@@ -983,6 +983,10 @@ def _render_logs_summary_page() -> None:
             getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_METRICS_SQL", "")
         ).strip(),
         output_dir=LOGS_DIR,
+        logs_timestamp_column=str(
+            getattr(settings, "CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp")
+        ).strip()
+        or "timestamp",
         logs_fetch_mode=LOGS_FETCH_MODE,
     )
     render_logs_summary_page(deps)

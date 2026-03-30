@@ -41,6 +41,11 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _normalize_timestamp_column_name(value: Any, *, default: str = "timestamp") -> str:
+    raw = str(value or "").strip()
+    return raw or default
+
+
 def _timeline_row_color(status: str) -> str:
     normalized = status.strip().lower()
     if normalized == "ok":
@@ -274,6 +279,7 @@ class LogsSummaryPageDeps:
     default_sql_query: str
     default_metrics_query: str
     output_dir: Path
+    logs_timestamp_column: str = "timestamp"
     logs_fetch_mode: str = "time_window"
     map_workers: int = 1
     max_retries: int = -1
@@ -304,10 +310,12 @@ class _StreamingLogsMerger:
         query_logs_df: Callable[[str], pd.DataFrame],
         register_query_error: Callable[[str], None],
         logger: logging.Logger,
+        timestamp_column: str = "timestamp",
     ) -> None:
         self._query_logs_df = query_logs_df
         self._register_query_error = register_query_error
         self._logger = logger
+        self._timestamp_column = _normalize_timestamp_column_name(timestamp_column)
         self._cursors: List[_StreamingQueryCursor] = [
             _StreamingQueryCursor(query_index=idx, spec=spec)
             for idx, spec in enumerate(query_specs)
@@ -356,6 +364,7 @@ class _StreamingLogsMerger:
                 limit=fetch_limit,
                 offset=cursor.next_offset,
                 last_ts=cursor.last_ts,  # None on first page → defaults to period_start
+                timestamp_column=self._timestamp_column,
             )
             try:
                 df = self._query_logs_df(query)
@@ -393,12 +402,12 @@ class _StreamingLogsMerger:
                 cursor.exhausted = True
                 return False
 
-            sorted_df = _sort_df_by_timestamp(df)
+            sorted_df = _sort_df_by_timestamp(df, timestamp_column=self._timestamp_column)
             if not sorted_df.empty:
                 # Advance keyset cursor to last timestamp in the fetched page
-                if uses_keyset and "timestamp" in sorted_df.columns:
+                if uses_keyset and self._timestamp_column in sorted_df.columns:
                     max_ts = pd.to_datetime(
-                        sorted_df["timestamp"], utc=True, errors="coerce"
+                        sorted_df[self._timestamp_column], utc=True, errors="coerce"
                     ).max()
                     if not pd.isna(max_ts):
                         cursor.last_ts = max_ts.isoformat()
@@ -411,7 +420,7 @@ class _StreamingLogsMerger:
                 return False
 
         self._register_query_error(
-            f"Запрос #{cursor.query_index + 1} пропущен: слишком много страниц без валидного timestamp"
+            f"Запрос #{cursor.query_index + 1} пропущен: слишком много страниц без валидного `{self._timestamp_column}`"
         )
         cursor.exhausted = True
         return False
@@ -440,7 +449,7 @@ class _StreamingLogsMerger:
 
             row = cursor.page_records[cursor.page_pos]
             cursor.page_pos += 1
-            ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+            ts = pd.to_datetime(row.get(self._timestamp_column), utc=True, errors="coerce")
             if pd.isna(ts):
                 continue
             cursor.row_seq += 1
@@ -648,18 +657,24 @@ def _column_set(df: pd.DataFrame) -> set[str]:
     return {str(col).strip().lower() for col in df.columns if str(col).strip()}
 
 
-def _validate_logs_merge_schema(previews: List[Dict[str, Any]]) -> List[str]:
+def _validate_logs_merge_schema(
+    previews: List[Dict[str, Any]],
+    *,
+    timestamp_column: str = "timestamp",
+) -> List[str]:
     if not previews:
         return []
 
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    ts_col_lc = ts_col.lower()
     errors: List[str] = []
     first_df = previews[0].get("df")
     if first_df is None or not isinstance(first_df, pd.DataFrame):
         return ["Не удалось валидировать логи: preview первого запроса отсутствует."]
 
     base_cols = _column_set(first_df)
-    if "timestamp" not in base_cols:
-        errors.append("Логи: в первом SQL отсутствует обязательная колонка `timestamp`.")
+    if ts_col_lc not in base_cols:
+        errors.append(f"Логи: в первом SQL отсутствует обязательная колонка `{ts_col}`.")
 
     for item in previews:
         idx = int(item.get("idx", 0)) + 1
@@ -668,8 +683,8 @@ def _validate_logs_merge_schema(previews: List[Dict[str, Any]]) -> List[str]:
             errors.append(f"Логи: запрос #{idx} не вернул preview-таблицу.")
             continue
         cols = _column_set(df)
-        if "timestamp" not in cols:
-            errors.append(f"Логи: запрос #{idx} не содержит колонку `timestamp`.")
+        if ts_col_lc not in cols:
+            errors.append(f"Логи: запрос #{idx} не содержит колонку `{ts_col}`.")
         if cols != base_cols:
             missing = sorted(base_cols - cols)
             extra = sorted(cols - base_cols)
@@ -720,11 +735,12 @@ def _validate_metrics_merge_schema(previews: List[Dict[str, Any]]) -> List[str]:
     return errors
 
 
-def _sort_df_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "timestamp" not in df.columns:
+def _sort_df_by_timestamp(df: pd.DataFrame, *, timestamp_column: str = "timestamp") -> pd.DataFrame:
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    if df.empty or ts_col not in df.columns:
         return df
     out = df.copy()
-    out["__cp_ts"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out["__cp_ts"] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
     out = out.dropna(subset=["__cp_ts"]).sort_values("__cp_ts", kind="mergesort")
     return out.drop(columns=["__cp_ts"]).reset_index(drop=True)
 
@@ -919,23 +935,25 @@ def _build_window_query_for_plain_sql(
     period_end_iso: str,
     limit: int,
     offset: int,
+    timestamp_column: str = "timestamp",
 ) -> str:
     safe_limit = max(int(limit), 1)
     safe_offset = max(int(offset), 0)
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
     base = _strip_trailing_limit_offset(_normalize_sql_query_text(base_query))
     start_escaped = _escape_sql_literal(period_start_iso)
     end_escaped = _escape_sql_literal(period_end_iso)
     # Only add ORDER BY to the inner subquery if the user's SQL doesn't already have one.
-    # We intentionally avoid forced outer ORDER BY timestamp because custom queries may not
+    # We intentionally avoid forced outer ORDER BY because custom queries may not
     # expose a `timestamp` column in the final SELECT (e.g. grouped queries with start_time).
-    inner_order = "" if "order by" in base.lower() else " ORDER BY timestamp ASC"
+    inner_order = "" if "order by" in base.lower() else f" ORDER BY {ts_col} ASC"
     return (
         "SELECT * FROM ("
         "SELECT * FROM ("
         f"{base}"
         ") AS cp_src "
-        f"WHERE timestamp >= parseDateTimeBestEffort('{start_escaped}') "
-        f"AND timestamp < parseDateTimeBestEffort('{end_escaped}')"
+        f"WHERE {ts_col} >= parseDateTimeBestEffort('{start_escaped}') "
+        f"AND {ts_col} < parseDateTimeBestEffort('{end_escaped}')"
         f"{inner_order}"
         ") AS cp_window "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
@@ -952,6 +970,7 @@ def _build_query_for_template(
     limit: int,
     offset: int,
     last_ts: Optional[str] = None,
+    timestamp_column: str = "timestamp",
 ) -> str:
     if uses_template:
         rendered_query = _render_query_template(
@@ -977,6 +996,7 @@ def _build_query_for_template(
         period_end_iso=period_end_iso,
         limit=limit,
         offset=offset,
+        timestamp_column=timestamp_column,
     )
 
 
@@ -992,6 +1012,7 @@ def _build_count_query_for_spec(
     spec: Dict[str, Any],
     period_start_iso: str,
     period_end_iso: str,
+    timestamp_column: str = "timestamp",
 ) -> str:
     template = str(spec["template"])
     uses_template = bool(spec["uses_template"])
@@ -1025,12 +1046,13 @@ def _build_count_query_for_spec(
         base_sql = _normalize_sql_query_text(template)
         start_escaped = _escape_sql_literal(period_start_iso)
         end_escaped = _escape_sql_literal(period_end_iso)
+        ts_col = _normalize_timestamp_column_name(timestamp_column)
         base = (
             "SELECT * FROM ("
             f"{base_sql}"
             ") AS cp_src "
-            f"WHERE timestamp >= parseDateTimeBestEffort('{start_escaped}') "
-            f"AND timestamp < parseDateTimeBestEffort('{end_escaped}')"
+            f"WHERE {ts_col} >= parseDateTimeBestEffort('{start_escaped}') "
+            f"AND {ts_col} < parseDateTimeBestEffort('{end_escaped}')"
         )
 
     return f"SELECT count() AS total_rows FROM ({base}) AS cp_count"
@@ -1042,6 +1064,7 @@ def _precount_rows(
     query_logs_df: Callable[[str], pd.DataFrame],
     period_start_iso: str,
     period_end_iso: str,
+    timestamp_column: str,
     logger: logging.Logger,
     on_error: Optional[Callable[[str], None]] = None,
 ) -> Optional[int]:
@@ -1052,6 +1075,7 @@ def _precount_rows(
                 spec=spec,
                 period_start_iso=period_start_iso,
                 period_end_iso=period_end_iso,
+                timestamp_column=timestamp_column,
             )
             df = query_logs_df(count_query)
             if df.empty:
@@ -1382,6 +1406,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         period_desc,
                         f"SQL запросов: `{state.get('queries_count', 1)}`",
                         f"SQL метрик: `{state.get('metrics_queries_count', 0)}`",
+                        f"Колонка времени логов: `{state.get('logs_timestamp_column', 'timestamp')}`",
                         logs_fetch_desc,
                         f"DB batch: `{state.get('db_batch_size')}`",
                         f"LLM batch: `{state.get('llm_batch_size')}`",
@@ -1946,6 +1971,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     end_dt_text = str(st.session_state.get("logs_sum_end_dt", end_default))
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
     llm_batch_size = int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1)))
+    logs_timestamp_column = _normalize_timestamp_column_name(
+        getattr(deps, "logs_timestamp_column", "timestamp")
+    )
     _parallel_map = bool(st.session_state.get("logs_sum_parallel_map", False))
     map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1))) if _parallel_map else 1
     max_retries = int(st.session_state.get("logs_sum_max_retries", int(deps.max_retries)))
@@ -1980,6 +2008,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "end_dt_text": end_dt_text,
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
+            "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
             "llm_timeout": llm_timeout,
@@ -2012,6 +2041,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "end_dt_text": end_dt_text,
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
+            "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
             "llm_timeout": llm_timeout,
@@ -2030,6 +2060,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     end_dt_text = str(active_params.get("end_dt_text", end_dt_text))
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = int(active_params.get("llm_batch_size", llm_batch_size))
+    logs_timestamp_column = _normalize_timestamp_column_name(
+        active_params.get("logs_timestamp_column", logs_timestamp_column)
+    )
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
     max_retries = int(active_params.get("max_retries", max_retries))
     llm_timeout = max(int(active_params.get("llm_timeout", llm_timeout)), 10)
@@ -2114,6 +2147,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     period_end_iso=period_end_iso,
                     limit=1,
                     offset=0,
+                    timestamp_column=logs_timestamp_column,
                 )
                 preview_df = deps.query_logs_df(preview_query)
                 all_columns.extend([str(col) for col in preview_df.columns])
@@ -2132,6 +2166,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     period_end_iso=period_end_iso,
                     limit=1,
                     offset=0,
+                    timestamp_column="timestamp",
                 )
                 preview_df = deps.query_metrics_df(preview_query)
                 metrics_preview_frames.append({"idx": idx, "df": preview_df})
@@ -2149,7 +2184,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             seen.add(key)
             preview_available_columns.append(col)
 
-        schema_errors.extend(_validate_logs_merge_schema(logs_preview_frames))
+        schema_errors.extend(
+            _validate_logs_merge_schema(
+                logs_preview_frames,
+                timestamp_column=logs_timestamp_column,
+            )
+        )
         schema_errors.extend(_validate_metrics_merge_schema(metrics_preview_frames))
         if preview_query_errors:
             schema_errors.extend(
@@ -2192,12 +2232,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         initial_events.append(
             f"Старт: режим выборки логов по датам ({period_start_iso} -> {period_end_iso})."
         )
+    initial_events.append(f"Колонка времени логов: `{logs_timestamp_column}`")
 
     state: Dict[str, Any] = {
         "status": "queued",
         "mode": "demo" if demo_mode else "db",
         "logs_fetch_mode": logs_fetch_mode,
         "logs_tail_limit": int(deps.logs_tail_limit),
+        "logs_timestamp_column": logs_timestamp_column,
         "demo_logs_count": int(demo_logs_count),
         "query": sql_query_clean,
         "metrics_query": metrics_query_clean,
@@ -2260,6 +2302,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "metrics_queries_count": len(metrics_query_specs),
         "logs_fetch_mode": logs_fetch_mode,
         "logs_tail_limit": int(deps.logs_tail_limit),
+        "logs_timestamp_column": logs_timestamp_column,
         "user_goal": user_goal.strip(),
         "period_mode": period_mode,
         "period_start": period_start_iso,
@@ -2481,6 +2524,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_end_iso=period_end_iso,
                             limit=page_limit,
                             offset=metrics_offset,
+                            timestamp_column="timestamp",
                         )
                         try:
                             chunk_df = deps.query_metrics_df(metrics_query)
@@ -2548,6 +2592,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 query_logs_df=deps.query_logs_df,
                 period_start_iso=period_start_iso,
                 period_end_iso=period_end_iso,
+                timestamp_column=logs_timestamp_column,
                 logger=deps.logger,
                 on_error=_register_query_error,
             )
@@ -2589,6 +2634,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     limit=safe_limit,
                     offset=safe_offset,
                     last_ts=_single_query_last_ts[0],  # None → period_start on first page
+                    timestamp_column=logs_timestamp_column,
                 )
                 try:
                     df = deps.query_logs_df(query)
@@ -2611,10 +2657,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     return []
                 if df.empty:
                     return []
-                df = _sort_df_by_timestamp(df)
+                df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
                 # Advance keyset cursor so the next call fetches the next page
-                if uses_keyset and "timestamp" in df.columns:
-                    max_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").max()
+                if uses_keyset and logs_timestamp_column in df.columns:
+                    max_ts = pd.to_datetime(
+                        df[logs_timestamp_column], utc=True, errors="coerce"
+                    ).max()
                     if not pd.isna(max_ts):
                         _single_query_last_ts[0] = max_ts.isoformat()
                 return [dict(row) for row in df.to_dict(orient="records")]
@@ -2973,6 +3021,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         limit=safe_limit,
                         offset=safe_offset,
                         last_ts=_last_ts[0],
+                        timestamp_column=logs_timestamp_column,
                     )
                     try:
                         df = deps.query_logs_df(query)
@@ -2992,9 +3041,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         return []
                     if df is None or df.empty:
                         return []
-                    df = _sort_df_by_timestamp(df)
-                    if _uses_keyset and "timestamp" in df.columns:
-                        max_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").max()
+                    df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
+                    if _uses_keyset and logs_timestamp_column in df.columns:
+                        max_ts = pd.to_datetime(
+                            df[logs_timestamp_column], utc=True, errors="coerce"
+                        ).max()
                         if not pd.isna(max_ts):
                             _last_ts[0] = max_ts.isoformat()
                     return [dict(row) for row in df.to_dict(orient="records")]
