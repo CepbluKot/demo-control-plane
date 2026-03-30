@@ -116,6 +116,40 @@ DEFAULT_ANTI_HALLUCINATION_RULES = (
 )
 
 
+def _chain_section_requirement(stage: str) -> str:
+    normalized = str(stage or "").strip().lower()
+    if normalized == "map":
+        title = "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА"
+    elif normalized == "reduce":
+        title = "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: СВОДНАЯ ЦЕПОЧКА СОБЫТИЙ ИСТОЧНИКА"
+    elif normalized == "cross":
+        title = "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЕДИНАЯ ЦЕПОЧКА СОБЫТИЙ ИНЦИДЕНТА"
+    else:
+        title = "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ"
+    return "\n".join(
+        [
+            title,
+            "Оформи красиво и явно как схему в Markdown.",
+            "Формат (сохрани стрелки и отступы):",
+            "[t1] ТРИГГЕР (компонент) [ФАКТ/ГИПОТЕЗА]",
+            "    └─> (механизм влияния)",
+            "[t2] СЛЕДСТВИЕ (компонент) [ФАКТ/ГИПОТЕЗА]",
+            "    └─> (механизм влияния)",
+            "[t3] АЛЕРТ/ПОСЛЕДСТВИЕ [ФАКТ]",
+            "Если цепочек несколько — перечисли ЦЕПОЧКА #1, ЦЕПОЧКА #2 и т.д.",
+            "Если есть разрыв — вставь узел: [РАЗРЫВ ЦЕПОЧКИ: каких данных не хватает].",
+        ]
+    )
+
+
+def _append_chain_requirement(prompt_text: str, stage: str) -> str:
+    base = str(prompt_text or "").strip()
+    chain_block = _chain_section_requirement(stage)
+    if not base:
+        return chain_block
+    return f"{base}\n\n{chain_block}"
+
+
 def _read_prompt_setting(name: str) -> str:
     return str(getattr(settings, name, "") or "").strip()
 
@@ -1363,7 +1397,7 @@ class PeriodLogSummarizer:
 
         map_template = _read_prompt_setting("CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE")
         if map_template:
-            return _render_prompt_template(
+            rendered = _render_prompt_template(
                 map_template,
                 {
                     "period_start": period_start,
@@ -1389,6 +1423,7 @@ class PeriodLogSummarizer:
                     "logs_text": logs_text,
                 },
             ).strip()
+            return _append_chain_requirement(rendered, "map")
 
         lines = [
             "Это MAP-этап расследования инцидента. Анализируй только этот фрагмент логов.",
@@ -1422,14 +1457,15 @@ class PeriodLogSummarizer:
             "2) КЛАССИФИКАЦИЯ ЗАПИСЕЙ: [РЕЛЕВАНТНО] / [ФОН] / [НЕЯСНО]",
             "3) КЛЮЧЕВЫЕ СОБЫТИЯ (только [РЕЛЕВАНТНО])",
             "4) ПАТТЕРНЫ И АНОМАЛИИ",
-            "5) ФРАГМЕНТЫ ПРИЧИННО-СЛЕДСТВЕННОЙ ЦЕПОЧКИ (A -> B, механизм, [ФАКТ]/[ГИПОТЕЗА])",
+            "5) ЦЕПОЧКА СОБЫТИЙ БАТЧА (ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК, A -> B -> C)",
             "6) СВЯЗЬ С АЛЕРТАМИ ([НАЙДЕНО]/[ЧАСТИЧНО]/[НЕ НАЙДЕНО])",
             "7) СИГНАЛЫ ДЛЯ ДАЛЬНЕЙШЕГО АНАЛИЗА",
+            "8) ФОРМАТ ВЫВОДА ЦЕПОЧКИ: используй стрелки и узлы в стиле Markdown-схемы.",
             "",
             "Логи (хронологический порядок):",
             logs_text,
         ]
-        return "\n".join(lines)
+        return _append_chain_requirement("\n".join(lines), "map")
 
     def _build_reduce_prompt(
         self,
@@ -1456,7 +1492,7 @@ class PeriodLogSummarizer:
 
         reduce_template = _read_prompt_setting("CONTROL_PLANE_LLM_REDUCE_PROMPT_TEMPLATE")
         if reduce_template:
-            return _render_prompt_template(
+            rendered = _render_prompt_template(
                 reduce_template,
                 {
                     "period_start": period_start,
@@ -1480,6 +1516,7 @@ class PeriodLogSummarizer:
                     "map_summaries_text": rendered_summaries,
                 },
             ).strip()
+            return _append_chain_requirement(rendered, "reduce")
 
         lines = [
             "Это REDUCE-этап расследования инцидента.",
@@ -1506,16 +1543,17 @@ class PeriodLogSummarizer:
             "Объедини частичные summary в единый отчёт со строгими секциями:",
             "1) ОБЗОР ИСТОЧНИКА",
             "2) ХРОНОЛОГИЯ КЛЮЧЕВЫХ СОБЫТИЙ (только [РЕЛЕВАНТНО])",
-            "3) ПРИЧИННО-СЛЕДСТВЕННЫЕ ЦЕПОЧКИ (несколько цепочек допустимы)",
+            "3) ЦЕПОЧКА СОБЫТИЙ ИСТОЧНИКА (ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК, несколько цепочек допустимы)",
             "4) СВЯЗЬ МЕЖДУ ЦЕПОЧКАМИ: [СВЯЗАНЫ]/[ВОЗМОЖНО СВЯЗАНЫ]/[НЕЗАВИСИМЫ]",
             "5) ОБЪЯСНЕНИЕ АЛЕРТОВ",
             "6) ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
             "7) ПРОБЕЛЫ В ДАННЫХ И РАЗРЫВЫ ЦЕПОЧЕК",
+            "8) ФОРМАТ ВЫВОДА ЦЕПОЧКИ: оформи красиво с узлами и стрелками.",
             "",
             "Частичные summary:",
             rendered_summaries,
         ]
-        return "\n".join(lines).strip()
+        return _append_chain_requirement("\n".join(lines).strip(), "reduce")
 
     def _build_freeform_prompt(
         self,
@@ -1528,7 +1566,7 @@ class PeriodLogSummarizer:
         anti_rules = _resolve_anti_hallucination_rules()
         freeform_template = _read_prompt_setting("CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE")
         if freeform_template:
-            return _render_prompt_template(
+            rendered = _render_prompt_template(
                 freeform_template,
                 {
                     "period_start": period_start,
@@ -1544,13 +1582,15 @@ class PeriodLogSummarizer:
                     "anti_hallucination_rules": anti_rules,
                 },
             ).strip()
-        return "\n".join([
+            return _append_chain_requirement(rendered, "freeform")
+        return _append_chain_requirement("\n".join([
             "На основе структурированного анализа инцидента ниже напиши черновой нарратив.",
             "Это промежуточный результат для SRE-команды — 3-5 абзацев связным текстом.",
             "Включи: что произошло, в какой последовательности, вероятные причины с пометками [ФАКТ]/[ГИПОТЕЗА],",
             "что нужно проверить дополнительно.",
             "Пиши конкретно — ссылайся на реальные timestamp'ы и цитаты из логов, не генерируй абстракции.",
             "Если данных недостаточно для какого-то утверждения — прямо напиши об этом.",
+            "Отдельным обязательным пунктом дай наглядную цепочку событий (узлы + стрелки).",
             "",
             "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
             anti_rules,
@@ -1560,7 +1600,7 @@ class PeriodLogSummarizer:
             "",
             "Структурированный анализ:",
             structured_summary,
-        ])
+        ]), "freeform")
 
     def _rank_rows_by_problem_signal(
         self,
@@ -1624,7 +1664,7 @@ def build_cross_source_reduce_prompt(
     extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
     template = _read_prompt_setting("CONTROL_PLANE_LLM_CROSS_SOURCE_REDUCE_PROMPT_TEMPLATE")
     if template:
-        return _render_prompt_template(
+        rendered = _render_prompt_template(
             template,
             {
                 "period_start": period_start,
@@ -1646,6 +1686,7 @@ def build_cross_source_reduce_prompt(
                 "anti_hallucination_rules": anti_rules,
             },
         ).strip()
+        return _append_chain_requirement(rendered, "cross")
 
     lines = [
         "Это финальный CROSS-SOURCE REDUCE: объедини результаты из нескольких источников.",
@@ -1669,7 +1710,7 @@ def build_cross_source_reduce_prompt(
         "1) ЕДИНАЯ ХРОНОЛОГИЯ ИНЦИДЕНТА",
         "2) КРОСС-КОРРЕЛЯЦИИ МЕЖДУ ИСТОЧНИКАМИ ([ФАКТ]/[ГИПОТЕЗА])",
         "3) ОБЪЯСНЕНИЕ АЛЕРТОВ (финальный вердикт)",
-        "4) ПРИЧИННО-СЛЕДСТВЕННЫЕ ЦЕПОЧКИ ИНЦИДЕНТА",
+        "4) ЦЕПОЧКА СОБЫТИЙ ИНЦИДЕНТА (ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК)",
         "5) СВЯЗЬ МЕЖДУ ЦЕПОЧКАМИ: [ОДИН ИНЦИДЕНТ]/[ВОЗМОЖНО СВЯЗАНЫ]/[НЕЗАВИСИМЫ]",
         "6) ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
         "7) МАСШТАБ ВОЗДЕЙСТВИЯ",
@@ -1679,7 +1720,7 @@ def build_cross_source_reduce_prompt(
         "Summary по источникам:",
         source_summaries_text,
     ]
-    return "\n".join(lines).strip()
+    return _append_chain_requirement("\n".join(lines).strip(), "cross")
 
 
 def summarize_logs(

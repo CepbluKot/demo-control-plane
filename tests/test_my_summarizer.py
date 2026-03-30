@@ -338,6 +338,7 @@ class TestMySummarizer(unittest.TestCase):
             )
         self.assertIn("CUSTOM MAP", prompt)
         self.assertIn("type=aggregated", prompt)
+        self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА", prompt)
 
 
 if __name__ == "__main__":

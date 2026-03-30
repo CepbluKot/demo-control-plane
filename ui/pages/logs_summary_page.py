@@ -1229,6 +1229,8 @@ def _save_logs_summary_result(
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"logs_summary_result_{stamp}.json"
     summary_path = output_dir / f"logs_summary_result_{stamp}.md"
+    structured_txt_path = output_dir / f"logs_summary_structured_{stamp}.txt"
+    freeform_txt_path = output_dir / f"logs_summary_freeform_{stamp}.txt"
 
     payload = {
         "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -1238,6 +1240,13 @@ def _save_logs_summary_result(
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    structured_summary = str(result_state.get("final_summary") or "").strip()
+    freeform_summary = str(result_state.get("freeform_final_summary") or "").strip()
+    if structured_summary:
+        structured_txt_path.write_text(structured_summary, encoding="utf-8")
+    if freeform_summary:
+        freeform_txt_path.write_text(freeform_summary, encoding="utf-8")
+
     lines = [
         "# Logs Summary Result",
         "",
@@ -1246,9 +1255,17 @@ def _save_logs_summary_result(
         f"- mode: `{result_state.get('mode')}`",
         f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
         "",
-        "## Final Summary",
+        "## Final Summary (Structured)",
         "",
-        str(result_state.get("final_summary") or "N/A"),
+        "```text",
+        (structured_summary or "N/A"),
+        "```",
+        "",
+        "## Final Summary (Freeform)",
+        "",
+        "```text",
+        (freeform_summary or "N/A"),
+        "```",
         "",
         "## Stats",
         "",
@@ -1258,11 +1275,18 @@ def _save_logs_summary_result(
         f"- error: `{result_state.get('error')}`",
         "",
         f"JSON dump: `{json_path}`",
+        (f"- structured txt: `{structured_txt_path}`" if structured_summary else ""),
+        (f"- freeform txt: `{freeform_txt_path}`" if freeform_summary else ""),
     ]
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    return {"json_path": str(json_path), "summary_path": str(summary_path)}
+    result = {"json_path": str(json_path), "summary_path": str(summary_path)}
+    if structured_summary:
+        result["structured_txt_path"] = str(structured_txt_path)
+    if freeform_summary:
+        result["freeform_txt_path"] = str(freeform_txt_path)
+    return result
 
 
 def _read_file_bytes(path: Optional[str]) -> Optional[bytes]:
@@ -1294,8 +1318,18 @@ def _build_freeform_summary_prompt(
     custom_template = str(
         getattr(settings, "CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE", "")
     ).strip()
+    chain_block = (
+        "\n\nОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ\n"
+        "Оформи наглядно (Markdown-схема со стрелками):\n"
+        "[t1] событие A [ФАКТ/ГИПОТЕЗА]\n"
+        "    └─> механизм\n"
+        "[t2] событие B [ФАКТ/ГИПОТЕЗА]\n"
+        "    └─> механизм\n"
+        "[t3] алерт/последствие [ФАКТ]\n"
+        "Если есть разрывы — добавь: [РАЗРЫВ ЦЕПОЧКИ: чего не хватает].\n"
+    )
     if custom_template:
-        return _render_prompt_template(
+        rendered = _render_prompt_template(
             custom_template,
             {
                 "final_summary": final_summary,
@@ -1312,6 +1346,7 @@ def _build_freeform_summary_prompt(
                 "anti_hallucination_rules": anti_rules,
             },
         )
+        return f"{rendered.strip()}{chain_block}"
     anti_block = f"ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n\n" if anti_rules else ""
     return (
         "Напиши финальный narrative-отчёт для SRE на основе структурированного анализа.\n\n"
@@ -1323,6 +1358,7 @@ def _build_freeform_summary_prompt(
         "3) Первопричина: что [ФАКТ], что [ГИПОТЕЗА].\n"
         "4) Что не удалось выяснить (разрывы цепочек и недостающие данные).\n"
         "5) Что делать дальше (конкретные приоритетные действия).\n\n"
+        "6) ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ (обязательно, в виде схемы со стрелками).\n\n"
         "Если видишь несколько независимых цепочек/инцидентов — скажи это явно.\n"
         "Если между событиями связь не доказана — помечай как гипотезу, не как факт.\n\n"
         "Если данных недостаточно для какого-то раздела — прямо напиши об этом.\n\n"
@@ -1331,6 +1367,7 @@ def _build_freeform_summary_prompt(
         f"Метрики: {metrics_block}\n\n"
         "Структурированный анализ логов:\n"
         f"{final_summary}"
+        f"{chain_block}"
     )
 
 
@@ -1439,6 +1476,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         if final_summary:
             st.markdown("Итоговое расследование")
             deps.render_pretty_summary_text(final_summary, height=max(final_height, 280))
+            with st.expander("Полный текст итогового расследования (без форматирования)", expanded=False):
+                deps.render_scrollable_text(final_summary, height=max(final_height, 520))
 
         freeform_summary = _normalize_summary_text(state.get("freeform_final_summary"))
         if freeform_summary:
@@ -1447,6 +1486,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 freeform_summary,
                 height=max(final_height, 320),
             )
+            with st.expander("Полный текст свободного отчета (без форматирования)", expanded=False):
+                deps.render_scrollable_text(freeform_summary, height=max(final_height, 620))
 
         query_errors = state.get("query_errors", [])
         if isinstance(query_errors, list) and query_errors:
@@ -1461,6 +1502,10 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 st.code(str(state.get("result_json_path")))
             if state.get("result_summary_path"):
                 st.code(str(state.get("result_summary_path")))
+            if state.get("result_structured_txt_path"):
+                st.code(str(state.get("result_structured_txt_path")))
+            if state.get("result_freeform_txt_path"):
+                st.code(str(state.get("result_freeform_txt_path")))
             if state.get("live_events_path"):
                 st.code(str(state.get("live_events_path")))
             if state.get("live_batches_path"):
@@ -1470,6 +1515,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             st.markdown("Скачать")
             json_bytes = _read_file_bytes(state.get("result_json_path"))
             md_bytes = _read_file_bytes(state.get("result_summary_path"))
+            structured_txt_bytes = _read_file_bytes(state.get("result_structured_txt_path"))
+            freeform_txt_bytes = _read_file_bytes(state.get("result_freeform_txt_path"))
             if json_bytes is not None and state.get("result_json_path"):
                 st.download_button(
                     label="JSON отчет",
@@ -1484,6 +1531,22 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     data=md_bytes,
                     file_name=Path(str(state.get("result_summary_path"))).name,
                     mime="text/markdown",
+                    use_container_width=True,
+                )
+            if structured_txt_bytes is not None and state.get("result_structured_txt_path"):
+                st.download_button(
+                    label="Structured TXT",
+                    data=structured_txt_bytes,
+                    file_name=Path(str(state.get("result_structured_txt_path"))).name,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            if freeform_txt_bytes is not None and state.get("result_freeform_txt_path"):
+                st.download_button(
+                    label="Freeform TXT",
+                    data=freeform_txt_bytes,
+                    file_name=Path(str(state.get("result_freeform_txt_path"))).name,
+                    mime="text/plain",
                     use_container_width=True,
                 )
 
@@ -1743,6 +1806,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             with st.chat_message("assistant"):
                 st.markdown("Итоговый Reduce summary")
                 deps.render_pretty_summary_text(state["final_summary"], height=final_height)
+                with st.expander("Полный текст (raw)", expanded=False):
+                    deps.render_scrollable_text(state["final_summary"], height=max(final_height, 520))
 
         if state.get("stats"):
             stats = state["stats"]
@@ -1774,6 +1839,10 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     st.code(str(state.get("result_json_path")))
                 if state.get("result_summary_path"):
                     st.code(str(state.get("result_summary_path")))
+                if state.get("result_structured_txt_path"):
+                    st.code(str(state.get("result_structured_txt_path")))
+                if state.get("result_freeform_txt_path"):
+                    st.code(str(state.get("result_freeform_txt_path")))
                 if state.get("live_events_path"):
                     st.code(str(state.get("live_events_path")))
                 if state.get("live_batches_path"):
@@ -2437,6 +2506,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "error": None,
         "result_json_path": None,
         "result_summary_path": None,
+        "result_structured_txt_path": None,
+        "result_freeform_txt_path": None,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -3480,6 +3551,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     )
     state["result_json_path"] = saved.get("json_path")
     state["result_summary_path"] = saved.get("summary_path")
+    state["result_structured_txt_path"] = saved.get("structured_txt_path")
+    state["result_freeform_txt_path"] = saved.get("freeform_txt_path")
     st.session_state[LAST_STATE_SESSION_KEY] = state
     st.session_state[RUNNING_SESSION_KEY] = False
     st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
