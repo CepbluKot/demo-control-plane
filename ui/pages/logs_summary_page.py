@@ -2197,13 +2197,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             hide_index=True,
                             height=220,
                         )
-            # --- Progress bar (rows + timestamp, choose the most stable ratio) ---
-            row_ratio: Optional[float] = None
-            rows_processed_num = pd.to_numeric(state.get("logs_processed"), errors="coerce")
-            rows_total_num = pd.to_numeric(state.get("logs_total"), errors="coerce")
-            if not pd.isna(rows_processed_num) and not pd.isna(rows_total_num) and float(rows_total_num) > 0:
-                row_ratio = min(max(float(rows_processed_num) / float(rows_total_num), 0.0), 1.0)
-
+            # --- Timestamp-based progress bar ---
             last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
             period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
             period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
@@ -2218,29 +2212,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 done_span = max((last_batch_ts - period_start_ts).total_seconds(), 0.0)
                 if total_span > 0:
                     ts_ratio = min(max(done_span / total_span, 0.0), 1.0)
-            display_ratio: Optional[float] = None
-            progress_text = "Прогресс"
-            if row_ratio is not None and ts_ratio is not None:
-                display_ratio = max(row_ratio, ts_ratio)
-                last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
-                progress_text = (
-                    f"Прогресс: {display_ratio * 100.0:.1f}% | "
-                    f"строки: {int(rows_processed_num):,}/{int(rows_total_num):,} | "
-                    f"лог до {last_ts_str}"
-                )
-            elif row_ratio is not None:
-                display_ratio = row_ratio
-                progress_text = (
-                    f"Прогресс: {display_ratio * 100.0:.1f}% | "
-                    f"строки: {int(rows_processed_num):,}/{int(rows_total_num):,}"
-                )
-            elif ts_ratio is not None:
-                display_ratio = ts_ratio
-                last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
-                progress_text = f"Прогресс: {display_ratio * 100.0:.1f}% | лог до {last_ts_str}"
-
-            if display_ratio is not None:
-                st.progress(display_ratio, text=progress_text)
+                    pct = ts_ratio * 100.0
+                    last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
+                    st.progress(
+                        ts_ratio,
+                        text=f"Прогресс: {pct:.1f}% | лог до {last_ts_str}",
+                    )
             elif state.get("logs_processed"):
                 st.caption(f"Обработано строк: {state['logs_processed']}")
 
@@ -3256,9 +3233,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_total": None,
         "resume_rows_offset": 0,
         "resume_batch_offset": 0,
-        "source_rows_base": 0,
-        "source_batch_base": 0,
-        "total_batches_processed": 0,
         "resume_stats_offset": {
             "pages_fetched": 0,
             "rows_processed": 0,
@@ -3379,9 +3353,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["resume_batch_offset"] = len(
             _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
         )
-        state["total_batches_processed"] = int(state["resume_batch_offset"])
-        state["source_rows_base"] = int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0)
-        state["source_batch_base"] = int(state["resume_batch_offset"])
         state["active_step"] = (
             f"Восстановление с прогресса: last_ts={state.get('last_batch_ts') or 'n/a'}"
         )
@@ -3809,16 +3780,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "map"
                 state["llm_phase_hint"] = "map"
                 state["active_step"] = "Читаем логи и готовим MAP-батчи"
-                if state.get("source_rows_base") is None:
-                    state["source_rows_base"] = int(
-                        pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0
-                    )
-                if state.get("source_batch_base") is None:
-                    state["source_batch_base"] = int(
-                        pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
-                        or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
-                        or 0
-                    )
                 events.append("Map этап запущен")
             elif event == "page_fetched":
                 state["status"] = "map"
@@ -3829,13 +3790,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             elif event == "map_batch_start":
                 state["status"] = "map"
                 state["llm_phase_hint"] = "map"
-                source_batch_base = int(
-                    pd.to_numeric(state.get("source_batch_base"), errors="coerce")
-                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
-                    or 0
-                )
+                resume_batch_offset = int(pd.to_numeric(state.get("resume_batch_offset"), errors="coerce") or 0)
                 local_batch_index = int(payload.get("batch_index", 0))
-                idx = source_batch_base + local_batch_index + 1
+                idx = resume_batch_offset + local_batch_index + 1
                 total = payload.get("batch_total")
                 retries_label = "∞" if int(max_retries) < 0 else str(max_retries)
                 state["active_step"] = (
@@ -3857,18 +3814,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
-                source_batch_base = int(
-                    pd.to_numeric(state.get("source_batch_base"), errors="coerce")
-                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
-                    or 0
-                )
+                resume_batch_offset = int(pd.to_numeric(state.get("resume_batch_offset"), errors="coerce") or 0)
                 local_batch_index = int(payload.get("batch_index", 0))
-                global_batch_index_zero = source_batch_base + local_batch_index
+                global_batch_index_zero = resume_batch_offset + local_batch_index
                 global_batch_index_one = global_batch_index_zero + 1
-                state["total_batches_processed"] = max(
-                    int(pd.to_numeric(state.get("total_batches_processed"), errors="coerce") or 0),
-                    global_batch_index_one,
-                )
 
                 # Track the timestamp of the last processed batch for timestamp-based
                 # progress bar and ETA — no pre-counting of rows required.
@@ -4039,12 +3988,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             if progress_rows is None:
                 progress_rows = payload.get("rows_fetched")
             if progress_rows is not None:
-                source_rows_base = int(
-                    pd.to_numeric(state.get("source_rows_base"), errors="coerce")
-                    or pd.to_numeric(state.get("resume_rows_offset"), errors="coerce")
-                    or 0
-                )
-                state["logs_processed"] = max(int(progress_rows) + source_rows_base, 0)
+                resume_rows_offset = int(pd.to_numeric(state.get("resume_rows_offset"), errors="coerce") or 0)
+                state["logs_processed"] = max(int(progress_rows) + resume_rows_offset, 0)
             if payload.get("rows_total") is not None:
                 state["logs_total"] = int(payload.get("rows_total"))
 
@@ -4386,14 +4331,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             for src_idx, spec in enumerate(query_specs):
                 src_label = str(spec.get("label", f"query_{src_idx + 1}"))
                 state["active_source_label"] = src_label
-                state["source_rows_base"] = int(
-                    pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0
-                )
-                state["source_batch_base"] = int(
-                    pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
-                    or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
-                    or 0
-                )
                 state.setdefault("events", []).append(
                     f"--- Источник: {src_label} ({src_idx + 1}/{len(query_specs)}) ---"
                 )
@@ -4530,16 +4467,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         else:
             # Single-query or demo mode: use _db_fetch_page directly
             state["active_source_label"] = "query_1"
-            state["source_rows_base"] = int(
-                pd.to_numeric(state.get("logs_processed"), errors="coerce")
-                or pd.to_numeric(state.get("resume_rows_offset"), errors="coerce")
-                or 0
-            )
-            state["source_batch_base"] = int(
-                pd.to_numeric(state.get("total_batches_processed"), errors="coerce")
-                or pd.to_numeric(state.get("resume_batch_offset"), errors="coerce")
-                or 0
-            )
             _single_prompt_context = {
                 "incident_start": period_start_iso,
                 "incident_end": period_end_iso,
