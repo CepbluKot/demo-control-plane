@@ -1334,6 +1334,47 @@ def _build_freeform_summary_prompt(
     )
 
 
+def _build_no_logs_hypothesis_prompt(
+    *,
+    period_start: str,
+    period_end: str,
+    user_goal: str,
+    metrics_context: str,
+    logs_fetch_mode: str,
+    logs_tail_limit: int,
+    logs_queries_count: int,
+) -> str:
+    goal_block = user_goal.strip() or "Контекст инцидента не указан."
+    metrics_block = metrics_context.strip() or "Метрики не предоставлены."
+    anti_rules = str(
+        getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
+    ).strip()
+    anti_block = f"\nПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n" if anti_rules else ""
+    mode_hint = (
+        f"режим tail_n_logs (limit={int(logs_tail_limit)})"
+        if _normalize_logs_fetch_mode(logs_fetch_mode) == "tail_n_logs"
+        else "режим выборки по временному окну"
+    )
+    return (
+        "Ты senior SRE-аналитик.\n"
+        "По указанному периоду логов в выборке нет, но нужно дать осторожное предварительное расследование.\n"
+        "Не выдумывай факты. Явно разделяй [ФАКТ] и [ГИПОТЕЗА].\n"
+        "Если данных мало — так и пиши.\n\n"
+        f"Период анализа: [{period_start}, {period_end})\n"
+        f"Режим получения логов: {mode_hint}\n"
+        f"SQL источников логов: {int(logs_queries_count)}\n"
+        f"Контекст инцидента/алертов:\n{goal_block}\n\n"
+        f"Контекст метрик:\n{metrics_block}\n"
+        f"{anti_block}\n"
+        "Сформируй ответ строго в секциях:\n"
+        "1) ЧТО ТОЧНО ИЗВЕСТНО [ФАКТ]\n"
+        "2) ОСТОРОЖНЫЕ ГИПОТЕЗЫ (3-7 пунктов) [ГИПОТЕЗА]\n"
+        "3) КАКИЕ ДАННЫЕ НУЖНЫ, ЧТОБЫ ПОДТВЕРДИТЬ/ОПРОВЕРГНУТЬ ГИПОТЕЗЫ\n"
+        "4) ЧТО ПРОВЕРИТЬ SRE ПРЯМО СЕЙЧАС (приоритет P0/P1)\n"
+        "5) КРАТКИЙ ВЫВОД ДЛЯ КОМАНДЫ\n"
+    )
+
+
 def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPageDeps) -> None:
     status = str(state.get("status", ""))
     if status not in ("done", "error"):
@@ -1509,6 +1550,11 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         f"MAP workers: `{state.get('map_workers', 1)}`",
                         ("Ретраи LLM: `∞`" if retries_num < 0 else f"Ретраи LLM: `{retries_num}`"),
                         f"Таймаут LLM: `{state.get('llm_timeout', 600)}s`",
+                        (
+                            "Нет логов -> гипотезы: `вкл`"
+                            if bool(state.get("enable_no_logs_hypothesis", False))
+                            else "Нет логов -> гипотезы: `выкл`"
+                        ),
                     ]
                 )
             )
@@ -2045,6 +2091,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "повторы идут бесконечно."
             ),
         )
+        st.checkbox(
+            "Если логов нет — сделать осторожное предположение через LLM",
+            key="logs_sum_enable_no_logs_hypothesis",
+            disabled=is_running,
+            help=(
+                "Опционально: даже если в периоде нет логов, "
+                "LLM сформирует гипотезы и список проверок для SRE."
+            ),
+        )
         st.toggle(
             "Демо режим (без БД)",
             key="logs_sum_demo_mode",
@@ -2082,6 +2137,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     map_workers = int(st.session_state.get("logs_sum_map_workers", max(int(deps.map_workers), 1))) if _parallel_map else 1
     max_retries = int(st.session_state.get("logs_sum_max_retries", int(deps.max_retries)))
     llm_timeout = max(int(st.session_state.get("logs_sum_llm_timeout", max(int(deps.llm_timeout), 10))), 10)
+    enable_no_logs_hypothesis = bool(
+        st.session_state.get("logs_sum_enable_no_logs_hypothesis", False)
+    )
     demo_mode = bool(st.session_state.get("logs_sum_demo_mode", bool(deps.test_mode)))
     demo_logs_count = int(
         st.session_state.get(
@@ -2116,6 +2174,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "map_workers": map_workers,
             "max_retries": max_retries,
             "llm_timeout": llm_timeout,
+            "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -2149,6 +2208,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "map_workers": map_workers,
             "max_retries": max_retries,
             "llm_timeout": llm_timeout,
+            "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
             "demo_mode": demo_mode,
             "demo_logs_count": demo_logs_count,
         }
@@ -2170,6 +2230,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     map_workers = max(int(active_params.get("map_workers", map_workers)), 1)
     max_retries = int(active_params.get("max_retries", max_retries))
     llm_timeout = max(int(active_params.get("llm_timeout", llm_timeout)), 10)
+    enable_no_logs_hypothesis = bool(
+        active_params.get("enable_no_logs_hypothesis", enable_no_logs_hypothesis)
+    )
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
 
@@ -2359,6 +2422,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "map_workers": map_workers,
         "max_retries": max_retries,
         "llm_timeout": llm_timeout,
+        "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "logs_processed": 0,
         "logs_total": None,
         "events": initial_events,
@@ -2416,6 +2480,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "demo_logs_count": demo_logs_count,
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
+        "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
     }
@@ -3089,6 +3154,51 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         llm_call = _llm_call_with_context
 
+        def _maybe_generate_no_logs_hypothesis() -> None:
+            if not bool(enable_no_logs_hypothesis):
+                return
+            normalized_summary = _normalize_summary_text(state.get("final_summary"))
+            if normalized_summary and normalized_summary != "Нет логов за указанный период.":
+                return
+            events = state.setdefault("events", [])
+            if isinstance(events, list):
+                events.append("Логи не найдены: запускаем LLM-гипотезы по контексту инцидента")
+            state["active_step"] = "Нет логов: формируем осторожные гипотезы"
+            _render_logs_summary_chat(analysis_placeholder, state, deps)
+            hypothesis_prompt = _build_no_logs_hypothesis_prompt(
+                period_start=period_start_iso,
+                period_end=period_end_iso,
+                user_goal=goal_text,
+                metrics_context=metrics_context_text,
+                logs_fetch_mode=logs_fetch_mode,
+                logs_tail_limit=int(deps.logs_tail_limit),
+                logs_queries_count=max(int(len(query_specs)), 1),
+            )
+            try:
+                hypothesis_text = _normalize_summary_text(base_llm_call(hypothesis_prompt))
+                stats = state.get("stats")
+                if isinstance(stats, dict):
+                    stats["llm_calls"] = int(pd.to_numeric(stats.get("llm_calls", 0), errors="coerce") or 0) + 1
+                if hypothesis_text:
+                    state["final_summary"] = (
+                        "Логи за выбранный период не найдены.\n\n"
+                        "Ниже — осторожные гипотезы на основе доступного контекста "
+                        "(это НЕ подтвержденные факты):\n\n"
+                        f"{hypothesis_text}"
+                    )
+                    if isinstance(events, list):
+                        events.append("LLM-гипотезы при отсутствии логов готовы")
+                else:
+                    if isinstance(events, list):
+                        events.append("LLM вернул пустой ответ для режима без логов")
+            except Exception as no_logs_exc:  # noqa: BLE001
+                deps.logger.warning("no-logs hypothesis generation failed: %s", no_logs_exc)
+                if isinstance(events, list):
+                    events.append(
+                        "Не удалось получить гипотезы без логов: "
+                        f"{str(no_logs_exc)[:180]}"
+                    )
+
         if multi_query_mode and not demo_mode:
             # ---------------------------------------------------------------
             # Two-level summarization:
@@ -3322,6 +3432,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state["logs_processed"] = int(result.rows_processed)
             if state.get("logs_total") is None and total_rows_estimate is not None:
                 state["logs_total"] = int(total_rows_estimate)
+
+        _maybe_generate_no_logs_hypothesis()
 
         final_summary_for_report = _normalize_summary_text(state.get("final_summary"))
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
