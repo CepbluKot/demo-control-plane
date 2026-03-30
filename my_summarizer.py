@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -99,6 +100,93 @@ class SummarizationResult:
 class _SafeFormatDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+DEFAULT_ANTI_HALLUCINATION_RULES = (
+    "1) Цитируй источник: timestamp/сообщение/cnt/поле.\n"
+    "2) Не додумывай: если данных нет — \"данных недостаточно\".\n"
+    "3) Разделяй [ФАКТ] и [ГИПОТЕЗА]; для гипотезы указывай, что проверить.\n"
+    "4) Не обобщай сверх данных (не раздувай масштаб).\n"
+    "5) Корреляция по времени != причинность.\n"
+    "6) Для [ФАКТ]-причинности нужны: A и B в данных, A<=B по времени, механизм влияния, подтверждение механизма.\n"
+    "7) В агрегированных логах argMin-поля — пример, cnt — масштаб.\n"
+    "8) Не экстраполируй вне временного диапазона данных.\n"
+    "9) При противоречиях показывай оба варианта.\n"
+    "10) Отделяй [РЕЛЕВАНТНО] от [ФОН]/[НЕЯСНО]."
+)
+
+
+def _read_prompt_setting(name: str) -> str:
+    return str(getattr(settings, name, "") or "").strip()
+
+
+def _resolve_anti_hallucination_rules() -> str:
+    custom = _read_prompt_setting("CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES")
+    return custom or DEFAULT_ANTI_HALLUCINATION_RULES
+
+
+def _render_prompt_template(template: str, values: Dict[str, Any]) -> str:
+    rendered = str(template)
+    # Basic Handlebars compatibility for user-provided templates.
+    rendered = re.sub(
+        r"\{\{#each\s+map_summaries\}\}[\s\S]*?\{\{\/each\}\}",
+        "{summaries_text}",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+    rendered = re.sub(
+        r"\{\{#each\s+source_summaries\}\}[\s\S]*?\{\{\/each\}\}",
+        "{source_summaries_text}",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_if_data_type(match: re.Match[str]) -> str:
+        body = match.group(1)
+        return body if str(values.get("data_type", "")).lower() == "aggregated" else ""
+
+    rendered = re.sub(
+        r"\{\{#if\s+data_type\s*==\s*\"aggregated\"\s*\}\}([\s\S]*?)\{\{\/if\}\}",
+        _replace_if_data_type,
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_if_key(match: re.Match[str]) -> str:
+        key = str(match.group(1) or "").strip()
+        body = match.group(2)
+        value = values.get(key)
+        return body if bool(value) else ""
+
+    rendered = re.sub(
+        r"\{\{#if\s+([a-zA-Z0-9_]+)\s*\}\}([\s\S]*?)\{\{\/if\}\}",
+        _replace_if_key,
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_var(match: re.Match[str]) -> str:
+        key = str(match.group(1) or "").strip()
+        if key.startswith("this."):
+            key = key.split(".", 1)[1]
+        return "{" + key + "}"
+
+    rendered = re.sub(
+        r"\{\{\s*([a-zA-Z0-9_\.]+)\s*\}\}",
+        _replace_var,
+        rendered,
+    )
+    safe_values = _SafeFormatDict({k: "" if v is None else str(v) for k, v in values.items()})
+    return rendered.format_map(safe_values)
+
+
+def _ctx_value(ctx: Optional[Dict[str, Any]], key: str, default: Any = "") -> str:
+    if not isinstance(ctx, dict):
+        return "" if default is None else str(default)
+    value = ctx.get(key, default)
+    if value is None:
+        return ""
+    return str(value)
 
 
 def has_required_env() -> bool:
@@ -542,12 +630,18 @@ def _make_llm_call(
         return _heuristic_llm_call
 
     default_system_prompt = (
-        "Ты senior SRE-инженер, специализирующийся на расследовании инцидентов.\n"
-        "Правила:\n"
-        "- Каждый вывод основывай на конкретных фактах из логов (цитата, timestamp).\n"
-        "- Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА].\n"
-        "- Если данных недостаточно — прямо пиши \"данных недостаточно\".\n"
-        "- Не генерируй generic выводы (\"возможна деградация\") без подтверждения из логов."
+        "Ты — senior SRE-аналитик инцидентов. Анализируй логи и метрики строго на основе данных.\n"
+        "Принципы:\n"
+        "1) Только факты: каждое утверждение подтверждай timestamp/сообщением/значением.\n"
+        "2) Маркировка: [ФАКТ] — прямое подтверждение, [ГИПОТЕЗА] — предположение.\n"
+        "3) Если данных недостаточно — пиши \"данных недостаточно\", не додумывай.\n"
+        "4) Хронология обязательна: строй цепочку событий по времени.\n"
+        "5) Главный результат: причинно-следственные цепочки (триггер→распространение→последствия→алерты).\n"
+        "6) Если звенья не связаны данными — отмечай разрывы цепочки и нужные данные для закрытия.\n"
+        "7) Возможны несколько независимых цепочек/инцидентов: не склеивай их без механизма связи.\n"
+        "8) Отделяй [РЕЛЕВАНТНО] события от [ФОН]/[НЕЯСНО].\n"
+        "9) Для агрегированных логов: строка=группа событий, cnt=масштаб, argMin-поля=пример.\n"
+        "10) Корреляция по времени не равна причинности."
     )
     custom_system_prompt = str(getattr(settings, "CONTROL_PLANE_LLM_SYSTEM_PROMPT", "")).strip()
     _system_prompt = custom_system_prompt or default_system_prompt
@@ -670,11 +764,13 @@ class PeriodLogSummarizer:
         llm_call: LLMTextCaller,
         config: SummarizerConfig | None = None,
         on_progress: Optional[ProgressCallback] = None,
+        prompt_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.db_fetch_page = db_fetch_page
         self.llm_call = llm_call
         self.config = config or SummarizerConfig()
         self.on_progress = on_progress
+        self.prompt_context = prompt_context or {}
 
     def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
         if self.on_progress is None:
@@ -703,6 +799,11 @@ class PeriodLogSummarizer:
         map_batch_index = 0
         rows_mapped = 0
         estimated_batch_total: Optional[int] = None
+        if total_rows_estimate is not None and total_rows_estimate > 0:
+            estimated_batch_total = max(
+                int(math.ceil(float(total_rows_estimate) / float(max(self.config.llm_chunk_rows, 1)))),
+                1,
+            )
         seen_sources: List[str] = []  # ordered unique sources seen across all pages
         self._emit_progress(
             "map_start",
@@ -776,6 +877,8 @@ class PeriodLogSummarizer:
                         period_end=period_end,
                         columns=columns,
                         rows=rows_chunk,
+                        batch_number=next_batch_index + 1,
+                        total_batches=estimated_batch_total,
                     )
                     future: Optional[Future] = None  # type: ignore[type-arg]
                     if executor is not None:
@@ -1216,6 +1319,8 @@ class PeriodLogSummarizer:
         period_end: str,
         columns: Sequence[str],
         rows: List[Dict[str, Any]],
+        batch_number: Optional[int] = None,
+        total_batches: Optional[int] = None,
     ) -> str:
         # Determine display columns: put _source first if present
         has_source = any(row.get("_source") for row in rows)
@@ -1223,44 +1328,18 @@ class PeriodLogSummarizer:
         display_columns: List[str] = (["_source"] + base_columns) if has_source else list(base_columns)
 
         critical_rows = [row for row in rows if self._row_problem_score(row, list(columns)) > 0]
+        extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
+        anti_rules = _resolve_anti_hallucination_rules()
+        lower_cols = {str(c).lower() for c in display_columns}
+        data_type = "aggregated" if {"start_time", "end_time", "cnt"}.issubset(lower_cols) else "raw"
+        preferred_time = ("start_time", "timestamp", "time", "ts", "datetime", "end_time")
+        time_column = next((c for c in preferred_time if c in lower_cols), "timestamp")
+        if not self.prompt_context.get("data_type"):
+            self.prompt_context["data_type"] = data_type
+        if not self.prompt_context.get("time_column"):
+            self.prompt_context["time_column"] = time_column
 
-        lines = [
-            "Это MAP-этап расследования инцидента. Анализируй только этот фрагмент логов.",
-            "ВАЖНО: если выше в запросе есть контекст инцидента/алертов — используй его.",
-            "Твоя задача: найти в этом фрагменте конкретные доказательства, объясняющие инцидент.",
-            "Строки идут в хронологическом порядке — сохраняй эту последовательность.",
-            "",
-            "Верни обычный текст (не JSON) со строгими секциями:",
-            "",
-            "СОБЫТИЯ",
-            "  Список реальных событий из логов: [timestamp] компонент: что произошло — строка N (цитата)",
-            "  Только факты из логов, без интерпретации.",
-            "",
-            "ПРИЗНАКИ ИНЦИДЕНТА",
-            "  Строки/события, которые могут объяснять алерты из контекста (если контекст есть).",
-            "  Формат: \"Алерт X (из контекста) ← строка N: [цитата]\"",
-            "  Если контекста нет — что выглядит как причина проблем.",
-            "",
-            "АНОМАЛИИ",
-            "  Что выглядит ненормально или неожиданно в этом фрагменте.",
-            "",
-            "ВОПРОСЫ",
-            "  Что непонятно; что нужно найти в других фрагментах или источниках.",
-            "",
-            f"Период: [{period_start}, {period_end})",
-            f"Строк в куске: {len(rows)}",
-            f"Строк с problem-сигналами: {len(critical_rows)}",
-            f"Колонки: {', '.join(display_columns)}",
-        ]
-        extra_prompt_context = str(
-            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
-        ).strip()
-        if extra_prompt_context:
-            lines += [
-                "",
-                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
-                extra_prompt_context,
-            ]
+        source_stat = ""
         if has_source:
             source_counts: Dict[str, int] = {}
             for row in rows:
@@ -1269,15 +1348,8 @@ class PeriodLogSummarizer:
             source_stat = ", ".join(
                 f"{src}={cnt}" for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])
             )
-            lines.append(f"Распределение по источникам: {source_stat}")
-            lines.append(
-                "ВАЖНО: при анализе учитывай источник каждой строки (_source). "
-                "Ищи причинно-следственные связи МЕЖДУ источниками по времени."
-            )
-        lines += [
-            "",
-            "Логи (хронологический порядок):",
-        ]
+
+        log_lines: List[str] = []
         for idx, row in enumerate(rows, start=1):
             rendered_parts: List[str] = []
             for col in display_columns:
@@ -1286,8 +1358,77 @@ class PeriodLogSummarizer:
                     continue
                 text = self._truncate(str(value), self.config.max_cell_chars)
                 rendered_parts.append(f"{col}={text}")
-            lines.append(f"{idx}. " + " | ".join(rendered_parts))
+            log_lines.append(f"{idx}. " + " | ".join(rendered_parts))
+        logs_text = "\n".join(log_lines) if log_lines else "Нет строк в батче."
 
+        map_template = _read_prompt_setting("CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE")
+        if map_template:
+            return _render_prompt_template(
+                map_template,
+                {
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "incident_start": _ctx_value(self.prompt_context, "incident_start", period_start),
+                    "incident_end": _ctx_value(self.prompt_context, "incident_end", period_end),
+                    "incident_description": _ctx_value(self.prompt_context, "incident_description", ""),
+                    "alerts_list": _ctx_value(self.prompt_context, "alerts_list", ""),
+                    "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
+                    "source_name": _ctx_value(self.prompt_context, "source_name", source_stat or "query_1"),
+                    "sql_query": _ctx_value(self.prompt_context, "sql_query", ""),
+                    "batch_number": batch_number if batch_number is not None else "",
+                    "total_batches": total_batches if total_batches is not None else "",
+                    "batch_data": logs_text,
+                    "rows_count": len(rows),
+                    "problem_rows": len(critical_rows),
+                    "columns": ", ".join(display_columns),
+                    "time_column": _ctx_value(self.prompt_context, "time_column", time_column),
+                    "data_type": _ctx_value(self.prompt_context, "data_type", data_type),
+                    "source_distribution": source_stat,
+                    "extra_prompt_context": extra_prompt_context,
+                    "anti_hallucination_rules": anti_rules,
+                    "logs_text": logs_text,
+                },
+            ).strip()
+
+        lines = [
+            "Это MAP-этап расследования инцидента. Анализируй только этот фрагмент логов.",
+            "Если выше есть контекст алертов/инцидента — используй его как приоритет.",
+            "",
+            f"Источник: {_ctx_value(self.prompt_context, 'source_name', source_stat or 'query_1')}",
+            f"SQL: {_ctx_value(self.prompt_context, 'sql_query', '')}",
+            f"Батч: {batch_number if batch_number is not None else ''}/{total_batches if total_batches is not None else ''}",
+            f"Период: [{period_start}, {period_end})",
+            f"Поле времени: {time_column}",
+            f"Тип данных: {data_type}",
+            f"Строк в куске: {len(rows)}",
+            f"Строк с problem-сигналами: {len(critical_rows)}",
+            f"Колонки: {', '.join(display_columns)}",
+        ]
+        if source_stat:
+            lines.append(f"Распределение по источникам: {source_stat}")
+        if extra_prompt_context:
+            lines += [
+                "",
+                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
+                extra_prompt_context,
+            ]
+        lines += [
+            "",
+            "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
+            anti_rules,
+            "",
+            "Верни обычный текст (не JSON) со строгими секциями:",
+            "1) ВРЕМЕННОЙ ДИАПАЗОН БАТЧА",
+            "2) КЛАССИФИКАЦИЯ ЗАПИСЕЙ: [РЕЛЕВАНТНО] / [ФОН] / [НЕЯСНО]",
+            "3) КЛЮЧЕВЫЕ СОБЫТИЯ (только [РЕЛЕВАНТНО])",
+            "4) ПАТТЕРНЫ И АНОМАЛИИ",
+            "5) ФРАГМЕНТЫ ПРИЧИННО-СЛЕДСТВЕННОЙ ЦЕПОЧКИ (A -> B, механизм, [ФАКТ]/[ГИПОТЕЗА])",
+            "6) СВЯЗЬ С АЛЕРТАМИ ([НАЙДЕНО]/[ЧАСТИЧНО]/[НЕ НАЙДЕНО])",
+            "7) СИГНАЛЫ ДЛЯ ДАЛЬНЕЙШЕГО АНАЛИЗА",
+            "",
+            "Логи (хронологический порядок):",
+            logs_text,
+        ]
         return "\n".join(lines)
 
     def _build_reduce_prompt(
@@ -1304,54 +1445,76 @@ class PeriodLogSummarizer:
             "Ищи причинно-следственные связи МЕЖДУ источниками."
             if sources else ""
         )
+        extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
+        anti_rules = _resolve_anti_hallucination_rules()
+        summaries_text = []
+        for idx, text in enumerate(summaries, start=1):
+            summaries_text.append(f"[BATCH {idx}]")
+            summaries_text.append(text)
+            summaries_text.append("")
+        rendered_summaries = "\n".join(summaries_text).strip()
+
+        reduce_template = _read_prompt_setting("CONTROL_PLANE_LLM_REDUCE_PROMPT_TEMPLATE")
+        if reduce_template:
+            return _render_prompt_template(
+                reduce_template,
+                {
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "incident_start": _ctx_value(self.prompt_context, "incident_start", period_start),
+                    "incident_end": _ctx_value(self.prompt_context, "incident_end", period_end),
+                    "incident_description": _ctx_value(self.prompt_context, "incident_description", ""),
+                    "alerts_list": _ctx_value(self.prompt_context, "alerts_list", ""),
+                    "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
+                    "source_name": _ctx_value(self.prompt_context, "source_name", ", ".join(sources or [])),
+                    "sql_query": _ctx_value(self.prompt_context, "sql_query", ""),
+                    "data_type": _ctx_value(self.prompt_context, "data_type", ""),
+                    "reduce_round": reduce_round,
+                    "source_names": ", ".join(sources or []),
+                    "sources_line": sources_line,
+                    "batch_count": len(summaries),
+                    "extra_prompt_context": extra_prompt_context,
+                    "anti_hallucination_rules": anti_rules,
+                    "summaries_text": rendered_summaries,
+                    "map_summaries": json.dumps(summaries, ensure_ascii=False),
+                    "map_summaries_text": rendered_summaries,
+                },
+            ).strip()
+
         lines = [
             "Это REDUCE-этап расследования инцидента.",
-            "ВАЖНО: если выше есть контекст инцидента/алертов — привяжи каждый вывод к конкретным алертам.",
+            "Если выше есть контекст инцидента/алертов — привяжи выводы к нему.",
             *(([sources_line]) if sources_line else []),
-            "Объедини частичные наблюдения из батчей в единый разбор.",
-            "Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА]. Дубли убирай.",
             "",
-            "Верни обычный текст (не JSON) со строгими секциями:",
-            "",
-            "ХРОНОЛОГИЯ",
-            "  Список событий с реальными timestamp'ами из логов (не сочинёнными).",
-            "  Формат: [timestamp] — событие (источник: batch N)",
-            "",
-            "ПЕРВОПРИЧИНА",
-            "  Одно конкретное утверждение + [ФАКТ] или [ГИПОТЕЗА] + доказательство из логов.",
-            "  Если неизвестна — напиши: \"данных недостаточно для вывода о первопричине\".",
-            "",
-            "ОБЪЯСНЕНИЕ АЛЕРТОВ",
-            "  Для каждого алерта из контекста выше (если контекст есть):",
-            "  - Алерт: [название/время из контекста]",
-            "  - Лог-объяснение: [что нашли] или \"не нашли объяснения в логах\"",
-            "  - Доказательство: [цитата из batch N]",
-            "",
-            "ЦЕПОЧКА СОБЫТИЙ",
-            "  Конкретная цепочка: событие A (timestamp) → B (timestamp) → алерт C.",
-            "  Только если цепочка подтверждена логами.",
-            "",
-            "ПРОБЕЛЫ",
-            "  Что осталось необъяснённым; что нужно проверить дополнительно.",
-            "",
+            f"Источник: {_ctx_value(self.prompt_context, 'source_name', ', '.join(sources or []))}",
+            f"SQL: {_ctx_value(self.prompt_context, 'sql_query', '')}",
             f"Период: [{period_start}, {period_end})",
             f"Reduce round: {reduce_round}",
-            "",
-            "Частичные наблюдения:",
+            f"Количество map-summary: {len(summaries)}",
         ]
-        extra_prompt_context = str(
-            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
-        ).strip()
         if extra_prompt_context:
             lines += [
                 "",
                 "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
                 extra_prompt_context,
             ]
-        for idx, text in enumerate(summaries, start=1):
-            lines.append(f"[BATCH {idx}]")
-            lines.append(text)
-            lines.append("")
+        lines += [
+            "",
+            "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
+            anti_rules,
+            "",
+            "Объедини частичные summary в единый отчёт со строгими секциями:",
+            "1) ОБЗОР ИСТОЧНИКА",
+            "2) ХРОНОЛОГИЯ КЛЮЧЕВЫХ СОБЫТИЙ (только [РЕЛЕВАНТНО])",
+            "3) ПРИЧИННО-СЛЕДСТВЕННЫЕ ЦЕПОЧКИ (несколько цепочек допустимы)",
+            "4) СВЯЗЬ МЕЖДУ ЦЕПОЧКАМИ: [СВЯЗАНЫ]/[ВОЗМОЖНО СВЯЗАНЫ]/[НЕЗАВИСИМЫ]",
+            "5) ОБЪЯСНЕНИЕ АЛЕРТОВ",
+            "6) ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
+            "7) ПРОБЕЛЫ В ДАННЫХ И РАЗРЫВЫ ЦЕПОЧЕК",
+            "",
+            "Частичные summary:",
+            rendered_summaries,
+        ]
         return "\n".join(lines).strip()
 
     def _build_freeform_prompt(
@@ -1361,9 +1524,26 @@ class PeriodLogSummarizer:
         period_end: str,
         structured_summary: str,
     ) -> str:
-        extra_prompt_context = str(
-            getattr(settings, "CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT", "")
-        ).strip()
+        extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
+        anti_rules = _resolve_anti_hallucination_rules()
+        freeform_template = _read_prompt_setting("CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE")
+        if freeform_template:
+            return _render_prompt_template(
+                freeform_template,
+                {
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "incident_start": _ctx_value(self.prompt_context, "incident_start", period_start),
+                    "incident_end": _ctx_value(self.prompt_context, "incident_end", period_end),
+                    "incident_description": _ctx_value(self.prompt_context, "incident_description", ""),
+                    "alerts_list": _ctx_value(self.prompt_context, "alerts_list", ""),
+                    "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
+                    "structured_summary": structured_summary,
+                    "cross_source_summary": structured_summary,
+                    "extra_prompt_context": extra_prompt_context,
+                    "anti_hallucination_rules": anti_rules,
+                },
+            ).strip()
         return "\n".join([
             "На основе структурированного анализа инцидента ниже напиши черновой нарратив.",
             "Это промежуточный результат для SRE-команды — 3-5 абзацев связным текстом.",
@@ -1371,6 +1551,9 @@ class PeriodLogSummarizer:
             "что нужно проверить дополнительно.",
             "Пиши конкретно — ссылайся на реальные timestamp'ы и цитаты из логов, не генерируй абстракции.",
             "Если данных недостаточно для какого-то утверждения — прямо напиши об этом.",
+            "",
+            "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
+            anti_rules,
             *((["", "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:", extra_prompt_context]) if extra_prompt_context else []),
             "",
             f"Период: [{period_start}, {period_end})",
@@ -1419,6 +1602,7 @@ def build_cross_source_reduce_prompt(
     summaries_by_source: Dict[str, str],
     period_start: str,
     period_end: str,
+    context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a cross-source REDUCE prompt that merges per-source MAP→REDUCE results.
 
@@ -1426,45 +1610,75 @@ def build_cross_source_reduce_prompt(
       1. Per-source MAP→REDUCE (independent summaries per query).
       2. One cross-source REDUCE LLM call using this prompt.
     """
+    ctx = context or {}
     sources = list(summaries_by_source.keys())
+    source_blocks: List[str] = []
+    for source, summary in summaries_by_source.items():
+        source_blocks.append(f"=== {source} ===\n{summary}")
+    source_summaries_text = "\n\n".join(source_blocks).strip()
+    source_summaries_array = [
+        {"source_name": str(source), "reduce_summary": str(summary)}
+        for source, summary in summaries_by_source.items()
+    ]
+    anti_rules = _resolve_anti_hallucination_rules()
+    extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
+    template = _read_prompt_setting("CONTROL_PLANE_LLM_CROSS_SOURCE_REDUCE_PROMPT_TEMPLATE")
+    if template:
+        return _render_prompt_template(
+            template,
+            {
+                "period_start": period_start,
+                "period_end": period_end,
+                "incident_start": _ctx_value(ctx, "incident_start", period_start),
+                "incident_end": _ctx_value(ctx, "incident_end", period_end),
+                "incident_description": _ctx_value(ctx, "incident_description", ""),
+                "alerts_list": _ctx_value(ctx, "alerts_list", ""),
+                "metrics_context": _ctx_value(ctx, "metrics_context", ""),
+                "source_names": ", ".join(sources),
+                "source_count": len(sources),
+                "source_name": _ctx_value(ctx, "source_name", ", ".join(sources)),
+                "sql_query": _ctx_value(ctx, "sql_query", ""),
+                "time_column": _ctx_value(ctx, "time_column", ""),
+                "data_type": _ctx_value(ctx, "data_type", ""),
+                "source_summaries_text": source_summaries_text,
+                "source_summaries": json.dumps(source_summaries_array, ensure_ascii=False),
+                "extra_prompt_context": extra_prompt_context,
+                "anti_hallucination_rules": anti_rules,
+            },
+        ).strip()
+
     lines = [
-        "Это финальный CROSS-SOURCE REDUCE — объединение результатов из нескольких независимых источников данных.",
-        "ВАЖНО: если выше есть контекст инцидента/алертов — привяжи каждый вывод к конкретным алертам.",
-        f"Источники данных: {', '.join(sources)}.",
-        "Найди причинно-следственные связи МЕЖДУ источниками по времени.",
-        "Факты помечай [ФАКТ], гипотезы — [ГИПОТЕЗА]. Дубли убирай.",
-        "",
-        "Верни обычный текст (не JSON) со строгими секциями:",
-        "",
-        "ХРОНОЛОГИЯ",
-        "  Единая хронология событий из всех источников с реальными timestamp'ами.",
-        "  Формат: [timestamp] — событие (источник: query_N)",
-        "",
-        "ПЕРВОПРИЧИНА",
-        "  Одно конкретное утверждение + [ФАКТ] или [ГИПОТЕЗА] + доказательство.",
-        "  Если неизвестна — напиши: \"данных недостаточно для вывода о первопричине\".",
-        "",
-        "ОБЪЯСНЕНИЕ АЛЕРТОВ",
-        "  Для каждого алерта из контекста выше (если контекст есть):",
-        "  - Алерт: [название/время из контекста]",
-        "  - Объяснение: [что нашли в каком источнике] или \"не нашли объяснения\"",
-        "  - Доказательство: [цитата]",
-        "",
-        "ЦЕПОЧКА СОБЫТИЙ",
-        "  Конкретная цепочка через источники: A (timestamp, источник) → B (timestamp, источник) → алерт C.",
-        "  Только если цепочка подтверждена данными.",
-        "",
-        "ПРОБЕЛЫ",
-        "  Что осталось необъяснённым; противоречия между источниками; что нужно проверить дополнительно.",
+        "Это финальный CROSS-SOURCE REDUCE: объедини результаты из нескольких источников.",
+        "Привяжи выводы к контексту инцидента/алертов, если он указан выше.",
+        f"Источники: {', '.join(sources)}.",
         "",
         f"Период: [{period_start}, {period_end})",
-        "",
-        "Результаты анализа по источникам:",
     ]
-    for source, summary in summaries_by_source.items():
-        lines.append(f"\n=== {source} ===")
-        lines.append(summary)
-        lines.append("")
+    if extra_prompt_context:
+        lines += [
+            "",
+            "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
+            extra_prompt_context,
+        ]
+    lines += [
+        "",
+        "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
+        anti_rules,
+        "",
+        "Верни структурированный отчёт со секциями:",
+        "1) ЕДИНАЯ ХРОНОЛОГИЯ ИНЦИДЕНТА",
+        "2) КРОСС-КОРРЕЛЯЦИИ МЕЖДУ ИСТОЧНИКАМИ ([ФАКТ]/[ГИПОТЕЗА])",
+        "3) ОБЪЯСНЕНИЕ АЛЕРТОВ (финальный вердикт)",
+        "4) ПРИЧИННО-СЛЕДСТВЕННЫЕ ЦЕПОЧКИ ИНЦИДЕНТА",
+        "5) СВЯЗЬ МЕЖДУ ЦЕПОЧКАМИ: [ОДИН ИНЦИДЕНТ]/[ВОЗМОЖНО СВЯЗАНЫ]/[НЕЗАВИСИМЫ]",
+        "6) ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
+        "7) МАСШТАБ ВОЗДЕЙСТВИЯ",
+        "8) РЕКОМЕНДАЦИИ ДЛЯ SRE (P0/P1/P2)",
+        "9) ПРОБЕЛЫ И ОТКРЫТЫЕ ВОПРОСЫ",
+        "",
+        "Summary по источникам:",
+        source_summaries_text,
+    ]
     return "\n".join(lines).strip()
 
 
@@ -1519,6 +1733,17 @@ def summarize_logs(
         llm_call=llm_call,
         config=SummarizerConfig(page_limit=page_limit),
         on_progress=on_progress,
+        prompt_context={
+            "incident_start": start_iso,
+            "incident_end": end_iso,
+            "incident_description": "",
+            "alerts_list": "",
+            "metrics_context": "",
+            "source_name": service,
+            "sql_query": _resolve_logs_query_template(),
+            "time_column": str(getattr(settings, "CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp")),
+            "data_type": "",
+        },
     )
     result = summarizer.summarize_period(
         period_start=start_iso,

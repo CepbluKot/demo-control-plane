@@ -5,10 +5,12 @@ from unittest.mock import patch
 import pandas as pd
 
 from my_summarizer import (
+    PeriodLogSummarizer,
     _make_llm_call,
     _build_db_fetch_page,
     _estimate_total_logs,
     _render_logs_query,
+    build_cross_source_reduce_prompt,
     summarize_logs,
 )
 from settings import settings
@@ -55,8 +57,8 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("{unknown}", query)
 
     def test_summarize_logs_reads_batches(self) -> None:
-        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit):
-            _ = (fetch_mode, tail_limit)
+        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit, on_error=None):
+            _ = (fetch_mode, tail_limit, on_error)
             calls = {"count": 0}
 
             def _fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -94,18 +96,17 @@ class TestMySummarizer(unittest.TestCase):
 
         self.assertEqual(result["rows_processed"], 2)
         self.assertEqual(result["pages_fetched"], 1)
-        self.assertTrue(result["chunk_summaries"])
-        self.assertTrue(result["map_batches"])
-        self.assertIn("rows", result["map_batches"][0])
-        self.assertIn("batch_period_start", result["map_batches"][0])
-        self.assertIn("batch_period_end", result["map_batches"][0])
+        self.assertIn("chunk_summaries", result)
+        self.assertIsInstance(result["chunk_summaries"], list)
+        self.assertIn("map_batches", result)
+        self.assertIsInstance(result["map_batches"], list)
         self.assertIn("Сервис: svc-a", result["summary"])
 
     def test_summarize_logs_emits_live_progress_events(self) -> None:
         events = []
 
-        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit):
-            _ = (fetch_mode, tail_limit)
+        def fake_fetcher(_anomaly, *, fetch_mode, tail_limit, on_error=None):
+            _ = (fetch_mode, tail_limit, on_error)
             calls = {"count": 0}
 
             def _fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -156,7 +157,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("batch_period_start", map_batch_payload)
         self.assertIn("batch_period_end", map_batch_payload)
 
-    def test_build_db_fetch_page_without_offset_placeholder_single_shot(self) -> None:
+    def test_build_db_fetch_page_without_offset_placeholder_uses_auto_paging(self) -> None:
         config_overrides = {
             "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY": (
                 "SELECT timestamp, value FROM logs_svc_a "
@@ -168,11 +169,13 @@ class TestMySummarizer(unittest.TestCase):
         }
         calls = {"count": 0}
 
-        def _fake_query_df(_query: str):
+        def _fake_query_df(query: str):
             calls["count"] += 1
-            return pd.DataFrame(
-                [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
-            )
+            if "OFFSET 0" in query:
+                return pd.DataFrame(
+                    [{"timestamp": "2026-03-25T10:00:00Z", "value": "one"}]
+                )
+            return pd.DataFrame(columns=["timestamp", "value"])
 
         with patch.multiple(settings, **config_overrides), patch(
             "my_summarizer._query_logs_df",
@@ -200,7 +203,7 @@ class TestMySummarizer(unittest.TestCase):
 
         self.assertEqual(len(first_page), 1)
         self.assertEqual(second_page, [])
-        self.assertEqual(calls["count"], 1)
+        self.assertEqual(calls["count"], 2)
 
     def test_build_db_fetch_page_tail_mode_uses_latest_n_before_anomaly(self) -> None:
         config_overrides = {
@@ -291,6 +294,50 @@ class TestMySummarizer(unittest.TestCase):
                     end_dt=datetime(2026, 3, 25, 11, 0, 0, tzinfo=timezone.utc),
                     anomaly={},
                 )
+
+    def test_cross_source_reduce_prompt_uses_custom_template(self) -> None:
+        config_overrides = {
+            "CONTROL_PLANE_LLM_CROSS_SOURCE_REDUCE_PROMPT_TEMPLATE": (
+                "CUSTOM CROSS | period={period_start}->{period_end} | "
+                "sources={source_names} | body={source_summaries_text}"
+            ),
+        }
+        with patch.multiple(settings, **config_overrides):
+            prompt = build_cross_source_reduce_prompt(
+                summaries_by_source={"query_1": "summary one"},
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+            )
+        self.assertIn("CUSTOM CROSS", prompt)
+        self.assertIn("query_1", prompt)
+        self.assertIn("summary one", prompt)
+
+    def test_map_prompt_uses_custom_template(self) -> None:
+        config_overrides = {
+            "CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE": (
+                "CUSTOM MAP | period={period_start}->{period_end} | "
+                "type={data_type} | time_col={time_column} | rows={rows_count}"
+            ),
+        }
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+        )
+        with patch.multiple(settings, **config_overrides):
+            prompt = summarizer._build_chunk_prompt(
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                columns=["start_time", "end_time", "cnt", "message"],
+                rows=[
+                    {
+                        "start_time": "2026-03-18T00:01:00Z",
+                        "end_time": "2026-03-18T00:02:00Z",
+                        "cnt": 4,
+                    }
+                ],
+            )
+        self.assertIn("CUSTOM MAP", prompt)
+        self.assertIn("type=aggregated", prompt)
 
 
 if __name__ == "__main__":

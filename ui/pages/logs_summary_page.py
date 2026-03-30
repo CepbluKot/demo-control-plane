@@ -18,6 +18,8 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
+from settings import settings
+
 
 MAX_EVENT_LINES = 160
 MAX_RENDERED_BATCHES = 10
@@ -44,6 +46,48 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 def _normalize_timestamp_column_name(value: Any, *, default: str = "timestamp") -> str:
     raw = str(value or "").strip()
     return raw or default
+
+
+def _normalize_summary_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"none", "null", "nan"}:
+        return ""
+    return text
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _render_prompt_template(template: str, values: Dict[str, Any]) -> str:
+    rendered = str(template)
+    rendered = re.sub(
+        r"\{\{#each\s+source_summaries\}\}[\s\S]*?\{\{\/each\}\}",
+        "{source_summaries_text}",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+    rendered = re.sub(
+        r"\{\{#each\s+map_summaries\}\}[\s\S]*?\{\{\/each\}\}",
+        "{summaries_text}",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_var(match: re.Match[str]) -> str:
+        key = str(match.group(1) or "").strip()
+        if key.startswith("this."):
+            key = key.split(".", 1)[1]
+        return "{" + key + "}"
+
+    rendered = re.sub(
+        r"\{\{\s*([a-zA-Z0-9_\.]+)\s*\}\}",
+        _replace_var,
+        rendered,
+    )
+    safe_values = _SafeFormatDict({k: "" if v is None else str(v) for k, v in values.items()})
+    return rendered.format_map(safe_values)
 
 
 def _timeline_row_color(status: str) -> str:
@@ -120,6 +164,30 @@ def _format_eta_seconds(seconds: float) -> str:
     if minutes > 0:
         return f"{minutes}м {secs}с"
     return f"{secs}с"
+
+
+def _resolve_elapsed_seconds(state: Dict[str, Any]) -> Optional[float]:
+    elapsed = pd.to_numeric(state.get("elapsed_seconds"), errors="coerce")
+    if not pd.isna(elapsed):
+        return max(float(elapsed), 0.0)
+    started_mono = state.get("started_monotonic")
+    if started_mono is None:
+        return None
+    try:
+        return max(time.monotonic() - float(started_mono), 0.0)
+    except Exception:
+        return None
+
+
+def _enrich_stats_with_elapsed(state: Dict[str, Any]) -> None:
+    stats = state.get("stats")
+    if not isinstance(stats, dict):
+        return
+    elapsed = _resolve_elapsed_seconds(state)
+    if elapsed is None:
+        return
+    stats["logs_processing_seconds"] = round(float(elapsed), 2)
+    stats["logs_processing_human"] = _format_eta_seconds(float(elapsed))
 
 
 def _format_attempts_total(total_attempts: Any) -> str:
@@ -1220,23 +1288,45 @@ def _build_freeform_summary_prompt(
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
+    anti_rules = str(
+        getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
+    ).strip()
+    custom_template = str(
+        getattr(settings, "CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE", "")
+    ).strip()
+    if custom_template:
+        return _render_prompt_template(
+            custom_template,
+            {
+                "final_summary": final_summary,
+                "cross_source_summary": final_summary,
+                "user_goal": goal_block,
+                "incident_description": goal_block,
+                "alerts_list": goal_block,
+                "incident_start": period_start,
+                "incident_end": period_end,
+                "period_start": period_start,
+                "period_end": period_end,
+                "stats": json.dumps(_json_safe(stats), ensure_ascii=False, indent=2),
+                "metrics_context": metrics_block,
+                "anti_hallucination_rules": anti_rules,
+            },
+        )
+    anti_block = f"ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n\n" if anti_rules else ""
     return (
-        "Ты пишешь итоговый отчёт об инциденте для дежурного SRE-инженера.\n\n"
+        "Напиши финальный narrative-отчёт для SRE на основе структурированного анализа.\n\n"
         f"КОНТЕКСТ ИНЦИДЕНТА:\n{goal_block}\n\n"
-        "Ниже — структурированный анализ логов. На его основе напиши отчёт строго по шаблону:\n\n"
-        "## Что произошло\n"
-        "2-3 предложения: суть инцидента простым языком.\n\n"
-        "## Хронология\n"
-        "Ключевые события с временными метками (только подтверждённые логами).\n\n"
-        "## Объяснение алертов\n"
-        "Для каждого алерта из контекста:\n"
-        "- [Название алерта] — объяснение найдено / частично / не найдено\n"
-        "  Что показывают логи: ...\n\n"
-        "## Первопричина\n"
-        "[ФАКТ] или [ГИПОТЕЗА]: конкретное утверждение с доказательством из логов.\n\n"
-        "## Что делать прямо сейчас\n"
-        "Конкретные шаги (не \"проверить ресурсы\", а \"проверить /var на node-X, т.к. логи показывают...\").\n\n"
+        "Нужен текст, который можно прочитать за 3–5 минут и понять полную картину.\n\n"
+        "Структура:\n"
+        "1) Краткое резюме (3-4 предложения).\n"
+        "2) Ход событий: связный рассказ по хронологии, с явными переходами причины -> следствие.\n"
+        "3) Первопричина: что [ФАКТ], что [ГИПОТЕЗА].\n"
+        "4) Что не удалось выяснить (разрывы цепочек и недостающие данные).\n"
+        "5) Что делать дальше (конкретные приоритетные действия).\n\n"
+        "Если видишь несколько независимых цепочек/инцидентов — скажи это явно.\n"
+        "Если между событиями связь не доказана — помечай как гипотезу, не как факт.\n\n"
         "Если данных недостаточно для какого-то раздела — прямо напиши об этом.\n\n"
+        f"{anti_block}"
         f"Период: [{period_start}, {period_end})\n"
         f"Метрики: {metrics_block}\n\n"
         "Структурированный анализ логов:\n"
@@ -1261,12 +1351,18 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         rows_total = pd.to_numeric(state.get("logs_total"), errors="coerce")
         llm_calls = int(pd.to_numeric(stats.get("llm_calls", 0), errors="coerce") or 0)
         reduce_rounds = int(pd.to_numeric(stats.get("reduce_rounds", 0), errors="coerce") or 0)
+        processing_seconds = pd.to_numeric(stats.get("logs_processing_seconds"), errors="coerce")
+        processing_human = str(stats.get("logs_processing_human") or "").strip()
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Статус", "Готово" if status == "done" else "Ошибка")
         col2.metric("Обработано логов", f"{rows_processed}")
         col3.metric("LLM вызовы", f"{llm_calls}")
         col4.metric("Reduce раунды", f"{reduce_rounds}")
+        if processing_human:
+            st.caption(f"Время обработки логов: {processing_human}")
+        elif not pd.isna(processing_seconds):
+            st.caption(f"Время обработки логов: {_format_eta_seconds(float(processing_seconds))}")
 
         _last_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
         _p_start = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
@@ -1298,12 +1394,12 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 f"Метрики в контексте: rows={metrics_rows}, services={', '.join(map(str, metrics_services))}"
             )
 
-        final_summary = str(state.get("final_summary") or "").strip()
+        final_summary = _normalize_summary_text(state.get("final_summary"))
         if final_summary:
             st.markdown("Итоговое расследование")
             deps.render_pretty_summary_text(final_summary, height=max(final_height, 280))
 
-        freeform_summary = str(state.get("freeform_final_summary") or "").strip()
+        freeform_summary = _normalize_summary_text(state.get("freeform_final_summary"))
         if freeform_summary:
             st.markdown("Итоговое расследование в свободном формате")
             deps.render_pretty_summary_text(
@@ -1604,6 +1700,13 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
 
         if state.get("stats"):
             stats = state["stats"]
+            elapsed_human = str(stats.get("logs_processing_human") or "")
+            elapsed_sec = pd.to_numeric(stats.get("logs_processing_seconds"), errors="coerce")
+            elapsed_text = ""
+            if elapsed_human:
+                elapsed_text = elapsed_human
+            elif not pd.isna(elapsed_sec):
+                elapsed_text = _format_eta_seconds(float(elapsed_sec))
             with st.chat_message("assistant"):
                 st.caption(
                     "Статистика: "
@@ -1611,6 +1714,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     f"rows={stats.get('rows_processed', 0)}, "
                     f"llm_calls={stats.get('llm_calls', 0)}, "
                     f"reduce_rounds={stats.get('reduce_rounds', 0)}"
+                    + (f", elapsed={elapsed_text}" if elapsed_text else "")
                 )
 
         if state.get("error"):
@@ -2798,8 +2902,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             elif event == "reduce_done":
                 state["status"] = "summary_ready"
                 state["active_step"] = "REDUCE завершён, собираем финальный отчёт"
-                if payload.get("summary") is not None:
-                    state["final_summary"] = str(payload.get("summary"))
+                final_from_payload = _normalize_summary_text(payload.get("summary"))
+                if final_from_payload:
+                    state["final_summary"] = final_from_payload
                 events.append("Reduce этап завершен")
             elif event == "fetch_error":
                 error_msg = str(payload.get("error", "ClickHouse query failed"))
@@ -2811,8 +2916,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             elif event == "freeform_done":
                 state["active_step"] = "Финальный narrative-отчёт готов"
                 freeform = payload.get("freeform_summary")
-                if freeform:
-                    state["freeform_final_summary"] = str(freeform)
+                freeform_text = _normalize_summary_text(freeform)
+                if freeform_text:
+                    state["freeform_final_summary"] = freeform_text
                 events.append("Нарратив готов")
             else:
                 events.append(f"Событие: {event}")
@@ -3063,12 +3169,32 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state.pop("last_batch_ts", None)  # reset timestamp progress for each source
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
 
-                src_summarizer = deps.period_log_summarizer_cls(
-                    db_fetch_page=_make_source_fetch_page(spec, src_label),
-                    llm_call=llm_call,
-                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
-                    on_progress=_on_progress,
-                )
+                _src_prompt_context = {
+                    "incident_start": period_start_iso,
+                    "incident_end": period_end_iso,
+                    "incident_description": goal_text,
+                    "alerts_list": goal_text,
+                    "metrics_context": metrics_context_text,
+                    "source_name": src_label,
+                    "sql_query": str(spec.get("template", "")),
+                    "time_column": logs_timestamp_column,
+                    "data_type": "",
+                }
+                try:
+                    src_summarizer = deps.period_log_summarizer_cls(
+                        db_fetch_page=_make_source_fetch_page(spec, src_label),
+                        llm_call=llm_call,
+                        config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                        on_progress=_on_progress,
+                        prompt_context=_src_prompt_context,
+                    )
+                except TypeError:
+                    src_summarizer = deps.period_log_summarizer_cls(
+                        db_fetch_page=_make_source_fetch_page(spec, src_label),
+                        llm_call=llm_call,
+                        config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                        on_progress=_on_progress,
+                    )
                 try:
                     src_result = src_summarizer.summarize_period(
                         period_start=period_start_iso,
@@ -3099,12 +3225,23 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     summaries_by_source=per_source_summaries,
                     period_start=period_start_iso,
                     period_end=period_end_iso,
+                    context={
+                        "incident_start": period_start_iso,
+                        "incident_end": period_end_iso,
+                        "incident_description": goal_text,
+                        "alerts_list": goal_text,
+                        "metrics_context": metrics_context_text,
+                        "source_name": "cross_source",
+                        "sql_query": sql_query_clean,
+                        "time_column": logs_timestamp_column,
+                        "data_type": "",
+                    },
                 )
                 enriched_cross = f"{context_prefix}\n\n{cross_prompt}" if context_prefix else cross_prompt
                 try:
                     cross_summary = llm_call(enriched_cross).strip()
                     agg_llm += 1
-                    final_summary_text = cross_summary or "\n\n---\n\n".join(
+                    final_summary_text = _normalize_summary_text(cross_summary) or "\n\n---\n\n".join(
                         f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
                     )
                 except Exception as cross_exc:  # noqa: BLE001
@@ -3120,22 +3257,43 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
-            state["final_summary"] = final_summary_text
+            state["final_summary"] = _normalize_summary_text(final_summary_text) or "Нет логов за указанный период."
             state["stats"] = {
                 "pages_fetched": agg_pages,
                 "rows_processed": agg_rows,
                 "llm_calls": agg_llm,
                 "reduce_rounds": agg_reduce,
             }
+            _enrich_stats_with_elapsed(state)
             state["logs_processed"] = agg_rows
         else:
             # Single-query or demo mode: use _db_fetch_page directly
-            summarizer = deps.period_log_summarizer_cls(
-                db_fetch_page=_db_fetch_page,
-                llm_call=llm_call,
-                config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
-                on_progress=_on_progress,
-            )
+            _single_prompt_context = {
+                "incident_start": period_start_iso,
+                "incident_end": period_end_iso,
+                "incident_description": goal_text,
+                "alerts_list": goal_text,
+                "metrics_context": metrics_context_text,
+                "source_name": "query_1",
+                "sql_query": sql_query_clean,
+                "time_column": logs_timestamp_column,
+                "data_type": "",
+            }
+            try:
+                summarizer = deps.period_log_summarizer_cls(
+                    db_fetch_page=_db_fetch_page,
+                    llm_call=llm_call,
+                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                    on_progress=_on_progress,
+                    prompt_context=_single_prompt_context,
+                )
+            except TypeError:
+                summarizer = deps.period_log_summarizer_cls(
+                    db_fetch_page=_db_fetch_page,
+                    llm_call=llm_call,
+                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                    on_progress=_on_progress,
+                )
             try:
                 result = summarizer.summarize_period(
                     period_start=period_start_iso,
@@ -3152,31 +3310,34 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
-            state["final_summary"] = str(result.summary)
+            normalized_final_summary = _normalize_summary_text(getattr(result, "summary", None))
+            state["final_summary"] = normalized_final_summary or "Нет логов за указанный период."
             state["stats"] = {
                 "pages_fetched": result.pages_fetched,
                 "rows_processed": result.rows_processed,
                 "llm_calls": result.llm_calls,
                 "reduce_rounds": result.reduce_rounds,
             }
+            _enrich_stats_with_elapsed(state)
             state["logs_processed"] = int(result.rows_processed)
             if state.get("logs_total") is None and total_rows_estimate is not None:
                 state["logs_total"] = int(total_rows_estimate)
 
-        if state.get("final_summary"):
+        final_summary_for_report = _normalize_summary_text(state.get("final_summary"))
+        if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
                 events = state.setdefault("events", [])
                 events.append("Готовим расширенный финальный отчет в свободном формате")
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
                 freeform_prompt = _build_freeform_summary_prompt(
-                    final_summary=str(state.get("final_summary", "")),
+                    final_summary=final_summary_for_report,
                     user_goal=goal_text,
                     period_start=period_start_iso,
                     period_end=period_end_iso,
                     stats=state.get("stats") or {},
                     metrics_context=metrics_context_text,
                 )
-                freeform_summary = str(base_llm_call(freeform_prompt)).strip()
+                freeform_summary = _normalize_summary_text(base_llm_call(freeform_prompt))
                 if freeform_summary:
                     state["freeform_final_summary"] = freeform_summary
                     events.append("Свободный финальный отчет готов")
@@ -3188,12 +3349,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     "Не удалось сгенерировать свободный финальный отчет"
                 )
         _estimate_eta(state, "done", {})
+        _enrich_stats_with_elapsed(state)
 
     except Exception as exc:  # noqa: BLE001
         state["status"] = "error"
         state["active_step"] = "Ошибка выполнения"
         state["error"] = str(exc)
         _estimate_eta(state, "error", {})
+        _enrich_stats_with_elapsed(state)
         deps.logger.exception("logs_summary_page.run_failed")
         with runtime_error_placeholder.container():
             st.error(f"Ошибка выполнения: {exc}")
