@@ -908,7 +908,6 @@ def _wrap_with_limit_offset(*, query: str, limit: int, offset: int) -> str:
         "SELECT * FROM ("
         f"{base}"
         ") AS cp_logs_page "
-        "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
 
@@ -927,7 +926,8 @@ def _build_window_query_for_plain_sql(
     start_escaped = _escape_sql_literal(period_start_iso)
     end_escaped = _escape_sql_literal(period_end_iso)
     # Only add ORDER BY to the inner subquery if the user's SQL doesn't already have one.
-    # The outermost ORDER BY is always required for deterministic LIMIT/OFFSET in ClickHouse.
+    # We intentionally avoid forced outer ORDER BY timestamp because custom queries may not
+    # expose a `timestamp` column in the final SELECT (e.g. grouped queries with start_time).
     inner_order = "" if "order by" in base.lower() else " ORDER BY timestamp ASC"
     return (
         "SELECT * FROM ("
@@ -938,7 +938,6 @@ def _build_window_query_for_plain_sql(
         f"AND timestamp < parseDateTimeBestEffort('{end_escaped}')"
         f"{inner_order}"
         ") AS cp_window "
-        "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
 

@@ -276,7 +276,6 @@ def _wrap_with_limit_offset(
         "SELECT * FROM ("
         f"{base_query}"
         ") AS cp_logs_page "
-        "ORDER BY timestamp ASC "
         f"LIMIT {safe_limit} OFFSET {safe_offset}"
     )
 
