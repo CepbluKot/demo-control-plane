@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from settings import settings
 from ui.pages.logs_summary_page import (
+    _extract_root_cause_hypotheses_block,
     _format_table_timestamps,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
@@ -24,6 +25,30 @@ import pandas as pd
 
 
 class TestLogsSummaryPageHelpers(unittest.TestCase):
+    def test_extract_root_cause_hypotheses_block_from_section(self) -> None:
+        text = (
+            "1) ХРОНОЛОГИЯ\n"
+            "...\n"
+            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ\n"
+            "- Инцидент: A\n"
+            "- [ГИПОТЕЗА] первопричина: X\n"
+            "2) РЕКОМЕНДАЦИИ\n"
+        )
+        out = _extract_root_cause_hypotheses_block(text)
+        self.assertIn("ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ", out)
+        self.assertIn("[ГИПОТЕЗА] первопричина: X", out)
+        self.assertNotIn("2) РЕКОМЕНДАЦИИ", out)
+
+    def test_extract_root_cause_hypotheses_block_fallback(self) -> None:
+        text = (
+            "some text\n"
+            "- [ГИПОТЕЗА] возможная первопричина: cache stampede\n"
+            "- [ГИПОТЕЗА] возможная первопричина: db locks\n"
+        )
+        out = _extract_root_cause_hypotheses_block(text)
+        self.assertIn("cache stampede", out)
+        self.assertIn("db locks", out)
+
     def test_format_table_timestamps_formats_start_end_time_with_microseconds(self) -> None:
         df = pd.DataFrame(
             [
@@ -88,6 +113,10 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("CUSTOM UI FREEFORM", prompt)
         self.assertIn("summary body", prompt)
         self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ", prompt)
+        self.assertIn(
+            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ",
+            prompt,
+        )
 
     def test_ui_freeform_prompt_default_includes_map_summaries(self) -> None:
         prompt = _build_freeform_summary_prompt(
@@ -134,6 +163,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("Период анализа", prompt)
         self.assertIn("Алерт по росту 5xx", prompt)
         self.assertIn("SQL источников логов: 2", prompt)
+        self.assertIn("ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ", prompt)
 
     def test_save_logs_summary_result_writes_both_structured_and_freeform(self) -> None:
         with TemporaryDirectory() as tmp_dir:

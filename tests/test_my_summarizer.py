@@ -449,6 +449,10 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("CUSTOM MAP", prompt)
         self.assertIn("type=aggregated", prompt)
         self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА", prompt)
+        self.assertIn(
+            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ",
+            prompt,
+        )
 
     def test_truncate_with_zero_limit_keeps_text(self) -> None:
         text = "a" * 5000

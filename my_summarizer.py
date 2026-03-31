@@ -164,9 +164,23 @@ def _append_chain_requirement(prompt_text: str, stage: str) -> str:
             "Если контекст инцидента пустой — напиши это явно отдельной строкой.",
         ]
     )
+    root_cause_hypotheses_block = "\n".join(
+        [
+            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ",
+            "Для КАЖДОГО выявленного инцидента/цепочки отдельно перечисли 2-5 гипотез первопричины.",
+            "Формат для каждого пункта:",
+            "- Инцидент/цепочка: <название>",
+            "- [ГИПОТЕЗА] первопричина: <кратко>",
+            "- Почему это вероятно: <ссылка на timestamp/логи/метрики>",
+            "- Что проверить для подтверждения/опровержения: <конкретные действия/данные>",
+            "Если инцидент один — блок всё равно обязателен и должен содержать минимум 2 гипотезы.",
+        ]
+    )
     if not base:
-        return f"{chain_block}\n\n{incident_link_block}"
-    return f"{base}\n\n{chain_block}\n\n{incident_link_block}"
+        return f"{chain_block}\n\n{incident_link_block}\n\n{root_cause_hypotheses_block}"
+    return (
+        f"{base}\n\n{chain_block}\n\n{incident_link_block}\n\n{root_cause_hypotheses_block}"
+    )
 
 
 def _read_prompt_setting(name: str) -> str:

@@ -89,6 +89,64 @@ def _md_fence_for_text(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _looks_like_section_heading(line: str) -> bool:
+    raw = str(line or "").strip()
+    if not raw:
+        return False
+    if re.match(r"^#{1,6}\s+\S+", raw):
+        return True
+    if re.match(r"^\d+\s*[\)\.\-:]\s+\S+", raw):
+        return True
+    if raw.startswith(("-", "*", "•")):
+        return False
+    plain = re.sub(r"^[>\s]+", "", raw).strip()
+    if plain.endswith(":") and len(plain) <= 120:
+        return True
+    if plain.isupper() and len(plain) <= 120 and len(plain.split()) <= 14:
+        return True
+    return False
+
+
+def _extract_root_cause_hypotheses_block(value: Any) -> str:
+    text = _normalize_summary_text(value)
+    if not text:
+        return ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    markers = (
+        "ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ",
+        "ГИПОТЕЗЫ ПЕРВОПРИЧИНЫ",
+        "ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
+        "ROOT_CAUSE_HYPOTHESES",
+    )
+    start_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        upper = str(line).upper()
+        if any(marker in upper for marker in markers):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        fallback = [
+            line
+            for line in lines
+            if ("ГИПОТЕЗ" in str(line).upper()) and ("ПЕРВОПРИЧ" in str(line).upper())
+        ]
+        return "\n".join(fallback).strip()
+
+    end_idx = len(lines)
+    for idx in range(start_idx + 1, len(lines)):
+        candidate = str(lines[idx] or "").strip()
+        if not candidate:
+            continue
+        upper = candidate.upper()
+        if any(marker in upper for marker in markers):
+            continue
+        if _looks_like_section_heading(candidate):
+            end_idx = idx
+            break
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
 class _SafeFormatDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -1731,6 +1789,15 @@ def _build_freeform_summary_prompt(
         "- цепочку причины->следствия (если подтверждается)\n"
         "- если не подтверждается: каких данных не хватает.\n"
     )
+    root_cause_hypotheses_block = (
+        "\nОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ\n"
+        "Для КАЖДОГО выявленного инцидента/цепочки отдельно перечисли 2-5 гипотез первопричины:\n"
+        "- Инцидент/цепочка: <название>\n"
+        "- [ГИПОТЕЗА] первопричина: <кратко>\n"
+        "- Почему это вероятно: <ссылка на timestamp/логи/метрики>\n"
+        "- Что проверить для подтверждения/опровержения: <конкретные действия/данные>\n"
+        "Если инцидент один — блок всё равно обязателен и минимум 2 гипотезы.\n"
+    )
     if custom_template:
         rendered = _render_prompt_template(
             custom_template,
@@ -1750,7 +1817,7 @@ def _build_freeform_summary_prompt(
                 "anti_hallucination_rules": anti_rules,
             },
         )
-        return f"{rendered.strip()}{chain_block}{incident_link_block}"
+        return f"{rendered.strip()}{chain_block}{incident_link_block}{root_cause_hypotheses_block}"
     anti_block = f"ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n\n" if anti_rules else ""
     return (
         "Напиши финальный narrative-отчёт для SRE на основе структурированного анализа.\n\n"
@@ -1765,6 +1832,7 @@ def _build_freeform_summary_prompt(
         "5) Что делать дальше (конкретные приоритетные действия).\n\n"
         "6) ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ (обязательно, в виде схемы со стрелками).\n\n"
         "7) ОТДЕЛЬНЫЙ БЛОК: СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI (обязательно, с явным статусом по каждому алерту/пункту).\n\n"
+        "8) ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ.\n\n"
         "Если видишь несколько независимых цепочек/инцидентов — скажи это явно.\n"
         "Если между событиями связь не доказана — помечай как гипотезу, не как факт.\n\n"
         "Если данных недостаточно для какого-то раздела — прямо напиши об этом.\n\n"
@@ -1775,7 +1843,7 @@ def _build_freeform_summary_prompt(
         f"{(map_summaries_text or 'Нет map-summary.')}\n\n"
         "Структурированный анализ логов:\n"
         f"{final_summary}"
-        f"{chain_block}{incident_link_block}"
+        f"{chain_block}{incident_link_block}{root_cause_hypotheses_block}"
     )
 
 
@@ -1817,7 +1885,8 @@ def _build_no_logs_hypothesis_prompt(
         "3) КАКИЕ ДАННЫЕ НУЖНЫ, ЧТОБЫ ПОДТВЕРДИТЬ/ОПРОВЕРГНУТЬ ГИПОТЕЗЫ\n"
         "4) ЧТО ПРОВЕРИТЬ SRE ПРЯМО СЕЙЧАС (приоритет P0/P1)\n"
         "5) СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI (по каждому пункту: [ОБЪЯСНЁН]/[ЧАСТИЧНО]/[НЕ ОБЪЯСНЁН])\n"
-        "6) КРАТКИЙ ВЫВОД ДЛЯ КОМАНДЫ\n"
+        "6) ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ (минимум 2 гипотезы на инцидент)\n"
+        "7) КРАТКИЙ ВЫВОД ДЛЯ КОМАНДЫ\n"
     )
 
 
@@ -1901,6 +1970,28 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             with st.expander("Полный текст свободного отчета (без форматирования)", expanded=False):
                 deps.render_scrollable_text(freeform_summary, height=max(final_height, 620))
 
+        structured_hypotheses = _extract_root_cause_hypotheses_block(final_summary)
+        freeform_hypotheses = _extract_root_cause_hypotheses_block(freeform_summary)
+        if structured_hypotheses or freeform_hypotheses:
+            st.markdown("Гипотезы Первопричин По Инцидентам")
+            if structured_hypotheses:
+                st.caption("Источник: структурированный отчет")
+                deps.render_pretty_summary_text(
+                    structured_hypotheses,
+                    height=max(260, min(final_height, 520)),
+                )
+            if freeform_hypotheses:
+                st.caption("Источник: свободный отчет")
+                deps.render_pretty_summary_text(
+                    freeform_hypotheses,
+                    height=max(260, min(final_height, 520)),
+                )
+        elif final_summary or freeform_summary:
+            st.info(
+                "Отдельный блок гипотез первопричин в тексте не найден. "
+                "Попросите пересобрать отчет — блок добавится автоматически."
+            )
+
         map_summaries_path = str(state.get("map_summaries_jsonl_path") or "").strip()
         if map_summaries_path:
             st.markdown("Переиспользование Summary")
@@ -1980,6 +2071,38 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             state.setdefault("events", []).append(
                                 "Итоговый Reduce summary пересобран из сохранённых MAP summary"
                             )
+                            try:
+                                map_summaries_text_for_final = "\n\n".join(
+                                    f"[MAP SUMMARY #{idx + 1}]\n{text}"
+                                    for idx, text in enumerate(cached_map_summaries)
+                                )
+                                freeform_prompt = _build_freeform_summary_prompt(
+                                    final_summary=rebuilt_summary,
+                                    map_summaries_text=map_summaries_text_for_final,
+                                    user_goal=str(state.get("user_goal") or ""),
+                                    period_start=str(state.get("period_start") or ""),
+                                    period_end=str(state.get("period_end") or ""),
+                                    stats=state.get("stats") or {},
+                                    metrics_context=str(state.get("metrics_context_text") or ""),
+                                )
+                                rebuilt_freeform = _normalize_summary_text(llm_call(freeform_prompt))
+                                if rebuilt_freeform:
+                                    state["freeform_final_summary"] = rebuilt_freeform
+                                    state.setdefault("events", []).append(
+                                        "Свободный отчет пересобран из обновлённого итогового summary"
+                                    )
+                                else:
+                                    state.setdefault("events", []).append(
+                                        "Свободный отчет при пересборке пустой, оставили предыдущую версию"
+                                    )
+                            except Exception as freeform_exc:  # noqa: BLE001
+                                deps.logger.warning(
+                                    "manual re-reduce freeform regeneration failed: %s",
+                                    freeform_exc,
+                                )
+                                state.setdefault("events", []).append(
+                                    "Не удалось пересобрать свободный отчет при manual re-reduce"
+                                )
                             rebuild_path = (
                                 Path(map_summaries_path).parent
                                 / f"rebuild_reduce_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.md"
@@ -2455,6 +2578,28 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 deps.render_pretty_summary_text(state["final_summary"], height=final_height)
                 with st.expander("Полный текст (raw)", expanded=False):
                     deps.render_scrollable_text(state["final_summary"], height=max(final_height, 520))
+
+        chat_structured_hypotheses = _extract_root_cause_hypotheses_block(
+            state.get("final_summary")
+        )
+        chat_freeform_hypotheses = _extract_root_cause_hypotheses_block(
+            state.get("freeform_final_summary")
+        )
+        if chat_structured_hypotheses or chat_freeform_hypotheses:
+            with st.chat_message("assistant"):
+                st.markdown("Гипотезы первопричин по инцидентам")
+                if chat_structured_hypotheses:
+                    st.caption("Из structured summary")
+                    deps.render_pretty_summary_text(
+                        chat_structured_hypotheses,
+                        height=max(220, min(final_height, 520)),
+                    )
+                if chat_freeform_hypotheses:
+                    st.caption("Из freeform summary")
+                    deps.render_pretty_summary_text(
+                        chat_freeform_hypotheses,
+                        height=max(220, min(final_height, 520)),
+                    )
 
         if state.get("stats"):
             stats = state["stats"]
