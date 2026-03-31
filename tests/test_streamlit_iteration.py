@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import streamlit_app
+from ui.pages.control_plane_page import _format_table_timestamps as _format_cp_table_timestamps
 
 
 class _FakeDetector:
@@ -23,6 +24,44 @@ class _FakeDetector:
 
 
 class TestStreamlitIteration(unittest.TestCase):
+    def test_streamlit_table_timestamps_format_start_end_time_with_microseconds(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "start_time": "2026-03-18T00:00:00.123456Z",
+                    "end_time": "2026-03-18T00:00:01.987654Z",
+                }
+            ]
+        )
+        out = streamlit_app._format_table_timestamps(df)
+        self.assertEqual(
+            str(out.loc[0, "start_time"]),
+            "2026-03-18 03:00:00.123456 MSK",
+        )
+        self.assertEqual(
+            str(out.loc[0, "end_time"]),
+            "2026-03-18 03:00:01.987654 MSK",
+        )
+
+    def test_control_plane_table_timestamps_format_start_end_time_with_microseconds(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "start_time": "2026-03-18T00:00:00.123456Z",
+                    "end_time": "2026-03-18T00:00:01.987654Z",
+                }
+            ]
+        )
+        out = _format_cp_table_timestamps(df)
+        self.assertEqual(
+            str(out.loc[0, "start_time"]),
+            "2026-03-18 03:00:00.123456 MSK",
+        )
+        self.assertEqual(
+            str(out.loc[0, "end_time"]),
+            "2026-03-18 03:00:01.987654 MSK",
+        )
+
     def test_test_mode_skips_external_fetchers(self) -> None:
         actual_df = pd.DataFrame(
             {

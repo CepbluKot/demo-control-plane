@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from settings import settings
 from ui.pages.logs_summary_page import (
+    _format_table_timestamps,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
     _build_freeform_summary_prompt,
@@ -19,9 +20,29 @@ from ui.pages.logs_summary_page import (
     _write_json_file,
     _save_logs_summary_result,
 )
+import pandas as pd
 
 
 class TestLogsSummaryPageHelpers(unittest.TestCase):
+    def test_format_table_timestamps_formats_start_end_time_with_microseconds(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "start_time": "2026-03-18T00:00:00.123456Z",
+                    "end_time": "2026-03-18T00:00:01.987654Z",
+                }
+            ]
+        )
+        formatted = _format_table_timestamps(df)
+        self.assertEqual(
+            str(formatted.loc[0, "start_time"]),
+            "2026-03-18 03:00:00.123456 MSK",
+        )
+        self.assertEqual(
+            str(formatted.loc[0, "end_time"]),
+            "2026-03-18 03:00:01.987654 MSK",
+        )
+
     def test_summary_origin_label_maps_known_and_unknown_values(self) -> None:
         self.assertEqual(
             _summary_origin_label("resume_rereduce"),

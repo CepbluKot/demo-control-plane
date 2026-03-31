@@ -38,7 +38,14 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     }
     for col in out.columns:
         col_name = str(col).strip().lower()
-        if col_name not in timestamp_like and "timestamp" not in col_name:
+        is_datetime_like = (
+            col_name in timestamp_like
+            or "timestamp" in col_name
+            or "datetime" in col_name
+            or col_name.endswith("_time")
+            or col_name.endswith("_at")
+        )
+        if not is_datetime_like:
             continue
         def _fmt(value: Any) -> str:
             ts = _to_msk_ts(value)
