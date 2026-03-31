@@ -175,6 +175,12 @@ class Settings(BaseSettings):
     CONTROL_PLANE_LLM_CROSS_SOURCE_REDUCE_PROMPT_TEMPLATE: str = ""
     CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE: str = ""
     CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE: str = ""
+    # Optional LLM generation cap (0 disables explicit max_tokens in request payload).
+    CONTROL_PLANE_LLM_MAX_TOKENS: int = 0
+    # If model stops with finish_reason=length/max_tokens, request continuation chunks.
+    CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH: bool = True
+    # Max continuation chunks after the first response.
+    CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS: int = 12
 
 
 settings = Settings()

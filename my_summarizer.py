@@ -262,6 +262,48 @@ def _build_chat_completions_url(api_base: str) -> str:
     return f"{base}/v1/chat/completions"
 
 
+def _extract_message_content(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text is None:
+                    text = item.get("content")
+                if text is None and "value" in item:
+                    text = item.get("value")
+                if text is not None:
+                    parts.append(str(text))
+            elif item is not None:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(value)
+
+
+def _parse_chat_completion_response(data: Any) -> Tuple[str, str]:
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+            message = choice.get("message", {})
+            content = ""
+            if isinstance(message, dict):
+                content = _extract_message_content(message.get("content"))
+            if not content and "text" in choice:
+                content = _extract_message_content(choice.get("text"))
+            if content:
+                return content, finish_reason
+        output_text = data.get("output_text")
+        if output_text is not None:
+            return _extract_message_content(output_text), ""
+    return str(data), ""
+
+
 def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 600.0) -> str:
     if not has_required_env():
         raise RuntimeError("OPENAI_API_BASE_DB and OPENAI_API_KEY_DB are required")
@@ -275,22 +317,61 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": message})
-    payload = {
+    base_payload: Dict[str, Any] = {
         "model": str(settings.LLM_MODEL_ID),
-        "messages": messages,
         "temperature": 0.1,
     }
+    configured_max_tokens = int(getattr(settings, "CONTROL_PLANE_LLM_MAX_TOKENS", 0) or 0)
+    if configured_max_tokens > 0:
+        base_payload["max_tokens"] = configured_max_tokens
+    continue_on_length = bool(
+        getattr(settings, "CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH", True)
+    )
+    continue_round_limit = max(
+        int(getattr(settings, "CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS", 12) or 12),
+        1,
+    )
 
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    choices = data.get("choices") if isinstance(data, dict) else None
-    if isinstance(choices, list) and choices:
-        msg = choices[0].get("message", {})
-        content = msg.get("content")
-        if content is not None:
-            return str(content)
-    return str(data)
+    dialog_messages: List[Dict[str, str]] = list(messages)
+    collected_parts: List[str] = []
+    for round_idx in range(1, continue_round_limit + 1):
+        payload = dict(base_payload)
+        payload["messages"] = list(dialog_messages)
+        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        chunk_text, finish_reason = _parse_chat_completion_response(data)
+        collected_parts.append(str(chunk_text or ""))
+
+        can_continue = continue_on_length and finish_reason in {"length", "max_tokens"}
+        if not can_continue:
+            break
+        if round_idx >= continue_round_limit:
+            logger.warning(
+                "LLM output still marked as truncated after %s continuation rounds; "
+                "returning accumulated text as-is.",
+                continue_round_limit,
+            )
+            break
+
+        logger.warning(
+            "LLM finish_reason=%s: requesting continuation chunk %s/%s",
+            finish_reason,
+            round_idx + 1,
+            continue_round_limit,
+        )
+        dialog_messages.append({"role": "assistant", "content": str(chunk_text or "")})
+        dialog_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Продолжи строго с того места, где остановился. "
+                    "Не повторяй предыдущие абзацы, сохрани формат ответа."
+                ),
+            }
+        )
+
+    return "".join(collected_parts).strip()
 
 
 def _normalize_period(

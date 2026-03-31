@@ -11,6 +11,7 @@ from my_summarizer import (
     _estimate_total_logs,
     _render_logs_query,
     build_cross_source_reduce_prompt,
+    communicate_with_llm,
     regenerate_reduce_summary_from_map_summaries,
     summarize_logs,
 )
@@ -18,6 +19,114 @@ from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
+    def test_communicate_with_llm_continues_when_finish_reason_length(self) -> None:
+        class _FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def _fake_post(_url, *, json=None, headers=None, timeout=None):
+            calls.append({"json": json, "headers": headers, "timeout": timeout})
+            if len(calls) == 1:
+                return _FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "part-1 "},
+                                "finish_reason": "length",
+                            }
+                        ]
+                    }
+                )
+            return _FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "part-2"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        config_overrides = {
+            "OPENAI_API_BASE_DB": "https://example.test/v1",
+            "OPENAI_API_KEY_DB": "secret",
+            "LLM_MODEL_ID": "demo-model",
+            "CONTROL_PLANE_LLM_MAX_TOKENS": 0,
+            "CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH": True,
+            "CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS": 4,
+        }
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer.requests.post",
+            side_effect=_fake_post,
+        ):
+            out = communicate_with_llm(
+                message="test prompt",
+                system_prompt="system",
+                timeout=15.0,
+            )
+
+        self.assertEqual(out, "part-1 part-2")
+        self.assertEqual(len(calls), 2)
+        second_messages = calls[1]["json"]["messages"]
+        self.assertIn(
+            "Продолжи строго с того места",
+            str(second_messages[-1]["content"]),
+        )
+
+    def test_communicate_with_llm_passes_max_tokens_when_configured(self) -> None:
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {"content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+
+        captured = {}
+
+        def _fake_post(_url, *, json=None, headers=None, timeout=None):
+            captured["json"] = json
+            captured["timeout"] = timeout
+            captured["headers"] = headers
+            return _FakeResponse()
+
+        config_overrides = {
+            "OPENAI_API_BASE_DB": "https://example.test/v1",
+            "OPENAI_API_KEY_DB": "secret",
+            "LLM_MODEL_ID": "demo-model",
+            "CONTROL_PLANE_LLM_MAX_TOKENS": 2048,
+            "CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH": True,
+            "CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS": 4,
+        }
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer.requests.post",
+            side_effect=_fake_post,
+        ):
+            out = communicate_with_llm(
+                message="test prompt",
+                system_prompt="",
+                timeout=12.0,
+            )
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(int(captured["json"]["max_tokens"]), 2048)
+        self.assertEqual(float(captured["timeout"]), 12.0)
+
     def test_make_llm_call_uses_new_llm_functions(self) -> None:
         with patch("my_summarizer.has_required_env", return_value=True), patch(
             "my_summarizer.communicate_with_llm",
