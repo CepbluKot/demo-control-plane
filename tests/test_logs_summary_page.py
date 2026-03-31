@@ -5,15 +5,18 @@ from unittest.mock import patch
 
 from settings import settings
 from ui.pages.logs_summary_page import (
+    FINAL_REPORT_SECTIONS,
     _extract_root_cause_hypotheses_block,
     _format_table_timestamps,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
     _build_freeform_summary_prompt,
+    _build_sectional_freeform_prompt,
     _discover_resume_sessions,
     _enrich_stats_with_elapsed,
     _extract_last_batch_ts_from_run_dir,
     _form_values_from_saved_params,
+    _generate_sectional_freeform_summary,
     _load_map_summaries_from_jsonl,
     _load_map_summaries_from_jsonl_for_source,
     _normalize_summary_text,
@@ -86,6 +89,17 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         text = "Причина инцидента подтверждена логами."
         self.assertEqual(_normalize_summary_text(text), text)
 
+    def test_normalize_summary_text_rewrites_legacy_heuristic_fallback(self) -> None:
+        legacy = (
+            "[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
+            "ОШИБКА: 400 Client Error: Bad Request\n\n"
+            "ХРОНОЛОГИЯ: данных нет."
+        )
+        out = _normalize_summary_text(legacy)
+        self.assertIn("[LLM ERROR]", out)
+        self.assertIn("ОШИБКА: 400 Client Error: Bad Request", out)
+        self.assertNotIn("эвристический fallback", out.lower())
+
     def test_enrich_stats_with_elapsed_adds_duration(self) -> None:
         state = {
             "elapsed_seconds": 12.34,
@@ -149,6 +163,48 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             )
         self.assertIn("MAPS=[MAP SUMMARY #1]", prompt)
         self.assertIn("FINAL=reduce summary", prompt)
+
+    def test_sectional_prompt_uses_previous_sections_context(self) -> None:
+        prompt = _build_sectional_freeform_prompt(
+            section_index=2,
+            section_total=3,
+            section_title="Причины",
+            section_requirement="Опиши причины",
+            previous_sections_text="## Вводная\nТекст первой секции",
+            final_summary="Structured reduce summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={"llm_calls": 3},
+            metrics_context="CPU=95%",
+        )
+        self.assertIn("СЕКЦИЯ 2/3: Причины", prompt)
+        self.assertIn("## Вводная", prompt)
+        self.assertIn("Structured reduce summary", prompt)
+
+    def test_generate_sectional_freeform_summary_merges_sections_and_chains_context(self) -> None:
+        prompts: list[str] = []
+
+        def fake_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return f"section_body_{len(prompts)}"
+
+        merged, sections = _generate_sectional_freeform_summary(
+            llm_call=fake_llm,
+            final_summary="Structured summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS))
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", merged)
+        self.assertIn("section_body_1", merged)
+        self.assertIn("Пока секций нет.", prompts[0])
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[1])
+        self.assertIn("section_body_1", prompts[1])
 
     def test_no_logs_hypothesis_prompt_includes_period_and_goal(self) -> None:
         prompt = _build_no_logs_hypothesis_prompt(

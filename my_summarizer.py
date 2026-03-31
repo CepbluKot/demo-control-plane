@@ -772,12 +772,21 @@ def _estimate_total_logs(
 def _heuristic_llm_call(prompt: str, error: Optional[str] = None) -> str:
     error_line = f"ОШИБКА: {error}" if error else "LLM не настроена (OPENAI_API_BASE_DB / OPENAI_API_KEY_DB)."
     return (
-        f"[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
+        "[LLM ERROR]\n\n"
         f"{error_line}\n\n"
-        "ХРОНОЛОГИЯ: данных нет.\n"
-        "ПЕРВОПРИЧИНА: [ГИПОТЕЗА] не определена.\n"
-        "ОБЪЯСНЕНИЕ АЛЕРТОВ: анализ недоступен.\n"
-        "ПРОБЕЛЫ: см. ошибку выше."
+        "Summary по этому шагу не получен из LLM.\n"
+        "Проверь параметры запроса/размер батча/таймаут и перезапусти шаг."
+    )
+
+
+def _is_llm_error_stub(summary_text: str) -> bool:
+    raw = str(summary_text or "").strip().lower()
+    if not raw:
+        return False
+    return (
+        raw.startswith("[llm error]")
+        or raw.startswith("[llm недоступна")
+        or "эвристический fallback" in raw
     )
 
 
@@ -807,6 +816,16 @@ def _is_non_retryable_llm_exception(exc: Exception) -> bool:
     return False
 
 
+def _is_400_bad_request_exception(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code == 400:
+            return True
+    text = str(exc).strip().lower()
+    return "400 client error" in text and "bad request" in text
+
+
 def _make_llm_call(
     max_retries: int = -1,
     retry_delay: float = 10.0,
@@ -816,10 +835,9 @@ def _make_llm_call(
     llm_timeout: float = 600.0,
 ) -> LLMTextCaller:
     if not has_required_env():
-        logger.warning(
-            "OPENAI_API_BASE_DB/OPENAI_API_KEY_DB не заданы; использую fallback summarizer"
+        raise RuntimeError(
+            "OPENAI_API_BASE_DB и OPENAI_API_KEY_DB обязательны для LLM-суммаризации."
         )
-        return _heuristic_llm_call
 
     default_system_prompt = (
         "Ты — senior SRE-аналитик инцидентов. Анализируй логи и метрики строго на основе данных.\n"
@@ -877,11 +895,14 @@ def _make_llm_call(
                     # For ReadTimeout we keep waiting indefinitely and progressively
                     # increase the request timeout on each occurrence.
                     effective_total_attempts = -1
+                result_total_attempts = (
+                    attempt_no if is_non_retryable else effective_total_attempts
+                )
                 if on_result is not None:
                     try:
                         on_result(
                             attempt_no,
-                            effective_total_attempts,
+                            result_total_attempts,
                             False,
                             elapsed,
                             str(exc),
@@ -890,10 +911,10 @@ def _make_llm_call(
                         pass
                 if is_non_retryable:
                     logger.error(
-                        "LLM non-retryable error (no retry): %s",
+                        "LLM non-retryable error (stop retries): %s",
                         exc,
                     )
-                    break
+                    raise
                 can_retry = (
                     is_read_timeout
                     or infinite_retries
@@ -932,11 +953,13 @@ def _make_llm_call(
                         time.sleep(retry_delay)
                 else:
                     logger.exception(
-                        "LLM все %d попытки исчерпаны; использую fallback",
+                        "LLM все %d попытки исчерпаны; поднимаем ошибку",
                         configured_total_attempts,
                     )
                     break
-        return _heuristic_llm_call(prompt, error=str(last_exc))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("LLM call failed without explicit exception")
 
     return _llm_call
 
@@ -979,7 +1002,7 @@ class PeriodLogSummarizer:
     @staticmethod
     def _is_400_bad_request_fallback(summary_text: str) -> bool:
         raw = str(summary_text or "").strip().lower()
-        if not raw.startswith("[llm недоступна"):
+        if not _is_llm_error_stub(raw):
             return False
         return (
             ("400 client error" in raw and "bad request" in raw)
@@ -1007,20 +1030,59 @@ class PeriodLogSummarizer:
             batch_number=batch_number,
             total_batches=total_batches,
         )
+        min_chunk = max(int(getattr(self.config, "min_llm_chunk_rows", 20) or 20), 1)
+        max_shrink_rounds = max(int(getattr(self.config, "max_shrink_rounds", 6) or 6), 0)
+        auto_shrink = bool(getattr(self.config, "auto_shrink_on_400", True))
         try:
             llm_text = self.llm_call(prompt)
         except Exception as exc:
-            logger.exception("LLM call failed on batch %s", batch_number - 1)
-            llm_text = _heuristic_llm_call(prompt, error=str(exc))
+            can_shrink_on_exc = (
+                auto_shrink
+                and _is_400_bad_request_exception(exc)
+                and len(rows_chunk) > min_chunk
+                and depth < max_shrink_rounds
+            )
+            if not can_shrink_on_exc:
+                raise
+            next_size = max(min_chunk, len(rows_chunk) // 2)
+            if next_size >= len(rows_chunk):
+                raise
+            self._emit_progress(
+                "map_batch_resize",
+                {
+                    "batch_number": batch_number,
+                    "depth": depth,
+                    "old_chunk_size": len(rows_chunk),
+                    "new_chunk_size": next_size,
+                    "reason": "llm_400_bad_request_exception",
+                    "batch_period_start": batch_period_start,
+                    "batch_period_end": batch_period_end,
+                    "error": str(exc),
+                },
+            )
+            merged_items: List[Dict[str, Any]] = []
+            llm_calls = 1
+            for start in range(0, len(rows_chunk), next_size):
+                sub_rows = rows_chunk[start : start + next_size]
+                sub_items, sub_calls = self._summarize_rows_with_auto_shrink(
+                    rows_chunk=sub_rows,
+                    columns=columns,
+                    period_start=period_start,
+                    period_end=period_end,
+                    batch_number=batch_number,
+                    total_batches=total_batches,
+                    depth=depth + 1,
+                )
+                merged_items.extend(sub_items)
+                llm_calls += sub_calls
+            return merged_items, llm_calls
 
         chunk_summary = (llm_text or "").strip() or "Пустой ответ LLM на map-этапе."
         chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
         llm_calls = 1
 
-        min_chunk = max(int(getattr(self.config, "min_llm_chunk_rows", 20) or 20), 1)
-        max_shrink_rounds = max(int(getattr(self.config, "max_shrink_rounds", 6) or 6), 0)
         can_shrink = (
-            bool(getattr(self.config, "auto_shrink_on_400", True))
+            auto_shrink
             and self._is_400_bad_request_fallback(chunk_summary)
             and len(rows_chunk) > min_chunk
             and depth < max_shrink_rounds
@@ -1276,8 +1338,8 @@ class PeriodLogSummarizer:
                 try:
                     result_text = fut.result()
                 except Exception as exc:
-                    logger.exception("Parallel LLM call failed on batch %s; using fallback", batch_idx)
-                    result_text = _heuristic_llm_call("", error=str(exc))
+                    logger.exception("Parallel LLM call failed on batch %s", batch_idx)
+                    raise
                 chunk_summary = (result_text or "").strip() or "Пустой ответ LLM на map-этапе."
                 chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
                 map_summaries.append(chunk_summary)
@@ -2033,7 +2095,7 @@ def regenerate_reduce_summary_from_map_summaries(
     Useful for "rerun final summary" without refetching logs.
     """
     prepared = [_normalize_summary_text(item) for item in map_summaries]
-    prepared = [item for item in prepared if item]
+    prepared = [item for item in prepared if item and not _is_llm_error_stub(item)]
     if not prepared:
         return "Нет map-summary для повторного REDUCE."
 

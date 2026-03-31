@@ -45,6 +45,52 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "cluster",
     "value",
 )
+FINAL_REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "Полная Хронология Событий",
+        "Построй детальную timeline с точными timestamp до микросекунд и timezone. "
+        "Для каждого шага укажи что произошло и какие компоненты затронуты.",
+    ),
+    (
+        "Причинно-Следственные Цепочки",
+        "Покажи цепочки что к чему привело, со стрелками причины -> следствия и механизмом влияния.",
+    ),
+    (
+        "Связь С Инцидентами И Алертами Из UI",
+        "Для каждого инцидента/алерта из UI дай статус [ОБЪЯСНЁН]/[ЧАСТИЧНО]/[НЕ ОБЪЯСНЁН], "
+        "доказательства и комментарий по связи.",
+    ),
+    (
+        "Предположения О Первопричине По Каждому Инциденту",
+        "Для каждого инцидента дай минимум 2-5 гипотез первопричины: почему вероятно, "
+        "какие данные подтверждают, что проверить.",
+    ),
+    (
+        "Разделение Фактов И Гипотез",
+        "Чётко раздели [ФАКТ] и [ГИПОТЕЗА], без смешивания.",
+    ),
+    (
+        "Связанные И Независимые Инциденты",
+        "Покажи какие инциденты связаны общей цепочкой, а какие независимы. "
+        "Обоснуй это по данным.",
+    ),
+    (
+        "Разрывы Цепочек И Недостающие Данные",
+        "Явно перечисли где цепочки рвутся и каких логов/метрик не хватает для закрытия разрыва.",
+    ),
+    (
+        "Рекомендации Для SRE",
+        "Дай конкретные действия с приоритетами P0/P1/P2 и ожидаемым эффектом.",
+    ),
+    (
+        "Техническая Полнота И Неусечённость",
+        "Проверь что в секции нет умышленного сокращения: нужны конкретика, детали, точные значения и ссылки на события.",
+    ),
+    (
+        "Итоговый Narrative Для Команды",
+        "Собери связный понятный текст для команды: что произошло, почему, что делать дальше.",
+    ),
+)
 
 
 def _normalize_timestamp_column_name(value: Any, *, default: str = "timestamp") -> str:
@@ -56,6 +102,20 @@ def _normalize_summary_text(value: Any) -> str:
     text = str(value or "").strip()
     if text.lower() in {"none", "null", "nan"}:
         return ""
+    lowered = text.lower()
+    if lowered.startswith("[llm недоступна") or "эвристический fallback" in lowered:
+        error_line = ""
+        for line in text.splitlines():
+            if line.strip().lower().startswith("ошибка:"):
+                error_line = line.strip()
+                break
+        if error_line:
+            return (
+                "[LLM ERROR]\n\n"
+                f"{error_line}\n\n"
+                "Summary по этому шагу не получен из LLM."
+            )
+        return "[LLM ERROR]\n\nSummary по этому шагу не получен из LLM."
     return text
 
 
@@ -1558,6 +1618,7 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "final_summary",
         "final_summary_origin",
         "freeform_final_summary",
+        "freeform_sections",
         "llm_calls_started",
         "llm_calls_succeeded",
         "llm_calls_failed",
@@ -1847,6 +1908,126 @@ def _build_freeform_summary_prompt(
     )
 
 
+def _build_sectional_freeform_prompt(
+    *,
+    section_index: int,
+    section_total: int,
+    section_title: str,
+    section_requirement: str,
+    previous_sections_text: str,
+    final_summary: str,
+    user_goal: str,
+    period_start: str,
+    period_end: str,
+    stats: Dict[str, Any],
+    metrics_context: str,
+) -> str:
+    goal_block = user_goal.strip() or "Не указан"
+    metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
+    anti_rules = str(
+        getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
+    ).strip()
+    anti_block = f"\nПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n" if anti_rules else ""
+    custom_template = str(
+        getattr(settings, "CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE", "")
+    ).strip()
+    custom_block = ""
+    if custom_template:
+        rendered_custom = _render_prompt_template(
+            custom_template,
+            {
+                "final_summary": final_summary,
+                "cross_source_summary": final_summary,
+                "user_goal": goal_block,
+                "incident_description": goal_block,
+                "alerts_list": goal_block,
+                "incident_start": period_start,
+                "incident_end": period_end,
+                "period_start": period_start,
+                "period_end": period_end,
+                "stats": json.dumps(_json_safe(stats), ensure_ascii=False, indent=2),
+                "metrics_context": metrics_block,
+                "previous_sections_text": previous_sections_text or "",
+                "section_index": section_index,
+                "section_total": section_total,
+                "section_title": section_title,
+                "section_requirement": section_requirement,
+            },
+        ).strip()
+        if rendered_custom:
+            custom_block = f"\nДОПОЛНИТЕЛЬНЫЕ ИНСТРУКЦИИ ИЗ ШАБЛОНА:\n{rendered_custom}\n"
+    previous_block = previous_sections_text.strip() or "Пока секций нет."
+    return (
+        "Ты формируешь финальный отчёт по частям. За этот вызов напиши только одну секцию.\n\n"
+        f"СЕКЦИЯ {section_index}/{section_total}: {section_title}\n"
+        f"Требование секции: {section_requirement}\n\n"
+        "Опирайся на уже написанные секции (если есть), не противоречь им, дополняй контекст.\n"
+        "Не повторяй целиком старые секции, но используй их выводы как основу.\n"
+        "Пиши максимально подробно и предметно.\n"
+        "Если данных недостаточно — явно пометь это.\n\n"
+        f"КОНТЕКСТ ИНЦИДЕНТА (UI):\n{goal_block}\n\n"
+        f"Период: [{period_start}, {period_end})\n"
+        f"Метрики: {metrics_block}\n"
+        f"Статистика: {json.dumps(_json_safe(stats), ensure_ascii=False)}\n\n"
+        "УЖЕ НАПИСАННЫЕ СЕКЦИИ:\n"
+        f"{previous_block}\n\n"
+        "СТРУКТУРИРОВАННЫЙ АНАЛИЗ (опорный контекст):\n"
+        f"{final_summary}\n"
+        f"{custom_block}"
+        f"{anti_block}\n"
+        "Верни только текст текущей секции, без префиксов вроде 'Секция N'."
+    )
+
+
+def _generate_sectional_freeform_summary(
+    *,
+    llm_call: Callable[[str], str],
+    final_summary: str,
+    user_goal: str,
+    period_start: str,
+    period_end: str,
+    stats: Dict[str, Any],
+    metrics_context: str,
+    on_section_start: Optional[Callable[[int, int, str], None]] = None,
+    on_section_done: Optional[Callable[[int, int, str], None]] = None,
+) -> tuple[str, List[Dict[str, str]]]:
+    sections: List[Dict[str, str]] = []
+    total = len(FINAL_REPORT_SECTIONS)
+    for idx, (title, requirement) in enumerate(FINAL_REPORT_SECTIONS, start=1):
+        if on_section_start is not None:
+            on_section_start(idx, total, title)
+        previous_text = "\n\n".join(
+            f"## {item['title']}\n{item['text']}" for item in sections if item.get("text")
+        )
+        prompt = _build_sectional_freeform_prompt(
+            section_index=idx,
+            section_total=total,
+            section_title=title,
+            section_requirement=requirement,
+            previous_sections_text=previous_text,
+            final_summary=final_summary,
+            user_goal=user_goal,
+            period_start=period_start,
+            period_end=period_end,
+            stats=stats,
+            metrics_context=metrics_context,
+        )
+        section_text = _normalize_summary_text(llm_call(prompt))
+        if not section_text:
+            section_text = "Данных недостаточно для уверенного вывода по этой секции."
+        sections.append({"title": title, "text": section_text})
+        if on_section_done is not None:
+            on_section_done(idx, total, title)
+
+    merged_lines: List[str] = []
+    for item in sections:
+        merged_lines.append(f"## {item['title']}")
+        merged_lines.append("")
+        merged_lines.append(item["text"])
+        merged_lines.append("")
+    return "\n".join(merged_lines).strip(), sections
+
+
 def _build_no_logs_hypothesis_prompt(
     *,
     period_start: str,
@@ -2068,26 +2249,27 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         if rebuilt_summary:
                             state["final_summary"] = rebuilt_summary
                             state["final_summary_origin"] = "manual_rereduce"
+                            state["freeform_sections"] = []
                             state.setdefault("events", []).append(
                                 "Итоговый Reduce summary пересобран из сохранённых MAP summary"
                             )
                             try:
-                                map_summaries_text_for_final = "\n\n".join(
-                                    f"[MAP SUMMARY #{idx + 1}]\n{text}"
-                                    for idx, text in enumerate(cached_map_summaries)
+                                state.setdefault("events", []).append(
+                                    "Пересборка freeform: пишем финальный отчет по секциям"
                                 )
-                                freeform_prompt = _build_freeform_summary_prompt(
+                                rebuilt_freeform, rebuilt_sections = _generate_sectional_freeform_summary(
+                                    llm_call=llm_call,
                                     final_summary=rebuilt_summary,
-                                    map_summaries_text=map_summaries_text_for_final,
                                     user_goal=str(state.get("user_goal") or ""),
                                     period_start=str(state.get("period_start") or ""),
                                     period_end=str(state.get("period_end") or ""),
                                     stats=state.get("stats") or {},
                                     metrics_context=str(state.get("metrics_context_text") or ""),
                                 )
-                                rebuilt_freeform = _normalize_summary_text(llm_call(freeform_prompt))
+                                rebuilt_freeform = _normalize_summary_text(rebuilt_freeform)
                                 if rebuilt_freeform:
                                     state["freeform_final_summary"] = rebuilt_freeform
+                                    state["freeform_sections"] = rebuilt_sections
                                     state.setdefault("events", []).append(
                                         "Свободный отчет пересобран из обновлённого итогового summary"
                                     )
@@ -3573,6 +3755,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "final_summary": None,
         "final_summary_origin": None,
         "freeform_final_summary": None,
+        "freeform_sections": [],
         "metrics_rows": 0,
         "metrics_services": [],
         "metrics_context_text": "",
@@ -3642,6 +3825,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "final_summary",
                 "final_summary_origin",
                 "freeform_final_summary",
+                "freeform_sections",
             ):
                 if checkpoint_state.get(key) is not None:
                     state[key] = checkpoint_state.get(key)
@@ -4453,10 +4637,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
                 else:
                     if is_read_timeout:
-                        _finish_read_timeout_episode(resolution="fallback")
-                    state["active_step"] = "LLM попытки исчерпаны, используем fallback"
+                        _finish_read_timeout_episode(resolution="exhausted")
+                    state["active_step"] = "LLM попытки исчерпаны, завершаем шаг с ошибкой"
                     _push_live_event(
-                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Попытки исчерпаны, fallback.",
+                        f"LLM ошибка ({elapsed_sec:.1f}s): {error_text}. Попытки исчерпаны.",
                         render_now=True,
                     )
             _persist_checkpoint(session_checkpoint_path, state)
@@ -5146,37 +5330,77 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
                 events = state.setdefault("events", [])
+                state["freeform_sections"] = []
                 events.append("Готовим расширенный финальный отчет в свободном формате")
                 state["llm_phase_hint"] = "final_freeform"
                 state["active_source_label"] = "final_freeform"
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
-                map_summaries_for_final = _load_map_summaries_from_jsonl(
-                    str(map_summaries_jsonl_path)
-                )
-                map_summaries_text_for_final = "\n\n".join(
-                    f"[MAP SUMMARY #{idx + 1}]\n{text}"
-                    for idx, text in enumerate(map_summaries_for_final)
-                )
-                freeform_prompt = _build_freeform_summary_prompt(
+                def _on_section_start(section_idx: int, section_total: int, title: str) -> None:
+                    state["active_step"] = (
+                        f"Финальный отчёт: секция {section_idx}/{section_total} — {title}"
+                    )
+                    _push_live_event(
+                        f"LLM пишет секцию {section_idx}/{section_total}: {title}",
+                        render_now=True,
+                    )
+
+                def _on_section_done(section_idx: int, section_total: int, title: str) -> None:
+                    _push_live_event(
+                        f"Секция готова {section_idx}/{section_total}: {title}",
+                        render_now=True,
+                    )
+
+                freeform_summary, freeform_sections = _generate_sectional_freeform_summary(
+                    llm_call=llm_call,
                     final_summary=final_summary_for_report,
-                    map_summaries_text=map_summaries_text_for_final,
                     user_goal=goal_text,
                     period_start=period_start_iso,
                     period_end=period_end_iso,
                     stats=state.get("stats") or {},
                     metrics_context=metrics_context_text,
+                    on_section_start=_on_section_start,
+                    on_section_done=_on_section_done,
                 )
-                freeform_summary = _normalize_summary_text(llm_call(freeform_prompt))
+                freeform_summary = _normalize_summary_text(freeform_summary)
                 if freeform_summary:
                     state["freeform_final_summary"] = freeform_summary
+                    state["freeform_sections"] = freeform_sections
                     events.append("Свободный финальный отчет готов")
                 else:
                     events.append("Свободный финальный отчет пустой, используем основной")
             except Exception as freeform_exc:  # noqa: BLE001
                 deps.logger.warning("freeform final report generation failed: %s", freeform_exc)
                 state.setdefault("events", []).append(
-                    "Не удалось сгенерировать свободный финальный отчет"
+                    "Секционная генерация отчета не удалась, пробуем резервный один запрос"
                 )
+                try:
+                    map_summaries_for_final = _load_map_summaries_from_jsonl(
+                        str(map_summaries_jsonl_path)
+                    )
+                    map_summaries_text_for_final = "\n\n".join(
+                        f"[MAP SUMMARY #{idx + 1}]\n{text}"
+                        for idx, text in enumerate(map_summaries_for_final)
+                    )
+                    freeform_prompt = _build_freeform_summary_prompt(
+                        final_summary=final_summary_for_report,
+                        map_summaries_text=map_summaries_text_for_final,
+                        user_goal=goal_text,
+                        period_start=period_start_iso,
+                        period_end=period_end_iso,
+                        stats=state.get("stats") or {},
+                        metrics_context=metrics_context_text,
+                    )
+                    fallback_freeform = _normalize_summary_text(llm_call(freeform_prompt))
+                    if fallback_freeform:
+                        state["freeform_final_summary"] = fallback_freeform
+                        state.setdefault("events", []).append(
+                            "Резервный freeform-отчет сгенерирован"
+                        )
+                except Exception as fallback_exc:  # noqa: BLE001
+                    deps.logger.warning("fallback freeform generation failed: %s", fallback_exc)
+                    state.setdefault("events", []).append(
+                        "Не удалось сгенерировать свободный финальный отчет"
+                    )
 
         final_structured_now = _normalize_summary_text(state.get("final_summary"))
         if final_structured_now:
@@ -5204,6 +5428,26 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         final_freeform_now,
                     ]
                 ),
+            )
+        final_freeform_sections = state.get("freeform_sections")
+        if isinstance(final_freeform_sections, list) and final_freeform_sections:
+            _write_json_file(
+                final_summaries_dir / "final_freeform_sections.json",
+                {
+                    "saved_at": datetime.now(MSK).isoformat(),
+                    "sections": _json_safe(final_freeform_sections),
+                },
+            )
+            section_lines: List[str] = ["# Final Freeform Sections", ""]
+            for item in final_freeform_sections:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip() or "Untitled Section"
+                text = _normalize_summary_text(item.get("text"))
+                section_lines.extend([f"## {title}", "", text or "N/A", ""])
+            _write_text_file(
+                final_summaries_dir / "final_freeform_sections.md",
+                "\n".join(section_lines).strip(),
             )
         _estimate_eta(state, "done", {})
         _enrich_stats_with_elapsed(state)

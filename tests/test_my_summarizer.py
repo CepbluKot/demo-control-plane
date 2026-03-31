@@ -94,9 +94,9 @@ class TestMySummarizer(unittest.TestCase):
                 retry_delay=0.0,
                 on_retry=lambda *_: retries.append("retry"),
             )
-            out = llm_call("test prompt")
+            with self.assertRaises(requests.exceptions.HTTPError):
+                llm_call("test prompt")
 
-        self.assertIn("LLM НЕДОСТУПНА", out)
         self.assertEqual(retries, [])
 
     def test_summarizer_auto_shrinks_batch_on_400_bad_request(self) -> None:
@@ -123,9 +123,12 @@ class TestMySummarizer(unittest.TestCase):
                     rows_count = 0
                 if rows_count > 2:
                     calls["map_large"] += 1
-                    return (
-                        "[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
-                        "ОШИБКА: 400 Client Error: Bad Request for url"
+                    class _Resp:
+                        status_code = 400
+
+                    raise requests.exceptions.HTTPError(
+                        "400 Client Error: Bad Request for url",
+                        response=_Resp(),
                     )
                 calls["map_small"] += 1
                 return f"MAP_OK_{rows_count}"
@@ -336,6 +339,9 @@ class TestMySummarizer(unittest.TestCase):
             with patch("my_summarizer._build_db_fetch_page", side_effect=fake_fetcher), patch(
                 "my_summarizer._estimate_total_logs",
                 return_value=2,
+            ), patch(
+                "my_summarizer._make_llm_call",
+                return_value=lambda _prompt: "LLM_OK",
             ):
                 result = summarize_logs(
                     start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
@@ -386,6 +392,9 @@ class TestMySummarizer(unittest.TestCase):
         ), patch(
             "my_summarizer._estimate_total_logs",
             return_value=2,
+        ), patch(
+            "my_summarizer._make_llm_call",
+            return_value=lambda _prompt: "LLM_OK",
         ):
             summarize_logs(
                 start_dt=datetime(2026, 3, 25, 10, 0, 0, tzinfo=timezone.utc),
