@@ -2674,10 +2674,24 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
     reduce_prompt_max_chars = int(
         getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
     )
+    auto_shrink_on_400 = bool(
+        getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400", True)
+    )
+    min_llm_batch_size = max(
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE", 20) or 20),
+        1,
+    )
+    max_shrink_rounds = max(
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
+        0,
+    )
     try:
         return deps.summarizer_config_cls(
             page_limit=db_batch_size,
             llm_chunk_rows=llm_batch_size,
+            min_llm_chunk_rows=min_llm_batch_size,
+            auto_shrink_on_400=auto_shrink_on_400,
+            max_shrink_rounds=max_shrink_rounds,
             max_cell_chars=max_cell_chars,
             max_summary_chars=max_summary_chars,
             reduce_prompt_max_chars=reduce_prompt_max_chars,
@@ -4120,6 +4134,19 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
                     if total else
                     f"LLM анализирует batch {idx} (таймаут {llm_timeout}s, ретраи {retries_label})"
+                )
+            elif event == "map_batch_resize":
+                old_size = int(pd.to_numeric(payload.get("old_chunk_size"), errors="coerce") or 0)
+                new_size = int(pd.to_numeric(payload.get("new_chunk_size"), errors="coerce") or 0)
+                events.append(
+                    "Batch auto-shrink: "
+                    f"400 Bad Request, уменьшаем размер batch {old_size} -> {new_size}"
+                )
+            elif event == "map_parallel_disabled":
+                workers = int(pd.to_numeric(payload.get("map_workers_requested"), errors="coerce") or 0)
+                events.append(
+                    "Параллельный MAP отключен для auto-shrink режима "
+                    f"(запрошено workers={workers})."
                 )
             elif event == "map_batch":
                 state["status"] = "map"

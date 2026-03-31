@@ -69,6 +69,9 @@ class LLMTextCaller(Protocol):
 class SummarizerConfig:
     page_limit: int = 1000
     llm_chunk_rows: int = 200
+    min_llm_chunk_rows: int = 20
+    auto_shrink_on_400: bool = True
+    max_shrink_rounds: int = 6
     reduce_group_size: int = 8
     max_reduce_rounds: int = 12
     # 0 or negative => no truncation.
@@ -352,6 +355,25 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
         payload = dict(base_payload)
         payload["messages"] = list(dialog_messages)
         response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if (
+            response.status_code == 400
+            and "max_tokens" in payload
+            and configured_max_tokens > 0
+        ):
+            # Some OpenAI-compatible gateways reject max_tokens or specific values.
+            # Retry once without explicit max_tokens before surfacing the error.
+            logger.warning(
+                "LLM gateway returned 400 with max_tokens=%s; retrying the same call without max_tokens.",
+                configured_max_tokens,
+            )
+            payload_without_max = dict(payload)
+            payload_without_max.pop("max_tokens", None)
+            response = requests.post(
+                url,
+                json=payload_without_max,
+                headers=headers,
+                timeout=timeout,
+            )
         response.raise_for_status()
         data = response.json()
         chunk_text, finish_reason = _parse_chat_completion_response(data)
@@ -770,6 +792,21 @@ def _is_read_timeout_exception(exc: Exception) -> bool:
     )
 
 
+def _is_non_retryable_llm_exception(exc: Exception) -> bool:
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            # Most 4xx errors are request-shape/auth/data problems and should not
+            # be retried in a loop. Keep 408/409/429 retryable.
+            if 400 <= status_code < 500 and status_code not in (408, 409, 429):
+                return True
+    text = str(exc).strip().lower()
+    if "400 client error" in text and "bad request" in text:
+        return True
+    return False
+
+
 def _make_llm_call(
     max_retries: int = -1,
     retry_delay: float = 10.0,
@@ -835,6 +872,7 @@ def _make_llm_call(
                 last_exc = exc
                 elapsed = max(time.monotonic() - started, 0.0)
                 is_read_timeout = _is_read_timeout_exception(exc)
+                is_non_retryable = _is_non_retryable_llm_exception(exc)
                 if is_read_timeout:
                     # For ReadTimeout we keep waiting indefinitely and progressively
                     # increase the request timeout on each occurrence.
@@ -850,6 +888,12 @@ def _make_llm_call(
                         )
                     except Exception:
                         pass
+                if is_non_retryable:
+                    logger.error(
+                        "LLM non-retryable error (no retry): %s",
+                        exc,
+                    )
+                    break
                 can_retry = (
                     is_read_timeout
                     or infinite_retries
@@ -932,6 +976,111 @@ class PeriodLogSummarizer:
             return
         self.on_progress(event, payload)
 
+    @staticmethod
+    def _is_400_bad_request_fallback(summary_text: str) -> bool:
+        raw = str(summary_text or "").strip().lower()
+        if not raw.startswith("[llm недоступна"):
+            return False
+        return (
+            ("400 client error" in raw and "bad request" in raw)
+            or "code: 400" in raw
+            or "status code 400" in raw
+        )
+
+    def _summarize_rows_with_auto_shrink(
+        self,
+        *,
+        rows_chunk: List[Dict[str, Any]],
+        columns: Sequence[str],
+        period_start: str,
+        period_end: str,
+        batch_number: int,
+        total_batches: Optional[int],
+        depth: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        batch_period_start, batch_period_end = _extract_batch_period(rows_chunk)
+        prompt = self._build_chunk_prompt(
+            period_start=period_start,
+            period_end=period_end,
+            columns=columns,
+            rows=rows_chunk,
+            batch_number=batch_number,
+            total_batches=total_batches,
+        )
+        try:
+            llm_text = self.llm_call(prompt)
+        except Exception as exc:
+            logger.exception("LLM call failed on batch %s", batch_number - 1)
+            llm_text = _heuristic_llm_call(prompt, error=str(exc))
+
+        chunk_summary = (llm_text or "").strip() or "Пустой ответ LLM на map-этапе."
+        chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
+        llm_calls = 1
+
+        min_chunk = max(int(getattr(self.config, "min_llm_chunk_rows", 20) or 20), 1)
+        max_shrink_rounds = max(int(getattr(self.config, "max_shrink_rounds", 6) or 6), 0)
+        can_shrink = (
+            bool(getattr(self.config, "auto_shrink_on_400", True))
+            and self._is_400_bad_request_fallback(chunk_summary)
+            and len(rows_chunk) > min_chunk
+            and depth < max_shrink_rounds
+        )
+        if not can_shrink:
+            return (
+                [
+                    {
+                        "summary": chunk_summary,
+                        "rows": list(rows_chunk),
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
+                    }
+                ],
+                llm_calls,
+            )
+
+        next_size = max(min_chunk, len(rows_chunk) // 2)
+        if next_size >= len(rows_chunk):
+            return (
+                [
+                    {
+                        "summary": chunk_summary,
+                        "rows": list(rows_chunk),
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
+                    }
+                ],
+                llm_calls,
+            )
+
+        self._emit_progress(
+            "map_batch_resize",
+            {
+                "batch_number": batch_number,
+                "depth": depth,
+                "old_chunk_size": len(rows_chunk),
+                "new_chunk_size": next_size,
+                "reason": "llm_400_bad_request",
+                "batch_period_start": batch_period_start,
+                "batch_period_end": batch_period_end,
+            },
+        )
+
+        merged_items: List[Dict[str, Any]] = []
+        for sub_start in range(0, len(rows_chunk), next_size):
+            sub_rows = rows_chunk[sub_start : sub_start + next_size]
+            sub_items, sub_calls = self._summarize_rows_with_auto_shrink(
+                rows_chunk=sub_rows,
+                columns=columns,
+                period_start=period_start,
+                period_end=period_end,
+                batch_number=batch_number,
+                total_batches=total_batches,
+                depth=depth + 1,
+            )
+            merged_items.extend(sub_items)
+            llm_calls += sub_calls
+        return merged_items, llm_calls
+
     def summarize_period(
         self,
         *,
@@ -959,6 +1108,9 @@ class PeriodLogSummarizer:
                 int(math.ceil(float(total_rows_estimate) / float(max(self.config.llm_chunk_rows, 1)))),
                 1,
             )
+        if bool(getattr(self.config, "auto_shrink_on_400", True)):
+            # Real batch count can grow dynamically after split-on-400.
+            estimated_batch_total = None
         seen_sources: List[str] = []  # ordered unique sources seen across all pages
         self._emit_progress(
             "map_start",
@@ -979,7 +1131,17 @@ class PeriodLogSummarizer:
             List[Dict[str, Any]],  # rows snapshot for progress callback
         ]
         pending_items: List[_PendingItem] = []
-        parallel = self.config.map_workers > 1
+        parallel = self.config.map_workers > 1 and not bool(
+            getattr(self.config, "auto_shrink_on_400", True)
+        )
+        if self.config.map_workers > 1 and not parallel:
+            self._emit_progress(
+                "map_parallel_disabled",
+                {
+                    "reason": "auto_shrink_on_400",
+                    "map_workers_requested": int(self.config.map_workers),
+                },
+            )
         executor = ThreadPoolExecutor(max_workers=self.config.map_workers) if parallel else None
 
         try:
@@ -1039,51 +1201,49 @@ class PeriodLogSummarizer:
                     if executor is not None:
                         future = executor.submit(self.llm_call, prompt)
                     else:
-                        # Sequential: run inline and wrap result as a fake "future"
-                        try:
-                            _result = self.llm_call(prompt)
-                        except Exception as exc:
-                            logger.exception("LLM call failed on batch %s", next_batch_index)
-                            _result = _heuristic_llm_call(prompt, error=str(exc))
-                        future = None
-                        # Store result directly — reuse the same pending tuple structure
-                        pending_items.append((
-                            None,
-                            next_batch_index,
-                            len(rows_chunk),
-                            batch_period_start,
-                            batch_period_end,
-                            list(rows_chunk),
-                        ))
-                        # Process immediately in sequential mode (maintains existing progress behaviour)
-                        chunk_summary = (_result or "").strip() or "Пустой ответ LLM на map-этапе."
-                        chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
-                        map_summaries.append(chunk_summary)
-                        if self.config.keep_map_batches_in_memory:
-                            map_batches.append({
-                                "batch_index": next_batch_index,
-                                "rows_count": len(rows_chunk),
-                                "summary": chunk_summary,
-                                "batch_period_start": batch_period_start,
-                                "batch_period_end": batch_period_end,
-                            })
-                        rows_mapped += len(rows_chunk)
-                        self._emit_progress(
-                            "map_batch",
-                            {
-                                "batch_index": next_batch_index,
-                                "batch_total": estimated_batch_total,
-                                "batch_summary": chunk_summary,
-                                "batch_logs_count": len(rows_chunk),
-                                "batch_logs": list(rows_chunk),
-                                "batch_period_start": batch_period_start,
-                                "batch_period_end": batch_period_end,
-                                "rows_processed": rows_mapped,
-                                "rows_total": total_rows_estimate,
-                            },
+                        # Sequential: run inline with optional auto-shrink on 400.
+                        summarized_items, map_llm_calls = self._summarize_rows_with_auto_shrink(
+                            rows_chunk=list(rows_chunk),
+                            columns=columns,
+                            period_start=period_start,
+                            period_end=period_end,
+                            batch_number=next_batch_index + 1,
+                            total_batches=estimated_batch_total,
                         )
-                        map_batch_index += 1
-                        llm_calls += 1
+                        llm_calls += map_llm_calls
+                        for item in summarized_items:
+                            item_rows = list(item.get("rows") or [])
+                            item_summary = str(item.get("summary") or "").strip()
+                            item_bp_start = item.get("batch_period_start")
+                            item_bp_end = item.get("batch_period_end")
+                            current_batch_index = map_batch_index
+                            map_summaries.append(item_summary)
+                            if self.config.keep_map_batches_in_memory:
+                                map_batches.append(
+                                    {
+                                        "batch_index": current_batch_index,
+                                        "rows_count": len(item_rows),
+                                        "summary": item_summary,
+                                        "batch_period_start": item_bp_start,
+                                        "batch_period_end": item_bp_end,
+                                    }
+                                )
+                            rows_mapped += len(item_rows)
+                            self._emit_progress(
+                                "map_batch",
+                                {
+                                    "batch_index": current_batch_index,
+                                    "batch_total": estimated_batch_total,
+                                    "batch_summary": item_summary,
+                                    "batch_logs_count": len(item_rows),
+                                    "batch_logs": item_rows,
+                                    "batch_period_start": item_bp_start,
+                                    "batch_period_end": item_bp_end,
+                                    "rows_processed": rows_mapped,
+                                    "rows_total": total_rows_estimate,
+                                },
+                            )
+                            map_batch_index += 1
                         continue  # skip appending to pending_items again
 
                     # Parallel mode: store future for later collection
@@ -1882,6 +2042,17 @@ def regenerate_reduce_summary_from_map_summaries(
         llm_call=llm_call,
         config=config
         or SummarizerConfig(
+            min_llm_chunk_rows=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE", 20) or 20),
+                1,
+            ),
+            auto_shrink_on_400=bool(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400", True)
+            ),
+            max_shrink_rounds=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
+                0,
+            ),
             max_cell_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
             ),
@@ -1955,6 +2126,21 @@ def summarize_logs(
         llm_call=llm_call,
         config=SummarizerConfig(
             page_limit=page_limit,
+            llm_chunk_rows=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE", 200) or 200),
+                1,
+            ),
+            min_llm_chunk_rows=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE", 20) or 20),
+                1,
+            ),
+            auto_shrink_on_400=bool(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400", True)
+            ),
+            max_shrink_rounds=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
+                0,
+            ),
             max_cell_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
             ),

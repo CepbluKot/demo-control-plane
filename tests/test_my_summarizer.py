@@ -3,9 +3,11 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pandas as pd
+import requests
 
 from my_summarizer import (
     PeriodLogSummarizer,
+    SummarizerConfig,
     _make_llm_call,
     _build_db_fetch_page,
     _estimate_total_logs,
@@ -19,10 +21,144 @@ from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
+    def test_communicate_with_llm_retries_without_max_tokens_on_400(self) -> None:
+        class _FakeResponse:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = str(payload)
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise requests.exceptions.HTTPError(
+                        f"{self.status_code} Client Error",
+                        response=self,
+                    )
+
+            def json(self):
+                return self._payload
+
+        calls = []
+
+        def _fake_post(_url, *, json=None, headers=None, timeout=None):
+            calls.append({"json": json, "headers": headers, "timeout": timeout})
+            if len(calls) == 1:
+                return _FakeResponse(400, {"error": {"message": "unsupported max_tokens"}})
+            return _FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {"message": {"content": "ok after fallback"}, "finish_reason": "stop"}
+                    ]
+                },
+            )
+
+        config_overrides = {
+            "OPENAI_API_BASE_DB": "https://example.test/v1",
+            "OPENAI_API_KEY_DB": "secret",
+            "LLM_MODEL_ID": "demo-model",
+            "CONTROL_PLANE_LLM_MAX_TOKENS": 16384,
+            "CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH": True,
+            "CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS": 2,
+        }
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer.requests.post",
+            side_effect=_fake_post,
+        ):
+            out = communicate_with_llm("prompt", timeout=10.0)
+
+        self.assertEqual(out, "ok after fallback")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("max_tokens", calls[0]["json"])
+        self.assertNotIn("max_tokens", calls[1]["json"])
+
+    def test_make_llm_call_does_not_retry_non_retryable_400(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        retries = []
+
+        def _raise_bad_request(*, message, system_prompt="", timeout=60.0):
+            _ = (message, system_prompt, timeout)
+            raise requests.exceptions.HTTPError(
+                "400 Client Error: Bad Request",
+                response=_Resp(),
+            )
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_raise_bad_request,
+        ):
+            llm_call = _make_llm_call(
+                max_retries=-1,
+                retry_delay=0.0,
+                on_retry=lambda *_: retries.append("retry"),
+            )
+            out = llm_call("test prompt")
+
+        self.assertIn("LLM НЕДОСТУПНА", out)
+        self.assertEqual(retries, [])
+
+    def test_summarizer_auto_shrinks_batch_on_400_bad_request(self) -> None:
+        calls = {"map_large": 0, "map_small": 0}
+
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [
+                {"timestamp": f"2026-03-25T10:00:0{i}Z", "message": f"log {i}"}
+                for i in range(8)
+            ]
+
+        def _fake_llm(prompt: str) -> str:
+            if "Это REDUCE-этап" in prompt:
+                return "REDUCE_OK"
+            marker = "Строк в куске:"
+            if marker in prompt:
+                try:
+                    part = prompt.split(marker, 1)[1].strip().splitlines()[0]
+                    rows_count = int(part)
+                except Exception:
+                    rows_count = 0
+                if rows_count > 2:
+                    calls["map_large"] += 1
+                    return (
+                        "[LLM НЕДОСТУПНА — эвристический fallback]\n\n"
+                        "ОШИБКА: 400 Client Error: Bad Request for url"
+                    )
+                calls["map_small"] += 1
+                return f"MAP_OK_{rows_count}"
+            return "GENERIC_OK"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=8,
+                min_llm_chunk_rows=2,
+                auto_shrink_on_400=True,
+                max_shrink_rounds=6,
+                keep_map_summaries_in_result=True,
+            ),
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message"],
+        )
+        self.assertNotIn("400 Client Error", str(result.summary))
+        self.assertGreater(calls["map_large"], 0)
+        self.assertGreater(calls["map_small"], 0)
+        self.assertTrue(any("MAP_OK_2" in item for item in result.map_summaries))
+
     def test_communicate_with_llm_continues_when_finish_reason_length(self) -> None:
         class _FakeResponse:
             def __init__(self, payload):
+                self.status_code = 200
                 self._payload = payload
+                self.text = str(payload)
 
             def raise_for_status(self):
                 return None
@@ -84,6 +220,9 @@ class TestMySummarizer(unittest.TestCase):
 
     def test_communicate_with_llm_passes_max_tokens_when_configured(self) -> None:
         class _FakeResponse:
+            status_code = 200
+            text = "ok"
+
             def raise_for_status(self):
                 return None
 
