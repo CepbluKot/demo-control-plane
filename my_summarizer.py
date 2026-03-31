@@ -1505,7 +1505,10 @@ class PeriodLogSummarizer:
                 )
                 return self._truncate(merged, self.config.max_summary_chars), llm_calls, 1
             except Exception as exc:  # noqa: BLE001
-                if not self._is_context_overflow_error(exc):
+                if not (
+                    self._is_context_overflow_error(exc)
+                    or _is_400_bad_request_exception(exc)
+                ):
                     raise
                 logger.warning("reduce full-merge overflow, fallback to adaptive mode: %s", exc)
                 self._emit_progress(
@@ -1590,7 +1593,10 @@ class PeriodLogSummarizer:
                         )
                         break
                     except Exception as exc:  # noqa: BLE001
-                        if self._is_context_overflow_error(exc) and used_size > 2:
+                        if (
+                            self._is_context_overflow_error(exc)
+                            or _is_400_bad_request_exception(exc)
+                        ) and used_size > 1:
                             used_size -= 1
                             continue
                         raise

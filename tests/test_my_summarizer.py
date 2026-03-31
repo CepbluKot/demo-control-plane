@@ -21,6 +21,32 @@ from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
+    def test_make_llm_call_raises_when_env_missing(self) -> None:
+        with patch("my_summarizer.has_required_env", return_value=False):
+            with self.assertRaises(RuntimeError):
+                _make_llm_call()
+
+    def test_make_llm_call_raises_after_retry_exhaustion(self) -> None:
+        retries = []
+
+        def _raise_conn_error(*, message, system_prompt="", timeout=60.0):
+            _ = (message, system_prompt, timeout)
+            raise requests.exceptions.ConnectionError("network down")
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_raise_conn_error,
+        ):
+            llm_call = _make_llm_call(
+                max_retries=1,
+                retry_delay=0.0,
+                on_retry=lambda *_: retries.append("retry"),
+            )
+            with self.assertRaises(requests.exceptions.ConnectionError):
+                llm_call("test prompt")
+
+        self.assertEqual(retries, ["retry"])
+
     def test_communicate_with_llm_retries_without_max_tokens_on_400(self) -> None:
         class _FakeResponse:
             def __init__(self, status_code: int, payload: dict):
@@ -155,6 +181,35 @@ class TestMySummarizer(unittest.TestCase):
         self.assertGreater(calls["map_large"], 0)
         self.assertGreater(calls["map_small"], 0)
         self.assertTrue(any("MAP_OK_2" in item for item in result.map_summaries))
+
+    def test_summarizer_raises_on_non_400_map_error_without_fallback(self) -> None:
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [{"timestamp": "2026-03-25T10:00:00Z", "message": "log"}]
+
+        def _fake_llm(_prompt: str) -> str:
+            raise requests.exceptions.ConnectionError("llm transport error")
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=8,
+                min_llm_chunk_rows=2,
+                auto_shrink_on_400=True,
+                max_shrink_rounds=6,
+                keep_map_summaries_in_result=True,
+            ),
+        )
+        with self.assertRaises(requests.exceptions.ConnectionError):
+            summarizer.summarize_period(
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                columns=["timestamp", "message"],
+            )
 
     def test_communicate_with_llm_continues_when_finish_reason_length(self) -> None:
         class _FakeResponse:
@@ -678,6 +733,18 @@ class TestMySummarizer(unittest.TestCase):
         )
         self.assertIn("Нет map-summary", out)
 
+    def test_regenerate_reduce_summary_filters_llm_error_stub_items(self) -> None:
+        out = regenerate_reduce_summary_from_map_summaries(
+            map_summaries=[
+                "[LLM ERROR]\n\nОШИБКА: 400 Client Error",
+                "валидный map summary",
+            ],
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            llm_call=lambda prompt: prompt,
+        )
+        self.assertEqual(out, "валидный map summary")
+
     def test_regenerate_reduce_summary_from_map_summaries_emits_progress(self) -> None:
         events = []
         out = regenerate_reduce_summary_from_map_summaries(
@@ -690,6 +757,247 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("MERGED SUMMARY", out)
         event_names = [name for name, _ in events]
         self.assertIn("reduce_group_start", event_names)
+
+    def test_reduce_summaries_handles_400_by_switching_to_adaptive(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        calls = {"n": 0}
+
+        def _fake_llm(_prompt: str) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request for url",
+                    response=_Resp(),
+                )
+            return "MERGED_OK"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["s1", "s2"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertEqual(final_summary, "MERGED_OK")
+        self.assertGreaterEqual(llm_calls, 1)
+        self.assertGreaterEqual(reduce_rounds, 1)
+
+    def test_reduce_summaries_shrinks_group_size_on_400_inside_round(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        def _fake_llm(prompt: str) -> str:
+            # fail when trying to merge 3 summaries at once, succeed for smaller groups
+            if prompt.count("[SUMMARY ") >= 3:
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request for url",
+                    response=_Resp(),
+                )
+            return "OK_GROUP"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["a", "b", "c"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertTrue(final_summary)
+        self.assertGreaterEqual(llm_calls, 1)
+        self.assertGreaterEqual(reduce_rounds, 1)
+
+    def test_summarize_period_does_not_fail_on_reduce_400(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        calls = {"reduce_errors": 0}
+        progress_events = []
+
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [
+                {"timestamp": "2026-03-25T10:00:00Z", "message": "m1"},
+                {"timestamp": "2026-03-25T10:00:01Z", "message": "m2"},
+                {"timestamp": "2026-03-25T10:00:02Z", "message": "m3"},
+                {"timestamp": "2026-03-25T10:00:03Z", "message": "m4"},
+            ]
+
+        def _fake_llm(prompt: str) -> str:
+            if "Это REDUCE-этап" in prompt:
+                if calls["reduce_errors"] == 0:
+                    calls["reduce_errors"] += 1
+                    raise requests.exceptions.HTTPError(
+                        "400 Client Error: Bad Request for url",
+                        response=_Resp(),
+                    )
+                return "REDUCE_OK_AFTER_400"
+            return "MAP_OK"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=2,
+                adaptive_reduce_on_overflow=True,
+                keep_map_summaries_in_result=True,
+            ),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
+        )
+
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message"],
+        )
+
+        self.assertEqual(result.summary, "REDUCE_OK_AFTER_400")
+        self.assertGreaterEqual(result.reduce_rounds, 1)
+        self.assertEqual(calls["reduce_errors"], 1)
+        self.assertIn("reduce_context_fallback", [name for name, _ in progress_events])
+
+    def test_reduce_summaries_single_summary_shortcut(self) -> None:
+        calls = {"n": 0}
+
+        def _fake_llm(_prompt: str) -> str:
+            calls["n"] += 1
+            return "SHOULD_NOT_CALL"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["only_one"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertEqual(final_summary, "only_one")
+        self.assertEqual(llm_calls, 0)
+        self.assertEqual(reduce_rounds, 0)
+        self.assertEqual(calls["n"], 0)
+
+    def test_reduce_summaries_raises_on_non_overflow_error(self) -> None:
+        def _fake_llm(_prompt: str) -> str:
+            raise requests.exceptions.ConnectionError("network error")
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+        )
+        with self.assertRaises(requests.exceptions.ConnectionError):
+            summarizer._reduce_summaries(
+                chunk_summaries=["a", "b"],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
+
+    def test_reduce_summaries_full_merge_empty_response_uses_default_text(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "",
+            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["a", "b"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertEqual(final_summary, "Пустой ответ LLM на reduce-этапе.")
+        self.assertEqual(llm_calls, 1)
+        self.assertEqual(reduce_rounds, 1)
+
+    def test_reduce_summaries_fixed_groups_when_adaptive_disabled(self) -> None:
+        calls = {"n": 0}
+
+        def _fake_llm(_prompt: str) -> str:
+            calls["n"] += 1
+            return f"R{calls['n']}"
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                adaptive_reduce_on_overflow=False,
+                reduce_group_size=2,
+            ),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["a", "b", "c"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertEqual(final_summary, "R3")
+        self.assertEqual(llm_calls, 3)
+        self.assertEqual(reduce_rounds, 2)
+        self.assertEqual(calls["n"], 3)
+
+    def test_reduce_summaries_fixed_groups_empty_response_uses_default(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "",
+            config=SummarizerConfig(
+                adaptive_reduce_on_overflow=False,
+                reduce_group_size=2,
+            ),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["a", "b"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertEqual(final_summary, "Пустой ответ LLM на reduce-этапе.")
+        self.assertEqual(llm_calls, 1)
+        self.assertEqual(reduce_rounds, 1)
+
+    def test_reduce_summaries_fixed_groups_raises_when_max_rounds_exceeded(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "X",
+            config=SummarizerConfig(
+                adaptive_reduce_on_overflow=False,
+                reduce_group_size=1,
+                max_reduce_rounds=1,
+            ),
+        )
+        with self.assertRaises(RuntimeError):
+            summarizer._reduce_summaries(
+                chunk_summaries=["a", "b"],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
+
+    def test_reduce_summaries_budget_fallback_emits_event_and_completes(self) -> None:
+        events = []
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "SHOULD_NOT_BE_CALLED",
+            config=SummarizerConfig(
+                adaptive_reduce_on_overflow=True,
+                reduce_prompt_max_chars=1,
+            ),
+            on_progress=lambda event, payload: events.append((event, payload)),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=["a", "b", "c"],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertTrue(final_summary)
+        self.assertEqual(llm_calls, 0)
+        self.assertGreaterEqual(reduce_rounds, 1)
+        self.assertIn("reduce_context_fallback", [name for name, _ in events])
 
 
 if __name__ == "__main__":
