@@ -541,7 +541,7 @@ def process_anomalies(
                     f"batches={len(test_batches)}, logs={sum(len(b.get('batch_logs', [])) for b in test_batches)})"
                 )
                 result["summary"] = summary
-                preview = summary[:SUMMARY_LOG_CHARS]
+                preview = summary
                 logger.info(
                     "do_summary.mock: anomaly_ts=%s, summary_len=%s, preview=%s",
                     timestamp_str,
@@ -598,7 +598,7 @@ def process_anomalies(
                 else:
                     alert_result = {
                         "status": "mocked",
-                        "message_preview": alert_text[:120],
+                        "message_preview": alert_text,
                     }
                 result["alert_result"] = alert_result
                 log_event(logger, "process_anomalies.mock_alert", index=i, alert=result["alert_result"])
@@ -715,7 +715,7 @@ def process_anomalies(
                     rows_total_result = getattr(summary_result, "rows_total_estimate", None)
                 summary = str(summary)
                 result["summary"] = summary
-                preview = summary[:SUMMARY_LOG_CHARS] if isinstance(summary, str) else str(summary)
+                preview = summary if isinstance(summary, str) else str(summary)
                 map_batches = _extract_map_batches(summary_result, preview)
                 if rows_processed_result is None:
                     rows_processed_result = live_state.get("rows_processed")

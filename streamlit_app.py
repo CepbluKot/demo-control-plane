@@ -911,16 +911,8 @@ def _render_anomaly_cards(
 
 
 def _ui_runtime_config() -> Dict[str, Any]:
-    ch_query = (
-        CLICKHOUSE_METRICS_QUERY
-        if len(CLICKHOUSE_METRICS_QUERY) <= 140
-        else f"{CLICKHOUSE_METRICS_QUERY[:140]}..."
-    )
-    ch_predictions_query = (
-        CLICKHOUSE_PREDICTIONS_QUERY
-        if len(CLICKHOUSE_PREDICTIONS_QUERY) <= 140
-        else f"{CLICKHOUSE_PREDICTIONS_QUERY[:140]}..."
-    )
+    ch_query = CLICKHOUSE_METRICS_QUERY
+    ch_predictions_query = CLICKHOUSE_PREDICTIONS_QUERY
     return {
         "CONTROL_PLANE_TEST_MODE": TEST_MODE,
         "CONTROL_PLANE_METRICS_SOURCE": METRICS_SOURCE,

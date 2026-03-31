@@ -218,7 +218,7 @@ def run_loop(sleep_seconds: int = 60) -> None:
                         if result["error"]:
                             logger.error("Ошибка: %s", result["error"])
                         if result["summary"]:
-                            logger.info("Summary: %s...", str(result["summary"])[:200])
+                            logger.info("Summary: %s", str(result["summary"]))
                         if result["alert_result"]:
                             logger.info("Результат алерта: %s", result["alert_result"])
             logger.info("Loop done: anomalies=%s, sleep=%ss", len(anomalies), sleep_seconds)

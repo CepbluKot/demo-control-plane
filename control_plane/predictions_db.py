@@ -155,7 +155,7 @@ def fetch_predictions_from_db(
         log_event(
             logger,
             "fetch_predictions_from_db.custom_query",
-            query_preview=custom_query[:800],
+            query_preview=custom_query,
         )
         df = _query_metrics_df(custom_query)
         log_event(logger, "fetch_predictions_from_db.rows_loaded", rows=len(df), mode="custom")
@@ -210,7 +210,7 @@ def fetch_predictions_from_db(
         f"  AND timestamp <= parseDateTimeBestEffort('{end_iso}') "
         f"ORDER BY timestamp"
     )
-    query_preview = predictions_query[:800]
+    query_preview = predictions_query
     log_event(logger, "fetch_predictions_from_db.query", query_preview=query_preview)
     df = _query_metrics_df(predictions_query)
     log_event(logger, "fetch_predictions_from_db.rows_loaded", rows=len(df))

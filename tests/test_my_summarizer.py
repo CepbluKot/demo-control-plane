@@ -341,6 +341,48 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("type=aggregated", prompt)
         self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА", prompt)
 
+    def test_truncate_with_zero_limit_keeps_text(self) -> None:
+        text = "a" * 5000
+        out = PeriodLogSummarizer._truncate(text, 0)
+        self.assertEqual(out, text)
+
+    def test_build_freeform_prompt_default_includes_map_summaries(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+        )
+        prompt = summarizer._build_freeform_prompt(
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            structured_summary="structured summary",
+            map_summaries=["map one", "map two"],
+        )
+        self.assertIn("MAP SUMMARY ПО БАТЧАМ ЛОГОВ", prompt)
+        self.assertIn("[MAP SUMMARY #1]", prompt)
+        self.assertIn("map one", prompt)
+        self.assertIn("map two", prompt)
+
+    def test_build_freeform_prompt_custom_template_uses_map_summaries_vars(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+        )
+        config_overrides = {
+            "CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE": (
+                "CUSTOM FREEFORM | maps={map_summaries_text} | final={structured_summary}"
+            ),
+        }
+        with patch.multiple(settings, **config_overrides):
+            prompt = summarizer._build_freeform_prompt(
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                structured_summary="structured summary",
+                map_summaries=["map one"],
+            )
+        self.assertIn("CUSTOM FREEFORM", prompt)
+        self.assertIn("maps=[MAP SUMMARY #1]", prompt)
+        self.assertIn("final=structured summary", prompt)
+
     def test_regenerate_reduce_summary_from_map_summaries(self) -> None:
         out = regenerate_reduce_summary_from_map_summaries(
             map_summaries=["batch-1 summary", "batch-2 summary"],
@@ -349,6 +391,22 @@ class TestMySummarizer(unittest.TestCase):
             llm_call=lambda _prompt: "MERGED SUMMARY",
         )
         self.assertIn("MERGED SUMMARY", out)
+
+    def test_regenerate_reduce_summary_does_not_truncate_when_limits_zero(self) -> None:
+        config_overrides = {
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS": 0,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS": 0,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS": 0,
+        }
+        long_result = "MERGED " + ("X" * 10000)
+        with patch.multiple(settings, **config_overrides):
+            out = regenerate_reduce_summary_from_map_summaries(
+                map_summaries=["batch-1 summary", "batch-2 summary"],
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                llm_call=lambda _prompt: long_result,
+            )
+        self.assertEqual(out, long_result)
 
     def test_regenerate_reduce_summary_from_map_summaries_empty(self) -> None:
         out = regenerate_reduce_summary_from_map_summaries(

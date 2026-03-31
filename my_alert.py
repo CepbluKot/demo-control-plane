@@ -18,12 +18,12 @@ def send_sre_alert(text: str) -> Dict[str, Any]:
     logger.info(
         "my_alert.send_sre_alert called: text_len=%s preview=%s",
         len(text),
-        text[:120],
+        text,
     )
     return {
         "status": "template_sent",
         "sent": True,
         "channel": "template",
         "sender": "my_alert.send_sre_alert",
-        "message_preview": text[:200],
+        "message_preview": text,
     }

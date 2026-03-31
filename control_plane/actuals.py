@@ -80,7 +80,7 @@ def _fetch_clickhouse_actuals(
     log_event(
         logger,
         "fetch_actuals.clickhouse.query",
-        query_preview=query[:600],
+        query_preview=query,
     )
     client = clickhouse_connect.get_client(
         host=CLICKHOUSE_METRICS_HOST,

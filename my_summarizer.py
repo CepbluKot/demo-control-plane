@@ -71,9 +71,12 @@ class SummarizerConfig:
     llm_chunk_rows: int = 200
     reduce_group_size: int = 8
     max_reduce_rounds: int = 12
-    max_cell_chars: int = 500
-    max_summary_chars: int = 10_000
-    reduce_prompt_max_chars: int = 120_000
+    # 0 or negative => no truncation.
+    max_cell_chars: int = 0
+    # 0 or negative => no truncation.
+    max_summary_chars: int = 0
+    # 0 or negative => no local reduce prompt-length cap.
+    reduce_prompt_max_chars: int = 0
     adaptive_reduce_on_overflow: bool = True
     keep_map_batches_in_memory: bool = False
     keep_map_summaries_in_result: bool = False
@@ -1109,6 +1112,7 @@ class PeriodLogSummarizer:
                     period_start=period_start,
                     period_end=period_end,
                     structured_summary=final_summary,
+                    map_summaries=map_summaries,
                 )
                 freeform_summary = self.llm_call(freeform_prompt).strip()
                 llm_calls += 1
@@ -1584,9 +1588,15 @@ class PeriodLogSummarizer:
         period_start: str,
         period_end: str,
         structured_summary: str,
+        map_summaries: Optional[Sequence[str]] = None,
     ) -> str:
         extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
         anti_rules = _resolve_anti_hallucination_rules()
+        map_items = [_normalize_summary_text(item) for item in (map_summaries or [])]
+        map_items = [item for item in map_items if item]
+        map_summaries_text = "\n\n".join(
+            f"[MAP SUMMARY #{idx + 1}]\n{item}" for idx, item in enumerate(map_items)
+        )
         freeform_template = _read_prompt_setting("CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE")
         if freeform_template:
             rendered = _render_prompt_template(
@@ -1601,6 +1611,8 @@ class PeriodLogSummarizer:
                     "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
                     "structured_summary": structured_summary,
                     "cross_source_summary": structured_summary,
+                    "map_summaries": json.dumps(map_items, ensure_ascii=False),
+                    "map_summaries_text": map_summaries_text,
                     "extra_prompt_context": extra_prompt_context,
                     "anti_hallucination_rules": anti_rules,
                 },
@@ -1618,6 +1630,7 @@ class PeriodLogSummarizer:
             "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
             anti_rules,
             *((["", "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:", extra_prompt_context]) if extra_prompt_context else []),
+            *((["", "MAP SUMMARY ПО БАТЧАМ ЛОГОВ:", map_summaries_text]) if map_summaries_text else []),
             "",
             f"Период: [{period_start}, {period_end})",
             "",
@@ -1772,7 +1785,18 @@ def regenerate_reduce_summary_from_map_summaries(
     reducer = PeriodLogSummarizer(
         db_fetch_page=lambda **_: [],
         llm_call=llm_call,
-        config=config or SummarizerConfig(),
+        config=config
+        or SummarizerConfig(
+            max_cell_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
+            ),
+            max_summary_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)
+            ),
+            reduce_prompt_max_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
+            ),
+        ),
         on_progress=on_progress,
         prompt_context=prompt_context or {},
     )

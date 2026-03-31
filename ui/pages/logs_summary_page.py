@@ -915,7 +915,7 @@ def _normalize_metrics_df(chunk: pd.DataFrame, *, default_service: str) -> pd.Da
     return _sort_df_by_timestamp(out)
 
 
-def _build_metrics_context(metrics_df: pd.DataFrame, *, max_services: int = 12) -> str:
+def _build_metrics_context(metrics_df: pd.DataFrame, *, max_services: int = 0) -> str:
     if metrics_df is None or metrics_df.empty:
         return ""
     if "timestamp" not in metrics_df.columns or "value" not in metrics_df.columns:
@@ -941,8 +941,7 @@ def _build_metrics_context(metrics_df: pd.DataFrame, *, max_services: int = 12) 
 
     grouped = normalized.groupby("service", sort=True)
     for idx, (service, group) in enumerate(grouped):
-        if idx >= max_services:
-            lines.append(f"... truncated services after {max_services}")
+        if max_services > 0 and idx >= max_services:
             break
         g = group.sort_values("timestamp")
         first_ts = _format_datetime_with_tz(g["timestamp"].iloc[0])
@@ -1365,7 +1364,7 @@ def _load_recent_batches_from_jsonl(
                         "batch_logs_count": payload.get("batch_logs_count"),
                         "batch_period_start": payload.get("batch_period_start"),
                         "batch_period_end": payload.get("batch_period_end"),
-                        "batch_logs": batch_logs[: max(int(max_logs_preview), 1)],
+                        "batch_logs": batch_logs,
                     }
                 )
     except Exception:
@@ -1690,6 +1689,7 @@ def _read_file_bytes(path: Optional[str]) -> Optional[bytes]:
 def _build_freeform_summary_prompt(
     *,
     final_summary: str,
+    map_summaries_text: str = "",
     user_goal: str,
     period_start: str,
     period_end: str,
@@ -1739,6 +1739,7 @@ def _build_freeform_summary_prompt(
                 "period_end": period_end,
                 "stats": json.dumps(_json_safe(stats), ensure_ascii=False, indent=2),
                 "metrics_context": metrics_block,
+                "map_summaries_text": str(map_summaries_text or ""),
                 "anti_hallucination_rules": anti_rules,
             },
         )
@@ -1763,6 +1764,8 @@ def _build_freeform_summary_prompt(
         f"{anti_block}"
         f"Период: [{period_start}, {period_end})\n"
         f"Метрики: {metrics_block}\n\n"
+        "MAP summary по батчам логов:\n"
+        f"{(map_summaries_text or 'Нет map-summary.')}\n\n"
         "Структурированный анализ логов:\n"
         f"{final_summary}"
         f"{chain_block}{incident_link_block}"
@@ -1930,6 +1933,27 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 period_start=str(state.get("period_start") or ""),
                                 period_end=str(state.get("period_end") or ""),
                                 llm_call=llm_call,
+                                config=_build_config(
+                                    deps,
+                                    int(
+                                        pd.to_numeric(
+                                            state.get("db_batch_size"), errors="coerce"
+                                        )
+                                        or deps.db_batch_size
+                                    ),
+                                    int(
+                                        pd.to_numeric(
+                                            state.get("llm_batch_size"), errors="coerce"
+                                        )
+                                        or deps.llm_batch_size
+                                    ),
+                                    int(
+                                        pd.to_numeric(
+                                            state.get("map_workers"), errors="coerce"
+                                        )
+                                        or deps.map_workers
+                                    ),
+                                ),
                                 prompt_context={
                                     "incident_start": str(state.get("period_start") or ""),
                                     "incident_end": str(state.get("period_end") or ""),
@@ -1966,6 +1990,28 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 ),
                             )
                             state["rebuild_reduce_path"] = str(rebuild_path)
+                            request_payload_for_save = {}
+                            try:
+                                request_path = Path(str(state.get("request_path") or ""))
+                                loaded_request = _read_json_file(request_path)
+                                if isinstance(loaded_request, dict):
+                                    request_payload_for_save = dict(loaded_request)
+                            except Exception:
+                                request_payload_for_save = {}
+                            saved_after_rebuild = _save_logs_summary_result(
+                                output_dir=deps.output_dir,
+                                request_payload=request_payload_for_save,
+                                result_state=state,
+                            )
+                            state["result_json_path"] = saved_after_rebuild.get("json_path")
+                            state["result_summary_path"] = saved_after_rebuild.get("summary_path")
+                            state["result_structured_md_path"] = saved_after_rebuild.get("structured_md_path")
+                            state["result_freeform_md_path"] = saved_after_rebuild.get("freeform_md_path")
+                            state["result_structured_txt_path"] = saved_after_rebuild.get("structured_txt_path")
+                            state["result_freeform_txt_path"] = saved_after_rebuild.get("freeform_txt_path")
+                            checkpoint_raw = str(state.get("checkpoint_path") or "").strip()
+                            if checkpoint_raw:
+                                _persist_checkpoint(Path(checkpoint_raw), state)
                             st.session_state[LAST_STATE_SESSION_KEY] = state
                             st.success("Пересборка завершена. Обновили итоговый summary.")
                             st.rerun()
@@ -3262,9 +3308,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             schema_errors.append("Логи: ни один SQL не дал preview-результат для проверки merge-схемы.")
 
     if schema_errors:
-        joined = "\n".join([str(err) for err in schema_errors[:12]])
-        if len(schema_errors) > 12:
-            joined += f"\n... и еще {len(schema_errors) - 12} ошибок."
+        joined = "\n".join([str(err) for err in schema_errors])
         _unlock_with_form_error(
             "Формат SQL-результатов несовместим для merge в единые DataFrame.\n" + joined
         )
@@ -3991,7 +4035,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         ),
                     )
 
-                preview_logs = full_logs[:MAX_LOG_ROWS_PREVIEW]
+                preview_logs = full_logs
                 batch_item = {
                     "batch_index": global_batch_index_zero,
                     "batch_total": payload.get("batch_total"),
@@ -4373,7 +4417,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 if isinstance(events, list):
                     events.append(
                         "Не удалось получить гипотезы без логов: "
-                        f"{str(no_logs_exc)[:180]}"
+                        f"{str(no_logs_exc)}"
                     )
 
         if multi_query_mode and not demo_mode:
@@ -4516,6 +4560,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                     period_start=str(period_start_iso or ""),
                                     period_end=str(period_end_iso or ""),
                                     llm_call=llm_call,
+                                    config=_build_config(
+                                        deps, db_batch_size, llm_batch_size, map_workers
+                                    ),
                                     prompt_context={
                                         "incident_start": period_start_iso,
                                         "incident_end": period_end_iso,
@@ -4604,6 +4651,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=str(period_start_iso or ""),
                             period_end=str(period_end_iso or ""),
                             llm_call=llm_call,
+                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -4743,6 +4791,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=str(period_start_iso or ""),
                             period_end=str(period_end_iso or ""),
                             llm_call=llm_call,
+                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -4814,6 +4863,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=period_start_iso,
                             period_end=period_end_iso,
                             llm_call=llm_call,
+                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -4857,7 +4907,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             except Exception as resume_exc:  # noqa: BLE001
                 deps.logger.warning("resume re-reduce failed: %s", resume_exc)
                 state.setdefault("events", []).append(
-                    f"Восстановление: пересборка итога не удалась ({str(resume_exc)[:160]})"
+                    f"Восстановление: пересборка итога не удалась ({str(resume_exc)})"
                 )
 
         final_summary_for_report = _normalize_summary_text(state.get("final_summary"))
@@ -4888,6 +4938,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=period_start_iso,
                             period_end=period_end_iso,
                             llm_call=llm_call,
+                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -4920,8 +4971,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["llm_phase_hint"] = "final_freeform"
                 state["active_source_label"] = "final_freeform"
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
+                map_summaries_for_final = _load_map_summaries_from_jsonl(
+                    str(map_summaries_jsonl_path)
+                )
+                map_summaries_text_for_final = "\n\n".join(
+                    f"[MAP SUMMARY #{idx + 1}]\n{text}"
+                    for idx, text in enumerate(map_summaries_for_final)
+                )
                 freeform_prompt = _build_freeform_summary_prompt(
                     final_summary=final_summary_for_report,
+                    map_summaries_text=map_summaries_text_for_final,
                     user_goal=goal_text,
                     period_start=period_start_iso,
                     period_end=period_end_iso,

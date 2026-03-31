@@ -12,8 +12,6 @@ def _safe_preview(value: Any, max_len: int = 200) -> str:
         rendered = json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         rendered = str(value)
-    if len(rendered) > max_len:
-        return f"{rendered[:max_len]}..."
     return rendered
 
 

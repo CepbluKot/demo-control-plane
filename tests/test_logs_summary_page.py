@@ -13,13 +13,23 @@ from ui.pages.logs_summary_page import (
     _extract_last_batch_ts_from_run_dir,
     _form_values_from_saved_params,
     _load_map_summaries_from_jsonl,
+    _load_map_summaries_from_jsonl_for_source,
     _normalize_summary_text,
+    _summary_origin_label,
     _write_json_file,
     _save_logs_summary_result,
 )
 
 
 class TestLogsSummaryPageHelpers(unittest.TestCase):
+    def test_summary_origin_label_maps_known_and_unknown_values(self) -> None:
+        self.assertEqual(
+            _summary_origin_label("resume_rereduce"),
+            "Resume: пересборка REDUCE из сохранённых MAP summary",
+        )
+        self.assertEqual(_summary_origin_label("custom_origin"), "custom_origin")
+        self.assertEqual(_summary_origin_label(""), "")
+
     def test_normalize_summary_text_drops_none_like_values(self) -> None:
         self.assertEqual(_normalize_summary_text(None), "")
         self.assertEqual(_normalize_summary_text("None"), "")
@@ -58,6 +68,38 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("summary body", prompt)
         self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ", prompt)
 
+    def test_ui_freeform_prompt_default_includes_map_summaries(self) -> None:
+        prompt = _build_freeform_summary_prompt(
+            final_summary="reduce summary",
+            map_summaries_text="[MAP SUMMARY #1]\nfirst batch",
+            user_goal="incident context",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertIn("MAP summary по батчам логов", prompt)
+        self.assertIn("[MAP SUMMARY #1]", prompt)
+        self.assertIn("first batch", prompt)
+
+    def test_ui_freeform_prompt_custom_template_receives_map_summaries(self) -> None:
+        with patch.object(
+            settings,
+            "CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE",
+            "MAPS={map_summaries_text} | FINAL={final_summary}",
+        ):
+            prompt = _build_freeform_summary_prompt(
+                final_summary="reduce summary",
+                map_summaries_text="[MAP SUMMARY #1]\nfirst batch",
+                user_goal="goal",
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                stats={},
+                metrics_context="",
+            )
+        self.assertIn("MAPS=[MAP SUMMARY #1]", prompt)
+        self.assertIn("FINAL=reduce summary", prompt)
+
     def test_no_logs_hypothesis_prompt_includes_period_and_goal(self) -> None:
         prompt = _build_no_logs_hypothesis_prompt(
             period_start="2026-03-18T00:00:00Z",
@@ -83,6 +125,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                     "period_start": "2026-03-18T00:00:00Z",
                     "period_end": "2026-03-18T01:00:00Z",
                     "final_summary": "structured summary",
+                    "final_summary_origin": "manual_rereduce",
                     "freeform_final_summary": "freeform summary",
                     "logs_processed": 10,
                     "logs_total": 10,
@@ -97,12 +140,37 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             self.assertIn("structured summary", md_text)
             self.assertIn("Final Summary (Freeform)", md_text)
             self.assertIn("freeform summary", md_text)
+            self.assertIn("summary_origin: `manual_rereduce`", md_text)
             self.assertIn("structured_md_path", saved)
             self.assertIn("freeform_md_path", saved)
             self.assertTrue(Path(saved["structured_md_path"]).exists())
             self.assertTrue(Path(saved["freeform_md_path"]).exists())
             self.assertIn("structured_txt_path", saved)
             self.assertIn("freeform_txt_path", saved)
+
+    def test_save_logs_summary_result_does_not_truncate_structured_text(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            long_summary = "x" * 20000
+            saved = _save_logs_summary_result(
+                output_dir=Path(tmp_dir),
+                request_payload={"x": 1},
+                result_state={
+                    "status": "done",
+                    "mode": "db",
+                    "period_start": "2026-03-18T00:00:00Z",
+                    "period_end": "2026-03-18T01:00:00Z",
+                    "final_summary": long_summary,
+                    "freeform_final_summary": "freeform summary",
+                    "logs_processed": 10,
+                    "logs_total": 10,
+                    "stats": {"llm_calls": 2},
+                    "error": None,
+                },
+            )
+            structured_txt = Path(saved["structured_txt_path"]).read_text(encoding="utf-8")
+            self.assertEqual(structured_txt, long_summary)
+            structured_md = Path(saved["structured_md_path"]).read_text(encoding="utf-8")
+            self.assertIn(long_summary, structured_md)
 
     def test_load_map_summaries_from_jsonl_reads_batch_summary(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -119,6 +187,26 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             items = _load_map_summaries_from_jsonl(str(p))
             self.assertEqual(items, ["one", "two"])
 
+    def test_load_map_summaries_from_jsonl_for_source_filters_by_source(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            p = Path(tmp_dir) / "map_summaries.jsonl"
+            p.write_text(
+                "\n".join(
+                    [
+                        '{"source_name":"query_1","batch_summary":"q1-1"}',
+                        '{"source_name":"query_2","batch_summary":"q2-1"}',
+                        '{"source_name":"query_1","batch_summary":"q1-2"}',
+                        '{"source_name":"query_1","batch_summary":"None"}',
+                        "not json",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            q1_items = _load_map_summaries_from_jsonl_for_source(str(p), "query_1")
+            q2_items = _load_map_summaries_from_jsonl_for_source(str(p), "query_2")
+            self.assertEqual(q1_items, ["q1-1", "q1-2"])
+            self.assertEqual(q2_items, ["q2-1"])
+
     def test_checkpoint_payload_has_state(self) -> None:
         payload = _checkpoint_payload_from_state(
             {
@@ -129,6 +217,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "resume_stats_offset": {"rows_processed": 77},
                 "eta_seconds_left": 99,
                 "log_seconds_per_second": 12.5,
+                "final_summary_origin": "manual_rereduce",
                 "events": ["x"],
             }
         )
@@ -140,6 +229,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(payload["state"]["resume_stats_offset"]["rows_processed"], 77)
         self.assertEqual(payload["state"]["eta_seconds_left"], 99)
         self.assertEqual(payload["state"]["log_seconds_per_second"], 12.5)
+        self.assertEqual(payload["state"]["final_summary_origin"], "manual_rereduce")
 
     def test_discover_resume_sessions_reads_run_params(self) -> None:
         with TemporaryDirectory() as tmp_dir:

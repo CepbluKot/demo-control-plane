@@ -22,5 +22,5 @@ def make_alert(text: str) -> Dict[str, Any]:
             "Alert sender is not configured yet. "
             "Set CONTROL_PLANE_ALERT_CALLABLE or implement control_plane.alerts.make_alert."
         ),
-        "summary_preview": text[:160],
+        "summary_preview": text,
     }
