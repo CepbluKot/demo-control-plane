@@ -59,6 +59,28 @@ def _normalize_summary_text(value: Any) -> str:
     return text
 
 
+def _summary_origin_label(value: Any) -> str:
+    raw = str(value or "").strip()
+    mapping = {
+        "reduce_done_event": "Прямой REDUCE (событие прогресса)",
+        "cross_reduce_llm": "Кросс-источниковый REDUCE (LLM)",
+        "cross_reduce_fallback_join": "Fallback: склейка source-summary после сбоя cross-reduce",
+        "per_source_reduce_direct": "Итог по единственному source-summary",
+        "recovered_from_map_reduce": "Восстановлено: REDUCE из сохранённых MAP summary",
+        "recovered_from_map_join": "Восстановлено: склейка сохранённых MAP summary",
+        "single_reduce_direct": "Прямой REDUCE (single-source)",
+        "single_recovered_from_map_reduce": "Восстановлено (single-source): REDUCE из MAP summary",
+        "single_recovered_from_map_join": "Восстановлено (single-source): склейка MAP summary",
+        "no_logs_hypothesis": "Режим без логов: гипотезы LLM",
+        "resume_rereduce": "Resume: пересборка REDUCE из сохранённых MAP summary",
+        "manual_rereduce": "Ручная пересборка REDUCE из сохранённых MAP summary",
+        "final_recovery_reduce": "Финальное восстановление: REDUCE из MAP summary",
+        "final_recovery_join": "Финальное восстановление: склейка MAP summary",
+        "no_logs": "Логи не найдены",
+    }
+    return mapping.get(raw, raw)
+
+
 def _md_fence_for_text(text: str) -> str:
     content = str(text or "")
     runs = re.findall(r"`+", content)
@@ -1286,6 +1308,30 @@ def _load_map_summaries_from_jsonl(path: str) -> List[str]:
     return summaries
 
 
+def _load_map_summaries_from_jsonl_for_source(path: str, source_name: str) -> List[str]:
+    p = Path(str(path or ""))
+    if not p.exists() or not p.is_file():
+        return []
+    target = str(source_name or "").strip()
+    summaries: List[str] = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            raw = str(line).strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            row_source = str(payload.get("source_name") or "").strip()
+            if target and row_source != target:
+                continue
+            summary_text = _normalize_summary_text(payload.get("batch_summary"))
+            if summary_text:
+                summaries.append(summary_text)
+    return summaries
+
+
 def _load_recent_batches_from_jsonl(
     path: str,
     *,
@@ -1446,6 +1492,7 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "resume_batch_offset",
         "resume_stats_offset",
         "final_summary",
+        "final_summary_origin",
         "freeform_final_summary",
         "llm_calls_started",
         "llm_calls_succeeded",
@@ -1543,6 +1590,7 @@ def _save_logs_summary_result(
                     "",
                     f"- saved_at: `{payload['saved_at']}`",
                     f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    f"- summary_origin: `{result_state.get('final_summary_origin')}`",
                     "",
                     f"{structured_fence}text",
                     structured_summary,
@@ -1559,6 +1607,7 @@ def _save_logs_summary_result(
                     "",
                     f"- saved_at: `{payload['saved_at']}`",
                     f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    f"- summary_origin: `{result_state.get('final_summary_origin')}`",
                     "",
                     f"{freeform_fence}text",
                     freeform_summary,
@@ -1576,6 +1625,7 @@ def _save_logs_summary_result(
         "",
         f"- saved_at: `{payload['saved_at']}`",
         f"- status: `{result_state.get('status')}`",
+        f"- summary_origin: `{result_state.get('final_summary_origin')}`",
         f"- mode: `{result_state.get('mode')}`",
         f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
         "",
@@ -1786,6 +1836,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         col2.metric("Обработано логов", f"{rows_processed}")
         col3.metric("LLM вызовы", f"{llm_calls}")
         col4.metric("Reduce раунды", f"{reduce_rounds}")
+        origin_label = _summary_origin_label(state.get("final_summary_origin"))
+        if origin_label:
+            st.caption(f"Источник итогового summary: `{origin_label}`")
         if processing_human:
             st.caption(f"Время обработки логов: {processing_human}")
         elif not pd.isna(processing_seconds):
@@ -1892,6 +1945,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         rebuilt_summary = _normalize_summary_text(rebuilt_summary)
                         if rebuilt_summary:
                             state["final_summary"] = rebuilt_summary
+                            state["final_summary_origin"] = "manual_rereduce"
                             state.setdefault("events", []).append(
                                 "Итоговый Reduce summary пересобран из сохранённых MAP summary"
                             )
@@ -2342,6 +2396,9 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         if state.get("final_summary"):
             with st.chat_message("assistant"):
                 st.markdown("Итоговый Reduce summary")
+                origin_label = _summary_origin_label(state.get("final_summary_origin"))
+                if origin_label:
+                    st.caption(f"Источник: {origin_label}")
                 deps.render_pretty_summary_text(state["final_summary"], height=final_height)
                 with st.expander("Полный текст (raw)", expanded=False):
                     deps.render_scrollable_text(state["final_summary"], height=max(final_height, 520))
@@ -3304,6 +3361,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "query_errors": list(preview_query_errors) + list(preview_metrics_errors),
         "map_batches": [],
         "final_summary": None,
+        "final_summary_origin": None,
         "freeform_final_summary": None,
         "metrics_rows": 0,
         "metrics_services": [],
@@ -3372,6 +3430,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "llm_last_error",
                 "llm_timeline",
                 "final_summary",
+                "final_summary_origin",
                 "freeform_final_summary",
             ):
                 if checkpoint_state.get(key) is not None:
@@ -3986,6 +4045,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 final_from_payload = _normalize_summary_text(payload.get("summary"))
                 if final_from_payload:
                     state["final_summary"] = final_from_payload
+                    state["final_summary_origin"] = "reduce_done_event"
                     src_label = str(state.get("active_source_label") or "query_1")
                     src_file_label = _safe_filename(src_label)
                     _append_jsonl(
@@ -4302,6 +4362,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "(это НЕ подтвержденные факты):\n\n"
                         f"{hypothesis_text}"
                     )
+                    state["final_summary_origin"] = "no_logs_hypothesis"
                     if isinstance(events, list):
                         events.append("LLM-гипотезы при отсутствии логов готовы")
                 else:
@@ -4434,7 +4495,48 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         columns=columns,
                     )
 
-                src_summary = (src_result.summary or "").strip()
+                src_summary = _normalize_summary_text(getattr(src_result, "summary", ""))
+                if not src_summary or src_summary == "Нет логов за указанный период.":
+                    source_map_summaries = _load_map_summaries_from_jsonl_for_source(
+                        str(map_summaries_jsonl_path),
+                        src_label,
+                    )
+                    if source_map_summaries:
+                        state.setdefault("events", []).append(
+                            f"{src_label}: source summary пустой/\"Нет логов\", пересобираем из MAP summary"
+                        )
+                        try:
+                            from my_summarizer import (  # noqa: PLC0415
+                                regenerate_reduce_summary_from_map_summaries,
+                            )
+
+                            rebuilt_src = _normalize_summary_text(
+                                regenerate_reduce_summary_from_map_summaries(
+                                    map_summaries=source_map_summaries,
+                                    period_start=str(period_start_iso or ""),
+                                    period_end=str(period_end_iso or ""),
+                                    llm_call=llm_call,
+                                    prompt_context={
+                                        "incident_start": period_start_iso,
+                                        "incident_end": period_end_iso,
+                                        "incident_description": goal_text,
+                                        "alerts_list": goal_text,
+                                        "metrics_context": metrics_context_text,
+                                        "source_name": src_label,
+                                        "sql_query": str(spec.get("template", "")),
+                                        "time_column": logs_timestamp_column,
+                                        "data_type": "",
+                                    },
+                                )
+                            )
+                            src_summary = rebuilt_src or "\n\n---\n\n".join(source_map_summaries)
+                        except Exception as rebuild_exc:  # noqa: BLE001
+                            deps.logger.warning(
+                                "%s: failed to rebuild source summary from MAP summaries: %s",
+                                src_label,
+                                rebuild_exc,
+                            )
+                            src_summary = "\n\n---\n\n".join(source_map_summaries)
                 if src_summary and src_summary != "Нет логов за указанный период.":
                     per_source_summaries[src_label] = src_summary
                 agg_pages += src_result.pages_fetched
@@ -4443,6 +4545,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 agg_reduce += src_result.reduce_rounds
 
             # Cross-source REDUCE: merge per-source summaries into a single report
+            final_summary_origin = "no_logs"
             if len(per_source_summaries) > 1:
                 state.setdefault("events", []).append("Кросс-источниковый анализ (финальный REDUCE)...")
                 state["llm_phase_hint"] = "cross_reduce"
@@ -4470,16 +4573,64 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     final_summary_text = _normalize_summary_text(cross_summary) or "\n\n---\n\n".join(
                         f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
                     )
+                    final_summary_origin = (
+                        "cross_reduce_llm"
+                        if _normalize_summary_text(cross_summary)
+                        else "cross_reduce_fallback_join"
+                    )
                 except Exception as cross_exc:  # noqa: BLE001
                     deps.logger.warning("Cross-source reduce failed: %s", cross_exc)
                     final_summary_text = "\n\n---\n\n".join(
                         f"=== {src} ===\n{s}" for src, s in per_source_summaries.items()
                     )
+                    final_summary_origin = "cross_reduce_fallback_join"
                 state.setdefault("events", []).append("Кросс-источниковый анализ завершён")
             elif per_source_summaries:
                 final_summary_text = next(iter(per_source_summaries.values()))
+                final_summary_origin = "per_source_reduce_direct"
             else:
-                final_summary_text = "Нет логов за указанный период."
+                cached_map_summaries = _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
+                if cached_map_summaries:
+                    state.setdefault("events", []).append(
+                        "Обнаружены MAP summary, но финальный итог пустой — пересобираем REDUCE из сохранённых MAP summary"
+                    )
+                    try:
+                        from my_summarizer import (  # noqa: PLC0415
+                            regenerate_reduce_summary_from_map_summaries,
+                        )
+
+                        rebuilt_multi = regenerate_reduce_summary_from_map_summaries(
+                            map_summaries=cached_map_summaries,
+                            period_start=str(period_start_iso or ""),
+                            period_end=str(period_end_iso or ""),
+                            llm_call=llm_call,
+                            prompt_context={
+                                "incident_start": period_start_iso,
+                                "incident_end": period_end_iso,
+                                "incident_description": goal_text,
+                                "alerts_list": goal_text,
+                                "metrics_context": metrics_context_text,
+                                "source_name": "cached_map_summaries",
+                                "sql_query": sql_query_clean,
+                                "time_column": logs_timestamp_column,
+                                "data_type": "",
+                            },
+                        )
+                        final_summary_text = _normalize_summary_text(rebuilt_multi)
+                    except Exception as rebuild_exc:  # noqa: BLE001
+                        deps.logger.warning(
+                            "fallback reduce rebuild from cached MAP summaries failed: %s",
+                            rebuild_exc,
+                        )
+                        final_summary_text = ""
+                    if not final_summary_text:
+                        final_summary_text = "\n\n---\n\n".join(cached_map_summaries)
+                        final_summary_origin = "recovered_from_map_join"
+                    else:
+                        final_summary_origin = "recovered_from_map_reduce"
+                else:
+                    final_summary_text = "Нет логов за указанный период."
+                    final_summary_origin = "no_logs"
 
             normalized_multi_final = _normalize_summary_text(final_summary_text)
             if normalized_multi_final:
@@ -4507,6 +4658,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
             state["final_summary"] = _normalize_summary_text(final_summary_text) or "Нет логов за указанный период."
+            state["final_summary_origin"] = final_summary_origin
             stats_offset = state.get("resume_stats_offset") if isinstance(state.get("resume_stats_offset"), dict) else {}
             pages_offset = int(pd.to_numeric((stats_offset or {}).get("pages_fetched"), errors="coerce") or 0)
             rows_offset_stats = int(pd.to_numeric((stats_offset or {}).get("rows_processed"), errors="coerce") or 0)
@@ -4567,7 +4719,59 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
             normalized_final_summary = _normalize_summary_text(getattr(result, "summary", None))
+            single_final_origin = (
+                "single_reduce_direct"
+                if normalized_final_summary and normalized_final_summary != "Нет логов за указанный период."
+                else "no_logs"
+            )
+            if (
+                not normalized_final_summary
+                or normalized_final_summary == "Нет логов за указанный период."
+            ):
+                cached_map_summaries = _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
+                if cached_map_summaries:
+                    state.setdefault("events", []).append(
+                        "Обнаружены MAP summary, но итог пустой — пересобираем REDUCE из сохранённых MAP summary"
+                    )
+                    try:
+                        from my_summarizer import (  # noqa: PLC0415
+                            regenerate_reduce_summary_from_map_summaries,
+                        )
+
+                        rebuilt_single = regenerate_reduce_summary_from_map_summaries(
+                            map_summaries=cached_map_summaries,
+                            period_start=str(period_start_iso or ""),
+                            period_end=str(period_end_iso or ""),
+                            llm_call=llm_call,
+                            prompt_context={
+                                "incident_start": period_start_iso,
+                                "incident_end": period_end_iso,
+                                "incident_description": goal_text,
+                                "alerts_list": goal_text,
+                                "metrics_context": metrics_context_text,
+                                "source_name": "cached_map_summaries",
+                                "sql_query": sql_query_clean,
+                                "time_column": logs_timestamp_column,
+                                "data_type": "",
+                            },
+                        )
+                        rebuilt_single_norm = _normalize_summary_text(rebuilt_single)
+                        if rebuilt_single_norm:
+                            normalized_final_summary = rebuilt_single_norm
+                            single_final_origin = "single_recovered_from_map_reduce"
+                    except Exception as rebuild_exc:  # noqa: BLE001
+                        deps.logger.warning(
+                            "fallback single-source reduce rebuild from cached MAP summaries failed: %s",
+                            rebuild_exc,
+                        )
+                    if (
+                        not normalized_final_summary
+                        or normalized_final_summary == "Нет логов за указанный период."
+                    ):
+                        normalized_final_summary = "\n\n---\n\n".join(cached_map_summaries)
+                        single_final_origin = "single_recovered_from_map_join"
             state["final_summary"] = normalized_final_summary or "Нет логов за указанный период."
+            state["final_summary_origin"] = single_final_origin
             stats_offset = state.get("resume_stats_offset") if isinstance(state.get("resume_stats_offset"), dict) else {}
             pages_offset = int(pd.to_numeric((stats_offset or {}).get("pages_fetched"), errors="coerce") or 0)
             rows_offset_stats = int(pd.to_numeric((stats_offset or {}).get("rows_processed"), errors="coerce") or 0)
@@ -4625,6 +4829,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
                     if rebuilt_from_resume:
                         state["final_summary"] = rebuilt_from_resume
+                        state["final_summary_origin"] = "resume_rereduce"
                         state.setdefault("events", []).append(
                             "Восстановление: итоговый Reduce summary пересобран успешно"
                         )
@@ -4656,6 +4861,58 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
 
         final_summary_for_report = _normalize_summary_text(state.get("final_summary"))
+        if (
+            not final_summary_for_report
+            or final_summary_for_report == "Нет логов за указанный период."
+        ):
+            recovered_map_summaries = _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
+            if not recovered_map_summaries:
+                recovered_map_summaries = [
+                    _normalize_summary_text(item.get("batch_summary"))
+                    for item in (state.get("map_batches") or [])
+                    if isinstance(item, dict)
+                ]
+                recovered_map_summaries = [item for item in recovered_map_summaries if item]
+            if recovered_map_summaries:
+                state.setdefault("events", []).append(
+                    "Финальный summary был пустой/\"Нет логов\", но MAP summary есть — восстанавливаем итог"
+                )
+                try:
+                    from my_summarizer import (  # noqa: PLC0415
+                        regenerate_reduce_summary_from_map_summaries,
+                    )
+
+                    rebuilt_summary = _normalize_summary_text(
+                        regenerate_reduce_summary_from_map_summaries(
+                            map_summaries=recovered_map_summaries,
+                            period_start=period_start_iso,
+                            period_end=period_end_iso,
+                            llm_call=llm_call,
+                            prompt_context={
+                                "incident_start": period_start_iso,
+                                "incident_end": period_end_iso,
+                                "incident_description": goal_text,
+                                "alerts_list": goal_text,
+                                "metrics_context": metrics_context_text,
+                                "source_name": "final_recovery",
+                                "sql_query": sql_query_clean,
+                                "time_column": logs_timestamp_column,
+                                "data_type": "",
+                            },
+                        )
+                    )
+                    if rebuilt_summary:
+                        final_summary_for_report = rebuilt_summary
+                        state["final_summary_origin"] = "final_recovery_reduce"
+                    else:
+                        final_summary_for_report = "\n\n---\n\n".join(recovered_map_summaries)
+                        state["final_summary_origin"] = "final_recovery_join"
+                except Exception as recover_exc:  # noqa: BLE001
+                    deps.logger.warning("final summary recovery from MAP summaries failed: %s", recover_exc)
+                    final_summary_for_report = "\n\n---\n\n".join(recovered_map_summaries)
+                    state["final_summary_origin"] = "final_recovery_join"
+                state["final_summary"] = final_summary_for_report
+
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
                 events = state.setdefault("events", [])
