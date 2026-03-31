@@ -160,6 +160,17 @@ def _ensure_report_topics_present(
     return combined, missing
 
 
+def _incident_verbatim_requirement_block(goal_text: str) -> str:
+    raw_goal = str(goal_text or "").strip() or "Контекст инцидента в UI не задан."
+    return (
+        "ОБЯЗАТЕЛЬНО ПЕРЕД ГИПОТЕЗАМИ:\n"
+        "Сначала выведи отдельный подраздел `ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)` и вставь текст ниже БЕЗ перефразирования.\n"
+        "Сохрани название инцидента, формулировки, ноды, IP, статусы, время и орфографию как в исходном вводе.\n"
+        "Только после этого пиши гипотезы первопричин.\n"
+        f"Текст инцидента из UI:\n{raw_goal}"
+    )
+
+
 def _summary_origin_label(value: Any) -> str:
     raw = str(value or "").strip()
     mapping = {
@@ -1865,6 +1876,7 @@ def _build_freeform_summary_prompt(
     metrics_context: str,
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
+    incident_verbatim_block = _incident_verbatim_requirement_block(goal_block)
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
     anti_rules = str(
         getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
@@ -1894,6 +1906,7 @@ def _build_freeform_summary_prompt(
     )
     root_cause_hypotheses_block = (
         "\nОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ\n"
+        f"{incident_verbatim_block}\n"
         "Для КАЖДОГО выявленного инцидента/цепочки отдельно перечисли 2-5 гипотез первопричины:\n"
         "- Инцидент/цепочка: <название>\n"
         "- [ГИПОТЕЗА] первопричина: <кратко>\n"
@@ -1966,6 +1979,16 @@ def _build_sectional_freeform_prompt(
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
+    is_root_cause_section = (
+        "первоприч" in str(section_title).lower()
+        or "первоприч" in str(section_requirement).lower()
+    )
+    incident_verbatim_block = (
+        f"\nДОПОЛНИТЕЛЬНОЕ ТРЕБОВАНИЕ К ЭТОЙ СЕКЦИИ:\n"
+        f"{_incident_verbatim_requirement_block(goal_block)}\n"
+        if is_root_cause_section
+        else ""
+    )
     anti_rules = str(
         getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
     ).strip()
@@ -2003,6 +2026,7 @@ def _build_sectional_freeform_prompt(
         "Ты формируешь финальный отчёт по частям. За этот вызов напиши только одну секцию.\n\n"
         f"СЕКЦИЯ {section_index}/{section_total}: {section_title}\n"
         f"Требование секции: {section_requirement}\n\n"
+        f"{incident_verbatim_block}"
         "Опирайся на уже написанные секции (если есть), не противоречь им, дополняй контекст.\n"
         "Не повторяй целиком старые секции, но используй их выводы как основу.\n"
         "Пиши максимально подробно и предметно.\n"
@@ -2037,6 +2061,16 @@ def _build_sectional_structured_prompt(
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
+    is_root_cause_section = (
+        "первоприч" in str(section_title).lower()
+        or "первоприч" in str(section_requirement).lower()
+    )
+    incident_verbatim_block = (
+        f"\nДОПОЛНИТЕЛЬНОЕ ТРЕБОВАНИЕ К ЭТОЙ СЕКЦИИ:\n"
+        f"{_incident_verbatim_requirement_block(goal_block)}\n"
+        if is_root_cause_section
+        else ""
+    )
     anti_rules = str(
         getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
     ).strip()
@@ -2046,6 +2080,7 @@ def _build_sectional_structured_prompt(
         "Ты формируешь СТРУКТУРИРОВАННЫЙ финальный отчёт по частям. За этот вызов напиши только одну секцию.\n\n"
         f"СЕКЦИЯ {section_index}/{section_total}: {section_title}\n"
         f"Требование секции: {section_requirement}\n\n"
+        f"{incident_verbatim_block}"
         "Критично: опирайся на уже написанные секции, не противоречь им, наращивай контекст.\n"
         "Нужен технический стиль, конкретика, timestamps, факты/гипотезы.\n"
         "Если данных недостаточно — так и напиши.\n\n"

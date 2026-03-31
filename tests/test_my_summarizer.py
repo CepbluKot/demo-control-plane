@@ -656,6 +656,7 @@ class TestMySummarizer(unittest.TestCase):
             "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ",
             prompt,
         )
+        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
 
     def test_truncate_with_zero_limit_keeps_text(self) -> None:
         text = "a" * 5000
@@ -667,6 +668,10 @@ class TestMySummarizer(unittest.TestCase):
             db_fetch_page=lambda **_: [],
             llm_call=lambda prompt: prompt,
         )
+        summarizer.prompt_context = {
+            "incident_description": "INCIDENT TEXT FROM UI",
+            "alerts_list": "ALERT LIST FROM UI",
+        }
         prompt = summarizer._build_freeform_prompt(
             period_start="2026-03-18T00:00:00Z",
             period_end="2026-03-18T01:00:00Z",
@@ -677,6 +682,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("[MAP SUMMARY #1]", prompt)
         self.assertIn("map one", prompt)
         self.assertIn("map two", prompt)
+        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
 
     def test_build_freeform_prompt_custom_template_uses_map_summaries_vars(self) -> None:
         summarizer = PeriodLogSummarizer(

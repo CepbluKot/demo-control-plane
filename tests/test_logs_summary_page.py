@@ -173,6 +173,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("MAP summary по батчам логов", prompt)
         self.assertIn("[MAP SUMMARY #1]", prompt)
         self.assertIn("first batch", prompt)
+        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+        self.assertIn("incident context", prompt)
 
     def test_ui_freeform_prompt_custom_template_receives_map_summaries(self) -> None:
         with patch.object(
@@ -209,6 +211,25 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("СЕКЦИЯ 2/3: Причины", prompt)
         self.assertIn("## Вводная", prompt)
         self.assertIn("Structured reduce summary", prompt)
+        self.assertNotIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+
+    def test_sectional_freeform_root_cause_section_requires_verbatim_incident(self) -> None:
+        incident_text = "INCIDENT_A: node restart at 18:52"
+        prompt = _build_sectional_freeform_prompt(
+            section_index=4,
+            section_total=10,
+            section_title="Предположения О Первопричине По Каждому Инциденту",
+            section_requirement="Для каждого инцидента опиши первопричины",
+            previous_sections_text="## Previous\nDone",
+            final_summary="Structured reduce summary",
+            user_goal=incident_text,
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={"llm_calls": 3},
+            metrics_context="CPU=95%",
+        )
+        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+        self.assertIn(incident_text, prompt)
 
     def test_generate_sectional_freeform_summary_merges_sections_and_chains_context(self) -> None:
         prompts: list[str] = []
@@ -251,6 +272,25 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("СЕКЦИЯ 2/3: Причины", prompt)
         self.assertIn("## Вводная", prompt)
         self.assertIn("Base reduce summary", prompt)
+        self.assertNotIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+
+    def test_sectional_structured_root_cause_section_requires_verbatim_incident(self) -> None:
+        incident_text = "INCIDENT_B: fs > 90% at 19:10"
+        prompt = _build_sectional_structured_prompt(
+            section_index=4,
+            section_total=10,
+            section_title="Предположения О Первопричине По Каждому Инциденту",
+            section_requirement="Опиши первопричины по каждому инциденту",
+            previous_sections_text="## Previous\nDone",
+            base_summary="Base reduce summary",
+            user_goal=incident_text,
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={"llm_calls": 3},
+            metrics_context="CPU=95%",
+        )
+        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+        self.assertIn(incident_text, prompt)
 
     def test_generate_sectional_structured_summary_merges_sections_and_chains_context(self) -> None:
         prompts: list[str] = []
