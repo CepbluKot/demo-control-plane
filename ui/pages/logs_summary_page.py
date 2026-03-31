@@ -119,6 +119,47 @@ def _normalize_summary_text(value: Any) -> str:
     return text
 
 
+def _ensure_report_topics_present(
+    summary_text: str,
+    *,
+    topic_titles: List[str],
+    preferred_sections: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[str, List[str]]:
+    normalized = _normalize_summary_text(summary_text)
+    preferred_by_title: Dict[str, str] = {}
+    for item in preferred_sections or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        body = _normalize_summary_text(item.get("text"))
+        if title and body:
+            preferred_by_title[title.lower()] = body
+
+    if not topic_titles:
+        return normalized, []
+
+    lowered = normalized.lower()
+    missing: List[str] = []
+    additions: List[str] = []
+    for title in topic_titles:
+        topic = str(title or "").strip()
+        if not topic:
+            continue
+        if topic.lower() in lowered:
+            continue
+        missing.append(topic)
+        body = preferred_by_title.get(topic.lower()) or "Данных недостаточно для уверенного вывода по этому разделу."
+        additions.extend([f"## {topic}", "", body, ""])
+
+    if not missing:
+        return normalized, []
+
+    combined_parts = [normalized] if normalized else []
+    combined_parts.append("\n".join(additions).strip())
+    combined = "\n\n".join(part for part in combined_parts if part).strip()
+    return combined, missing
+
+
 def _summary_origin_label(value: Any) -> str:
     raw = str(value or "").strip()
     mapping = {
@@ -1617,6 +1658,7 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "resume_stats_offset",
         "final_summary",
         "final_summary_origin",
+        "structured_sections",
         "freeform_final_summary",
         "freeform_sections",
         "llm_calls_started",
@@ -1979,6 +2021,96 @@ def _build_sectional_freeform_prompt(
     )
 
 
+def _build_sectional_structured_prompt(
+    *,
+    section_index: int,
+    section_total: int,
+    section_title: str,
+    section_requirement: str,
+    previous_sections_text: str,
+    base_summary: str,
+    user_goal: str,
+    period_start: str,
+    period_end: str,
+    stats: Dict[str, Any],
+    metrics_context: str,
+) -> str:
+    goal_block = user_goal.strip() or "Не указан"
+    metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
+    anti_rules = str(
+        getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
+    ).strip()
+    anti_block = f"\nПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n" if anti_rules else ""
+    previous_block = previous_sections_text.strip() or "Пока секций нет."
+    return (
+        "Ты формируешь СТРУКТУРИРОВАННЫЙ финальный отчёт по частям. За этот вызов напиши только одну секцию.\n\n"
+        f"СЕКЦИЯ {section_index}/{section_total}: {section_title}\n"
+        f"Требование секции: {section_requirement}\n\n"
+        "Критично: опирайся на уже написанные секции, не противоречь им, наращивай контекст.\n"
+        "Нужен технический стиль, конкретика, timestamps, факты/гипотезы.\n"
+        "Если данных недостаточно — так и напиши.\n\n"
+        f"КОНТЕКСТ ИНЦИДЕНТА (UI):\n{goal_block}\n\n"
+        f"Период: [{period_start}, {period_end})\n"
+        f"Метрики: {metrics_block}\n"
+        f"Статистика: {json.dumps(_json_safe(stats), ensure_ascii=False)}\n\n"
+        "УЖЕ НАПИСАННЫЕ СЕКЦИИ СТРУКТУРИРОВАННОГО ОТЧЁТА:\n"
+        f"{previous_block}\n\n"
+        "БАЗОВЫЙ REDUCE SUMMARY (опорный контекст):\n"
+        f"{base_summary}\n"
+        f"{anti_block}\n"
+        "Верни только текст текущей секции, без префиксов вроде 'Секция N'."
+    )
+
+
+def _generate_sectional_structured_summary(
+    *,
+    llm_call: Callable[[str], str],
+    base_summary: str,
+    user_goal: str,
+    period_start: str,
+    period_end: str,
+    stats: Dict[str, Any],
+    metrics_context: str,
+    on_section_start: Optional[Callable[[int, int, str], None]] = None,
+    on_section_done: Optional[Callable[[int, int, str], None]] = None,
+) -> tuple[str, List[Dict[str, str]]]:
+    sections: List[Dict[str, str]] = []
+    total = len(FINAL_REPORT_SECTIONS)
+    for idx, (title, requirement) in enumerate(FINAL_REPORT_SECTIONS, start=1):
+        if on_section_start is not None:
+            on_section_start(idx, total, title)
+        previous_text = "\n\n".join(
+            f"## {item['title']}\n{item['text']}" for item in sections if item.get("text")
+        )
+        prompt = _build_sectional_structured_prompt(
+            section_index=idx,
+            section_total=total,
+            section_title=title,
+            section_requirement=requirement,
+            previous_sections_text=previous_text,
+            base_summary=base_summary,
+            user_goal=user_goal,
+            period_start=period_start,
+            period_end=period_end,
+            stats=stats,
+            metrics_context=metrics_context,
+        )
+        section_text = _normalize_summary_text(llm_call(prompt))
+        if not section_text:
+            section_text = "Данных недостаточно для уверенного вывода по этой секции."
+        sections.append({"title": title, "text": section_text})
+        if on_section_done is not None:
+            on_section_done(idx, total, title)
+
+    merged_lines: List[str] = []
+    for item in sections:
+        merged_lines.append(f"## {item['title']}")
+        merged_lines.append("")
+        merged_lines.append(item["text"])
+        merged_lines.append("")
+    return "\n".join(merged_lines).strip(), sections
+
+
 def _generate_sectional_freeform_summary(
     *,
     llm_call: Callable[[str], str],
@@ -2249,10 +2381,44 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         if rebuilt_summary:
                             state["final_summary"] = rebuilt_summary
                             state["final_summary_origin"] = "manual_rereduce"
+                            state["structured_sections"] = []
                             state["freeform_sections"] = []
                             state.setdefault("events", []).append(
                                 "Итоговый Reduce summary пересобран из сохранённых MAP summary"
                             )
+                            try:
+                                state.setdefault("events", []).append(
+                                    "Пересборка structured: пишем структурированный отчет по секциям"
+                                )
+                                rebuilt_structured, rebuilt_structured_sections = _generate_sectional_structured_summary(
+                                    llm_call=llm_call,
+                                    base_summary=rebuilt_summary,
+                                    user_goal=str(state.get("user_goal") or ""),
+                                    period_start=str(state.get("period_start") or ""),
+                                    period_end=str(state.get("period_end") or ""),
+                                    stats=state.get("stats") or {},
+                                    metrics_context=str(state.get("metrics_context_text") or ""),
+                                )
+                                rebuilt_structured = _normalize_summary_text(rebuilt_structured)
+                                if rebuilt_structured:
+                                    state["final_summary"] = rebuilt_structured
+                                    state["structured_sections"] = rebuilt_structured_sections
+                                    rebuilt_summary = rebuilt_structured
+                                    state.setdefault("events", []).append(
+                                        "Структурированный отчет пересобран из обновлённого итогового summary"
+                                    )
+                                else:
+                                    state.setdefault("events", []).append(
+                                        "Структурированный отчет при пересборке пустой, оставили предыдущую версию"
+                                    )
+                            except Exception as structured_exc:  # noqa: BLE001
+                                deps.logger.warning(
+                                    "manual re-reduce structured regeneration failed: %s",
+                                    structured_exc,
+                                )
+                                state.setdefault("events", []).append(
+                                    "Не удалось пересобрать структурированный отчет при manual re-reduce"
+                                )
                             try:
                                 state.setdefault("events", []).append(
                                     "Пересборка freeform: пишем финальный отчет по секциям"
@@ -2284,6 +2450,47 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 )
                                 state.setdefault("events", []).append(
                                     "Не удалось пересобрать свободный отчет при manual re-reduce"
+                                )
+                            topic_titles = [title for title, _ in FINAL_REPORT_SECTIONS]
+                            preferred_structured_sections = (
+                                state.get("structured_sections")
+                                if isinstance(state.get("structured_sections"), list)
+                                else (
+                                    state.get("freeform_sections")
+                                    if isinstance(state.get("freeform_sections"), list)
+                                    else None
+                                )
+                            )
+                            preferred_freeform_sections = (
+                                state.get("freeform_sections")
+                                if isinstance(state.get("freeform_sections"), list)
+                                else (
+                                    state.get("structured_sections")
+                                    if isinstance(state.get("structured_sections"), list)
+                                    else None
+                                )
+                            )
+                            synced_structured, missing_structured = _ensure_report_topics_present(
+                                str(state.get("final_summary") or ""),
+                                topic_titles=topic_titles,
+                                preferred_sections=preferred_structured_sections,
+                            )
+                            if synced_structured:
+                                state["final_summary"] = synced_structured
+                            synced_freeform, missing_freeform = _ensure_report_topics_present(
+                                str(state.get("freeform_final_summary") or ""),
+                                topic_titles=topic_titles,
+                                preferred_sections=preferred_freeform_sections,
+                            )
+                            if synced_freeform:
+                                state["freeform_final_summary"] = synced_freeform
+                            if missing_structured:
+                                state.setdefault("events", []).append(
+                                    "Manual re-reduce: добавили недостающие топики в структурированный отчет"
+                                )
+                            if missing_freeform:
+                                state.setdefault("events", []).append(
+                                    "Manual re-reduce: добавили недостающие топики в свободный отчет"
                                 )
                             rebuild_path = (
                                 Path(map_summaries_path).parent
@@ -3754,6 +3961,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "map_batches": [],
         "final_summary": None,
         "final_summary_origin": None,
+        "structured_sections": [],
         "freeform_final_summary": None,
         "freeform_sections": [],
         "metrics_rows": 0,
@@ -3824,6 +4032,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "llm_timeline",
                 "final_summary",
                 "final_summary_origin",
+                "structured_sections",
                 "freeform_final_summary",
                 "freeform_sections",
             ):
@@ -5330,6 +5539,63 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
                 events = state.setdefault("events", [])
+                state["structured_sections"] = []
+                events.append("Готовим структурированный финальный отчет по секциям")
+                state["llm_phase_hint"] = "final_structured"
+                state["active_source_label"] = "final_structured"
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+
+                def _on_structured_section_start(
+                    section_idx: int,
+                    section_total: int,
+                    title: str,
+                ) -> None:
+                    state["active_step"] = (
+                        f"Структурированный отчёт: секция {section_idx}/{section_total} — {title}"
+                    )
+                    _push_live_event(
+                        f"LLM пишет structured секцию {section_idx}/{section_total}: {title}",
+                        render_now=True,
+                    )
+
+                def _on_structured_section_done(
+                    section_idx: int,
+                    section_total: int,
+                    title: str,
+                ) -> None:
+                    _push_live_event(
+                        f"Structured секция готова {section_idx}/{section_total}: {title}",
+                        render_now=True,
+                    )
+
+                structured_summary, structured_sections = _generate_sectional_structured_summary(
+                    llm_call=llm_call,
+                    base_summary=final_summary_for_report,
+                    user_goal=goal_text,
+                    period_start=period_start_iso,
+                    period_end=period_end_iso,
+                    stats=state.get("stats") or {},
+                    metrics_context=metrics_context_text,
+                    on_section_start=_on_structured_section_start,
+                    on_section_done=_on_structured_section_done,
+                )
+                structured_summary = _normalize_summary_text(structured_summary)
+                if structured_summary:
+                    final_summary_for_report = structured_summary
+                    state["final_summary"] = structured_summary
+                    state["structured_sections"] = structured_sections
+                    events.append("Структурированный финальный отчет готов")
+                else:
+                    events.append("Структурированный секционный отчет пустой, оставляем reduce summary")
+            except Exception as structured_exc:  # noqa: BLE001
+                deps.logger.warning("structured sectional report generation failed: %s", structured_exc)
+                state.setdefault("events", []).append(
+                    "Не удалось сгенерировать структурированный секционный отчет, оставляем reduce summary"
+                )
+
+            try:
+                events = state.setdefault("events", [])
+                state["final_summary"] = final_summary_for_report
                 state["freeform_sections"] = []
                 events.append("Готовим расширенный финальный отчет в свободном формате")
                 state["llm_phase_hint"] = "final_freeform"
@@ -5402,6 +5668,48 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "Не удалось сгенерировать свободный финальный отчет"
                     )
 
+        topic_titles = [title for title, _ in FINAL_REPORT_SECTIONS]
+        preferred_structured_sections = (
+            state.get("structured_sections")
+            if isinstance(state.get("structured_sections"), list)
+            else (
+                state.get("freeform_sections")
+                if isinstance(state.get("freeform_sections"), list)
+                else None
+            )
+        )
+        preferred_freeform_sections = (
+            state.get("freeform_sections")
+            if isinstance(state.get("freeform_sections"), list)
+            else (
+                state.get("structured_sections")
+                if isinstance(state.get("structured_sections"), list)
+                else None
+            )
+        )
+        synced_structured, missing_in_structured = _ensure_report_topics_present(
+            str(state.get("final_summary") or ""),
+            topic_titles=topic_titles,
+            preferred_sections=preferred_structured_sections,
+        )
+        if synced_structured:
+            state["final_summary"] = synced_structured
+        synced_freeform, missing_in_freeform = _ensure_report_topics_present(
+            str(state.get("freeform_final_summary") or ""),
+            topic_titles=topic_titles,
+            preferred_sections=preferred_freeform_sections,
+        )
+        if synced_freeform:
+            state["freeform_final_summary"] = synced_freeform
+        if missing_in_structured:
+            state.setdefault("events", []).append(
+                "Синхронизация топиков: добавили недостающие разделы в структурированный отчет"
+            )
+        if missing_in_freeform:
+            state.setdefault("events", []).append(
+                "Синхронизация топиков: добавили недостающие разделы в свободный отчет"
+            )
+
         final_structured_now = _normalize_summary_text(state.get("final_summary"))
         if final_structured_now:
             _write_text_file(
@@ -5415,6 +5723,26 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         final_structured_now,
                     ]
                 ),
+            )
+        final_structured_sections = state.get("structured_sections")
+        if isinstance(final_structured_sections, list) and final_structured_sections:
+            _write_json_file(
+                final_summaries_dir / "final_structured_sections.json",
+                {
+                    "saved_at": datetime.now(MSK).isoformat(),
+                    "sections": _json_safe(final_structured_sections),
+                },
+            )
+            section_lines: List[str] = ["# Final Structured Sections", ""]
+            for item in final_structured_sections:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or "").strip() or "Untitled Section"
+                text = _normalize_summary_text(item.get("text"))
+                section_lines.extend([f"## {title}", "", text or "N/A", ""])
+            _write_text_file(
+                final_summaries_dir / "final_structured_sections.md",
+                "\n".join(section_lines).strip(),
             )
         final_freeform_now = _normalize_summary_text(state.get("freeform_final_summary"))
         if final_freeform_now:

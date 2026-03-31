@@ -7,16 +7,19 @@ from settings import settings
 from ui.pages.logs_summary_page import (
     FINAL_REPORT_SECTIONS,
     _extract_root_cause_hypotheses_block,
+    _ensure_report_topics_present,
     _format_table_timestamps,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
     _build_freeform_summary_prompt,
     _build_sectional_freeform_prompt,
+    _build_sectional_structured_prompt,
     _discover_resume_sessions,
     _enrich_stats_with_elapsed,
     _extract_last_batch_ts_from_run_dir,
     _form_values_from_saved_params,
     _generate_sectional_freeform_summary,
+    _generate_sectional_structured_summary,
     _load_map_summaries_from_jsonl,
     _load_map_summaries_from_jsonl_for_source,
     _normalize_summary_text,
@@ -51,6 +54,31 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         out = _extract_root_cause_hypotheses_block(text)
         self.assertIn("cache stampede", out)
         self.assertIn("db locks", out)
+
+    def test_ensure_report_topics_present_adds_missing_from_preferred_sections(self) -> None:
+        summary = "## Полная Хронология Событий\n\nok"
+        preferred_sections = [
+            {"title": "Рекомендации Для SRE", "text": "P0: restart component"},
+        ]
+        synced, missing = _ensure_report_topics_present(
+            summary,
+            topic_titles=["Полная Хронология Событий", "Рекомендации Для SRE"],
+            preferred_sections=preferred_sections,
+        )
+        self.assertIn("## Полная Хронология Событий", synced)
+        self.assertIn("## Рекомендации Для SRE", synced)
+        self.assertIn("P0: restart component", synced)
+        self.assertEqual(missing, ["Рекомендации Для SRE"])
+
+    def test_ensure_report_topics_present_uses_placeholder_without_preferred_text(self) -> None:
+        synced, missing = _ensure_report_topics_present(
+            "",
+            topic_titles=["Разрывы Цепочек И Недостающие Данные"],
+            preferred_sections=[],
+        )
+        self.assertIn("## Разрывы Цепочек И Недостающие Данные", synced)
+        self.assertIn("Данных недостаточно", synced)
+        self.assertEqual(missing, ["Разрывы Цепочек И Недостающие Данные"])
 
     def test_format_table_timestamps_formats_start_end_time_with_microseconds(self) -> None:
         df = pd.DataFrame(
@@ -205,6 +233,48 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("Пока секций нет.", prompts[0])
         self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[1])
         self.assertIn("section_body_1", prompts[1])
+
+    def test_sectional_structured_prompt_uses_previous_sections_context(self) -> None:
+        prompt = _build_sectional_structured_prompt(
+            section_index=2,
+            section_total=3,
+            section_title="Причины",
+            section_requirement="Опиши причины",
+            previous_sections_text="## Вводная\nТекст первой секции",
+            base_summary="Base reduce summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={"llm_calls": 3},
+            metrics_context="CPU=95%",
+        )
+        self.assertIn("СЕКЦИЯ 2/3: Причины", prompt)
+        self.assertIn("## Вводная", prompt)
+        self.assertIn("Base reduce summary", prompt)
+
+    def test_generate_sectional_structured_summary_merges_sections_and_chains_context(self) -> None:
+        prompts: list[str] = []
+
+        def fake_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return f"struct_body_{len(prompts)}"
+
+        merged, sections = _generate_sectional_structured_summary(
+            llm_call=fake_llm,
+            base_summary="Structured reduce summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS))
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", merged)
+        self.assertIn("struct_body_1", merged)
+        self.assertIn("Пока секций нет.", prompts[0])
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[1])
+        self.assertIn("struct_body_1", prompts[1])
 
     def test_no_logs_hypothesis_prompt_includes_period_and_goal(self) -> None:
         prompt = _build_no_logs_hypothesis_prompt(
