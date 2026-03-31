@@ -112,7 +112,8 @@ DEFAULT_ANTI_HALLUCINATION_RULES = (
     "7) В агрегированных логах argMin-поля — пример, cnt — масштаб.\n"
     "8) Не экстраполируй вне временного диапазона данных.\n"
     "9) При противоречиях показывай оба варианта.\n"
-    "10) Отделяй [РЕЛЕВАНТНО] от [ФОН]/[НЕЯСНО]."
+    "10) Отделяй [РЕЛЕВАНТНО] от [ФОН]/[НЕЯСНО].\n"
+    "11) В хронологии КАЖДОЕ событие обязано содержать полную дату и время (до микросекунд) и timezone."
 )
 
 
@@ -130,12 +131,14 @@ def _chain_section_requirement(stage: str) -> str:
         [
             title,
             "Оформи красиво и явно как схему в Markdown.",
+            "Для КАЖДОГО узла обязательно укажи точный timestamp события: `YYYY-MM-DD HH:MM:SS.ffffff TZ`.",
+            "Запрещены абстрактные метки без времени (например, просто t1/t2/t3).",
             "Формат (сохрани стрелки и отступы):",
-            "[t1] ТРИГГЕР (компонент) [ФАКТ/ГИПОТЕЗА]",
+            "[2026-03-31 12:34:56.123456 MSK] ТРИГГЕР (компонент) [ФАКТ/ГИПОТЕЗА]",
             "    └─> (механизм влияния)",
-            "[t2] СЛЕДСТВИЕ (компонент) [ФАКТ/ГИПОТЕЗА]",
+            "[2026-03-31 12:35:07.654321 MSK] СЛЕДСТВИЕ (компонент) [ФАКТ/ГИПОТЕЗА]",
             "    └─> (механизм влияния)",
-            "[t3] АЛЕРТ/ПОСЛЕДСТВИЕ [ФАКТ]",
+            "[2026-03-31 12:35:10.000001 MSK] АЛЕРТ/ПОСЛЕДСТВИЕ [ФАКТ]",
             "Если цепочек несколько — перечисли ЦЕПОЧКА #1, ЦЕПОЧКА #2 и т.д.",
             "Если есть разрыв — вставь узел: [РАЗРЫВ ЦЕПОЧКИ: каких данных не хватает].",
         ]
@@ -145,9 +148,22 @@ def _chain_section_requirement(stage: str) -> str:
 def _append_chain_requirement(prompt_text: str, stage: str) -> str:
     base = str(prompt_text or "").strip()
     chain_block = _chain_section_requirement(stage)
+    incident_link_block = "\n".join(
+        [
+            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI",
+            "Нужно явно связать выводы с контекстом, который пользователь ввёл в UI",
+            "(incident_description / alerts_list / user goal).",
+            "Для каждого пункта инцидента/алерта укажи:",
+            "- статус: [ОБЪЯСНЁН] / [ЧАСТИЧНО ОБЪЯСНЁН] / [НЕ ОБЪЯСНЁН]",
+            "- доказательства: конкретные timestamp/сообщения/метрики",
+            "- причинно-следственная связь (если есть)",
+            "- если связи нет: что нужно проверить дополнительно.",
+            "Если контекст инцидента пустой — напиши это явно отдельной строкой.",
+        ]
+    )
     if not base:
-        return chain_block
-    return f"{base}\n\n{chain_block}"
+        return f"{chain_block}\n\n{incident_link_block}"
+    return f"{base}\n\n{chain_block}\n\n{incident_link_block}"
 
 
 def _read_prompt_setting(name: str) -> str:
@@ -1640,8 +1656,12 @@ class PeriodLogSummarizer:
 
     @staticmethod
     def _truncate(value: str, max_chars: int) -> str:
+        if max_chars <= 0:
+            return value
         if len(value) <= max_chars:
             return value
+        if max_chars <= 3:
+            return value[:max_chars]
         return value[: max_chars - 3] + "..."
 
 
@@ -1814,7 +1834,15 @@ def summarize_logs(
     summarizer = PeriodLogSummarizer(
         db_fetch_page=db_fetch_page,
         llm_call=llm_call,
-        config=SummarizerConfig(page_limit=page_limit),
+        config=SummarizerConfig(
+            page_limit=page_limit,
+            max_cell_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
+            ),
+            max_summary_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)
+            ),
+        ),
         on_progress=on_progress,
         prompt_context={
             "incident_start": start_iso,

@@ -247,7 +247,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 encoding="utf-8",
             )
             ts = _extract_last_batch_ts_from_run_dir(run_dir)
-            self.assertTrue(ts.startswith("2026-03-30T10:05:00"))
+            self.assertTrue(ts.startswith("2026-03-30T13:05:00+03:00"))
 
     def test_extract_last_batch_ts_from_run_dir_returns_empty_when_missing(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -271,7 +271,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 encoding="utf-8",
             )
             ts = _extract_last_batch_ts_from_run_dir(run_dir)
-            self.assertTrue(ts.startswith("2026-03-30T10:00:01"))
+            self.assertTrue(ts.startswith("2026-03-30T13:00:01+03:00"))
 
     def test_form_values_from_saved_params_maps_values(self) -> None:
         mapped = _form_values_from_saved_params(

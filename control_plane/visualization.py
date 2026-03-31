@@ -259,7 +259,7 @@ def create_anomaly_detail_plot(
     plt.ylabel("Значение")
     plt.title(
         "Детальный график аномалии "
-        f"{anomaly_idx + 1} ({anomaly_time.strftime('%Y-%m-%d %H:%M:%S')})"
+        f"{anomaly_idx + 1} ({anomaly_time.strftime('%Y-%m-%d %H:%M:%S.%f')})"
     )
     plt.legend()
     plt.grid(True, alpha=0.3)

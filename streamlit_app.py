@@ -64,17 +64,26 @@ from control_plane.predictions_db import fetch_predictions_from_db
 from control_plane.processing import process_anomalies
 from control_plane.test_mode import generate_mock_data
 from control_plane.trace import log_dataframe, log_event
-from control_plane.utils import to_iso_z
 from control_plane.visualization import visualize, visualize_combined
 from settings import settings
 
 logger = logging.getLogger(__name__)
+MSK = timezone(timedelta(hours=3))
 
 LOGS_BATCH_TABLE_HEIGHT = 240
 ANOMALIES_TABLE_HEIGHT = 220
 SUMMARY_TEXT_HEIGHT = 180
 FINAL_TEXT_HEIGHT = 230
 LOGS_SQL_TEXTAREA_HEIGHT = 220
+
+
+def _to_msk_ts(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return ts
+    if ts.tzinfo is None:
+        return ts.tz_localize(MSK)
+    return ts.tz_convert(MSK)
 
 
 def _ensure_runtime() -> None:
@@ -148,7 +157,7 @@ def _prepare_anomalies(
             continue
         anomalies.append(
             {
-                "timestamp": to_iso_z(pd.to_datetime(row["timestamp"], utc=True)),
+                "timestamp": _to_msk_ts(row["timestamp"]).isoformat(),
                 "service": service,
                 "value": float(row["value"]),
                 "predicted": float(row.get("predicted")) if row.get("predicted") is not None else None,
@@ -313,7 +322,7 @@ def run_single_iteration(
         process_alerts=process_alerts,
     )
     _emit("init", 2, {"message": "Инициализация запуска"})
-    end_time = datetime.now(timezone.utc)
+    end_time = datetime.now(MSK)
     start_time = end_time - timedelta(minutes=data_lookback_minutes)
     if not test_mode and METRICS_SOURCE == "prometheus":
         # Requirement: for Prometheus mode always pull full month of points.
@@ -445,7 +454,7 @@ def run_single_iteration(
         )
         sorted_anomalies = sorted(
             anomalies,
-            key=lambda x: datetime.fromisoformat(x["timestamp"].replace("Z", "+00:00")),
+            key=lambda x: _to_msk_ts(x.get("timestamp")),
             reverse=True,
         )
         recent_anomalies = sorted_anomalies[:analyze_top_n]
@@ -596,10 +605,10 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         if col_name not in timestamp_like and "timestamp" not in col_name:
             continue
         def _fmt(value: Any) -> str:
-            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            ts = _to_msk_ts(value)
             if pd.isna(ts):
                 return str(value)
-            return ts.strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+            return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
 
         out[col] = out[col].apply(_fmt).astype(str)
     return out
@@ -612,7 +621,7 @@ def _only_future_predictions(
     if predictions_df is None or predictions_df.empty or actual_end_ts is None:
         return pd.DataFrame(columns=["timestamp", "predicted"])
     out = predictions_df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out["timestamp"] = out["timestamp"].apply(_to_msk_ts)
     out = out.dropna(subset=["timestamp"])
     return out[out["timestamp"] > actual_end_ts].copy()
 
@@ -641,14 +650,14 @@ def _infer_batch_period(batch: Dict[str, Any]) -> tuple[Optional[str], Optional[
                 break
         if raw_ts is None:
             continue
-        ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+        ts = _to_msk_ts(raw_ts)
         if pd.isna(ts):
             continue
         timestamps.append(ts)
 
     if not timestamps:
         return None, None
-    return to_iso_z(min(timestamps)), to_iso_z(max(timestamps))
+    return min(timestamps).isoformat(), max(timestamps).isoformat()
 
 
 def _build_anomaly_window_figure(
@@ -660,7 +669,7 @@ def _build_anomaly_window_figure(
 ) -> Optional[plt.Figure]:
     if merged_df is None or merged_df.empty:
         return None
-    ts = pd.to_datetime(anomaly.get("timestamp"), utc=True, errors="coerce")
+    ts = _to_msk_ts(anomaly.get("timestamp"))
     if pd.isna(ts):
         return None
     start = ts - pd.Timedelta(minutes=window_minutes)
@@ -690,7 +699,7 @@ def _build_anomaly_window_figure(
     if anomaly_value is not None:
         ax.scatter([ts], [float(anomaly_value)], color="#16a34a", marker="x", s=120, label="anomaly")
     ax.axvline(ts, color="#6b7280", linestyle=":", linewidth=1.2)
-    ax.set_title(f"Аномалия @ {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+    ax.set_title(f"Аномалия @ {ts.strftime('%Y-%m-%d %H:%M:%S.%f')}")
     ax.set_xlabel("timestamp")
     ax.set_ylabel("value")
     ax.grid(alpha=0.25)
@@ -715,14 +724,14 @@ def _build_predictions_focus_figure(
         return None
 
     actual = actual_df.copy()
-    actual["timestamp"] = pd.to_datetime(actual["timestamp"], utc=True, errors="coerce")
+    actual["timestamp"] = actual["timestamp"].apply(_to_msk_ts)
     actual["value"] = pd.to_numeric(actual["value"], errors="coerce")
     actual = actual.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
     if actual.empty:
         return None
 
     preds = predictions_df.copy()
-    preds["timestamp"] = pd.to_datetime(preds["timestamp"], utc=True, errors="coerce")
+    preds["timestamp"] = preds["timestamp"].apply(_to_msk_ts)
     preds[pred_col] = pd.to_numeric(preds[pred_col], errors="coerce")
     preds = preds.dropna(subset=["timestamp", pred_col]).sort_values("timestamp")
     if preds.empty:

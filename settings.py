@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     CONTROL_PLANE_UI_LOGS_SUMMARY_BATCH_SIZE: int = 200
     CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE: int = 1000
     CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE: int = 200
+    # 0 or negative disables per-cell truncation in prompts.
+    CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS: int = 0
+    # 0 or negative disables post-LLM truncation of map/reduce summaries.
+    CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS: int = 0
     CONTROL_PLANE_UI_LOGS_SUMMARY_MAP_WORKERS: int = 1
     CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES: int = -1
     CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT: int = 600

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta, timezone
 from pathlib import Path
 import logging
 from typing import Any, Callable, Dict, Optional
@@ -8,6 +9,17 @@ from typing import Any, Callable, Dict, Optional
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+
+MSK = timezone(timedelta(hours=3))
+
+
+def _to_msk_ts(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return ts
+    if ts.tzinfo is None:
+        return ts.tz_localize(MSK)
+    return ts.tz_convert(MSK)
 
 
 def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
@@ -29,10 +41,10 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         if col_name not in timestamp_like and "timestamp" not in col_name:
             continue
         def _fmt(value: Any) -> str:
-            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            ts = _to_msk_ts(value)
             if pd.isna(ts):
                 return str(value)
-            return ts.strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+            return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
 
         out[col] = out[col].apply(_fmt).astype(str)
     return out
@@ -307,9 +319,7 @@ def render_control_plane_page(deps: ControlPlanePageDeps) -> None:
             summary_state["predictions_df"] = stage_predictions_df
             ui_data["actual_df"] = stage_actual_df
             if isinstance(stage_actual_df, pd.DataFrame) and not stage_actual_df.empty:
-                summary_state["actual_end_ts"] = pd.to_datetime(
-                    stage_actual_df["timestamp"], utc=True
-                ).max()
+                summary_state["actual_end_ts"] = stage_actual_df["timestamp"].apply(_to_msk_ts).max()
             summary_state["predictions_df"] = deps.only_future_predictions(
                 summary_state.get("predictions_df"),
                 summary_state.get("actual_end_ts"),
@@ -361,7 +371,7 @@ def render_control_plane_page(deps: ControlPlanePageDeps) -> None:
         st.stop()
 
     actual_end_ts = (
-        pd.to_datetime(result["actual_df"]["timestamp"], utc=True).max()
+        result["actual_df"]["timestamp"].apply(_to_msk_ts).max()
         if not result["actual_df"].empty
         else None
     )

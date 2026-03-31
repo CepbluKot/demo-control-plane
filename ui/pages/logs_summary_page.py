@@ -59,6 +59,14 @@ def _normalize_summary_text(value: Any) -> str:
     return text
 
 
+def _md_fence_for_text(text: str) -> str:
+    content = str(text or "")
+    runs = re.findall(r"`+", content)
+    longest = max((len(run) for run in runs), default=2)
+    # At least triple backticks and strictly longer than any sequence inside content.
+    return "`" * max(3, longest + 1)
+
+
 class _SafeFormatDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -124,10 +132,32 @@ def _style_llm_timeline(df: pd.DataFrame) -> Optional[Any]:
 
 
 def _format_datetime_with_tz(value: Any) -> str:
-    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    ts = pd.to_datetime(value, errors="coerce")
     if pd.isna(ts):
         return str(value)
-    return ts.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(MSK)
+    else:
+        ts = ts.tz_convert(MSK)
+    return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+
+
+def _to_msk_ts(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return ts
+    if ts.tzinfo is None:
+        return ts.tz_localize(MSK)
+    return ts.tz_convert(MSK)
+
+
+def _parse_user_dt(value: str) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return ts
+    if ts.tzinfo is None:
+        return ts.tz_localize(MSK)
+    return ts.tz_convert(MSK)
 
 
 def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
@@ -149,10 +179,14 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         if col_name not in timestamp_like and "timestamp" not in col_name:
             continue
         def _fmt(value: Any) -> str:
-            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            ts = pd.to_datetime(value, errors="coerce")
             if pd.isna(ts):
                 return str(value)
-            return ts.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(MSK)
+            else:
+                ts = ts.tz_convert(MSK)
+            return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
 
         out[col] = out[col].apply(_fmt).astype(str)
     return out
@@ -248,9 +282,9 @@ def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) ->
 
     # Primary: timestamp-based progress.  Works for both OFFSET and keyset pagination,
     # doesn't require pre-counting rows.  Rate is measured in "log-seconds per real second".
-    period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
-    period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
-    last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
+    period_start_ts = _to_msk_ts(state.get("period_start"))
+    period_end_ts = _to_msk_ts(state.get("period_end"))
+    last_batch_ts = _to_msk_ts(state.get("last_batch_ts"))
 
     if (
         not pd.isna(period_start_ts)
@@ -306,11 +340,11 @@ def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) ->
 
     if status in ("done", "error"):
         state["eta_seconds_left"] = 0
-        state["eta_finish_at"] = datetime.now(timezone.utc).isoformat()
+        state["eta_finish_at"] = datetime.now(MSK).isoformat()
         return
 
     if remaining is not None and remaining >= 0:
-        finish_dt = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+        finish_dt = datetime.now(MSK) + timedelta(seconds=remaining)
         state["eta_seconds_left"] = int(remaining)
         state["eta_finish_at"] = finish_dt.isoformat()
         return
@@ -323,7 +357,7 @@ def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) ->
     ratio = min(max(ratio, 0.01), 0.99)
     total_estimated = elapsed / ratio
     remaining = max(total_estimated - elapsed, 0.0)
-    finish_dt = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+    finish_dt = datetime.now(MSK) + timedelta(seconds=remaining)
     state["eta_seconds_left"] = int(remaining)
     state["eta_finish_at"] = finish_dt.isoformat()
 
@@ -478,9 +512,7 @@ class _StreamingLogsMerger:
             if not sorted_df.empty:
                 # Advance keyset cursor to last timestamp in the fetched page
                 if uses_keyset and self._timestamp_column in sorted_df.columns:
-                    max_ts = pd.to_datetime(
-                        sorted_df[self._timestamp_column], utc=True, errors="coerce"
-                    ).max()
+                    max_ts = sorted_df[self._timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         cursor.last_ts = max_ts.isoformat()
                 cursor.page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
@@ -521,7 +553,7 @@ class _StreamingLogsMerger:
 
             row = cursor.page_records[cursor.page_pos]
             cursor.page_pos += 1
-            ts = pd.to_datetime(row.get(self._timestamp_column), utc=True, errors="coerce")
+            ts = _to_msk_ts(row.get(self._timestamp_column))
             if pd.isna(ts):
                 continue
             cursor.row_seq += 1
@@ -812,7 +844,7 @@ def _sort_df_by_timestamp(df: pd.DataFrame, *, timestamp_column: str = "timestam
     if df.empty or ts_col not in df.columns:
         return df
     out = df.copy()
-    out["__cp_ts"] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+    out["__cp_ts"] = out[ts_col].apply(_to_msk_ts)
     out = out.dropna(subset=["__cp_ts"]).sort_values("__cp_ts", kind="mergesort")
     return out.drop(columns=["__cp_ts"]).reset_index(drop=True)
 
@@ -824,7 +856,7 @@ def _normalize_metrics_df(chunk: pd.DataFrame, *, default_service: str) -> pd.Da
         return pd.DataFrame(columns=["timestamp", "value", "service"])
 
     out = chunk.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out["timestamp"] = out["timestamp"].apply(_to_msk_ts)
     out = out.dropna(subset=["timestamp"])
     if out.empty:
         return pd.DataFrame(columns=["timestamp", "value", "service"])
@@ -868,7 +900,7 @@ def _build_metrics_context(metrics_df: pd.DataFrame, *, max_services: int = 12) 
         return ""
 
     normalized = metrics_df.copy()
-    normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True, errors="coerce")
+    normalized["timestamp"] = normalized["timestamp"].apply(_to_msk_ts)
     normalized["value"] = pd.to_numeric(normalized["value"], errors="coerce")
     if "service" not in normalized.columns:
         normalized["service"] = "unknown-service"
@@ -1188,7 +1220,7 @@ def _build_demo_logs_for_window(
 
         rows.append(
             {
-                "timestamp": ts.isoformat().replace("+00:00", "Z"),
+                "timestamp": ts.isoformat(),
                 "level": level,
                 "message": f"{level.lower()} synthetic log #{idx + 1}",
                 "service": "demo-service",
@@ -1315,7 +1347,7 @@ def _extract_last_batch_ts_from_run_dir(run_dir: Path) -> str:
                     except Exception:
                         continue
                     ts_value = payload.get("batch_period_end")
-                    ts_parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
+                    ts_parsed = _to_msk_ts(ts_value)
                     if pd.isna(ts_parsed):
                         continue
                     if latest_ts is None or ts_parsed > latest_ts:
@@ -1424,7 +1456,7 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "query_errors",
     )
     return {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "saved_at": datetime.now(MSK).isoformat(),
         "state": {k: _json_safe(state.get(k)) for k in keys},
     }
 
@@ -1450,9 +1482,9 @@ def _discover_resume_sessions(output_dir: Path) -> List[Dict[str, Any]]:
         status = str(checkpoint_state.get("status", "unknown"))
         saved_at = str(checkpoint.get("saved_at", ""))
         try:
-            parsed_saved = pd.to_datetime(saved_at, utc=True, errors="coerce")
+            parsed_saved = _to_msk_ts(saved_at)
             saved_text = (
-                parsed_saved.tz_convert(MSK).strftime("%Y-%m-%d %H:%M:%S MSK")
+                parsed_saved.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
                 if not pd.isna(parsed_saved)
                 else "n/a"
             )
@@ -1480,7 +1512,7 @@ def _save_logs_summary_result(
     result_state: Dict[str, Any],
 ) -> Dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"logs_summary_result_{stamp}.json"
     summary_path = output_dir / f"logs_summary_result_{stamp}.md"
     structured_md_path = output_dir / f"logs_summary_structured_{stamp}.md"
@@ -1489,7 +1521,7 @@ def _save_logs_summary_result(
     freeform_txt_path = output_dir / f"logs_summary_freeform_{stamp}.txt"
 
     payload = {
-        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "saved_at": datetime.now(MSK).isoformat(),
         "request": _json_safe(request_payload),
         "result": _json_safe(result_state),
     }
@@ -1498,6 +1530,10 @@ def _save_logs_summary_result(
 
     structured_summary = str(result_state.get("final_summary") or "").strip()
     freeform_summary = str(result_state.get("freeform_final_summary") or "").strip()
+    structured_fence = _md_fence_for_text(structured_summary)
+    freeform_fence = _md_fence_for_text(freeform_summary)
+    combined_structured_fence = _md_fence_for_text(structured_summary or "N/A")
+    combined_freeform_fence = _md_fence_for_text(freeform_summary or "N/A")
     if structured_summary:
         _write_text_file(
             structured_md_path,
@@ -1508,9 +1544,9 @@ def _save_logs_summary_result(
                     f"- saved_at: `{payload['saved_at']}`",
                     f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
                     "",
-                    "```text",
+                    f"{structured_fence}text",
                     structured_summary,
-                    "```",
+                    structured_fence,
                 ]
             ),
         )
@@ -1524,9 +1560,9 @@ def _save_logs_summary_result(
                     f"- saved_at: `{payload['saved_at']}`",
                     f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
                     "",
-                    "```text",
+                    f"{freeform_fence}text",
                     freeform_summary,
-                    "```",
+                    freeform_fence,
                 ]
             ),
         )
@@ -1545,15 +1581,15 @@ def _save_logs_summary_result(
         "",
         "## Final Summary (Structured)",
         "",
-        "```text",
+        f"{combined_structured_fence}text",
         (structured_summary or "N/A"),
-        "```",
+        combined_structured_fence,
         "",
         "## Final Summary (Freeform)",
         "",
-        "```text",
+        f"{combined_freeform_fence}text",
         (freeform_summary or "N/A"),
-        "```",
+        combined_freeform_fence,
         "",
         "## Stats",
         "",
@@ -1621,12 +1657,22 @@ def _build_freeform_summary_prompt(
     chain_block = (
         "\n\nОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ\n"
         "Оформи наглядно (Markdown-схема со стрелками):\n"
-        "[t1] событие A [ФАКТ/ГИПОТЕЗА]\n"
+        "Для каждого узла обязательно укажи точную дату и время: YYYY-MM-DD HH:MM:SS.ffffff TZ.\n"
+        "Не используй абстрактные t1/t2/t3 без реальных timestamp.\n"
+        "[2026-03-31 12:34:56.123456 MSK] событие A [ФАКТ/ГИПОТЕЗА]\n"
         "    └─> механизм\n"
-        "[t2] событие B [ФАКТ/ГИПОТЕЗА]\n"
+        "[2026-03-31 12:35:07.654321 MSK] событие B [ФАКТ/ГИПОТЕЗА]\n"
         "    └─> механизм\n"
-        "[t3] алерт/последствие [ФАКТ]\n"
+        "[2026-03-31 12:35:10.000001 MSK] алерт/последствие [ФАКТ]\n"
         "Если есть разрывы — добавь: [РАЗРЫВ ЦЕПОЧКИ: чего не хватает].\n"
+    )
+    incident_link_block = (
+        "\nОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI\n"
+        "Возьми контекст инцидента/алертов из UI и для каждого пункта укажи:\n"
+        "- статус: [ОБЪЯСНЁН]/[ЧАСТИЧНО ОБЪЯСНЁН]/[НЕ ОБЪЯСНЁН]\n"
+        "- доказательства: конкретные timestamp/сообщения/метрики\n"
+        "- цепочку причины->следствия (если подтверждается)\n"
+        "- если не подтверждается: каких данных не хватает.\n"
     )
     if custom_template:
         rendered = _render_prompt_template(
@@ -1646,7 +1692,7 @@ def _build_freeform_summary_prompt(
                 "anti_hallucination_rules": anti_rules,
             },
         )
-        return f"{rendered.strip()}{chain_block}"
+        return f"{rendered.strip()}{chain_block}{incident_link_block}"
     anti_block = f"ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:\n{anti_rules}\n\n" if anti_rules else ""
     return (
         "Напиши финальный narrative-отчёт для SRE на основе структурированного анализа.\n\n"
@@ -1655,10 +1701,12 @@ def _build_freeform_summary_prompt(
         "Структура:\n"
         "1) Краткое резюме (3-4 предложения).\n"
         "2) Ход событий: связный рассказ по хронологии, с явными переходами причины -> следствие.\n"
+        "   Для каждого события обязательно указывай полную дату и время (до микросекунд) и timezone.\n"
         "3) Первопричина: что [ФАКТ], что [ГИПОТЕЗА].\n"
         "4) Что не удалось выяснить (разрывы цепочек и недостающие данные).\n"
         "5) Что делать дальше (конкретные приоритетные действия).\n\n"
         "6) ОТДЕЛЬНЫЙ БЛОК: ЦЕПОЧКА СОБЫТИЙ (обязательно, в виде схемы со стрелками).\n\n"
+        "7) ОТДЕЛЬНЫЙ БЛОК: СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI (обязательно, с явным статусом по каждому алерту/пункту).\n\n"
         "Если видишь несколько независимых цепочек/инцидентов — скажи это явно.\n"
         "Если между событиями связь не доказана — помечай как гипотезу, не как факт.\n\n"
         "Если данных недостаточно для какого-то раздела — прямо напиши об этом.\n\n"
@@ -1667,7 +1715,7 @@ def _build_freeform_summary_prompt(
         f"Метрики: {metrics_block}\n\n"
         "Структурированный анализ логов:\n"
         f"{final_summary}"
-        f"{chain_block}"
+        f"{chain_block}{incident_link_block}"
     )
 
 
@@ -1708,7 +1756,8 @@ def _build_no_logs_hypothesis_prompt(
         "2) ОСТОРОЖНЫЕ ГИПОТЕЗЫ (3-7 пунктов) [ГИПОТЕЗА]\n"
         "3) КАКИЕ ДАННЫЕ НУЖНЫ, ЧТОБЫ ПОДТВЕРДИТЬ/ОПРОВЕРГНУТЬ ГИПОТЕЗЫ\n"
         "4) ЧТО ПРОВЕРИТЬ SRE ПРЯМО СЕЙЧАС (приоритет P0/P1)\n"
-        "5) КРАТКИЙ ВЫВОД ДЛЯ КОМАНДЫ\n"
+        "5) СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI (по каждому пункту: [ОБЪЯСНЁН]/[ЧАСТИЧНО]/[НЕ ОБЪЯСНЁН])\n"
+        "6) КРАТКИЙ ВЫВОД ДЛЯ КОМАНДЫ\n"
     )
 
 
@@ -1742,9 +1791,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         elif not pd.isna(processing_seconds):
             st.caption(f"Время обработки логов: {_format_eta_seconds(float(processing_seconds))}")
 
-        _last_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
-        _p_start = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
-        _p_end = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
+        _last_ts = _to_msk_ts(state.get("last_batch_ts"))
+        _p_start = _to_msk_ts(state.get("period_start"))
+        _p_end = _to_msk_ts(state.get("period_end"))
         if (
             not pd.isna(_last_ts)
             and not pd.isna(_p_start)
@@ -1756,7 +1805,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             _pct = min(_done / _span, 1.0) * 100.0
             st.caption(
                 f"Покрытие периода по времени: {_pct:.1f}% "
-                f"(лог до {_last_ts.tz_convert(MSK).strftime('%H:%M:%S MSK')} | строк: {rows_processed:,})"
+                f"(лог до {_last_ts.tz_convert(MSK).strftime('%H:%M:%S.%f MSK')} | строк: {rows_processed:,})"
             )
         elif rows_processed > 0:
             st.caption(f"Обработано логов: {rows_processed:,}")
@@ -1848,14 +1897,14 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             )
                             rebuild_path = (
                                 Path(map_summaries_path).parent
-                                / f"rebuild_reduce_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.md"
+                                / f"rebuild_reduce_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.md"
                             )
                             _write_text_file(
                                 rebuild_path,
                                 "\n".join(
                                     [
                                         "# Rebuilt Reduce Summary",
-                                        f"- rebuilt_at: `{datetime.now(timezone.utc).isoformat()}`",
+                                        f"- rebuilt_at: `{datetime.now(MSK).isoformat()}`",
                                         f"- map_summaries: `{len(cached_map_summaries)}`",
                                         "",
                                         rebuilt_summary,
@@ -2198,9 +2247,9 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             height=220,
                         )
             # --- Timestamp-based progress bar ---
-            last_batch_ts = pd.to_datetime(state.get("last_batch_ts"), utc=True, errors="coerce")
-            period_start_ts = pd.to_datetime(state.get("period_start"), utc=True, errors="coerce")
-            period_end_ts = pd.to_datetime(state.get("period_end"), utc=True, errors="coerce")
+            last_batch_ts = _to_msk_ts(state.get("last_batch_ts"))
+            period_start_ts = _to_msk_ts(state.get("period_start"))
+            period_end_ts = _to_msk_ts(state.get("period_end"))
 
             ts_ratio: Optional[float] = None
             if (
@@ -2213,7 +2262,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if total_span > 0:
                     ts_ratio = min(max(done_span / total_span, 0.0), 1.0)
                     pct = ts_ratio * 100.0
-                    last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S MSK")
+                    last_ts_str = last_batch_ts.tz_convert(MSK).strftime("%H:%M:%S.%f MSK")
                     st.progress(
                         ts_ratio,
                         text=f"Прогресс: {pct:.1f}% | лог до {last_ts_str}",
@@ -2241,9 +2290,9 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             if eta_left is not None and status not in ("done", "error"):
                 if eta_finish:
                     try:
-                        eta_finish_dt = pd.to_datetime(eta_finish, utc=True, errors="coerce")
+                        eta_finish_dt = _to_msk_ts(eta_finish)
                         if not pd.isna(eta_finish_dt):
-                            finish_text = eta_finish_dt.tz_convert(MSK).strftime("%H:%M:%S MSK")
+                            finish_text = eta_finish_dt.tz_convert(MSK).strftime("%H:%M:%S.%f MSK")
                             st.caption(
                                 f"Ориентировочно завершится в {finish_text} "
                                 f"(через ~{_format_eta_seconds(float(eta_left))})"
@@ -2361,10 +2410,18 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
 
 
 def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size: int, map_workers: int = 1) -> Any:
+    max_cell_chars = int(
+        getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
+    )
+    max_summary_chars = int(
+        getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)
+    )
     try:
         return deps.summarizer_config_cls(
             page_limit=db_batch_size,
             llm_chunk_rows=llm_batch_size,
+            max_cell_chars=max_cell_chars,
+            max_summary_chars=max_summary_chars,
             keep_map_batches_in_memory=False,
             keep_map_summaries_in_result=False,
             map_workers=max(map_workers, 1),
@@ -2760,7 +2817,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "Целевая дата/время (ISO)",
                 key="logs_sum_center_dt",
                 placeholder="Например: 2026-03-27T14:30:00+03:00",
-                help="Указывай дату/время с часовым поясом: `+03:00` или `Z`.",
+                help="Часовой пояс по умолчанию — MSK (`+03:00`). Можно явно указать `+03:00` или `Z`.",
                 disabled=is_running,
             )
             st.number_input(
@@ -2776,14 +2833,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "Дата/время начала (ISO)",
                 key="logs_sum_start_dt",
                 placeholder="Например: 2026-03-27T10:00:00+03:00",
-                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (или `Z` для UTC).",
+                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
                 disabled=is_running,
             )
             st.text_input(
                 "Дата/время конца (ISO)",
                 key="logs_sum_end_dt",
                 placeholder="Например: 2026-03-27T12:00:00+03:00",
-                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (или `Z` для UTC).",
+                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
                 disabled=is_running,
             )
 
@@ -3010,15 +3067,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     try:
         if period_mode == "window":
-            parsed_center = pd.to_datetime(center_dt_text, utc=True, errors="coerce")
+            parsed_center = _parse_user_dt(center_dt_text)
             if pd.isna(parsed_center):
                 raise ValueError("Неверный формат даты/времени (ISO).")
             center_dt = parsed_center.to_pydatetime()
             period_start_dt = center_dt - timedelta(minutes=window_minutes)
             period_end_dt = center_dt + timedelta(minutes=window_minutes)
         else:
-            parsed_start = pd.to_datetime(start_dt_text, utc=True, errors="coerce")
-            parsed_end = pd.to_datetime(end_dt_text, utc=True, errors="coerce")
+            parsed_start = _parse_user_dt(start_dt_text)
+            parsed_end = _parse_user_dt(end_dt_text)
             if pd.isna(parsed_start) or pd.isna(parsed_end):
                 raise ValueError("Неверный формат start/end (ISO).")
             period_start_dt = parsed_start.to_pydatetime()
@@ -3032,8 +3089,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     period_end_iso = period_end_dt.isoformat()
     effective_period_start_iso = period_start_iso
     if resume_mode == "continue" and resume_from_ts:
-        parsed_resume_ts = pd.to_datetime(resume_from_ts, utc=True, errors="coerce")
-        parsed_end_ts = pd.to_datetime(period_end_iso, utc=True, errors="coerce")
+        parsed_resume_ts = _to_msk_ts(resume_from_ts)
+        parsed_end_ts = _to_msk_ts(period_end_iso)
         if not pd.isna(parsed_resume_ts) and not pd.isna(parsed_end_ts) and parsed_resume_ts < parsed_end_ts:
             effective_period_start_iso = (
                 parsed_resume_ts.to_pydatetime() + timedelta(microseconds=1)
@@ -3151,7 +3208,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "Формат SQL-результатов несовместим для merge в единые DataFrame.\n" + joined
         )
 
-    run_stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    run_stamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S_%f")
     run_dir = deps.output_dir / "logs_summary_live" / f"run_{run_stamp}"
     is_resume_continue = False
     if resume_mode == "continue" and resume_session_dir:
@@ -3264,7 +3321,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "map_summaries_jsonl_path": str(map_summaries_jsonl_path),
         "reduce_summaries_jsonl_path": str(reduce_summaries_jsonl_path),
         "llm_calls_jsonl_path": str(llm_calls_jsonl_path),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(MSK).isoformat(),
         "started_monotonic": time.monotonic(),
         "elapsed_seconds": 0.0,
         "active_step": "Инициализация пайплайна",
@@ -3474,7 +3531,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             elapsed_sec: float,
             error_text: str,
         ) -> None:
-            now_iso = datetime.now(timezone.utc).isoformat()
+            now_iso = datetime.now(MSK).isoformat()
             if not bool(state.get("read_timeout_active", False)):
                 state["read_timeout_active"] = True
                 state["read_timeout_started_at"] = now_iso
@@ -3509,10 +3566,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 return
 
             start_iso = state.get("read_timeout_started_at")
-            end_iso = datetime.now(timezone.utc).isoformat()
+            end_iso = datetime.now(MSK).isoformat()
             errors_count = int(pd.to_numeric(state.get("read_timeout_count"), errors="coerce") or 0)
-            start_ts = pd.to_datetime(start_iso, utc=True, errors="coerce")
-            end_ts = pd.to_datetime(end_iso, utc=True, errors="coerce")
+            start_ts = _to_msk_ts(start_iso)
+            end_ts = _to_msk_ts(end_iso)
             duration_sec: Optional[float] = None
             if not pd.isna(start_ts) and not pd.isna(end_ts):
                 duration_sec = max((end_ts - start_ts).total_seconds(), 0.0)
@@ -3737,9 +3794,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
                 # Advance keyset cursor so the next call fetches the next page
                 if uses_keyset and logs_timestamp_column in df.columns:
-                    max_ts = pd.to_datetime(
-                        df[logs_timestamp_column], utc=True, errors="coerce"
-                    ).max()
+                    max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         _single_query_last_ts[0] = max_ts.isoformat()
                 return [dict(row) for row in df.to_dict(orient="records")]
@@ -3761,7 +3816,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             _append_jsonl(
                 live_events_path,
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(MSK).isoformat(),
                     "event": event,
                     "rows_processed": payload.get("rows_processed"),
                     "rows_total": payload.get("rows_total"),
@@ -3828,7 +3883,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 _append_jsonl(
                     live_batches_path,
                     {
-                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "ts": datetime.now(MSK).isoformat(),
                         "event": "map_batch",
                         "batch_index": global_batch_index_zero,
                         "batch_total": payload.get("batch_total"),
@@ -3848,7 +3903,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     _append_jsonl(
                         map_summaries_jsonl_path,
                         {
-                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "ts": datetime.now(MSK).isoformat(),
                             "source_name": src_label,
                             "batch_index": global_batch_index_one,
                             "batch_total": payload.get("batch_total"),
@@ -3932,7 +3987,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     _append_jsonl(
                         reduce_summaries_jsonl_path,
                         {
-                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "ts": datetime.now(MSK).isoformat(),
                             "source_name": src_label,
                             "reduce_round": payload.get("reduce_round"),
                             "summary": final_from_payload,
@@ -4147,7 +4202,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             _append_jsonl(
                 llm_calls_jsonl_path,
                 {
-                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "ts": datetime.now(MSK).isoformat(),
                     "call_index": call_idx,
                     "phase": phase or "unknown",
                     "prompt_path": str(prompt_path),
@@ -4316,9 +4371,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         return []
                     df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
                     if _uses_keyset and logs_timestamp_column in df.columns:
-                        max_ts = pd.to_datetime(
-                            df[logs_timestamp_column], utc=True, errors="coerce"
-                        ).max()
+                        max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                         if not pd.isna(max_ts):
                             _last_ts[0] = max_ts.isoformat()
                     return [dict(row) for row in df.to_dict(orient="records")]
@@ -4429,7 +4482,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 _append_jsonl(
                     reduce_summaries_jsonl_path,
                     {
-                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "ts": datetime.now(MSK).isoformat(),
                         "source_name": "cross_source" if len(per_source_summaries) > 1 else "query_1",
                         "summary": normalized_multi_final,
                     },
@@ -4581,7 +4634,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             "\n".join(
                                 [
                                     "# Resume Rebuilt REDUCE Final Summary",
-                                    f"- rebuilt_at: `{datetime.now(timezone.utc).isoformat()}`",
+                                    f"- rebuilt_at: `{datetime.now(MSK).isoformat()}`",
                                     f"- map_summaries_count: `{len(cached_map_summaries)}`",
                                     "",
                                     rebuilt_from_resume,
