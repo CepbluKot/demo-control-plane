@@ -1842,6 +1842,9 @@ def summarize_logs(
             max_summary_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)
             ),
+            reduce_prompt_max_chars=int(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
+            ),
         ),
         on_progress=on_progress,
         prompt_context={

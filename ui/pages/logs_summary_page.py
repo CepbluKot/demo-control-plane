@@ -2416,12 +2416,16 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
     max_summary_chars = int(
         getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)
     )
+    reduce_prompt_max_chars = int(
+        getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
+    )
     try:
         return deps.summarizer_config_cls(
             page_limit=db_batch_size,
             llm_chunk_rows=llm_batch_size,
             max_cell_chars=max_cell_chars,
             max_summary_chars=max_summary_chars,
+            reduce_prompt_max_chars=reduce_prompt_max_chars,
             keep_map_batches_in_memory=False,
             keep_map_summaries_in_result=False,
             map_workers=max(map_workers, 1),
