@@ -180,6 +180,17 @@ class Settings(BaseSettings):
     CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE: str = ""
     # Optional LLM generation cap (0 disables explicit max_tokens in request payload).
     CONTROL_PLANE_LLM_MAX_TOKENS: int = 0
+    # Token-budget controls for new map-reduce algorithm.
+    CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS: int = 200000
+    CONTROL_PLANE_LLM_FILL_RATIO: float = 0.7
+    CONTROL_PLANE_LLM_RESERVED_TOKENS: int = 24000
+    CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT: int = 50
+    CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT: int = 50
+    CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD: float = 0.7
+    CONTROL_PLANE_LLM_USE_TIKTOKEN: bool = True
+    CONTROL_PLANE_LLM_USE_INSTRUCTOR: bool = True
+    CONTROL_PLANE_LLM_USE_NEW_ALGORITHM: bool = True
+    CONTROL_PLANE_UI_LOGS_SUMMARY_USE_NEW_ALGORITHM: bool = True
     # If model stops with finish_reason=length/max_tokens, request continuation chunks.
     CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH: bool = True
     # Max continuation chunks after the first response.

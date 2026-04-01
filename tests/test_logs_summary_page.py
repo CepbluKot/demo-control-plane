@@ -1,4 +1,6 @@
 import unittest
+import zipfile
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -6,23 +8,30 @@ from unittest.mock import patch
 from settings import settings
 from ui.pages.logs_summary_page import (
     FINAL_REPORT_SECTIONS,
+    _build_config,
     _extract_root_cause_hypotheses_block,
     _ensure_report_topics_present,
     _format_table_timestamps,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
     _build_freeform_summary_prompt,
+    _build_causal_graph_dot,
     _build_sectional_freeform_prompt,
     _build_sectional_structured_prompt,
+    _build_zip_artifacts_bytes,
+    _collect_timeline_events,
     _discover_resume_sessions,
     _enrich_stats_with_elapsed,
+    _extract_alerts_from_items,
     _extract_last_batch_ts_from_run_dir,
     _form_values_from_saved_params,
     _generate_sectional_freeform_summary,
     _generate_sectional_structured_summary,
     _load_map_summaries_from_jsonl,
     _load_map_summaries_from_jsonl_for_source,
+    _normalize_alert_items,
     _normalize_summary_text,
+    _render_alerts_context,
     _summary_origin_label,
     _write_json_file,
     _save_logs_summary_result,
@@ -248,11 +257,15 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             metrics_context="",
         )
         self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
-        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS))
+        # 2 секции заполняются программно без LLM:
+        # 1) Контекст из UI (дословно), 2) Метрики (когда metrics_context пустой).
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
         self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", merged)
-        self.assertIn("section_body_1", merged)
-        self.assertIn("Пока секций нет.", prompts[0])
-        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[1])
+        self.assertIn("исходный текст инцидента из ui (дословно", merged.lower())
+        self.assertIn("incident goal", merged)
+        self.assertIn("Метрики не предоставлены", merged)
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[0])
+        self.assertIn("incident goal", prompts[0])
         self.assertIn("section_body_1", prompts[1])
 
     def test_sectional_structured_prompt_uses_previous_sections_context(self) -> None:
@@ -309,11 +322,13 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             metrics_context="",
         )
         self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
-        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
         self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", merged)
-        self.assertIn("struct_body_1", merged)
-        self.assertIn("Пока секций нет.", prompts[0])
-        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[1])
+        self.assertIn("исходный текст инцидента из ui (дословно", merged.lower())
+        self.assertIn("incident goal", merged)
+        self.assertIn("Метрики не предоставлены", merged)
+        self.assertIn(f"## {FINAL_REPORT_SECTIONS[0][0]}", prompts[0])
+        self.assertIn("incident goal", prompts[0])
         self.assertIn("struct_body_1", prompts[1])
 
     def test_no_logs_hypothesis_prompt_includes_period_and_goal(self) -> None:
@@ -604,10 +619,13 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         )
         self.assertEqual(mapped["logs_queries"], ["SELECT 1"])
         self.assertEqual(mapped["metrics_queries"], ["SELECT 2"])
-        self.assertEqual(mapped["logs_sum_user_goal"], "goal")
+        self.assertIn("legacy_alert_context", mapped["logs_sum_user_goal"])
+        self.assertIn("описание: goal", mapped["logs_sum_user_goal"])
+        self.assertTrue(isinstance(mapped.get("alerts"), list))
+        self.assertGreaterEqual(len(mapped["alerts"]), 1)
         self.assertEqual(mapped["logs_sum_window_minutes"], 45)
-        self.assertTrue(mapped["logs_sum_parallel_map"])
-        self.assertEqual(mapped["logs_sum_map_workers"], 4)
+        self.assertFalse(mapped["logs_sum_parallel_map"])
+        self.assertEqual(mapped["logs_sum_map_workers"], 1)
         self.assertTrue(mapped["logs_sum_demo_mode"])
         self.assertTrue(mapped["logs_sum_enable_no_logs_hypothesis"])
 
@@ -617,6 +635,133 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             default_query="SELECT fallback_query",
         )
         self.assertEqual(mapped["logs_queries"], ["SELECT fallback_query"])
+
+    def test_extract_alerts_from_items_keeps_point_and_range(self) -> None:
+        items = _normalize_alert_items(
+            [
+                {
+                    "title": "alert_point",
+                    "time_mode": "point",
+                    "time_point": "2026-03-18T18:42:00+03:00",
+                    "details": "node down",
+                },
+                {
+                    "title": "alert_range",
+                    "time_mode": "range",
+                    "time_start": "2026-03-18T18:42:00+03:00",
+                    "time_end": "2026-03-18T19:10:00+03:00",
+                    "details": "filesystem low",
+                },
+            ],
+            min_items=1,
+        )
+        alerts = _extract_alerts_from_items(items)
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual(alerts[0]["time_mode"], "point")
+        self.assertEqual(alerts[1]["time_mode"], "range")
+        rendered = _render_alerts_context(alerts)
+        self.assertIn("alert_point", rendered)
+        self.assertIn("alert_range", rendered)
+        self.assertIn("период:", rendered)
+
+    def test_build_config_passes_new_algorithm_and_token_budget_settings(self) -> None:
+        deps = type(
+            "_Deps",
+            (),
+            {
+                "summarizer_config_cls": staticmethod(lambda **kwargs: kwargs),
+            },
+        )()
+        overrides = {
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_USE_NEW_ALGORITHM": True,
+            "CONTROL_PLANE_LLM_USE_NEW_ALGORITHM": True,
+            "CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS": 123456,
+            "CONTROL_PLANE_LLM_FILL_RATIO": 0.66,
+            "CONTROL_PLANE_LLM_RESERVED_TOKENS": 7777,
+            "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT": 44,
+            "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT": 33,
+            "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD": 0.81,
+            "CONTROL_PLANE_LLM_USE_TIKTOKEN": True,
+            "CONTROL_PLANE_LLM_USE_INSTRUCTOR": False,
+        }
+        with patch.multiple(settings, **overrides):
+            cfg = _build_config(deps, db_batch_size=1000, llm_batch_size=250, map_workers=3)
+
+        self.assertTrue(cfg["use_new_algorithm"])
+        self.assertEqual(cfg["max_context_tokens"], 123456)
+        self.assertAlmostEqual(float(cfg["fill_ratio"]), 0.66, places=6)
+        self.assertEqual(cfg["reserved_tokens"], 7777)
+        self.assertEqual(cfg["reduce_target_token_pct"], 44)
+        self.assertEqual(cfg["compression_target_pct"], 33)
+        self.assertAlmostEqual(float(cfg["compression_importance_threshold"]), 0.81, places=6)
+        self.assertTrue(cfg["use_tiktoken"])
+        self.assertFalse(cfg["use_instructor"])
+        self.assertEqual(cfg["page_limit"], 1000)
+        self.assertEqual(cfg["llm_chunk_rows"], 250)
+        self.assertEqual(cfg["map_workers"], 3)
+
+    def test_collect_timeline_events_from_map_batches(self) -> None:
+        state = {
+            "map_batches": [
+                {
+                    "batch_index": 0,
+                    "batch_period_start": "2026-03-18T00:00:00+00:00",
+                    "batch_period_end": "2026-03-18T00:05:00+00:00",
+                    "batch_summary_structured": {
+                        "timeline": [
+                            {
+                                "id": "evt-1",
+                                "timestamp": "2026-03-18T00:01:00.123456+00:00",
+                                "source": "api",
+                                "description": "error",
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        rows = _collect_timeline_events(state)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "evt-1")
+        self.assertEqual(rows[0]["batch_index"], 1)
+
+    def test_build_causal_graph_dot(self) -> None:
+        dot = _build_causal_graph_dot(
+            events=[
+                {"id": "evt-1", "timestamp": "t1", "description": "first"},
+                {"id": "evt-2", "timestamp": "t2", "description": "second"},
+            ],
+            links=[
+                {
+                    "cause_event_id": "evt-1",
+                    "effect_event_id": "evt-2",
+                    "confidence": 0.9,
+                }
+            ],
+        )
+        self.assertTrue(isinstance(dot, str))
+        self.assertIn("evt-1", dot)
+        self.assertIn("evt-2", dot)
+        self.assertIn("conf=0.90", dot)
+
+    def test_build_zip_artifacts_bytes_contains_known_entries(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            report = base / "report.md"
+            checkpoint = base / "checkpoint.json"
+            report.write_text("report", encoding="utf-8")
+            checkpoint.write_text("{}", encoding="utf-8")
+            blob = _build_zip_artifacts_bytes(
+                {
+                    "result_summary_path": str(report),
+                    "checkpoint_path": str(checkpoint),
+                }
+            )
+            self.assertIsNotNone(blob)
+            with zipfile.ZipFile(io.BytesIO(blob), "r") as zf:
+                names = set(zf.namelist())
+            self.assertIn("report/report.md", names)
+            self.assertIn("runtime/checkpoint.json", names)
 
 
 if __name__ == "__main__":

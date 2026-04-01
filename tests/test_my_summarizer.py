@@ -1,4 +1,5 @@
 import unittest
+import json
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -180,7 +181,11 @@ class TestMySummarizer(unittest.TestCase):
         self.assertNotIn("400 Client Error", str(result.summary))
         self.assertGreater(calls["map_large"], 0)
         self.assertGreater(calls["map_small"], 0)
-        self.assertTrue(any("MAP_OK_2" in item for item in result.map_summaries))
+        parsed_map = [json.loads(item) for item in result.map_summaries if str(item).strip().startswith("{")]
+        self.assertTrue(parsed_map)
+        self.assertTrue(
+            any(int(entry.get("context", {}).get("total_log_entries", 0)) == 2 for entry in parsed_map)
+        )
 
     def test_summarizer_raises_on_non_400_map_error_without_fallback(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -1004,6 +1009,342 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(llm_calls, 0)
         self.assertGreaterEqual(reduce_rounds, 1)
         self.assertIn("reduce_context_fallback", [name for name, _ in events])
+
+    def test_map_summary_returns_structured_json_with_required_sections(self) -> None:
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [
+                {
+                    "timestamp": "2026-03-25T10:00:00+00:00",
+                    "message": "error timeout",
+                    "_source": "svc-a",
+                }
+            ]
+
+        def _fake_llm(_prompt: str) -> str:
+            return json.dumps(
+                {
+                    "context": {},
+                    "timeline": [
+                        {
+                            "id": "evt-1",
+                            "timestamp": "2026-03-25T10:00:00+00:00",
+                            "source": "svc-a",
+                            "description": "Timeout detected",
+                            "severity": "high",
+                            "importance": 0.9,
+                            "evidence_type": "FACT",
+                            "evidence_quote": "error timeout",
+                            "tags": ["timeout"],
+                        }
+                    ],
+                    "causal_links": [],
+                    "alert_refs": [],
+                    "hypotheses": [],
+                    "pinned_facts": [],
+                    "gaps": [],
+                    "impact": {},
+                    "conflicts": [],
+                    "data_quality": {
+                        "is_empty": False,
+                        "noise_ratio": 0.2,
+                        "has_gaps": False,
+                        "gap_periods": [],
+                        "notes": "",
+                    },
+                    "preliminary_recommendations": [],
+                },
+                ensure_ascii=False,
+            )
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=200,
+                keep_map_summaries_in_result=True,
+            ),
+            prompt_context={"sql_query": "SELECT * FROM logs"},
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message", "_source"],
+        )
+        payload = json.loads(result.summary)
+        for key in (
+            "context",
+            "timeline",
+            "causal_links",
+            "alert_refs",
+            "hypotheses",
+            "pinned_facts",
+            "gaps",
+            "impact",
+            "conflicts",
+            "data_quality",
+            "preliminary_recommendations",
+        ):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["context"]["batch_id"], "batch-000001")
+        self.assertEqual(payload["context"]["source_query"], ["SELECT * FROM logs"])
+
+    def test_map_summary_invalid_json_is_converted_to_degraded_structured_payload(self) -> None:
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line"}]
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=lambda _prompt: "not a json response",
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=200,
+                keep_map_summaries_in_result=True,
+            ),
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message"],
+        )
+        payload = json.loads(result.summary)
+        self.assertIn("data_quality", payload)
+        notes_text = str(payload["data_quality"].get("notes", ""))
+        self.assertTrue(notes_text)
+        self.assertIn("Raw LLM map summary", notes_text)
+
+    def test_new_algorithm_reduce_uses_premerged_alert_refs(self) -> None:
+        def _mk_summary(
+            batch_id: str,
+            alert_status: str,
+            explanation: str,
+            *,
+            event_id: str = "evt-1",
+        ) -> str:
+            return json.dumps(
+                {
+                    "context": {
+                        "batch_id": batch_id,
+                        "time_range_start": "2026-03-25T10:00:00+00:00",
+                        "time_range_end": "2026-03-25T10:05:00+00:00",
+                        "total_log_entries": 1,
+                        "source_query": ["SELECT * FROM logs"],
+                        "source_services": ["svc-a"],
+                    },
+                    "timeline": [
+                        {
+                            "id": event_id,
+                            "timestamp": "2026-03-25T10:00:00+00:00",
+                            "source": "svc-a",
+                            "description": "event",
+                            "severity": "low",
+                            "importance": 0.9,
+                            "evidence_type": "HYPOTHESIS",
+                            "tags": ["test"],
+                        }
+                    ],
+                    "causal_links": [],
+                    "alert_refs": [
+                        {
+                            "alert_id": "A1",
+                            "status": alert_status,
+                            "related_events": [event_id],
+                            "explanation": explanation,
+                        }
+                    ],
+                    "hypotheses": [],
+                    "pinned_facts": [],
+                    "gaps": [],
+                    "impact": {
+                        "affected_services": ["svc-a"],
+                        "affected_operations": [],
+                        "error_counts": [],
+                    },
+                    "conflicts": [],
+                    "data_quality": {"is_empty": False, "noise_ratio": 0.1, "notes": ""},
+                    "preliminary_recommendations": [],
+                },
+                ensure_ascii=False,
+            )
+
+        prompts: list[str] = []
+
+        def _fake_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return _mk_summary(
+                "reduce-r1-g1",
+                "EXPLAINED",
+                "merged explanation",
+                event_id="evt-out",
+            )
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                use_new_algorithm=True,
+                adaptive_reduce_on_overflow=True,
+            ),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=[
+                _mk_summary("batch-1", "PARTIALLY", "from batch 1", event_id="evt-1"),
+                _mk_summary("batch-2", "EXPLAINED", "from batch 2", event_id="evt-2"),
+            ],
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+        )
+
+        self.assertEqual(llm_calls, 1)
+        self.assertEqual(reduce_rounds, 1)
+        self.assertIn("PROGRAMMATICALLY MERGED ALERT_REFS", prompts[0])
+        self.assertIn('"status": "EXPLAINED"', prompts[0])
+        self.assertIn('"related_events": [', prompts[0])
+        self.assertIn('"evt-1"', prompts[0])
+        self.assertIn('"evt-2"', prompts[0])
+        parsed = json.loads(final_summary)
+        self.assertEqual(parsed["alert_refs"][0]["status"], "EXPLAINED")
+
+    def test_new_algorithm_reduce_prompt_uses_json_objects_not_escaped_strings(self) -> None:
+        captured_prompt = {"text": ""}
+
+        def _mk_summary(batch_id: str) -> str:
+            return json.dumps(
+                {
+                    "context": {
+                        "batch_id": batch_id,
+                        "time_range_start": "2026-03-25T10:00:00+00:00",
+                        "time_range_end": "2026-03-25T10:05:00+00:00",
+                        "total_log_entries": 1,
+                        "source_query": [],
+                        "source_services": ["svc-a"],
+                    },
+                    "timeline": [
+                        {
+                            "id": "evt-1",
+                            "timestamp": "2026-03-25T10:00:00+00:00",
+                            "source": "svc-a",
+                            "description": "event",
+                            "severity": "low",
+                            "importance": 0.9,
+                            "evidence_type": "HYPOTHESIS",
+                            "tags": ["test"],
+                        }
+                    ],
+                    "causal_links": [],
+                    "alert_refs": [],
+                    "hypotheses": [],
+                    "pinned_facts": [],
+                    "gaps": [],
+                    "impact": {},
+                    "conflicts": [],
+                    "data_quality": {"is_empty": False, "noise_ratio": 0.1, "notes": ""},
+                    "preliminary_recommendations": [],
+                },
+                ensure_ascii=False,
+            )
+
+        def _fake_llm(prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return _mk_summary("reduce-out")
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(use_new_algorithm=True),
+        )
+        summarizer._reduce_summaries(
+            chunk_summaries=[_mk_summary("batch-1"), _mk_summary("batch-2")],
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+        )
+
+        prompt_text = captured_prompt["text"]
+        self.assertIn('"context": {', prompt_text)
+        # Old behavior encoded summaries as JSON strings with escaped quotes.
+        self.assertNotIn('\\"context\\"', prompt_text)
+
+    def test_new_algorithm_reduce_splits_group_on_400(self) -> None:
+        def _mk_summary(batch_id: str) -> str:
+            return json.dumps(
+                {
+                    "context": {
+                        "batch_id": batch_id,
+                        "time_range_start": "2026-03-25T10:00:00+00:00",
+                        "time_range_end": "2026-03-25T10:05:00+00:00",
+                        "total_log_entries": 1,
+                        "source_query": [],
+                        "source_services": ["svc-a"],
+                    },
+                    "timeline": [
+                        {
+                            "id": "evt-1",
+                            "timestamp": "2026-03-25T10:00:00+00:00",
+                            "source": "svc-a",
+                            "description": "event",
+                            "severity": "low",
+                            "importance": 0.9,
+                            "evidence_type": "HYPOTHESIS",
+                            "tags": ["test"],
+                        }
+                    ],
+                    "causal_links": [],
+                    "alert_refs": [],
+                    "hypotheses": [],
+                    "pinned_facts": [],
+                    "gaps": [],
+                    "impact": {},
+                    "conflicts": [],
+                    "data_quality": {"is_empty": False, "noise_ratio": 0.1, "notes": ""},
+                    "preliminary_recommendations": [],
+                },
+                ensure_ascii=False,
+            )
+
+        class _Resp:
+            status_code = 400
+
+        calls = {"count": 0}
+
+        def _fake_llm(_prompt: str) -> str:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request for url",
+                    response=_Resp(),
+                )
+            return _mk_summary(f"reduce-{calls['count']}")
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(
+                use_new_algorithm=True,
+                adaptive_reduce_on_overflow=True,
+            ),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=[
+                _mk_summary("batch-1"),
+                _mk_summary("batch-2"),
+                _mk_summary("batch-3"),
+            ],
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+        )
+
+        self.assertGreaterEqual(calls["count"], 3)
+        self.assertGreaterEqual(llm_calls, 2)
+        self.assertGreaterEqual(reduce_rounds, 1)
+        parsed = json.loads(final_summary)
+        self.assertIn("timeline", parsed)
+        self.assertFalse(bool(parsed.get("data_quality", {}).get("is_empty", True)))
 
 
 if __name__ == "__main__":

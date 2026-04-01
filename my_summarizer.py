@@ -8,12 +8,34 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import pandas as pd
 import requests
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+import prompts as incident_prompts
+from alert_merge import merge_alert_refs
+from schemas import AlertRef as IncidentAlertRef
+from schemas import Conflict as IncidentConflict
+from schemas import Context as IncidentContext
+from schemas import DataQuality as IncidentDataQuality
+from schemas import Impact as IncidentImpact
+from schemas import IncidentSummary
+from schemas import Recommendation as IncidentRecommendation
+from schemas import TimelineEvent as IncidentTimelineEvent
 from settings import settings
+
+try:
+    import tiktoken  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None  # type: ignore[assignment]
+
+try:
+    import instructor  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    instructor = None  # type: ignore[assignment]
 
 
 LOGS_SQL_COLUMNS: tuple[str, ...] = ("timestamp", "value")
@@ -45,6 +67,7 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
 _EARLIEST_PERIOD_START = "1970-01-01T00:00:00+00:00"
+_TOKEN_CHARS_FALLBACK_RATIO = 4.0
 
 
 class DBPageFetcher(Protocol):
@@ -88,6 +111,19 @@ class SummarizerConfig:
     # LLM endpoint supports concurrent requests — total MAP time becomes roughly
     # ceil(n_batches / map_workers) × avg_llm_latency instead of n_batches × avg_llm_latency.
     map_workers: int = 1
+    # New pipeline mode (algorithm.md): token-budget map split + cascading structured reduce.
+    use_new_algorithm: bool = False
+    # Budget settings for prompt packing.
+    max_context_tokens: int = 200_000
+    fill_ratio: float = 0.7
+    reserved_tokens: int = 24_000
+    # Reduce/compression target size in percents of input size.
+    reduce_target_token_pct: int = 50
+    compression_target_pct: int = 50
+    compression_importance_threshold: float = 0.7
+    # Optional tech flags.
+    use_tiktoken: bool = True
+    use_instructor: bool = True
 
 
 @dataclass
@@ -200,6 +236,22 @@ def _resolve_anti_hallucination_rules() -> str:
     return custom or DEFAULT_ANTI_HALLUCINATION_RULES
 
 
+def _estimate_tokens_with_fallback(text: str, *, model_name: str = "") -> int:
+    raw = str(text or "")
+    if not raw:
+        return 0
+    if tiktoken is not None:
+        try:
+            if model_name:
+                enc = tiktoken.encoding_for_model(model_name)
+            else:
+                enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(raw))
+        except Exception:
+            pass
+    return max(int(math.ceil(len(raw) / _TOKEN_CHARS_FALLBACK_RATIO)), 1)
+
+
 def _render_prompt_template(template: str, values: Dict[str, Any]) -> str:
     rendered = str(template)
     # Basic Handlebars compatibility for user-provided templates.
@@ -262,6 +314,259 @@ def _ctx_value(ctx: Optional[Dict[str, Any]], key: str, default: Any = "") -> st
     if value is None:
         return ""
     return str(value)
+
+
+def _validate_iso_timestamp(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("timestamp must not be empty")
+    datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return text
+
+
+class MapEventSeverity(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class MapEvidenceType(str, Enum):
+    FACT = "FACT"
+    HYPOTHESIS = "HYPOTHESIS"
+
+
+class MapAlertStatus(str, Enum):
+    EXPLAINED = "EXPLAINED"
+    PARTIALLY = "PARTIALLY"
+    NOT_EXPLAINED = "NOT_EXPLAINED"
+    NOT_SEEN_IN_BATCH = "NOT_SEEN_IN_BATCH"
+
+
+class MapHypothesisStatus(str, Enum):
+    ACTIVE = "active"
+    MERGED = "merged"
+    CONFLICTING = "conflicting"
+    DISMISSED = "dismissed"
+
+
+class MapRecommendationPriority(str, Enum):
+    P0 = "P0"
+    P1 = "P1"
+    P2 = "P2"
+
+
+class MapContextModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    batch_id: str
+    time_range_start: str
+    time_range_end: str
+    total_log_entries: int = Field(ge=0)
+    source_query: List[str]
+    source_services: List[str] = Field(default_factory=list)
+
+    @field_validator("time_range_start", "time_range_end")
+    @classmethod
+    def _validate_time(cls, value: str) -> str:
+        return _validate_iso_timestamp(value)
+
+
+class MapTimelineEventModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    timestamp: str
+    source: str
+    description: str
+    severity: MapEventSeverity
+    importance: float = Field(ge=0.0, le=1.0)
+    evidence_type: MapEvidenceType
+    evidence_quote: str = ""
+    tags: List[str] = Field(default_factory=list)
+
+    @field_validator("timestamp")
+    @classmethod
+    def _validate_ts(cls, value: str) -> str:
+        return _validate_iso_timestamp(value)
+
+    @field_validator("evidence_type", mode="before")
+    @classmethod
+    def _normalize_evidence_type(cls, value: Any) -> Any:
+        raw = str(value or "").strip().upper()
+        if raw in {"ФАКТ", "FACT"}:
+            return "FACT"
+        if raw in {"ГИПОТЕЗА", "HYPOTHESIS"}:
+            return "HYPOTHESIS"
+        return value
+
+
+class MapCausalLinkModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    cause_event_id: str
+    effect_event_id: str
+    mechanism: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class MapAlertRefModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    alert_id: str
+    status: MapAlertStatus
+    related_events: List[str] = Field(default_factory=list)
+    explanation: str = ""
+
+
+class MapHypothesisModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    related_alert_ids: List[str] = Field(default_factory=list)
+    title: str
+    description: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    supporting_events: List[str] = Field(default_factory=list)
+    contradicting_events: List[str] = Field(default_factory=list)
+    status: MapHypothesisStatus = MapHypothesisStatus.ACTIVE
+
+
+class MapPinnedFactModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    fact: str
+    evidence_quote: str = ""
+    relevance: str = ""
+    importance: float = Field(ge=0.0, le=1.0)
+
+
+class MapGapModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    description: str
+    between_events: List[str] = Field(default_factory=list)
+    missing_data: str = ""
+
+
+class MapImpactModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    affected_services: List[str] = Field(default_factory=list)
+    affected_operations: List[str] = Field(default_factory=list)
+    error_counts: List[str] = Field(default_factory=list)
+    degradation_period_start: str = ""
+    degradation_period_end: str = ""
+
+    @field_validator("degradation_period_start", "degradation_period_end")
+    @classmethod
+    def _validate_degradation_period(cls, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        return _validate_iso_timestamp(raw)
+
+
+class MapConflictSideModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    description: str
+    supporting_events: List[str] = Field(default_factory=list)
+
+
+class MapConflictModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    description: str
+    side_a: MapConflictSideModel
+    side_b: MapConflictSideModel
+    resolution: str = ""
+
+
+class MapGapPeriodModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    start: str
+    end: str
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_period_ts(cls, value: str) -> str:
+        return _validate_iso_timestamp(value)
+
+
+class MapDataQualityModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    is_empty: bool
+    noise_ratio: float = Field(ge=0.0, le=1.0)
+    has_gaps: bool = False
+    gap_periods: List[MapGapPeriodModel] = Field(default_factory=list)
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def _sync_gap_flags(self) -> "MapDataQualityModel":
+        if self.gap_periods and not self.has_gaps:
+            self.has_gaps = True
+        if not self.gap_periods and self.has_gaps:
+            self.has_gaps = False
+        return self
+
+
+class MapRecommendationModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    priority: MapRecommendationPriority
+    action: str
+    rationale: str
+    related_hypothesis_ids: List[str] = Field(default_factory=list)
+
+
+class MapBatchSummaryModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    context: MapContextModel
+    timeline: List[MapTimelineEventModel] = Field(default_factory=list)
+    causal_links: List[MapCausalLinkModel] = Field(default_factory=list)
+    alert_refs: List[MapAlertRefModel] = Field(default_factory=list)
+    hypotheses: List[MapHypothesisModel] = Field(default_factory=list)
+    pinned_facts: List[MapPinnedFactModel] = Field(default_factory=list)
+    gaps: List[MapGapModel] = Field(default_factory=list)
+    impact: MapImpactModel = Field(default_factory=MapImpactModel)
+    conflicts: List[MapConflictModel] = Field(default_factory=list)
+    data_quality: MapDataQualityModel
+    preliminary_recommendations: List[MapRecommendationModel] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_references(self) -> "MapBatchSummaryModel":
+        event_ids = {item.id for item in self.timeline}
+        hypothesis_ids = {item.id for item in self.hypotheses}
+        for link in self.causal_links:
+            if link.cause_event_id not in event_ids:
+                raise ValueError(f"cause_event_id `{link.cause_event_id}` not found in timeline")
+            if link.effect_event_id not in event_ids:
+                raise ValueError(f"effect_event_id `{link.effect_event_id}` not found in timeline")
+        for alert in self.alert_refs:
+            for event_id in alert.related_events:
+                if event_id not in event_ids:
+                    raise ValueError(f"alert `{alert.alert_id}` references unknown event `{event_id}`")
+        for hypothesis in self.hypotheses:
+            for event_id in hypothesis.supporting_events:
+                if event_id not in event_ids:
+                    raise ValueError(
+                        f"hypothesis `{hypothesis.id}` references unknown supporting event `{event_id}`"
+                    )
+            for event_id in hypothesis.contradicting_events:
+                if event_id not in event_ids:
+                    raise ValueError(
+                        f"hypothesis `{hypothesis.id}` references unknown contradicting event `{event_id}`"
+                    )
+        for gap in self.gaps:
+            for event_id in gap.between_events:
+                if event_id not in event_ids:
+                    raise ValueError(f"gap `{gap.id}` references unknown event `{event_id}`")
+        for conflict in self.conflicts:
+            for event_id in conflict.side_a.supporting_events + conflict.side_b.supporting_events:
+                if event_id not in event_ids:
+                    raise ValueError(f"conflict `{conflict.id}` references unknown event `{event_id}`")
+        for recommendation in self.preliminary_recommendations:
+            for hypothesis_id in recommendation.related_hypothesis_ids:
+                if hypothesis_id not in hypothesis_ids:
+                    raise ValueError(
+                        f"recommendation `{recommendation.id}` references unknown hypothesis `{hypothesis_id}`"
+                    )
+        return self
 
 
 def _normalize_summary_text(value: Any) -> str:
@@ -999,6 +1304,493 @@ class PeriodLogSummarizer:
         self.on_progress = on_progress
         self.prompt_context = prompt_context or {}
 
+    def _token_budget(self) -> int:
+        max_context = max(int(getattr(self.config, "max_context_tokens", 200_000) or 200_000), 1)
+        fill_ratio = float(getattr(self.config, "fill_ratio", 0.7) or 0.7)
+        fill_ratio = max(min(fill_ratio, 1.0), 0.1)
+        reserved = max(int(getattr(self.config, "reserved_tokens", 24_000) or 24_000), 0)
+        budget = int(max_context * fill_ratio) - reserved
+        return max(budget, 512)
+
+    def _estimate_tokens(self, text: str) -> int:
+        model_name = str(getattr(settings, "LLM_MODEL_ID", "") or "")
+        use_tiktoken = bool(getattr(self.config, "use_tiktoken", True))
+        if not use_tiktoken:
+            return max(int(math.ceil(len(str(text or "")) / _TOKEN_CHARS_FALLBACK_RATIO)), 1)
+        return _estimate_tokens_with_fallback(str(text or ""), model_name=model_name)
+
+    def _render_rows_as_text(
+        self,
+        *,
+        rows: Sequence[Dict[str, Any]],
+        columns: Sequence[str],
+    ) -> str:
+        rendered: List[str] = []
+        for idx, row in enumerate(rows, start=1):
+            parts: List[str] = []
+            for col in columns:
+                if col not in row:
+                    continue
+                value = row.get(col)
+                if value is None or value == "":
+                    continue
+                parts.append(f"{col}={value}")
+            if parts:
+                rendered.append(f"{idx}. " + " | ".join(parts))
+        return "\n".join(rendered)
+
+    def _split_rows_by_token_budget(
+        self,
+        *,
+        rows: List[Dict[str, Any]],
+        columns: Sequence[str],
+    ) -> List[List[Dict[str, Any]]]:
+        if not rows:
+            return []
+        if not bool(getattr(self.config, "use_new_algorithm", False)):
+            return [rows]
+        budget = self._token_budget()
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+        for row in rows:
+            row_text = self._render_rows_as_text(rows=[row], columns=columns)
+            row_tokens = max(self._estimate_tokens(row_text), 1)
+            if current and current_tokens + row_tokens > budget:
+                chunks.append(current)
+                current = [row]
+                current_tokens = row_tokens
+                continue
+            current.append(row)
+            current_tokens += row_tokens
+        if current:
+            chunks.append(current)
+        return chunks or [rows]
+
+    @staticmethod
+    def _normalize_incident_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(payload or {})
+        impact = data.get("impact")
+        if isinstance(impact, dict):
+            if "degradation_period" not in impact:
+                start = str(impact.get("degradation_period_start") or "").strip()
+                end = str(impact.get("degradation_period_end") or "").strip()
+                if start and end:
+                    impact["degradation_period"] = {"start": start, "end": end}
+            impact.pop("degradation_period_start", None)
+            impact.pop("degradation_period_end", None)
+            data["impact"] = impact
+        return data
+
+    def _parse_incident_summary_text(
+        self,
+        text: str,
+        *,
+        fallback_batch_id: str,
+        fallback_start: str,
+        fallback_end: str,
+    ) -> Optional[IncidentSummary]:
+        payload = self._extract_json_payload(text)
+        if not isinstance(payload, dict):
+            return None
+        normalized = self._normalize_incident_payload(payload)
+        context = normalized.get("context")
+        if not isinstance(context, dict):
+            context = {}
+        context.setdefault("batch_id", fallback_batch_id)
+        context.setdefault("time_range_start", fallback_start)
+        context.setdefault("time_range_end", fallback_end)
+        context.setdefault("total_log_entries", 0)
+        context.setdefault("source_query", [])
+        context.setdefault("source_services", [])
+        normalized["context"] = context
+        try:
+            return IncidentSummary.model_validate(normalized)
+        except ValidationError:
+            return None
+
+    @staticmethod
+    def _incident_summary_to_json(summary: IncidentSummary) -> str:
+        return json.dumps(summary.model_dump(mode="json"), ensure_ascii=False, indent=2)
+
+    def _build_reduce_prompt_with_premerged_alerts(
+        self,
+        *,
+        period_start: str,
+        period_end: str,
+        reduce_round: int,
+        summaries: List[str],
+        premerged_alert_refs: Optional[List[IncidentAlertRef]] = None,
+        sources: Optional[List[str]] = None,
+    ) -> str:
+        base_prompt = self._build_reduce_prompt(
+            period_start=period_start,
+            period_end=period_end,
+            reduce_round=reduce_round,
+            summaries=summaries,
+            sources=sources,
+        )
+        if not premerged_alert_refs:
+            return base_prompt
+        refs_payload = [
+            ref.model_dump(mode="json")
+            for ref in premerged_alert_refs
+        ]
+        refs_text = json.dumps(refs_payload, ensure_ascii=False, indent=2)
+        return (
+            f"{base_prompt}\n\n"
+            "PROGRAMMATICALLY MERGED ALERT_REFS (final statuses, do not recalculate):\n"
+            f"{refs_text}"
+        )
+
+    @staticmethod
+    def _summary_is_empty(summary: IncidentSummary) -> bool:
+        is_empty_flag = bool(getattr(summary.data_quality, "is_empty", False))
+        return is_empty_flag or len(summary.timeline) == 0
+
+    def _group_structured_summaries_by_budget(
+        self,
+        summaries: List[IncidentSummary],
+    ) -> List[List[IncidentSummary]]:
+        if not summaries:
+            return []
+        budget = self._token_budget()
+        groups: List[List[IncidentSummary]] = []
+        current: List[IncidentSummary] = []
+        current_tokens = 0
+        for summary in summaries:
+            token_count = max(self._estimate_tokens(self._incident_summary_to_json(summary)), 1)
+            if current and current_tokens + token_count > budget:
+                groups.append(current)
+                current = [summary]
+                current_tokens = token_count
+                continue
+            current.append(summary)
+            current_tokens += token_count
+        if current:
+            groups.append(current)
+        return groups
+
+    def _compress_structured_summary_if_needed(
+        self,
+        summary: IncidentSummary,
+        *,
+        period_start: str,
+        period_end: str,
+    ) -> tuple[IncidentSummary, int]:
+        if not bool(getattr(self.config, "use_new_algorithm", False)):
+            return summary, 0
+        budget = self._token_budget()
+        current = summary
+        llm_calls = 0
+        max_rounds = 3
+        for _ in range(max_rounds):
+            size = self._estimate_tokens(self._incident_summary_to_json(current))
+            if size <= budget:
+                return current, llm_calls
+            target_pct = max(min(int(getattr(self.config, "compression_target_pct", 50) or 50), 90), 20)
+            importance_threshold = float(
+                getattr(self.config, "compression_importance_threshold", 0.7) or 0.7
+            )
+            system_text = incident_prompts.COMPRESSION_SYSTEM_PROMPT.format(
+                target_pct=target_pct,
+                importance_threshold=importance_threshold,
+            )
+            user_text = incident_prompts.COMPRESSION_USER_PROMPT.format(
+                summary_json=self._incident_summary_to_json(current),
+            )
+            prompt = f"{system_text}\n\n{user_text}"
+            raw = str(self.llm_call(prompt) or "").strip()
+            llm_calls += 1
+            parsed = self._parse_incident_summary_text(
+                raw,
+                fallback_batch_id=current.context.batch_id,
+                fallback_start=current.context.time_range_start,
+                fallback_end=current.context.time_range_end,
+            )
+            if parsed is None:
+                break
+            current = parsed
+        return current, llm_calls
+
+    @staticmethod
+    def _deterministic_merge_alert_refs(
+        summaries: List[IncidentSummary],
+    ) -> List[IncidentAlertRef]:
+        merged = merge_alert_refs(summaries)
+        normalized: List[IncidentAlertRef] = []
+        for item in merged:
+            normalized.append(
+                IncidentAlertRef(
+                    alert_id=str(item.alert_id),
+                    status=item.status,
+                    # Keep union of related events from programmatic merge; reduce stage
+                    # can remap them to the renumbered timeline ids.
+                    related_events=sorted({str(eid) for eid in (item.related_events or []) if str(eid)}),
+                    explanation=str(item.explanation or ""),
+                )
+            )
+        return normalized
+
+    def _extract_json_payload(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        text = str(raw_text or "").strip()
+        if not text:
+            return None
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+            text = text.strip()
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                payload = json.loads(text)
+                return payload if isinstance(payload, dict) else None
+            except Exception:
+                pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            candidate = text[start : end + 1]
+            try:
+                payload = json.loads(candidate)
+                return payload if isinstance(payload, dict) else None
+            except Exception:
+                return None
+        return None
+
+    def _derive_source_services(self, rows_chunk: List[Dict[str, Any]]) -> List[str]:
+        values: List[str] = []
+        for row in rows_chunk:
+            for key in ("_source", "service", "source", "host", "node", "pod", "container"):
+                value = str(row.get(key) or "").strip()
+                if value and value not in values:
+                    values.append(value)
+                    break
+        return values
+
+    def _build_map_default_payload(
+        self,
+        *,
+        rows_chunk: List[Dict[str, Any]],
+        batch_number: int,
+        batch_period_start: Optional[str],
+        batch_period_end: Optional[str],
+        raw_summary_text: str = "",
+    ) -> Dict[str, Any]:
+        source_query = str(self.prompt_context.get("sql_query") or "").strip()
+        source_services = self._derive_source_services(rows_chunk)
+        total_logs = len(rows_chunk)
+        timeline_seed = []
+        if raw_summary_text:
+            timeline_seed = [
+                {
+                    "id": "evt-raw-summary",
+                    "timestamp": batch_period_start or _EARLIEST_PERIOD_START,
+                    "source": source_services[0] if source_services else "unknown",
+                    "description": "LLM вернула неструктурированный MAP summary; сохранён raw-текст.",
+                    "severity": "low",
+                    "importance": 0.2,
+                    "evidence_type": "HYPOTHESIS",
+                    "evidence_quote": "",
+                    "tags": ["raw_summary", "degraded"],
+                }
+            ]
+        noise_ratio = 1.0 if total_logs <= 0 else max(0.0, min(1.0, 1.0 - (len(timeline_seed) / float(total_logs))))
+        return {
+            "context": {
+                "batch_id": f"batch-{int(batch_number):06d}",
+                "time_range_start": batch_period_start or _EARLIEST_PERIOD_START,
+                "time_range_end": batch_period_end or _EARLIEST_PERIOD_START,
+                "total_log_entries": total_logs,
+                "source_query": [source_query] if source_query else [],
+                "source_services": source_services,
+            },
+            "timeline": timeline_seed,
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {
+                "affected_services": [],
+                "affected_operations": [],
+                "error_counts": [],
+                "degradation_period_start": "",
+                "degradation_period_end": "",
+            },
+            "conflicts": [],
+            "data_quality": {
+                "is_empty": len(timeline_seed) == 0,
+                "noise_ratio": noise_ratio,
+                "has_gaps": False,
+                "gap_periods": [],
+                "notes": (
+                    f"Raw LLM map summary (для справки): {raw_summary_text}"
+                    if raw_summary_text
+                    else ""
+                ),
+            },
+            "preliminary_recommendations": [],
+        }
+
+    def _normalize_map_summary_payload(
+        self,
+        *,
+        raw_summary_text: str,
+        rows_chunk: List[Dict[str, Any]],
+        batch_number: int,
+        batch_period_start: Optional[str],
+        batch_period_end: Optional[str],
+    ) -> Tuple[MapBatchSummaryModel, Optional[str]]:
+        payload = self._extract_json_payload(raw_summary_text)
+        parse_error: Optional[str] = None
+        if payload is None:
+            parse_error = "LLM map summary is not valid JSON."
+            payload = {}
+        defaults = self._build_map_default_payload(
+            rows_chunk=rows_chunk,
+            batch_number=batch_number,
+            batch_period_start=batch_period_start,
+            batch_period_end=batch_period_end,
+            raw_summary_text=raw_summary_text if parse_error else "",
+        )
+        merged: Dict[str, Any] = dict(payload)
+        merged_context = dict(defaults["context"])
+        merged_context.update(payload.get("context") or {})
+        # Programmatic context is authoritative.
+        merged_context["batch_id"] = defaults["context"]["batch_id"]
+        merged_context["time_range_start"] = defaults["context"]["time_range_start"]
+        merged_context["time_range_end"] = defaults["context"]["time_range_end"]
+        merged_context["total_log_entries"] = defaults["context"]["total_log_entries"]
+        merged_context["source_query"] = defaults["context"]["source_query"]
+        merged_context["source_services"] = defaults["context"]["source_services"]
+        merged["context"] = merged_context
+        for key in (
+            "timeline",
+            "causal_links",
+            "alert_refs",
+            "hypotheses",
+            "pinned_facts",
+            "gaps",
+            "conflicts",
+            "preliminary_recommendations",
+        ):
+            if key not in merged or not isinstance(merged.get(key), list):
+                merged[key] = defaults[key]
+        if "impact" not in merged or not isinstance(merged.get("impact"), dict):
+            merged["impact"] = defaults["impact"]
+        if "data_quality" not in merged or not isinstance(merged.get("data_quality"), dict):
+            merged["data_quality"] = defaults["data_quality"]
+        try:
+            model = MapBatchSummaryModel.model_validate(merged)
+        except ValidationError as exc:
+            parse_error = str(exc)
+            degraded = self._build_map_default_payload(
+                rows_chunk=rows_chunk,
+                batch_number=batch_number,
+                batch_period_start=batch_period_start,
+                batch_period_end=batch_period_end,
+                raw_summary_text=raw_summary_text,
+            )
+            degraded["data_quality"]["notes"] = (
+                f"Validation error: {parse_error}\n\n"
+                f"{degraded['data_quality'].get('notes', '')}".strip()
+            )
+            model = MapBatchSummaryModel.model_validate(degraded)
+        return model, parse_error
+
+    @staticmethod
+    def _render_map_summary_json(model: MapBatchSummaryModel) -> str:
+        return json.dumps(model.model_dump(mode="json"), ensure_ascii=False, indent=2)
+
+    def _map_schema_retry_prompt(self, *, raw_summary_text: str, error_text: str) -> str:
+        schema_hint = (
+            "{"
+            "\"context\": {...}, "
+            "\"timeline\": [...], "
+            "\"causal_links\": [...], "
+            "\"alert_refs\": [...], "
+            "\"hypotheses\": [...], "
+            "\"pinned_facts\": [...], "
+            "\"gaps\": [...], "
+            "\"impact\": {...}, "
+            "\"conflicts\": [...], "
+            "\"data_quality\": {...}, "
+            "\"preliminary_recommendations\": [...]"
+            "}"
+        )
+        return "\n".join(
+            [
+                "Исправь ответ в СТРОГИЙ JSON без markdown и без пояснений.",
+                "Нужен ровно один JSON-объект по схеме:",
+                schema_hint,
+                "",
+                "Ошибка валидации предыдущего ответа:",
+                str(error_text or "unknown validation error"),
+                "",
+                "Предыдущий ответ:",
+                str(raw_summary_text or ""),
+            ]
+        )
+
+    def _normalize_map_summary_response(
+        self,
+        *,
+        raw_summary_text: str,
+        rows_chunk: List[Dict[str, Any]],
+        batch_number: int,
+        batch_period_start: Optional[str],
+        batch_period_end: Optional[str],
+        allow_schema_retry: bool = True,
+    ) -> Tuple[str, Dict[str, Any], int]:
+        model, parse_error = self._normalize_map_summary_payload(
+            raw_summary_text=raw_summary_text,
+            rows_chunk=rows_chunk,
+            batch_number=batch_number,
+            batch_period_start=batch_period_start,
+            batch_period_end=batch_period_end,
+        )
+        llm_extra_calls = 0
+        max_schema_retries = 2
+        if parse_error and allow_schema_retry:
+            current_text = str(raw_summary_text or "")
+            for attempt in range(1, max_schema_retries + 1):
+                self._emit_progress(
+                    "map_schema_retry",
+                    {
+                        "batch_number": int(batch_number),
+                        "attempt": attempt,
+                        "reason": parse_error,
+                    },
+                )
+                retry_prompt = self._map_schema_retry_prompt(
+                    raw_summary_text=current_text,
+                    error_text=parse_error,
+                )
+                current_text = str(self.llm_call(retry_prompt) or "")
+                llm_extra_calls += 1
+                model, parse_error = self._normalize_map_summary_payload(
+                    raw_summary_text=current_text,
+                    rows_chunk=rows_chunk,
+                    batch_number=batch_number,
+                    batch_period_start=batch_period_start,
+                    batch_period_end=batch_period_end,
+                )
+                if not parse_error:
+                    break
+        if parse_error:
+            self._emit_progress(
+                "map_schema_degraded",
+                {
+                    "batch_number": int(batch_number),
+                    "reason": parse_error,
+                },
+            )
+        json_text = self._truncate(
+            self._render_map_summary_json(model),
+            self.config.max_summary_chars,
+        )
+        return json_text, model.model_dump(mode="json"), llm_extra_calls
+
     def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
         if self.on_progress is None:
             return
@@ -1082,13 +1874,21 @@ class PeriodLogSummarizer:
                 llm_calls += sub_calls
             return merged_items, llm_calls
 
-        chunk_summary = (llm_text or "").strip() or "Пустой ответ LLM на map-этапе."
-        chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
+        raw_llm_text = (llm_text or "").strip()
         llm_calls = 1
+        chunk_summary, chunk_summary_structured, schema_retry_calls = self._normalize_map_summary_response(
+            raw_summary_text=raw_llm_text,
+            rows_chunk=rows_chunk,
+            batch_number=batch_number,
+            batch_period_start=batch_period_start,
+            batch_period_end=batch_period_end,
+            allow_schema_retry=True,
+        )
+        llm_calls += schema_retry_calls
 
         can_shrink = (
             auto_shrink
-            and self._is_400_bad_request_fallback(chunk_summary)
+            and self._is_400_bad_request_fallback(raw_llm_text)
             and len(rows_chunk) > min_chunk
             and depth < max_shrink_rounds
         )
@@ -1097,6 +1897,7 @@ class PeriodLogSummarizer:
                 [
                     {
                         "summary": chunk_summary,
+                        "summary_structured": chunk_summary_structured,
                         "rows": list(rows_chunk),
                         "batch_period_start": batch_period_start,
                         "batch_period_end": batch_period_end,
@@ -1111,6 +1912,7 @@ class PeriodLogSummarizer:
                 [
                     {
                         "summary": chunk_summary,
+                        "summary_structured": chunk_summary_structured,
                         "rows": list(rows_chunk),
                         "batch_period_start": batch_period_start,
                         "batch_period_end": batch_period_end,
@@ -1178,12 +1980,20 @@ class PeriodLogSummarizer:
         if bool(getattr(self.config, "auto_shrink_on_400", True)):
             # Real batch count can grow dynamically after split-on-400.
             estimated_batch_total = None
+        if bool(getattr(self.config, "use_new_algorithm", False)):
+            # Token-based map splitting can further split chunks dynamically.
+            estimated_batch_total = None
         seen_sources: List[str] = []  # ordered unique sources seen across all pages
         self._emit_progress(
             "map_start",
             {
                 "rows_processed": 0,
                 "rows_total": total_rows_estimate,
+                "token_budget": self._token_budget(),
+                "use_new_algorithm": bool(getattr(self.config, "use_new_algorithm", False)),
+                "use_tiktoken": bool(getattr(self.config, "use_tiktoken", True)),
+                "use_instructor": bool(getattr(self.config, "use_instructor", True)),
+                "instructor_runtime_available": bool(instructor is not None),
             },
         )
 
@@ -1241,88 +2051,96 @@ class PeriodLogSummarizer:
                 )
 
                 for i in range(0, len(page), self.config.llm_chunk_rows):
-                    rows_chunk = page[i : i + self.config.llm_chunk_rows]
-                    next_batch_index = map_batch_index
-                    batch_period_start, batch_period_end = _extract_batch_period(rows_chunk)
-                    self._emit_progress(
-                        "map_batch_start",
-                        {
-                            "batch_index": next_batch_index,
-                            "batch_total": estimated_batch_total,
-                            "batch_logs_count": len(rows_chunk),
-                            "batch_period_start": batch_period_start,
-                            "batch_period_end": batch_period_end,
-                            "rows_processed": rows_mapped,
-                            "rows_total": total_rows_estimate,
-                        },
-                    )
-                    prompt = self._build_chunk_prompt(
-                        period_start=period_start,
-                        period_end=period_end,
+                    base_chunk = page[i : i + self.config.llm_chunk_rows]
+                    rows_sub_chunks = self._split_rows_by_token_budget(
+                        rows=list(base_chunk),
                         columns=columns,
-                        rows=rows_chunk,
-                        batch_number=next_batch_index + 1,
-                        total_batches=estimated_batch_total,
                     )
-                    future: Optional[Future] = None  # type: ignore[type-arg]
-                    if executor is not None:
-                        future = executor.submit(self.llm_call, prompt)
-                    else:
-                        # Sequential: run inline with optional auto-shrink on 400.
-                        summarized_items, map_llm_calls = self._summarize_rows_with_auto_shrink(
-                            rows_chunk=list(rows_chunk),
-                            columns=columns,
+                    for rows_chunk in rows_sub_chunks:
+                        next_batch_index = map_batch_index
+                        batch_period_start, batch_period_end = _extract_batch_period(rows_chunk)
+                        self._emit_progress(
+                            "map_batch_start",
+                            {
+                                "batch_index": next_batch_index,
+                                "batch_total": estimated_batch_total,
+                                "batch_logs_count": len(rows_chunk),
+                                "batch_period_start": batch_period_start,
+                                "batch_period_end": batch_period_end,
+                                "rows_processed": rows_mapped,
+                                "rows_total": total_rows_estimate,
+                            },
+                        )
+                        prompt = self._build_chunk_prompt(
                             period_start=period_start,
                             period_end=period_end,
+                            columns=columns,
+                            rows=rows_chunk,
                             batch_number=next_batch_index + 1,
                             total_batches=estimated_batch_total,
                         )
-                        llm_calls += map_llm_calls
-                        for item in summarized_items:
-                            item_rows = list(item.get("rows") or [])
-                            item_summary = str(item.get("summary") or "").strip()
-                            item_bp_start = item.get("batch_period_start")
-                            item_bp_end = item.get("batch_period_end")
-                            current_batch_index = map_batch_index
-                            map_summaries.append(item_summary)
-                            if self.config.keep_map_batches_in_memory:
-                                map_batches.append(
+                        future: Optional[Future] = None  # type: ignore[type-arg]
+                        if executor is not None:
+                            future = executor.submit(self.llm_call, prompt)
+                        else:
+                            # Sequential: run inline with optional auto-shrink on 400.
+                            summarized_items, map_llm_calls = self._summarize_rows_with_auto_shrink(
+                                rows_chunk=list(rows_chunk),
+                                columns=columns,
+                                period_start=period_start,
+                                period_end=period_end,
+                                batch_number=next_batch_index + 1,
+                                total_batches=estimated_batch_total,
+                            )
+                            llm_calls += map_llm_calls
+                            for item in summarized_items:
+                                item_rows = list(item.get("rows") or [])
+                                item_summary = str(item.get("summary") or "").strip()
+                                item_summary_structured = dict(item.get("summary_structured") or {})
+                                item_bp_start = item.get("batch_period_start")
+                                item_bp_end = item.get("batch_period_end")
+                                current_batch_index = map_batch_index
+                                map_summaries.append(item_summary)
+                                if self.config.keep_map_batches_in_memory:
+                                    map_batches.append(
+                                        {
+                                            "batch_index": current_batch_index,
+                                            "rows_count": len(item_rows),
+                                            "summary": item_summary,
+                                            "summary_structured": item_summary_structured,
+                                            "batch_period_start": item_bp_start,
+                                            "batch_period_end": item_bp_end,
+                                        }
+                                    )
+                                rows_mapped += len(item_rows)
+                                self._emit_progress(
+                                    "map_batch",
                                     {
                                         "batch_index": current_batch_index,
-                                        "rows_count": len(item_rows),
-                                        "summary": item_summary,
+                                        "batch_total": estimated_batch_total,
+                                        "batch_summary": item_summary,
+                                        "batch_summary_structured": item_summary_structured,
+                                        "batch_logs_count": len(item_rows),
+                                        "batch_logs": item_rows,
                                         "batch_period_start": item_bp_start,
                                         "batch_period_end": item_bp_end,
-                                    }
+                                        "rows_processed": rows_mapped,
+                                        "rows_total": total_rows_estimate,
+                                    },
                                 )
-                            rows_mapped += len(item_rows)
-                            self._emit_progress(
-                                "map_batch",
-                                {
-                                    "batch_index": current_batch_index,
-                                    "batch_total": estimated_batch_total,
-                                    "batch_summary": item_summary,
-                                    "batch_logs_count": len(item_rows),
-                                    "batch_logs": item_rows,
-                                    "batch_period_start": item_bp_start,
-                                    "batch_period_end": item_bp_end,
-                                    "rows_processed": rows_mapped,
-                                    "rows_total": total_rows_estimate,
-                                },
-                            )
-                            map_batch_index += 1
-                        continue  # skip appending to pending_items again
+                                map_batch_index += 1
+                            continue  # skip appending to pending_items again
 
-                    # Parallel mode: store future for later collection
-                    pending_items.append((
-                        future,
-                        next_batch_index,
-                        len(rows_chunk),
-                        batch_period_start,
-                        batch_period_end,
-                        list(rows_chunk),
-                    ))
-                    map_batch_index += 1
+                        # Parallel mode: store future for later collection
+                        pending_items.append((
+                            future,
+                            next_batch_index,
+                            len(rows_chunk),
+                            batch_period_start,
+                            batch_period_end,
+                            list(rows_chunk),
+                        ))
+                        map_batch_index += 1
 
                 if len(page) < self.config.page_limit:
                     break
@@ -1345,25 +2163,33 @@ class PeriodLogSummarizer:
                 except Exception as exc:
                     logger.exception("Parallel LLM call failed on batch %s", batch_idx)
                     raise
-                chunk_summary = (result_text or "").strip() or "Пустой ответ LLM на map-этапе."
-                chunk_summary = self._truncate(chunk_summary, self.config.max_summary_chars)
+                chunk_summary, chunk_summary_structured, extra_calls = self._normalize_map_summary_response(
+                    raw_summary_text=(result_text or "").strip(),
+                    rows_chunk=rows_snap,
+                    batch_number=batch_idx + 1,
+                    batch_period_start=bp_start,
+                    batch_period_end=bp_end,
+                    allow_schema_retry=False,
+                )
                 map_summaries.append(chunk_summary)
                 if self.config.keep_map_batches_in_memory:
                     map_batches.append({
                         "batch_index": batch_idx,
                         "rows_count": nrows,
                         "summary": chunk_summary,
+                        "summary_structured": chunk_summary_structured,
                         "batch_period_start": bp_start,
                         "batch_period_end": bp_end,
                     })
                 rows_mapped += nrows
-                llm_calls += 1
+                llm_calls += 1 + extra_calls
                 self._emit_progress(
                     "map_batch",
                     {
                         "batch_index": batch_idx,
                         "batch_total": estimated_batch_total,
                         "batch_summary": chunk_summary,
+                        "batch_summary_structured": chunk_summary_structured,
                         "batch_logs_count": nrows,
                         "batch_logs": rows_snap,
                         "batch_period_start": bp_start,
@@ -1455,6 +2281,272 @@ class PeriodLogSummarizer:
             map_batches=map_batches,
         )
 
+    def _reduce_structured_group(
+        self,
+        *,
+        summaries: List[IncidentSummary],
+        period_start: str,
+        period_end: str,
+        reduce_round: int,
+        group_index: int,
+        group_total: int,
+        sources: Optional[List[str]] = None,
+        depth: int = 0,
+    ) -> tuple[IncidentSummary, int]:
+        if len(summaries) == 1:
+            return summaries[0], 0
+        if depth > 12:
+            # Safety net: deterministic fallback to guarantee convergence.
+            merged_alerts = self._deterministic_merge_alert_refs(summaries)
+            total_logs = sum(max(int(s.context.total_log_entries), 0) for s in summaries)
+            fallback = IncidentSummary(
+                context=IncidentContext(
+                    batch_id=f"reduce-fallback-r{reduce_round}-g{group_index}",
+                    time_range_start=period_start,
+                    time_range_end=period_end,
+                    total_log_entries=total_logs,
+                    source_query=[],
+                    source_services=[],
+                ),
+                timeline=[],
+                causal_links=[],
+                alert_refs=merged_alerts,
+                hypotheses=[],
+                pinned_facts=[],
+                gaps=[],
+                impact=IncidentImpact(),
+                conflicts=[],
+                data_quality=IncidentDataQuality(
+                    is_empty=True,
+                    noise_ratio=1.0,
+                    notes="Deterministic fallback merge (max recursion depth reached).",
+                ),
+                preliminary_recommendations=[],
+            )
+            return fallback, 0
+
+        serialized_group = [self._incident_summary_to_json(item) for item in summaries]
+        merged_alerts = self._deterministic_merge_alert_refs(summaries)
+        prompt = self._build_reduce_prompt_with_premerged_alerts(
+            period_start=period_start,
+            period_end=period_end,
+            reduce_round=reduce_round,
+            summaries=serialized_group,
+            premerged_alert_refs=merged_alerts,
+            sources=sources,
+        )
+        budget = self._token_budget()
+        prompt_tokens = self._estimate_tokens(prompt)
+        if prompt_tokens > budget and len(summaries) > 1:
+            mid = max(len(summaries) // 2, 1)
+            left, left_calls = self._reduce_structured_group(
+                summaries=summaries[:mid],
+                period_start=period_start,
+                period_end=period_end,
+                reduce_round=reduce_round,
+                group_index=group_index,
+                group_total=group_total,
+                sources=sources,
+                depth=depth + 1,
+            )
+            right, right_calls = self._reduce_structured_group(
+                summaries=summaries[mid:],
+                period_start=period_start,
+                period_end=period_end,
+                reduce_round=reduce_round,
+                group_index=group_index,
+                group_total=group_total,
+                sources=sources,
+                depth=depth + 1,
+            )
+            combined, combined_calls = self._reduce_structured_group(
+                summaries=[left, right],
+                period_start=period_start,
+                period_end=period_end,
+                reduce_round=reduce_round,
+                group_index=group_index,
+                group_total=group_total,
+                sources=sources,
+                depth=depth + 1,
+            )
+            return combined, left_calls + right_calls + combined_calls
+
+        calls = 0
+        try:
+            raw = str(self.llm_call(prompt) or "").strip()
+            calls += 1
+        except Exception as exc:  # noqa: BLE001
+            if (
+                self._is_context_overflow_error(exc)
+                or _is_400_bad_request_exception(exc)
+                or _is_read_timeout_exception(exc)
+            ) and len(summaries) > 1:
+                mid = max(len(summaries) // 2, 1)
+                left, left_calls = self._reduce_structured_group(
+                    summaries=summaries[:mid],
+                    period_start=period_start,
+                    period_end=period_end,
+                    reduce_round=reduce_round,
+                    group_index=group_index,
+                    group_total=group_total,
+                    sources=sources,
+                    depth=depth + 1,
+                )
+                right, right_calls = self._reduce_structured_group(
+                    summaries=summaries[mid:],
+                    period_start=period_start,
+                    period_end=period_end,
+                    reduce_round=reduce_round,
+                    group_index=group_index,
+                    group_total=group_total,
+                    sources=sources,
+                    depth=depth + 1,
+                )
+                combined, combined_calls = self._reduce_structured_group(
+                    summaries=[left, right],
+                    period_start=period_start,
+                    period_end=period_end,
+                    reduce_round=reduce_round,
+                    group_index=group_index,
+                    group_total=group_total,
+                    sources=sources,
+                    depth=depth + 1,
+                )
+                return combined, calls + left_calls + right_calls + combined_calls
+            raise
+
+        parsed = self._parse_incident_summary_text(
+            raw,
+            fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
+            fallback_start=period_start,
+            fallback_end=period_end,
+        )
+        if parsed is not None:
+            return parsed, calls
+
+        # Schema-repair retry (Instructor-like behavior, but through existing llm_call).
+        retry_prompt = "\n".join(
+            [
+                "Return STRICT JSON only (no markdown, no explanations).",
+                "The JSON must validate against IncidentSummary schema.",
+                "Fix invalid references and required fields.",
+                "",
+                "Previous invalid response:",
+                raw,
+            ]
+        )
+        raw_retry = str(self.llm_call(retry_prompt) or "").strip()
+        calls += 1
+        parsed_retry = self._parse_incident_summary_text(
+            raw_retry,
+            fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
+            fallback_start=period_start,
+            fallback_end=period_end,
+        )
+        if parsed_retry is not None:
+            return parsed_retry, calls
+
+        # If response is plain text, keep compatibility by giving control back to legacy reducer.
+        raise ValueError("structured_reduce_invalid_json")
+
+    def _reduce_summaries_structured(
+        self,
+        *,
+        chunk_summaries: List[str],
+        period_start: str,
+        period_end: str,
+        sources: Optional[List[str]] = None,
+    ) -> Optional[tuple[str, int, int]]:
+        if len(chunk_summaries) <= 1:
+            return None
+        parsed_inputs: List[IncidentSummary] = []
+        for idx, text in enumerate(chunk_summaries, start=1):
+            parsed = self._parse_incident_summary_text(
+                str(text or ""),
+                fallback_batch_id=f"map-{idx:06d}",
+                fallback_start=period_start,
+                fallback_end=period_end,
+            )
+            if parsed is None:
+                # Not a structured payload => keep legacy behavior.
+                return None
+            if not self._summary_is_empty(parsed):
+                parsed_inputs.append(parsed)
+
+        if not parsed_inputs:
+            return (
+                "В предоставленных логах не обнаружено событий, связанных с инцидентом. "
+                "Возможные причины: логи не покрывают нужный временной диапазон, "
+                "релевантные сервисы не представлены в выборке, уровень логирования недостаточен.",
+                0,
+                0,
+            )
+
+        llm_calls = 0
+        reduce_rounds = 0
+        current = parsed_inputs
+        while len(current) > 1:
+            reduce_rounds += 1
+            if reduce_rounds > self.config.max_reduce_rounds:
+                raise RuntimeError("Exceeded max reduce rounds")
+
+            adjusted: List[IncidentSummary] = []
+            for item in current:
+                compressed, compressed_calls = self._compress_structured_summary_if_needed(
+                    item,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+                llm_calls += compressed_calls
+                adjusted.append(compressed)
+            current = adjusted
+
+            groups = self._group_structured_summaries_by_budget(current)
+            if len(groups) == len(current) and len(current) > 1:
+                groups = [current[i : i + 2] for i in range(0, len(current), 2)]
+
+            next_level: List[IncidentSummary] = []
+            for group_index, group in enumerate(groups):
+                self._emit_progress(
+                    "reduce_group_start",
+                    {
+                        "reduce_round": reduce_rounds,
+                        "group_index": group_index,
+                        "group_total": len(groups),
+                        "group_size": len(group),
+                    },
+                )
+                try:
+                    merged, group_calls = self._reduce_structured_group(
+                        summaries=group,
+                        period_start=period_start,
+                        period_end=period_end,
+                        reduce_round=reduce_rounds,
+                        group_index=group_index + 1,
+                        group_total=len(groups),
+                        sources=sources,
+                    )
+                except ValueError as exc:
+                    if str(exc) == "structured_reduce_invalid_json":
+                        # Fallback to legacy reducer for compatibility with plain-text LLM outputs.
+                        return None
+                    raise
+                llm_calls += group_calls
+                next_level.append(merged)
+                self._emit_progress(
+                    "reduce_group_done",
+                    {
+                        "reduce_round": reduce_rounds,
+                        "group_index": group_index,
+                        "group_total": len(groups),
+                        "group_size": len(group),
+                    },
+                )
+            current = next_level
+
+        final_text = self._incident_summary_to_json(current[0])
+        return final_text, llm_calls, reduce_rounds
+
     def _reduce_summaries(
         self,
         *,
@@ -1463,6 +2555,15 @@ class PeriodLogSummarizer:
         period_end: str,
         sources: Optional[List[str]] = None,
     ) -> tuple[str, int, int]:
+        if bool(getattr(self.config, "use_new_algorithm", False)):
+            structured_result = self._reduce_summaries_structured(
+                chunk_summaries=chunk_summaries,
+                period_start=period_start,
+                period_end=period_end,
+                sources=sources,
+            )
+            if structured_result is not None:
+                return structured_result
         if len(chunk_summaries) == 1:
             return chunk_summaries[0], 0, 0
         if not self.config.adaptive_reduce_on_overflow:
@@ -1750,6 +2851,29 @@ class PeriodLogSummarizer:
             log_lines.append(f"{idx}. " + " | ".join(rendered_parts))
         logs_text = "\n".join(log_lines) if log_lines else "Нет строк в батче."
 
+        if bool(getattr(self.config, "use_new_algorithm", False)):
+            user_context = _ctx_value(self.prompt_context, "incident_description", "")
+            alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
+            source_services = self._derive_source_services(rows)
+            source_query = str(self.prompt_context.get("sql_query") or "").strip()
+            batch_period_start, batch_period_end = _extract_batch_period(rows)
+            map_batch_id = f"batch-{int(batch_number or 1):06d}"
+            system_text = incident_prompts.MAP_SYSTEM_PROMPT.format(
+                user_context=user_context,
+                alerts_list=alerts_context,
+                batch_id=map_batch_id,
+                time_range_start=batch_period_start or period_start,
+                time_range_end=batch_period_end or period_end,
+                total_log_entries=len(rows),
+                source_services=", ".join(source_services) if source_services else "unknown",
+                source_query=source_query or "N/A",
+            )
+            user_text = incident_prompts.MAP_USER_PROMPT.format(
+                batch_id=map_batch_id,
+                log_entries=logs_text,
+            )
+            return f"{system_text}\n\n{user_text}"
+
         map_template = _read_prompt_setting("CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE")
         if map_template:
             rendered = _render_prompt_template(
@@ -1807,15 +2931,19 @@ class PeriodLogSummarizer:
             "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
             anti_rules,
             "",
-            "Верни обычный текст (не JSON) со строгими секциями:",
-            "1) ВРЕМЕННОЙ ДИАПАЗОН БАТЧА",
-            "2) КЛАССИФИКАЦИЯ ЗАПИСЕЙ: [РЕЛЕВАНТНО] / [ФОН] / [НЕЯСНО]",
-            "3) КЛЮЧЕВЫЕ СОБЫТИЯ (только [РЕЛЕВАНТНО])",
-            "4) ПАТТЕРНЫ И АНОМАЛИИ",
-            "5) ЦЕПОЧКА СОБЫТИЙ БАТЧА (ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК, A -> B -> C)",
-            "6) СВЯЗЬ С АЛЕРТАМИ ([НАЙДЕНО]/[ЧАСТИЧНО]/[НЕ НАЙДЕНО])",
-            "7) СИГНАЛЫ ДЛЯ ДАЛЬНЕЙШЕГО АНАЛИЗА",
-            "8) ФОРМАТ ВЫВОДА ЦЕПОЧКИ: используй стрелки и узлы в стиле Markdown-схемы.",
+            "Верни СТРОГО один JSON-объект (без markdown, без пояснений) для map-summary.",
+            "ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ JSON:",
+            "context, timeline, causal_links, alert_refs, hypotheses, pinned_facts, gaps, impact, conflicts, data_quality, preliminary_recommendations",
+            "Требования к JSON:",
+            "- timeline[*].evidence_type: FACT или HYPOTHESIS",
+            "- timeline[*].severity: critical|high|medium|low",
+            "- importance/confidence/noise_ratio: число от 0 до 1",
+            "- timestamp: ISO8601 с timezone и максимальной доступной точностью",
+            "- все ссылки на события (event_id) должны существовать в timeline.id",
+            "- для status в alert_refs используй: EXPLAINED|PARTIALLY|NOT_EXPLAINED|NOT_SEEN_IN_BATCH",
+            "- для hypotheses.status используй: active|merged|conflicting|dismissed",
+            "- для recommendations.priority используй: P0|P1|P2",
+            "- НЕ фильтруй входные логи по типу (healthcheck/debug и т.п.): анализируй ровно переданный батч.",
             "",
             "Логи (хронологический порядок):",
             logs_text,
@@ -1844,6 +2972,26 @@ class PeriodLogSummarizer:
             summaries_text.append(text)
             summaries_text.append("")
         rendered_summaries = "\n".join(summaries_text).strip()
+
+        if bool(getattr(self.config, "use_new_algorithm", False)):
+            target_pct = max(min(int(getattr(self.config, "reduce_target_token_pct", 50) or 50), 90), 20)
+            user_context = _ctx_value(self.prompt_context, "incident_description", "")
+            alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
+            summaries_payload: List[Any] = []
+            for item in summaries:
+                parsed_item = self._extract_json_payload(str(item or ""))
+                summaries_payload.append(parsed_item if isinstance(parsed_item, dict) else str(item or ""))
+            system_text = incident_prompts.REDUCE_SYSTEM_PROMPT.format(
+                num_summaries=len(summaries),
+                user_context=user_context,
+                alerts_list=alerts_context,
+                target_token_pct=target_pct,
+            )
+            user_text = incident_prompts.REDUCE_USER_PROMPT.format(
+                num_summaries=len(summaries),
+                summaries_json=json.dumps(summaries_payload, ensure_ascii=False),
+            )
+            return f"{system_text}\n\n{user_text}"
 
         reduce_template = _read_prompt_setting("CONTROL_PLANE_LLM_REDUCE_PROMPT_TEMPLATE")
         if reduce_template:
