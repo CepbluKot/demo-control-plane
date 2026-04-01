@@ -1346,6 +1346,98 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("timeline", parsed)
         self.assertFalse(bool(parsed.get("data_quality", {}).get("is_empty", True)))
 
+    def test_new_algorithm_map_does_not_pre_split_rows_locally(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "ok",
+            config=SummarizerConfig(use_new_algorithm=True),
+        )
+        rows = [{"timestamp": f"2026-03-25T10:00:0{i}+00:00", "message": f"log-{i}"} for i in range(5)]
+        chunks = summarizer._split_rows_for_map(rows=rows, columns=["timestamp", "message"])
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], rows)
+
+    def test_new_algorithm_reduce_groups_use_fixed_group_size(self) -> None:
+        def _mk_summary_obj(batch_id: str):
+            raw = json.dumps(
+                {
+                    "context": {
+                        "batch_id": batch_id,
+                        "time_range_start": "2026-03-25T10:00:00+00:00",
+                        "time_range_end": "2026-03-25T10:05:00+00:00",
+                        "total_log_entries": 1,
+                        "source_query": [],
+                        "source_services": ["svc-a"],
+                    },
+                    "timeline": [
+                        {
+                            "id": "evt-1",
+                            "timestamp": "2026-03-25T10:00:00+00:00",
+                            "source": "svc-a",
+                            "description": "event",
+                            "severity": "low",
+                            "importance": 0.9,
+                            "evidence_type": "HYPOTHESIS",
+                            "tags": ["test"],
+                        }
+                    ],
+                    "causal_links": [],
+                    "alert_refs": [],
+                    "hypotheses": [],
+                    "pinned_facts": [],
+                    "gaps": [],
+                    "impact": {},
+                    "conflicts": [],
+                    "data_quality": {"is_empty": False, "noise_ratio": 0.1, "notes": ""},
+                    "preliminary_recommendations": [],
+                },
+                ensure_ascii=False,
+            )
+            obj = PeriodLogSummarizer(
+                db_fetch_page=lambda **_: [],
+                llm_call=lambda _prompt: "ok",
+                config=SummarizerConfig(use_new_algorithm=True, reduce_group_size=3),
+            )._parse_incident_summary_text(
+                raw,
+                fallback_batch_id=batch_id,
+                fallback_start="2026-03-25T10:00:00+00:00",
+                fallback_end="2026-03-25T10:05:00+00:00",
+            )
+            self.assertIsNotNone(obj)
+            return obj
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "ok",
+            config=SummarizerConfig(use_new_algorithm=True, reduce_group_size=3),
+        )
+        summaries = [_mk_summary_obj(f"batch-{i}") for i in range(7)]
+        groups = summarizer._group_structured_summaries_by_budget(summaries)
+        self.assertEqual([len(g) for g in groups], [3, 3, 1])
+
+    def test_map_start_progress_has_no_legacy_split_fields(self) -> None:
+        progress_events = []
+
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line"}]
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=lambda _prompt: "MAP_OK",
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=1),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
+        )
+        summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T10:05:00+00:00",
+            columns=["timestamp", "message"],
+        )
+        map_start_payload = next(payload for event, payload in progress_events if event == "map_start")
+        self.assertNotIn("token_budget", map_start_payload)
+
 
 if __name__ == "__main__":
     unittest.main()

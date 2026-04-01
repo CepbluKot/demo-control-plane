@@ -2120,39 +2120,6 @@ def _summary_payload_from_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
     return _json_dict_from_text(batch.get("batch_summary"))
 
 
-def _estimate_tokens_from_logs(rows: List[Dict[str, Any]]) -> int:
-    if not isinstance(rows, list) or not rows:
-        return 0
-    total_chars = 0
-    for row in rows[:1000]:
-        if not isinstance(row, dict):
-            continue
-        for value in row.values():
-            total_chars += len(str(value))
-    if len(rows) > 1000:
-        scale = len(rows) / 1000.0
-        total_chars = int(total_chars * scale)
-    return max(int(math.ceil(total_chars / 4.0)), 1)
-
-
-def _effective_max_context_for_model(model_id: str) -> int:
-    model_raw = str(model_id or "").strip()
-    if not model_raw:
-        return max(int(getattr(settings, "CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS", 200_000) or 200_000), 1)
-    for key, value in MODEL_CONTEXT_PRESETS.items():
-        if model_raw.lower() == key.lower():
-            return int(value)
-    return max(int(getattr(settings, "CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS", 200_000) or 200_000), 1)
-
-
-def _compute_token_budget_for_model(model_id: str) -> int:
-    max_context = _effective_max_context_for_model(model_id)
-    fill_ratio = float(getattr(settings, "CONTROL_PLANE_LLM_FILL_RATIO", 0.7) or 0.7)
-    fill_ratio = min(max(fill_ratio, 0.1), 1.0)
-    reserved = max(int(getattr(settings, "CONTROL_PLANE_LLM_RESERVED_TOKENS", 24_000) or 24_000), 0)
-    return max(int(max_context * fill_ratio) - reserved, 512)
-
-
 def _get_report_sections_map(state: Dict[str, Any]) -> Dict[str, str]:
     sections_map: Dict[str, str] = {}
     raw_sections = state.get("structured_sections")
@@ -3914,14 +3881,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 # fallback plan from already processed map batches
                 for item in map_batches:
                     logs_count = _safe_int(item.get("batch_logs_count"), 0)
-                    rows = item.get("batch_logs")
-                    est_tokens = _estimate_tokens_from_logs(rows if isinstance(rows, list) else [])
                     batch_plan.append(
                         {
                             "batch_id": _safe_int(item.get("batch_index"), 0) + 1,
                             "period": f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}",
                             "rows": logs_count,
-                            "tokens": est_tokens,
+                            "tokens": "disabled",
                             "status": "Готов",
                         }
                     )
@@ -4171,15 +4136,6 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
             getattr(settings, "CONTROL_PLANE_LLM_USE_NEW_ALGORITHM", True),
         )
     )
-    max_context_tokens = max(
-        int(getattr(settings, "CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS", 200_000) or 200_000),
-        1,
-    )
-    fill_ratio = float(getattr(settings, "CONTROL_PLANE_LLM_FILL_RATIO", 0.7) or 0.7)
-    reserved_tokens = max(
-        int(getattr(settings, "CONTROL_PLANE_LLM_RESERVED_TOKENS", 24_000) or 24_000),
-        0,
-    )
     reduce_target_token_pct = max(
         min(int(getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50) or 50), 95),
         10,
@@ -4191,7 +4147,6 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
     compression_importance_threshold = float(
         getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7) or 0.7
     )
-    use_tiktoken = bool(getattr(settings, "CONTROL_PLANE_LLM_USE_TIKTOKEN", True))
     use_instructor = bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True))
     try:
         return deps.summarizer_config_cls(
@@ -4207,13 +4162,9 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
             keep_map_summaries_in_result=False,
             map_workers=max(map_workers, 1),
             use_new_algorithm=use_new_algorithm,
-            max_context_tokens=max_context_tokens,
-            fill_ratio=fill_ratio,
-            reserved_tokens=reserved_tokens,
             reduce_target_token_pct=reduce_target_token_pct,
             compression_target_pct=compression_target_pct,
             compression_importance_threshold=compression_importance_threshold,
-            use_tiktoken=use_tiktoken,
             use_instructor=use_instructor,
         )
     except TypeError:
@@ -4777,14 +4728,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             options=model_candidates,
             key="logs_sum_model_id",
             disabled=is_running,
-            help="Модель влияет на максимально доступный контекст и token budget.",
+            help="Модель используется только на стороне API; локальный подсчёт токенов отключён.",
         )
         selected_model_for_budget = str(st.session_state.get("logs_sum_model_id") or "").strip()
-        computed_budget = _compute_token_budget_for_model(selected_model_for_budget)
         st.caption(
-            "Бюджет на данные: "
-            f"`~{computed_budget:,}` токенов "
-            f"(model: `{selected_model_for_budget or 'n/a'}`)"
+            f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
         )
         st.caption("MAP обрабатывается последовательно (workers = 1).")
         st.number_input(
@@ -4942,7 +4890,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "llm_model_id": llm_model_id,
-            "llm_token_budget": _compute_token_budget_for_model(llm_model_id),
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -4982,7 +4929,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "llm_model_id": llm_model_id,
-            "llm_token_budget": _compute_token_budget_for_model(llm_model_id),
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -5255,7 +5201,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
         "llm_model_id": llm_model_id,
-        "llm_token_budget": _compute_token_budget_for_model(llm_model_id),
         "map_workers": map_workers,
         "max_retries": max_retries,
         "llm_timeout": llm_timeout,
@@ -5429,7 +5374,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
         "llm_model_id": llm_model_id,
-        "llm_token_budget": _compute_token_budget_for_model(llm_model_id),
         "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
@@ -5852,10 +5796,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["llm_phase_hint"] = "map"
                 state["active_step"] = "Читаем логи и готовим MAP-батчи"
                 state["estimated_batch_total"] = payload.get("batch_total")
-                state["llm_token_budget"] = _safe_int(
-                    payload.get("token_budget"),
-                    _safe_int(state.get("llm_token_budget"), 0),
-                )
                 state["use_new_algorithm"] = bool(payload.get("use_new_algorithm", False))
                 state["batch_plan"] = []
                 events.append("Map этап запущен")
@@ -5883,7 +5823,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_id": idx,
                         "period": f"{payload.get('batch_period_start')} -> {payload.get('batch_period_end')}",
                         "rows": _safe_int(payload.get("batch_logs_count"), 0),
-                        "tokens": _safe_int(payload.get("batch_tokens"), 0),
+                        "tokens": "disabled",
                         "status": "В Работе",
                         "reason": str(payload.get("split_reason") or ""),
                     }
@@ -6010,7 +5950,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_id": global_batch_index_one,
                         "period": f"{payload.get('batch_period_start')} -> {payload.get('batch_period_end')}",
                         "rows": _safe_int(payload.get("batch_logs_count"), len(full_logs)),
-                        "tokens": _estimate_tokens_from_logs(full_logs),
+                        "tokens": "disabled",
                         "status": "Готов",
                         "reason": str(payload.get("split_reason") or ""),
                     }

@@ -11,4 +11,3 @@ pydantic-settings
 pyod
 ruptures
 instructor
-tiktoken

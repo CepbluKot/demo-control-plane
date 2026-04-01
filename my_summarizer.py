@@ -28,11 +28,6 @@ from schemas import TimelineEvent as IncidentTimelineEvent
 from settings import settings
 
 try:
-    import tiktoken  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover - optional dependency
-    tiktoken = None  # type: ignore[assignment]
-
-try:
     import instructor  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - optional dependency
     instructor = None  # type: ignore[assignment]
@@ -67,9 +62,6 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
 _EARLIEST_PERIOD_START = "1970-01-01T00:00:00+00:00"
-_TOKEN_CHARS_FALLBACK_RATIO = 4.0
-
-
 class DBPageFetcher(Protocol):
     def __call__(
         self,
@@ -95,7 +87,8 @@ class SummarizerConfig:
     min_llm_chunk_rows: int = 20
     auto_shrink_on_400: bool = True
     max_shrink_rounds: int = 6
-    reduce_group_size: int = 8
+    # New algorithm default: fixed-size reduce groups (algorithm (1).md).
+    reduce_group_size: int = 3
     max_reduce_rounds: int = 12
     # 0 or negative => no truncation.
     max_cell_chars: int = 0
@@ -111,18 +104,13 @@ class SummarizerConfig:
     # LLM endpoint supports concurrent requests — total MAP time becomes roughly
     # ceil(n_batches / map_workers) × avg_llm_latency instead of n_batches × avg_llm_latency.
     map_workers: int = 1
-    # New pipeline mode (algorithm.md): token-budget map split + cascading structured reduce.
+    # New pipeline mode (algorithm (1).md): no local token estimation,
+    # split only on real overflow/timeouts + cascading structured reduce.
     use_new_algorithm: bool = False
-    # Budget settings for prompt packing.
-    max_context_tokens: int = 200_000
-    fill_ratio: float = 0.7
-    reserved_tokens: int = 24_000
     # Reduce/compression target size in percents of input size.
     reduce_target_token_pct: int = 50
     compression_target_pct: int = 50
     compression_importance_threshold: float = 0.7
-    # Optional tech flags.
-    use_tiktoken: bool = True
     use_instructor: bool = True
 
 
@@ -234,22 +222,6 @@ def _read_prompt_setting(name: str) -> str:
 def _resolve_anti_hallucination_rules() -> str:
     custom = _read_prompt_setting("CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES")
     return custom or DEFAULT_ANTI_HALLUCINATION_RULES
-
-
-def _estimate_tokens_with_fallback(text: str, *, model_name: str = "") -> int:
-    raw = str(text or "")
-    if not raw:
-        return 0
-    if tiktoken is not None:
-        try:
-            if model_name:
-                enc = tiktoken.encoding_for_model(model_name)
-            else:
-                enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(raw))
-        except Exception:
-            pass
-    return max(int(math.ceil(len(raw) / _TOKEN_CHARS_FALLBACK_RATIO)), 1)
 
 
 def _render_prompt_template(template: str, values: Dict[str, Any]) -> str:
@@ -1304,21 +1276,6 @@ class PeriodLogSummarizer:
         self.on_progress = on_progress
         self.prompt_context = prompt_context or {}
 
-    def _token_budget(self) -> int:
-        max_context = max(int(getattr(self.config, "max_context_tokens", 200_000) or 200_000), 1)
-        fill_ratio = float(getattr(self.config, "fill_ratio", 0.7) or 0.7)
-        fill_ratio = max(min(fill_ratio, 1.0), 0.1)
-        reserved = max(int(getattr(self.config, "reserved_tokens", 24_000) or 24_000), 0)
-        budget = int(max_context * fill_ratio) - reserved
-        return max(budget, 512)
-
-    def _estimate_tokens(self, text: str) -> int:
-        model_name = str(getattr(settings, "LLM_MODEL_ID", "") or "")
-        use_tiktoken = bool(getattr(self.config, "use_tiktoken", True))
-        if not use_tiktoken:
-            return max(int(math.ceil(len(str(text or "")) / _TOKEN_CHARS_FALLBACK_RATIO)), 1)
-        return _estimate_tokens_with_fallback(str(text or ""), model_name=model_name)
-
     def _render_rows_as_text(
         self,
         *,
@@ -1339,7 +1296,7 @@ class PeriodLogSummarizer:
                 rendered.append(f"{idx}. " + " | ".join(parts))
         return "\n".join(rendered)
 
-    def _split_rows_by_token_budget(
+    def _split_rows_for_map(
         self,
         *,
         rows: List[Dict[str, Any]],
@@ -1347,25 +1304,10 @@ class PeriodLogSummarizer:
     ) -> List[List[Dict[str, Any]]]:
         if not rows:
             return []
-        if not bool(getattr(self.config, "use_new_algorithm", False)):
-            return [rows]
-        budget = self._token_budget()
-        chunks: List[List[Dict[str, Any]]] = []
-        current: List[Dict[str, Any]] = []
-        current_tokens = 0
-        for row in rows:
-            row_text = self._render_rows_as_text(rows=[row], columns=columns)
-            row_tokens = max(self._estimate_tokens(row_text), 1)
-            if current and current_tokens + row_tokens > budget:
-                chunks.append(current)
-                current = [row]
-                current_tokens = row_tokens
-                continue
-            current.append(row)
-            current_tokens += row_tokens
-        if current:
-            chunks.append(current)
-        return chunks or [rows]
+        # New algorithm works without local token estimation and does not pre-split
+        # batches by estimated token size. Split-on-overflow is handled only after
+        # actual LLM 400/timeouts.
+        return [rows]
 
     @staticmethod
     def _normalize_incident_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1454,22 +1396,9 @@ class PeriodLogSummarizer:
     ) -> List[List[IncidentSummary]]:
         if not summaries:
             return []
-        budget = self._token_budget()
-        groups: List[List[IncidentSummary]] = []
-        current: List[IncidentSummary] = []
-        current_tokens = 0
-        for summary in summaries:
-            token_count = max(self._estimate_tokens(self._incident_summary_to_json(summary)), 1)
-            if current and current_tokens + token_count > budget:
-                groups.append(current)
-                current = [summary]
-                current_tokens = token_count
-                continue
-            current.append(summary)
-            current_tokens += token_count
-        if current:
-            groups.append(current)
-        return groups
+        # Updated algorithm: fixed-size grouping, no local token budgeting.
+        group_size = max(int(getattr(self.config, "reduce_group_size", 3) or 3), 1)
+        return [summaries[i : i + group_size] for i in range(0, len(summaries), group_size)]
 
     def _compress_structured_summary_if_needed(
         self,
@@ -1478,23 +1407,24 @@ class PeriodLogSummarizer:
         period_start: str,
         period_end: str,
     ) -> tuple[IncidentSummary, int]:
-        if not bool(getattr(self.config, "use_new_algorithm", False)):
-            return summary, 0
-        budget = self._token_budget()
+        # No local token estimation in the updated algorithm.
+        # Compression is applied reactively on real 400/timeouts in reduce.
+        _ = (period_start, period_end)
+        return summary, 0
+
+    def _compress_summary_on_overflow(
+        self,
+        summary: IncidentSummary,
+        *,
+        importance_thresholds: Sequence[float] = (0.7, 0.85),
+    ) -> tuple[IncidentSummary, int]:
         current = summary
         llm_calls = 0
-        max_rounds = 3
-        for _ in range(max_rounds):
-            size = self._estimate_tokens(self._incident_summary_to_json(current))
-            if size <= budget:
-                return current, llm_calls
-            target_pct = max(min(int(getattr(self.config, "compression_target_pct", 50) or 50), 90), 20)
-            importance_threshold = float(
-                getattr(self.config, "compression_importance_threshold", 0.7) or 0.7
-            )
+        target_pct = max(min(int(getattr(self.config, "compression_target_pct", 50) or 50), 90), 20)
+        for threshold in importance_thresholds:
             system_text = incident_prompts.COMPRESSION_SYSTEM_PROMPT.format(
                 target_pct=target_pct,
-                importance_threshold=importance_threshold,
+                importance_threshold=float(threshold),
             )
             user_text = incident_prompts.COMPRESSION_USER_PROMPT.format(
                 summary_json=self._incident_summary_to_json(current),
@@ -1989,9 +1919,7 @@ class PeriodLogSummarizer:
             {
                 "rows_processed": 0,
                 "rows_total": total_rows_estimate,
-                "token_budget": self._token_budget(),
                 "use_new_algorithm": bool(getattr(self.config, "use_new_algorithm", False)),
-                "use_tiktoken": bool(getattr(self.config, "use_tiktoken", True)),
                 "use_instructor": bool(getattr(self.config, "use_instructor", True)),
                 "instructor_runtime_available": bool(instructor is not None),
             },
@@ -2050,9 +1978,17 @@ class PeriodLogSummarizer:
                     },
                 )
 
-                for i in range(0, len(page), self.config.llm_chunk_rows):
-                    base_chunk = page[i : i + self.config.llm_chunk_rows]
-                    rows_sub_chunks = self._split_rows_by_token_budget(
+                if bool(getattr(self.config, "use_new_algorithm", False)):
+                    # Updated algorithm: one DB page == one map batch (no local token pre-splitting).
+                    base_chunks: List[List[Dict[str, Any]]] = [list(page)]
+                else:
+                    base_chunks = [
+                        page[i : i + self.config.llm_chunk_rows]
+                        for i in range(0, len(page), self.config.llm_chunk_rows)
+                    ]
+
+                for base_chunk in base_chunks:
+                    rows_sub_chunks = self._split_rows_for_map(
                         rows=list(base_chunk),
                         columns=columns,
                     )
@@ -2335,41 +2271,6 @@ class PeriodLogSummarizer:
             premerged_alert_refs=merged_alerts,
             sources=sources,
         )
-        budget = self._token_budget()
-        prompt_tokens = self._estimate_tokens(prompt)
-        if prompt_tokens > budget and len(summaries) > 1:
-            mid = max(len(summaries) // 2, 1)
-            left, left_calls = self._reduce_structured_group(
-                summaries=summaries[:mid],
-                period_start=period_start,
-                period_end=period_end,
-                reduce_round=reduce_round,
-                group_index=group_index,
-                group_total=group_total,
-                sources=sources,
-                depth=depth + 1,
-            )
-            right, right_calls = self._reduce_structured_group(
-                summaries=summaries[mid:],
-                period_start=period_start,
-                period_end=period_end,
-                reduce_round=reduce_round,
-                group_index=group_index,
-                group_total=group_total,
-                sources=sources,
-                depth=depth + 1,
-            )
-            combined, combined_calls = self._reduce_structured_group(
-                summaries=[left, right],
-                period_start=period_start,
-                period_end=period_end,
-                reduce_round=reduce_round,
-                group_index=group_index,
-                group_total=group_total,
-                sources=sources,
-                depth=depth + 1,
-            )
-            return combined, left_calls + right_calls + combined_calls
 
         calls = 0
         try:
@@ -2402,6 +2303,13 @@ class PeriodLogSummarizer:
                     sources=sources,
                     depth=depth + 1,
                 )
+                compression_calls = 0
+                if len(summaries) == 2:
+                    # Updated algorithm: when a small group still overflows, proactively
+                    # compress single summaries using COMPRESSION prompt and retry.
+                    left, c_left = self._compress_summary_on_overflow(left)
+                    right, c_right = self._compress_summary_on_overflow(right)
+                    compression_calls += c_left + c_right
                 combined, combined_calls = self._reduce_structured_group(
                     summaries=[left, right],
                     period_start=period_start,
@@ -2412,7 +2320,7 @@ class PeriodLogSummarizer:
                     sources=sources,
                     depth=depth + 1,
                 )
-                return combined, calls + left_calls + right_calls + combined_calls
+                return combined, calls + left_calls + right_calls + compression_calls + combined_calls
             raise
 
         parsed = self._parse_incident_summary_text(
@@ -2490,20 +2398,7 @@ class PeriodLogSummarizer:
             if reduce_rounds > self.config.max_reduce_rounds:
                 raise RuntimeError("Exceeded max reduce rounds")
 
-            adjusted: List[IncidentSummary] = []
-            for item in current:
-                compressed, compressed_calls = self._compress_structured_summary_if_needed(
-                    item,
-                    period_start=period_start,
-                    period_end=period_end,
-                )
-                llm_calls += compressed_calls
-                adjusted.append(compressed)
-            current = adjusted
-
             groups = self._group_structured_summaries_by_budget(current)
-            if len(groups) == len(current) and len(current) > 1:
-                groups = [current[i : i + 2] for i in range(0, len(current), 2)]
 
             next_level: List[IncidentSummary] = []
             for group_index, group in enumerate(groups):

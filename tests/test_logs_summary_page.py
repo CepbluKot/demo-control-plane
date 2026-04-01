@@ -664,7 +664,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("alert_range", rendered)
         self.assertIn("период:", rendered)
 
-    def test_build_config_passes_new_algorithm_and_token_budget_settings(self) -> None:
+    def test_build_config_passes_new_algorithm(self) -> None:
         deps = type(
             "_Deps",
             (),
@@ -675,26 +675,18 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         overrides = {
             "CONTROL_PLANE_UI_LOGS_SUMMARY_USE_NEW_ALGORITHM": True,
             "CONTROL_PLANE_LLM_USE_NEW_ALGORITHM": True,
-            "CONTROL_PLANE_LLM_MAX_CONTEXT_TOKENS": 123456,
-            "CONTROL_PLANE_LLM_FILL_RATIO": 0.66,
-            "CONTROL_PLANE_LLM_RESERVED_TOKENS": 7777,
             "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT": 44,
             "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT": 33,
             "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD": 0.81,
-            "CONTROL_PLANE_LLM_USE_TIKTOKEN": True,
             "CONTROL_PLANE_LLM_USE_INSTRUCTOR": False,
         }
         with patch.multiple(settings, **overrides):
             cfg = _build_config(deps, db_batch_size=1000, llm_batch_size=250, map_workers=3)
 
         self.assertTrue(cfg["use_new_algorithm"])
-        self.assertEqual(cfg["max_context_tokens"], 123456)
-        self.assertAlmostEqual(float(cfg["fill_ratio"]), 0.66, places=6)
-        self.assertEqual(cfg["reserved_tokens"], 7777)
         self.assertEqual(cfg["reduce_target_token_pct"], 44)
         self.assertEqual(cfg["compression_target_pct"], 33)
         self.assertAlmostEqual(float(cfg["compression_importance_threshold"]), 0.81, places=6)
-        self.assertTrue(cfg["use_tiktoken"])
         self.assertFalse(cfg["use_instructor"])
         self.assertEqual(cfg["page_limit"], 1000)
         self.assertEqual(cfg["llm_chunk_rows"], 250)
