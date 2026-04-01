@@ -204,6 +204,9 @@ CONTROL_PLANE_PROCESS_ALERTS=true
 
 1. Пошаговый интерактивный чат map/reduce.
 2. Итоговый отчет (структурированный summary + свободный summary + метрики/артефакты).
+3. Единый переносимый файл `report.bundle.json`:
+   можно скачать после завершения, передать коллеге и открыть в UI через блок импорта;
+   при импорте восстанавливаются входные параметры и полный итоговый отчёт.
 
 ## Полезные переменные .env
 
@@ -247,6 +250,9 @@ CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY=SELECT timestamp, level, message FROM logs_a
 CONTROL_PLANE_LOGS_PAGE_LIMIT=1000
 CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL=SELECT timestamp, level, message FROM logs_airflow_test_v1 WHERE timestamp > parseDateTimeBestEffort('{last_ts}') AND timestamp < parseDateTimeBestEffort('{period_end}') ORDER BY timestamp LIMIT {limit}
 CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE=1000
+# Верхняя граница строк на 1 MAP-вызов LLM (можно менять в UI перед запуском).
+# Пайплайн не отправляет больше этого значения и автоматически уменьшает размер
+# батча при overflow/400 ошибках LLM.
 CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE=200
 ```
 

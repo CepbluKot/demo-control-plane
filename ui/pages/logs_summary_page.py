@@ -7,6 +7,7 @@ import io
 MSK = timezone(timedelta(hours=3))
 from collections import deque
 import heapq
+import html
 import json
 import logging
 import math
@@ -19,6 +20,7 @@ from uuid import uuid4
 import zipfile
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from settings import settings
@@ -36,6 +38,8 @@ FORM_ERROR_SESSION_KEY = "logs_summary_form_error"
 RESUME_SELECTED_SESSION_KEY = "logs_summary_resume_selected"
 RESUME_BANNER_DISMISSED_SESSION_KEY = "logs_summary_resume_banner_dismissed_session"
 PENDING_PREFILL_SESSION_KEY = "logs_summary_pending_prefill_params"
+PORTABLE_BUNDLE_TYPE = "logs_summary_portable_report"
+PORTABLE_BUNDLE_VERSION = 1
 DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
     "timestamp",
     "message",
@@ -131,6 +135,73 @@ FINAL_REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
         "Дай честную оценку уверенности, перечисли ограничения анализа и зоны низкой достоверности.",
     ),
 )
+
+
+def _build_models_url(api_base: str) -> str:
+    base = str(api_base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/models"):
+        return base
+    if base.endswith("/chat/completions"):
+        return f"{base[: -len('/chat/completions')]}/models"
+    if base.endswith("/v1"):
+        return f"{base}/models"
+    return f"{base}/v1/models"
+
+
+def _extract_model_ids_from_payload(payload: Any) -> List[str]:
+    rows: List[Any] = []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "models", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                rows = value
+                break
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        model_id = ""
+        if isinstance(row, str):
+            model_id = row.strip()
+        elif isinstance(row, dict):
+            for key in ("id", "model", "name"):
+                value = row.get(key)
+                if value is None:
+                    continue
+                candidate = str(value).strip()
+                if candidate:
+                    model_id = candidate
+                    break
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            out.append(model_id)
+    return out
+
+
+def _fetch_llm_model_candidates(timeout_seconds: float = 5.0) -> tuple[List[str], str]:
+    api_base = str(getattr(settings, "OPENAI_API_BASE_DB", "") or "").strip()
+    if not api_base:
+        return [], "OPENAI_API_BASE_DB не задан."
+    url = _build_models_url(api_base)
+    if not url:
+        return [], "Некорректный OPENAI_API_BASE_DB."
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    api_key = str(getattr(settings, "OPENAI_API_KEY_DB", "") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        response = requests.get(url, headers=headers, timeout=float(timeout_seconds))
+        response.raise_for_status()
+        model_ids = _extract_model_ids_from_payload(response.json())
+        if not model_ids:
+            return [], "API вернула пустой список моделей."
+        return model_ids, ""
+    except Exception as exc:  # noqa: BLE001
+        return [], f"{type(exc).__name__}: {exc}"
 
 
 def _normalize_timestamp_column_name(value: Any, *, default: str = "timestamp") -> str:
@@ -624,6 +695,86 @@ def _estimate_eta(state: Dict[str, Any], event: str, payload: Dict[str, Any]) ->
     state["eta_finish_at"] = finish_dt.isoformat()
 
 
+def _build_stage1_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(state.get("status", "queued")).strip().lower()
+    if status not in {"queued", "map", "summarizing"}:
+        return {"show": False, "ratio": 0.0, "label": "", "runtime_line": ""}
+
+    def _as_int(value: Any) -> int:
+        parsed = pd.to_numeric(value, errors="coerce")
+        if pd.isna(parsed):
+            return 0
+        return int(parsed)
+
+    ratio: Optional[float] = None
+    label = ""
+
+    logs_processed = _as_int(state.get("logs_processed"))
+    logs_total = _as_int(state.get("logs_total"))
+    if logs_total > 0:
+        ratio = max(min(float(logs_processed) / float(logs_total), 1.0), 0.0)
+        label = (
+            f"Загрузка логов + MAP: {logs_processed:,}/{logs_total:,} строк "
+            f"({ratio * 100:.1f}%)"
+        )
+    else:
+        period_start_ts = _to_msk_ts(state.get("period_start"))
+        period_end_ts = _to_msk_ts(state.get("period_end"))
+        last_batch_ts = _to_msk_ts(state.get("last_batch_ts"))
+        if (
+            not pd.isna(period_start_ts)
+            and not pd.isna(period_end_ts)
+            and not pd.isna(last_batch_ts)
+            and (period_end_ts - period_start_ts).total_seconds() > 0
+        ):
+            total_span = (period_end_ts - period_start_ts).total_seconds()
+            done_span = max((last_batch_ts - period_start_ts).total_seconds(), 0.0)
+            ratio = max(min(done_span / total_span, 1.0), 0.0)
+            label = f"Загрузка логов + MAP: покрытие периода {ratio * 100:.1f}%"
+        else:
+            batch_total = _as_int(state.get("estimated_batch_total"))
+            batch_done = len(state.get("map_batches") or [])
+            if batch_total > 0:
+                ratio = max(min(float(batch_done) / float(batch_total), 1.0), 0.0)
+                label = f"Загрузка логов + MAP: батчи {batch_done}/{batch_total} ({ratio * 100:.1f}%)"
+            else:
+                ratio = 0.0
+                label = "Загрузка логов + MAP: ожидание первых данных"
+
+    elapsed = _resolve_elapsed_seconds(state)
+    rate = None
+    if elapsed is not None and elapsed > 0 and logs_processed > 0:
+        rate = float(logs_processed) / float(elapsed)
+    if rate is None:
+        rate = pd.to_numeric(state.get("rows_per_second"), errors="coerce")
+        if pd.isna(rate):
+            rate = None
+        else:
+            rate = float(rate)
+
+    runtime_parts: List[str] = []
+    if elapsed is not None:
+        runtime_parts.append(f"elapsed: {_format_eta_seconds(elapsed)}")
+    if rate is not None and rate > 0:
+        runtime_parts.append(f"rate: {rate:.1f} rows/s")
+
+    eta_seconds = pd.to_numeric(state.get("eta_seconds_left"), errors="coerce")
+    if not pd.isna(eta_seconds):
+        runtime_parts.append(f"eta: {_format_eta_seconds(float(eta_seconds))}")
+
+    eta_finish_at = state.get("eta_finish_at")
+    if eta_finish_at:
+        runtime_parts.append(f"finish: {_format_datetime_with_tz(eta_finish_at)}")
+
+    runtime_line = " | ".join(runtime_parts)
+    return {
+        "show": True,
+        "ratio": max(min(float(ratio or 0.0), 1.0), 0.0),
+        "label": label,
+        "runtime_line": runtime_line,
+    }
+
+
 @dataclass(frozen=True)
 class LogsSummaryPageDeps:
     logger: logging.Logger
@@ -945,7 +1096,7 @@ def _new_alert_item(
     time_point: str = "",
     time_start: str = "",
     time_end: str = "",
-) -> Dict[str, str]:
+    ) -> Dict[str, str]:
     return {
         "id": uuid4().hex,
         "title": str(title),
@@ -954,6 +1105,22 @@ def _new_alert_item(
         "time_point": str(time_point),
         "time_start": str(time_start),
         "time_end": str(time_end),
+    }
+
+
+def _default_alert_time_values(
+    *,
+    center_dt_text: str,
+    start_dt_text: str,
+    end_dt_text: str,
+    center_default: str,
+    start_default: str,
+    end_default: str,
+) -> Dict[str, str]:
+    return {
+        "time_point": (str(center_dt_text or "").strip() or str(center_default or "").strip()),
+        "time_start": (str(start_dt_text or "").strip() or str(start_default or "").strip()),
+        "time_end": (str(end_dt_text or "").strip() or str(end_default or "").strip()),
     }
 
 
@@ -1816,7 +1983,7 @@ def _form_values_from_saved_params(
         "logs_sum_start_dt": str(saved_params.get("start_dt_text", "")),
         "logs_sum_end_dt": str(saved_params.get("end_dt_text", "")),
         "logs_sum_db_batch": _to_int(saved_params.get("db_batch_size", 1000), 1000),
-        # LLM chunk size is auto-managed in the new UI mode.
+        # User-defined upper cap for rows per one LLM MAP call.
         "logs_sum_llm_batch": _to_int(
             saved_params.get("llm_batch_size", saved_params.get("db_batch_size", 1000)),
             _to_int(saved_params.get("db_batch_size", 1000), 1000),
@@ -1881,6 +2048,14 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "structured_sections",
         "freeform_final_summary",
         "freeform_sections",
+        "result_json_path",
+        "result_bundle_path",
+        "result_summary_path",
+        "result_html_path",
+        "result_structured_md_path",
+        "result_freeform_md_path",
+        "result_structured_txt_path",
+        "result_freeform_txt_path",
         "llm_calls_started",
         "llm_calls_succeeded",
         "llm_calls_failed",
@@ -1939,6 +2114,798 @@ def _discover_resume_sessions(output_dir: Path) -> List[Dict[str, Any]]:
     return sessions
 
 
+def _build_portable_report_bundle(
+    *,
+    request_payload: Dict[str, Any],
+    result_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "bundle_type": PORTABLE_BUNDLE_TYPE,
+        "bundle_version": PORTABLE_BUNDLE_VERSION,
+        "saved_at": datetime.now(MSK).isoformat(),
+        "request": _json_safe(request_payload),
+        "result": _json_safe(result_state),
+    }
+
+
+def _extract_request_result_from_bundle(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}, {}
+    request = payload.get("request")
+    result = payload.get("result")
+    if isinstance(request, dict) and isinstance(result, dict):
+        return request, result
+    return {}, {}
+
+
+def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any]:
+    state = dict(result_payload or {})
+    status = str(state.get("status") or "").strip().lower()
+    if status not in {"done", "error"}:
+        state["status"] = "done"
+    path_keys = (
+        "result_json_path",
+        "result_summary_path",
+        "result_bundle_path",
+        "result_html_path",
+        "result_structured_md_path",
+        "result_freeform_md_path",
+        "result_structured_txt_path",
+        "result_freeform_txt_path",
+        "rebuild_reduce_path",
+        "live_events_path",
+        "live_batches_path",
+        "run_params_path",
+        "request_path",
+        "checkpoint_path",
+        "map_summaries_jsonl_path",
+        "reduce_summaries_jsonl_path",
+        "llm_calls_jsonl_path",
+    )
+    for key in path_keys:
+        state[key] = None
+    state.setdefault("events", [])
+    state.setdefault("map_batches", [])
+    state.setdefault("reduce_nodes", [])
+    state.setdefault("structured_sections", [])
+    state.setdefault("freeform_sections", [])
+    state.setdefault("stats", {})
+    state.setdefault("final_summary_origin", "imported_bundle")
+    return state
+
+
+def _build_saved_params_from_import_request(
+    *,
+    request_payload: Dict[str, Any],
+    center_default: str,
+    start_default: str,
+    end_default: str,
+    default_query: str,
+) -> Dict[str, Any]:
+    request = dict(request_payload or {})
+    logs_queries_raw = request.get("logs_queries")
+    if isinstance(logs_queries_raw, list):
+        logs_queries = [str(item) for item in logs_queries_raw if str(item).strip()]
+    else:
+        sql_query = str(request.get("sql_query") or "").strip()
+        logs_queries = [sql_query] if sql_query else []
+    if not logs_queries:
+        logs_queries = [default_query]
+
+    metrics_queries_raw = request.get("metrics_queries")
+    if isinstance(metrics_queries_raw, list):
+        metrics_queries = [str(item) for item in metrics_queries_raw if str(item).strip()]
+    else:
+        metrics_query = str(request.get("metrics_query") or "").strip()
+        metrics_queries = [metrics_query] if metrics_query else []
+
+    period_mode_raw = str(request.get("period_mode") or "").strip().lower()
+    period_mode = (
+        "Окно вокруг даты (±N минут)"
+        if period_mode_raw in {"window", "окно вокруг даты (±n минут)"}
+        else "Явный диапазон (start/end)"
+    )
+    start_text = str(request.get("period_start") or request.get("effective_period_start") or start_default)
+    end_text = str(request.get("period_end") or end_default)
+    center_text = center_default
+    start_ts = _parse_user_dt(start_text)
+    end_ts = _parse_user_dt(end_text)
+    if not pd.isna(start_ts) and not pd.isna(end_ts):
+        midpoint = start_ts + (end_ts - start_ts) / 2
+        try:
+            center_text = midpoint.to_pydatetime().isoformat()
+        except Exception:
+            center_text = center_default
+
+    return {
+        "logs_queries": logs_queries,
+        "metrics_queries": metrics_queries,
+        "alerts": request.get("alerts", []),
+        "user_goal": str(request.get("user_goal") or ""),
+        "period_mode": period_mode,
+        "window_minutes": _safe_int(request.get("window_minutes"), 30),
+        "center_dt_text": center_text,
+        "start_dt_text": start_text,
+        "end_dt_text": end_text,
+        "db_batch_size": _safe_int(request.get("db_batch_size"), 1000),
+        "llm_batch_size": _safe_int(
+            request.get("llm_batch_size", request.get("db_batch_size")),
+            1000,
+        ),
+        "llm_model_id": str(request.get("llm_model_id") or getattr(settings, "LLM_MODEL_ID", "")).strip(),
+        "max_retries": _safe_int(request.get("max_retries"), -1),
+        "llm_timeout": _safe_int(request.get("llm_timeout"), 600),
+        "demo_mode": bool(request.get("demo_mode", False)),
+        "demo_logs_count": _safe_int(request.get("demo_logs_count"), 4000),
+        "enable_no_logs_hypothesis": bool(request.get("enable_no_logs_hypothesis", False)),
+    }
+
+
+def _html_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(_json_safe(value), ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _html_table_from_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    preferred_columns: Optional[List[str]] = None,
+    empty_text: str = "Данные отсутствуют.",
+) -> str:
+    if not rows:
+        return f"<div class='empty'>{html.escape(empty_text)}</div>"
+    columns: List[str] = []
+    if preferred_columns:
+        for col in preferred_columns:
+            if any(col in row for row in rows):
+                columns.append(col)
+    if not columns:
+        seen: set[str] = set()
+        for row in rows:
+            for key in row.keys():
+                key_text = str(key)
+                if key_text not in seen:
+                    seen.add(key_text)
+                    columns.append(key_text)
+    head_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+    body_parts: List[str] = []
+    for row in rows:
+        cells = "".join(
+            f"<td>{html.escape(_html_cell_text(row.get(col)))}</td>" for col in columns
+        )
+        body_parts.append(f"<tr>{cells}</tr>")
+    body_html = "".join(body_parts)
+    return (
+        "<div class='table-wrap'>"
+        "<table>"
+        f"<thead><tr>{head_html}</tr></thead>"
+        f"<tbody>{body_html}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+def _html_pre_block(text: str, *, empty_text: str = "Данные отсутствуют.") -> str:
+    normalized = _normalize_summary_text(text)
+    if not normalized:
+        return f"<div class='empty'>{html.escape(empty_text)}</div>"
+    return f"<pre class='report-text'>{html.escape(normalized)}</pre>"
+
+
+def _build_interactive_final_report_html(state: Dict[str, Any]) -> str:
+    final_summary = _normalize_summary_text(state.get("final_summary"))
+    freeform_summary = _normalize_summary_text(state.get("freeform_final_summary"))
+    report_sections_map = _get_report_sections_map(state)
+    if not report_sections_map:
+        report_sections_map = _extract_sections_from_text(final_summary)
+
+    timeline_rows = _collect_timeline_events(state)
+    timeline_rows_view: List[Dict[str, Any]] = []
+    for row in timeline_rows:
+        item = dict(row)
+        if item.get("timestamp"):
+            item["timestamp"] = _format_datetime_with_tz(item.get("timestamp"))
+        tags_value = item.get("tags")
+        if isinstance(tags_value, list):
+            item["tags"] = ", ".join([str(tag) for tag in tags_value if str(tag).strip()])
+        timeline_rows_view.append(item)
+
+    hypotheses_rows = _collect_hypotheses(state)
+    causal_links_rows = _collect_causal_links(state)
+    gaps_rows = _collect_gaps(state)
+    conflicts_rows = _collect_conflicts(state)
+    recommendations_rows = _collect_recommendations(state)
+    alert_rows = _build_alert_panel_state(state)
+
+    grouped_hypotheses: Dict[str, List[Dict[str, Any]]] = {}
+    for hyp in hypotheses_rows:
+        related = hyp.get("related_alert_ids")
+        if isinstance(related, list) and related:
+            key = str(related[0])
+        else:
+            key = "unbound"
+        grouped_hypotheses.setdefault(key, []).append(dict(hyp))
+
+    grouped_recs = _group_recommendations_by_priority(recommendations_rows)
+    stats = state.get("stats") or {}
+    status_text = "Готово" if str(state.get("status", "")).strip().lower() == "done" else "Ошибка"
+    rows_processed = _safe_int(state.get("logs_processed"), 0)
+    llm_calls = _safe_int(stats.get("llm_calls"), 0)
+    reduce_rounds = _safe_int(stats.get("reduce_rounds"), 0)
+    processing_human = str(stats.get("logs_processing_human") or "").strip()
+    processing_seconds = pd.to_numeric(stats.get("logs_processing_seconds"), errors="coerce")
+    if not processing_human and not pd.isna(processing_seconds):
+        processing_human = _format_eta_seconds(float(processing_seconds))
+
+    section_1 = _find_section_text(report_sections_map, "1.")
+    section_2 = _find_section_text(report_sections_map, "2.") or final_summary
+    section_3 = _find_section_text(report_sections_map, "3.")
+    section_4 = _find_section_text(report_sections_map, "4.")
+    section_5 = _find_section_text(report_sections_map, "5.")
+    section_6 = _find_section_text(report_sections_map, "6.")
+    section_7 = _find_section_text(report_sections_map, "7.")
+    section_8 = _find_section_text(report_sections_map, "8.")
+    section_9 = _find_section_text(report_sections_map, "9.")
+    section_10 = _find_section_text(report_sections_map, "10.")
+    section_11 = _find_section_text(report_sections_map, "11.")
+    section_12 = _find_section_text(report_sections_map, "12.")
+    section_13 = _find_section_text(report_sections_map, "13.")
+
+    alert_cards: List[str] = []
+    for row in alert_rows:
+        status = str(row.get("status") or "NOT_SEEN_IN_BATCH")
+        view = ALERT_STATUS_VIEW.get(status, ALERT_STATUS_VIEW["NOT_SEEN_IN_BATCH"])
+        details = str(row.get("details") or "").strip()
+        explanation = str(row.get("explanation") or "").strip()
+        details_html = (
+            f"<div class='meta'>{html.escape(details)}</div>" if details else ""
+        )
+        explanation_html = (
+            f"<div class='meta'>{html.escape(explanation)}</div>" if explanation else ""
+        )
+        related = row.get("related_events") or []
+        related_html = ""
+        if isinstance(related, list) and related:
+            related_html = (
+                "<div class='meta'>related_events: "
+                + html.escape(", ".join([str(x) for x in related]))
+                + "</div>"
+            )
+        alert_cards.append(
+            (
+                "<div class='alert-card' style='border-left-color:"
+                + html.escape(view["color"])
+                + ";'>"
+                + f"<div class='alert-title'>{html.escape(view['icon'])} {html.escape(str(row.get('alert_id') or 'alert'))} — {html.escape(view['label'])}</div>"
+                + details_html
+                + related_html
+                + explanation_html
+                + "</div>"
+            )
+        )
+    alerts_html = "".join(alert_cards) or "<div class='empty'>Алерты отсутствуют.</div>"
+
+    hypotheses_html_blocks: List[str] = []
+    if grouped_hypotheses:
+        for alert_id, items in grouped_hypotheses.items():
+            hypotheses_html_blocks.append(f"<h3>{html.escape(str(alert_id))}</h3>")
+            ordered = sorted(
+                items,
+                key=lambda item: _safe_float(item.get("confidence"), 0.0),
+                reverse=True,
+            )
+            for hyp in ordered:
+                conf = min(max(_safe_float(hyp.get("confidence"), 0.0), 0.0), 1.0)
+                title = str(hyp.get("title") or "Гипотеза")
+                desc = _normalize_summary_text(hyp.get("description"))
+                hypotheses_html_blocks.append(
+                    "<div class='hypothesis-item'>"
+                    f"<div class='hypothesis-title'>{html.escape(title)} ({conf:.2f})</div>"
+                    "<div class='progress-track'>"
+                    f"<div class='progress-fill' style='width:{conf * 100:.1f}%;'></div>"
+                    "</div>"
+                    + (f"<div class='meta'>{html.escape(desc)}</div>" if desc else "")
+                    + "</div>"
+                )
+    hypotheses_html = "".join(hypotheses_html_blocks) or "<div class='empty'>Гипотезы отсутствуют.</div>"
+
+    rec_blocks: List[str] = []
+    priority_styles = {"P0": "#b91c1c", "P1": "#a16207", "P2": "#4b5563"}
+    for priority in ("P0", "P1", "P2"):
+        rec_blocks.append(
+            f"<h3 style='color:{priority_styles[priority]};'>{priority}</h3>"
+        )
+        items = grouped_recs.get(priority) or []
+        if not items:
+            rec_blocks.append("<div class='empty'>—</div>")
+            continue
+        for item in items:
+            action = str(item.get("action") or "Действие не указано")
+            rationale = str(item.get("rationale") or "").strip()
+            rec_blocks.append(
+                "<div class='rec-item'>"
+                f"<div><strong>{html.escape(action)}</strong></div>"
+                + (f"<div class='meta'>{html.escape(rationale)}</div>" if rationale else "")
+                + "</div>"
+            )
+    recs_html = "".join(rec_blocks)
+
+    timeline_json = json.dumps(_json_safe(timeline_rows_view), ensure_ascii=False).replace(
+        "</", "<\\/"
+    )
+    alert_rows_json = json.dumps(_json_safe(alert_rows), ensure_ascii=False).replace(
+        "</", "<\\/"
+    )
+    causal_links_table = _html_table_from_rows(
+        [dict(item) for item in causal_links_rows if isinstance(item, dict)],
+        preferred_columns=["id", "cause_event_id", "effect_event_id", "mechanism", "confidence"],
+        empty_text="Causal links отсутствуют.",
+    )
+    conflicts_table = _html_table_from_rows(
+        [dict(item) for item in conflicts_rows if isinstance(item, dict)],
+        empty_text="Конфликтующие интерпретации не обнаружены.",
+    )
+    gaps_table = _html_table_from_rows(
+        [dict(item) for item in gaps_rows if isinstance(item, dict)],
+        empty_text="Разрывы не обнаружены.",
+    )
+
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Logs Summary Interactive Report</title>
+  <style>
+    :root {{
+      --bg: #f4f6fb;
+      --panel: #ffffff;
+      --text: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --primary: #2563eb;
+      --ok: #15803d;
+      --warn: #a16207;
+      --danger: #b91c1c;
+      --chip: #eef2ff;
+    }}
+    body {{
+      margin: 0;
+      background: linear-gradient(180deg, #eef2ff 0%, #f8fafc 100%);
+      color: var(--text);
+      font-family: "Segoe UI", "SF Pro Text", "Inter", Arial, sans-serif;
+      line-height: 1.45;
+    }}
+    .wrap {{
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 1.2rem;
+    }}
+    .title {{
+      margin: 0 0 0.5rem 0;
+      font-size: 1.4rem;
+      font-weight: 700;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      white-space: pre-wrap;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.65rem;
+      margin: 0.9rem 0 1rem 0;
+    }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.75rem;
+    }}
+    .metric-value {{
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-top: 0.2rem;
+    }}
+    .tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 0.8rem;
+    }}
+    .tab-btn {{
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--text);
+      border-radius: 999px;
+      padding: 0.38rem 0.82rem;
+      cursor: pointer;
+      font-size: 0.92rem;
+    }}
+    .tab-btn.active {{
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }}
+    .tab-pane {{
+      display: none;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.85rem;
+      margin-bottom: 0.9rem;
+    }}
+    .tab-pane.active {{ display: block; }}
+    .report-text {{
+      margin: 0;
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.75rem;
+      white-space: pre-wrap;
+      font-size: 0.95rem;
+      max-height: 540px;
+      overflow: auto;
+    }}
+    .table-wrap {{
+      overflow: auto;
+      max-height: 520px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 800px;
+      font-size: 0.9rem;
+    }}
+    th, td {{
+      border-bottom: 1px solid #edf2f7;
+      text-align: left;
+      padding: 0.42rem 0.5rem;
+      vertical-align: top;
+    }}
+    thead th {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #f8fafc;
+      font-weight: 700;
+    }}
+    .filters {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.5rem;
+      margin-bottom: 0.55rem;
+    }}
+    .filters label {{
+      font-size: 0.84rem;
+      color: var(--muted);
+      display: block;
+      margin-bottom: 0.2rem;
+    }}
+    .filters select, .filters input {{
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.4rem 0.45rem;
+      font-size: 0.9rem;
+      background: #fff;
+    }}
+    .alert-card {{
+      background: #fff;
+      border: 1px solid var(--border);
+      border-left-width: 6px;
+      border-radius: 10px;
+      padding: 0.65rem;
+      margin-bottom: 0.55rem;
+    }}
+    .alert-title {{
+      font-weight: 700;
+      margin-bottom: 0.2rem;
+    }}
+    .hypothesis-item, .rec-item {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.55rem;
+      margin-bottom: 0.5rem;
+      background: #fff;
+    }}
+    .hypothesis-title {{
+      font-weight: 700;
+      margin-bottom: 0.25rem;
+    }}
+    .progress-track {{
+      width: 100%;
+      height: 8px;
+      background: #e2e8f0;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 0.25rem;
+    }}
+    .progress-fill {{
+      height: 100%;
+      background: var(--primary);
+    }}
+    .chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 0.55rem;
+    }}
+    .chip {{
+      border: 1px solid #c7d2fe;
+      background: var(--chip);
+      border-radius: 999px;
+      padding: 0.22rem 0.6rem;
+      font-size: 0.84rem;
+    }}
+    .empty {{
+      color: var(--muted);
+      border: 1px dashed #cbd5e1;
+      border-radius: 10px;
+      padding: 0.75rem;
+      background: #f8fafc;
+    }}
+    details {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.5rem 0.65rem;
+      margin-bottom: 0.55rem;
+      background: #fff;
+    }}
+    summary {{
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    @media (max-width: 1080px) {{
+      .grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .filters {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+    }}
+    @media (max-width: 680px) {{
+      .grid {{
+        grid-template-columns: 1fr;
+      }}
+      .filters {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1 class="title">Итоговый Отчёт По Саммаризации Логов</h1>
+    <div class="meta">saved_at: {html.escape(datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S.%f MSK"))}</div>
+    <div class="meta">period: {html.escape(_format_datetime_with_tz(state.get("period_start")))} -> {html.escape(_format_datetime_with_tz(state.get("period_end")))}</div>
+    <div class="meta">summary_origin: {html.escape(_summary_origin_label(state.get("final_summary_origin")) or str(state.get("final_summary_origin") or ""))}</div>
+
+    <div class="grid">
+      <div class="card"><div class="meta">Статус</div><div class="metric-value">{html.escape(status_text)}</div></div>
+      <div class="card"><div class="meta">Обработано логов</div><div class="metric-value">{rows_processed:,}</div></div>
+      <div class="card"><div class="meta">LLM вызовы</div><div class="metric-value">{llm_calls}</div></div>
+      <div class="card"><div class="meta">Reduce раунды</div><div class="metric-value">{reduce_rounds}</div></div>
+    </div>
+    <div class="meta">Время обработки логов: {html.escape(processing_human or "n/a")}</div>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="summary">Резюме</button>
+      <button class="tab-btn" data-tab="timeline">Хронология</button>
+      <button class="tab-btn" data-tab="chains">Цепочки</button>
+      <button class="tab-btn" data-tab="alerts">Алерты</button>
+      <button class="tab-btn" data-tab="hypotheses">Гипотезы</button>
+      <button class="tab-btn" data-tab="recs">Рекомендации</button>
+      <button class="tab-btn" data-tab="more">Ещё</button>
+    </div>
+
+    <section id="tab-summary" class="tab-pane active">
+      {_html_pre_block(section_2, empty_text="Резюме пока недоступно.")}
+    </section>
+
+    <section id="tab-timeline" class="tab-pane">
+      <div class="filters">
+        <div>
+          <label for="severityFilter">Severity</label>
+          <select id="severityFilter"><option value="">Все</option></select>
+        </div>
+        <div>
+          <label for="sourceFilter">Source</label>
+          <select id="sourceFilter"><option value="">Все</option></select>
+        </div>
+        <div>
+          <label for="evidenceFilter">Тип</label>
+          <select id="evidenceFilter"><option value="">Все</option></select>
+        </div>
+        <div>
+          <label for="tagFilter">Tags contains</label>
+          <input id="tagFilter" type="text" placeholder="например: OOM" />
+        </div>
+      </div>
+      <div class="meta" id="timelineCounter"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>timestamp</th><th>source</th><th>description</th><th>severity</th><th>evidence_type</th><th>importance</th><th>tags</th><th>id</th><th>batch_index</th>
+            </tr>
+          </thead>
+          <tbody id="timelineBody"></tbody>
+        </table>
+      </div>
+      <details style="margin-top:0.6rem;">
+        <summary>Текст раздела 4 (Полная Хронология)</summary>
+        {_html_pre_block(section_4, empty_text="Раздел 4 отсутствует.")}
+      </details>
+    </section>
+
+    <section id="tab-chains" class="tab-pane">
+      {causal_links_table}
+      <details style="margin-top:0.6rem;">
+        <summary>Текст раздела 5 (Причинно-следственные цепочки)</summary>
+        {_html_pre_block(section_5, empty_text="Раздел 5 отсутствует.")}
+      </details>
+    </section>
+
+    <section id="tab-alerts" class="tab-pane">
+      <div class="chips" id="alertChips"></div>
+      {alerts_html}
+      <details style="margin-top:0.6rem;">
+        <summary>Текст раздела 6 (Связь с алертами)</summary>
+        {_html_pre_block(section_6, empty_text="Раздел 6 отсутствует.")}
+      </details>
+    </section>
+
+    <section id="tab-hypotheses" class="tab-pane">
+      {hypotheses_html}
+      <details style="margin-top:0.6rem;">
+        <summary>Текст раздела 8 (Гипотезы первопричин)</summary>
+        {_html_pre_block(section_8, empty_text="Раздел 8 отсутствует.")}
+      </details>
+    </section>
+
+    <section id="tab-recs" class="tab-pane">
+      {recs_html}
+      <details style="margin-top:0.6rem;">
+        <summary>Текст раздела 12 (Рекомендации)</summary>
+        {_html_pre_block(section_12, empty_text="Раздел 12 отсутствует.")}
+      </details>
+    </section>
+
+    <section id="tab-more" class="tab-pane">
+      <details open><summary>1. Контекст Инцидента</summary>{_html_pre_block(section_1, empty_text="Раздел 1 отсутствует.")}</details>
+      <details><summary>3. Покрытие Данных</summary>{_html_pre_block(section_3, empty_text="Раздел 3 отсутствует.")}</details>
+      <details><summary>7. Метрики И Корреляции</summary>{_html_pre_block(section_7, empty_text="Раздел 7 отсутствует.")}</details>
+      <details><summary>9. Конфликтующие Версии</summary>{conflicts_table}{_html_pre_block(section_9, empty_text="Раздел 9 отсутствует.")}</details>
+      <details><summary>10. Разрывы В Цепочках</summary>{gaps_table}{_html_pre_block(section_10, empty_text="Раздел 10 отсутствует.")}</details>
+      <details><summary>11. Масштаб И Влияние</summary>{_html_pre_block(section_11, empty_text="Раздел 11 отсутствует.")}</details>
+      <details><summary>13. Ограничения Анализа</summary>{_html_pre_block(section_13, empty_text="Раздел 13 отсутствует.")}</details>
+      <details><summary>Итоговое расследование в свободном формате</summary>{_html_pre_block(freeform_summary, empty_text="Свободный отчёт отсутствует.")}</details>
+    </section>
+  </div>
+
+  <script>
+    const timelineRows = {timeline_json};
+    const alertRows = {alert_rows_json};
+
+    function uniqSorted(values) {{
+      return Array.from(new Set(values.filter(Boolean).map(v => String(v)))).sort((a, b) => a.localeCompare(b));
+    }}
+
+    function populateSelect(selectId, values) {{
+      const select = document.getElementById(selectId);
+      if (!select) return;
+      values.forEach(v => {{
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = v;
+        select.appendChild(opt);
+      }});
+    }}
+
+    function getSelected(id) {{
+      const el = document.getElementById(id);
+      return el ? String(el.value || "").trim() : "";
+    }}
+
+    function renderTimeline() {{
+      const severity = getSelected("severityFilter");
+      const source = getSelected("sourceFilter");
+      const evidence = getSelected("evidenceFilter");
+      const tagNeedle = getSelected("tagFilter").toLowerCase();
+
+      const filtered = timelineRows.filter(row => {{
+        const rowSeverity = String(row.severity || "");
+        const rowSource = String(row.source || "");
+        const rowEvidence = String(row.evidence_type || "");
+        const rowTags = String(row.tags || "").toLowerCase();
+        if (severity && rowSeverity !== severity) return false;
+        if (source && rowSource !== source) return false;
+        if (evidence && rowEvidence !== evidence) return false;
+        if (tagNeedle && !rowTags.includes(tagNeedle)) return false;
+        return true;
+      }});
+
+      const tbody = document.getElementById("timelineBody");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      filtered.forEach(row => {{
+        const tr = document.createElement("tr");
+        const cols = ["timestamp", "source", "description", "severity", "evidence_type", "importance", "tags", "id", "batch_index"];
+        cols.forEach(col => {{
+          const td = document.createElement("td");
+          td.textContent = row[col] === undefined || row[col] === null ? "" : String(row[col]);
+          tr.appendChild(td);
+        }});
+        tbody.appendChild(tr);
+      }});
+
+      const counter = document.getElementById("timelineCounter");
+      if (counter) {{
+        counter.textContent = `Показано событий: ${{filtered.length}} / ${{timelineRows.length}}`;
+      }}
+    }}
+
+    function renderAlertChips() {{
+      const container = document.getElementById("alertChips");
+      if (!container) return;
+      container.innerHTML = "";
+      alertRows.forEach(row => {{
+        const chip = document.createElement("div");
+        chip.className = "chip";
+        chip.textContent = `${{row.alert_id}}: ${{row.status}}`;
+        container.appendChild(chip);
+      }});
+    }}
+
+    function initTabs() {{
+      const buttons = document.querySelectorAll(".tab-btn");
+      const panes = document.querySelectorAll(".tab-pane");
+      buttons.forEach(btn => {{
+        btn.addEventListener("click", () => {{
+          const target = btn.getAttribute("data-tab");
+          buttons.forEach(x => x.classList.remove("active"));
+          panes.forEach(x => x.classList.remove("active"));
+          btn.classList.add("active");
+          const pane = document.getElementById(`tab-${{target}}`);
+          if (pane) pane.classList.add("active");
+        }});
+      }});
+    }}
+
+    function init() {{
+      initTabs();
+      populateSelect("severityFilter", uniqSorted(timelineRows.map(r => r.severity)));
+      populateSelect("sourceFilter", uniqSorted(timelineRows.map(r => r.source)));
+      populateSelect("evidenceFilter", uniqSorted(timelineRows.map(r => r.evidence_type)));
+      ["severityFilter", "sourceFilter", "evidenceFilter", "tagFilter"].forEach(id => {{
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener("change", renderTimeline);
+        el.addEventListener("input", renderTimeline);
+      }});
+      renderTimeline();
+      renderAlertChips();
+    }}
+
+    document.addEventListener("DOMContentLoaded", init);
+  </script>
+</body>
+</html>
+"""
+
+
 def _save_logs_summary_result(
     *,
     output_dir: Path,
@@ -1948,7 +2915,9 @@ def _save_logs_summary_result(
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"logs_summary_result_{stamp}.json"
+    bundle_path = output_dir / f"logs_summary_bundle_{stamp}.json"
     summary_path = output_dir / f"logs_summary_result_{stamp}.md"
+    report_html_path = output_dir / f"logs_summary_report_{stamp}.html"
     structured_md_path = output_dir / f"logs_summary_structured_{stamp}.md"
     freeform_md_path = output_dir / f"logs_summary_freeform_{stamp}.md"
     structured_txt_path = output_dir / f"logs_summary_structured_{stamp}.txt"
@@ -1961,6 +2930,16 @@ def _save_logs_summary_result(
     }
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(bundle_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _build_portable_report_bundle(
+                request_payload=request_payload,
+                result_state=result_state,
+            ),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     structured_summary = str(result_state.get("final_summary") or "").strip()
     freeform_summary = str(result_state.get("freeform_final_summary") or "").strip()
@@ -2007,6 +2986,11 @@ def _save_logs_summary_result(
     if freeform_summary:
         freeform_txt_path.write_text(freeform_summary, encoding="utf-8")
 
+    _write_text_file(
+        report_html_path,
+        _build_interactive_final_report_html(result_state),
+    )
+
     lines = [
         "# Logs Summary Result",
         "",
@@ -2042,6 +3026,8 @@ def _save_logs_summary_result(
         f"- checkpoint_path: `{result_state.get('checkpoint_path')}`",
         "",
         f"JSON dump: `{json_path}`",
+        f"- portable bundle: `{bundle_path}`",
+        f"- report html: `{report_html_path}`",
         (f"- structured md: `{structured_md_path}`" if structured_summary else ""),
         (f"- freeform md: `{freeform_md_path}`" if freeform_summary else ""),
         (f"- structured txt: `{structured_txt_path}`" if structured_summary else ""),
@@ -2050,7 +3036,12 @@ def _save_logs_summary_result(
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    result = {"json_path": str(json_path), "summary_path": str(summary_path)}
+    result = {
+        "json_path": str(json_path),
+        "bundle_path": str(bundle_path),
+        "summary_path": str(summary_path),
+        "html_path": str(report_html_path),
+    }
     if structured_summary:
         result["structured_md_path"] = str(structured_md_path)
     if freeform_summary:
@@ -2222,7 +3213,9 @@ def _build_alert_panel_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _build_zip_artifacts_bytes(state: Dict[str, Any]) -> Optional[bytes]:
     artifact_candidates = [
         ("report/report.json", state.get("result_json_path")),
+        ("report/report.bundle.json", state.get("result_bundle_path")),
         ("report/report.md", state.get("result_summary_path")),
+        ("report/report.html", state.get("result_html_path")),
         ("report/structured.md", state.get("result_structured_md_path")),
         ("report/freeform.md", state.get("result_freeform_md_path")),
         ("report/structured.txt", state.get("result_structured_txt_path")),
@@ -3329,7 +4322,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             result_state=state,
                         )
                         state["result_json_path"] = saved_after_rebuild.get("json_path")
+                        state["result_bundle_path"] = saved_after_rebuild.get("bundle_path")
                         state["result_summary_path"] = saved_after_rebuild.get("summary_path")
+                        state["result_html_path"] = saved_after_rebuild.get("html_path")
                         state["result_structured_md_path"] = saved_after_rebuild.get("structured_md_path")
                         state["result_freeform_md_path"] = saved_after_rebuild.get("freeform_md_path")
                         state["result_structured_txt_path"] = saved_after_rebuild.get("structured_txt_path")
@@ -3560,7 +4555,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 result_state=state,
                             )
                             state["result_json_path"] = saved_after_rebuild.get("json_path")
+                            state["result_bundle_path"] = saved_after_rebuild.get("bundle_path")
                             state["result_summary_path"] = saved_after_rebuild.get("summary_path")
+                            state["result_html_path"] = saved_after_rebuild.get("html_path")
                             state["result_structured_md_path"] = saved_after_rebuild.get("structured_md_path")
                             state["result_freeform_md_path"] = saved_after_rebuild.get("freeform_md_path")
                             state["result_structured_txt_path"] = saved_after_rebuild.get("structured_txt_path")
@@ -3594,7 +4591,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             )
 
         json_bytes = _read_file_bytes(state.get("result_json_path"))
+        bundle_bytes = _read_file_bytes(state.get("result_bundle_path"))
         md_bytes = _read_file_bytes(state.get("result_summary_path"))
+        html_bytes = _read_file_bytes(state.get("result_html_path"))
         structured_md_bytes = _read_file_bytes(state.get("result_structured_md_path"))
         freeform_md_bytes = _read_file_bytes(state.get("result_freeform_md_path"))
         structured_txt_bytes = _read_file_bytes(state.get("result_structured_txt_path"))
@@ -3619,11 +4618,32 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             ]
         )
         with artifact_tabs[0]:
+            with st.expander("Что в этих файлах", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `report.bundle.json (portable)` — единый переносимый файл: входные параметры + полный итоговый отчёт; можно импортировать в UI у коллег.",
+                            "- `report.json` — полный технический dump запроса и результата запуска.",
+                            "- `report.md (общий)` — markdown с обоими версиями отчёта и stats.",
+                            "- `report.html (интерактивный)` — интерактивная страница, похожая на финальный UI.",
+                            "- `structured.md` — только структурированный итоговый отчёт.",
+                            "- `freeform.md` — только свободная narrative-версия отчёта.",
+                        ]
+                    )
+                )
             if json_bytes is not None and state.get("result_json_path"):
                 st.download_button(
                     label="Скачать report.json",
                     data=json_bytes,
                     file_name=Path(str(state.get("result_json_path"))).name,
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            if bundle_bytes is not None and state.get("result_bundle_path"):
+                st.download_button(
+                    label="Скачать report.bundle.json (portable)",
+                    data=bundle_bytes,
+                    file_name=Path(str(state.get("result_bundle_path"))).name,
                     mime="application/json",
                     use_container_width=True,
                 )
@@ -3633,6 +4653,14 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     data=md_bytes,
                     file_name=Path(str(state.get("result_summary_path"))).name,
                     mime="text/markdown",
+                    use_container_width=True,
+                )
+            if html_bytes is not None and state.get("result_html_path"):
+                st.download_button(
+                    label="Скачать report.html (интерактивный)",
+                    data=html_bytes,
+                    file_name=Path(str(state.get("result_html_path"))).name,
+                    mime="text/html",
                     use_container_width=True,
                 )
             if structured_md_bytes is not None and state.get("result_structured_md_path"):
@@ -3652,6 +4680,16 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     use_container_width=True,
                 )
         with artifact_tabs[1]:
+            with st.expander("Что в этих файлах", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `structured.txt` — plain text структурированного отчёта (без markdown).",
+                            "- `freeform.txt` — plain text свободного narrative-отчёта.",
+                            "- `rebuild_reduce.md` — отчёт пересборки reduce (если запускалась пересборка).",
+                        ]
+                    )
+                )
             if structured_txt_bytes is not None and state.get("result_structured_txt_path"):
                 st.download_button(
                     label="Скачать structured.txt",
@@ -3677,6 +4715,15 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     use_container_width=True,
                 )
         with artifact_tabs[2]:
+            with st.expander("Что в этих файлах", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `map_summaries.jsonl` — все MAP-summary по батчам (по одной записи на строку).",
+                            "- `batches.jsonl` — live-лента обработанных батчей и их метаданных.",
+                        ]
+                    )
+                )
             if map_jsonl_bytes is not None and state.get("map_summaries_jsonl_path"):
                 st.download_button(
                     label="Скачать map_summaries.jsonl",
@@ -3694,6 +4741,15 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     use_container_width=True,
                 )
         with artifact_tabs[3]:
+            with st.expander("Что в этих файлах", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `reduce_summaries.jsonl` — промежуточные и финальные summary reduce-этапа.",
+                            "- `llm_calls.jsonl` — журнал LLM-вызовов (попытки, ошибки, retry и т.д.).",
+                        ]
+                    )
+                )
             if reduce_jsonl_bytes is not None and state.get("reduce_summaries_jsonl_path"):
                 st.download_button(
                     label="Скачать reduce_summaries.jsonl",
@@ -3711,6 +4767,17 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     use_container_width=True,
                 )
         with artifact_tabs[4]:
+            with st.expander("Что в этих файлах", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `run_params.json` — параметры запуска, зафиксированные перед стартом.",
+                            "- `request.json` — собранный runtime-request (периоды, SQL, режимы и т.д.).",
+                            "- `checkpoint.json` — состояние пайплайна для resume.",
+                            "- `events.jsonl` — живой журнал событий выполнения.",
+                        ]
+                    )
+                )
             if run_params_bytes is not None and state.get("run_params_path"):
                 st.download_button(
                     label="Скачать run_params.json",
@@ -3815,7 +4882,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         if not isinstance(reduce_nodes, list):
             reduce_nodes = []
         max_reduce_round = max((_safe_int(item.get("round"), 0) for item in reduce_nodes), default=0)
-        stage_labels: List[str] = ["Батчинг", "Map"]
+        stage_labels: List[str] = ["Получение Логов", "Саммаризация (MAP)"]
         if max_reduce_round <= 1:
             stage_labels.append("Reduce L1")
         else:
@@ -3823,14 +4890,27 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 stage_labels.append(f"Reduce L{round_idx}")
         stage_labels += ["Верификация", "Отчёт"]
 
+        active_step_text = str(state.get("active_step") or "").strip().lower()
+
         current_stage_idx = 0
         if status == "map":
+            is_fetching_logs = any(
+                marker in active_step_text
+                for marker in (
+                    "читаем логи",
+                    "выгружаем страницу",
+                    "страница логов",
+                    "fetch",
+                )
+            )
+            current_stage_idx = 0 if is_fetching_logs else 1
+        elif status == "summarizing":
             current_stage_idx = 1
         elif status == "reduce":
             active_reduce_round = _safe_int(state.get("active_reduce_round"), 1)
             reduce_stage_base = 2
             current_stage_idx = min(reduce_stage_base + max(active_reduce_round - 1, 0), len(stage_labels) - 2)
-        elif status in {"summary_ready", "summarizing"}:
+        elif status == "summary_ready":
             current_stage_idx = max(len(stage_labels) - 2, 0)
         elif status in {"done", "error"}:
             current_stage_idx = len(stage_labels) - 1
@@ -3847,7 +4927,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             else:
                 step_style = STEP_STATUS_STYLE["future"]
             progress_suffix = ""
-            if label == "Map" and batch_total > 0:
+            if label == "Саммаризация (MAP)" and batch_total > 0:
                 progress_suffix = f" ({done_batches}/{batch_total})"
             if label.startswith("Reduce L"):
                 round_idx = _safe_int(label.replace("Reduce L", ""), 1)
@@ -3870,10 +4950,21 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         if active_step:
             st.caption(f"Текущий шаг: {active_step}")
 
+        stage1_progress = _build_stage1_progress_snapshot(state)
+        if bool(stage1_progress.get("show")):
+            st.markdown("### Прогресс Этапа 1 (Загрузка Логов + MAP)")
+            st.progress(
+                float(stage1_progress.get("ratio", 0.0)),
+                text=str(stage1_progress.get("label") or ""),
+            )
+            runtime_line = str(stage1_progress.get("runtime_line") or "").strip()
+            if runtime_line:
+                st.caption(runtime_line)
+
         # --- Details area for active stage ---
         st.markdown("### Детали Текущего Этапа")
         if current_stage_idx == 0:
-            st.markdown("#### Батчинг")
+            st.markdown("#### Получение Логов")
             batch_plan = state.get("batch_plan")
             if not isinstance(batch_plan, list):
                 batch_plan = []
@@ -3909,7 +5000,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 st.info("План батчинга появится после старта map-фазы.")
 
         elif current_stage_idx == 1:
-            st.markdown("#### Map")
+            st.markdown("#### Саммаризация (MAP)")
             if not map_batches:
                 st.info("Map-батчи ещё не обработаны.")
             for item in map_batches:
@@ -4121,10 +5212,11 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
     auto_shrink_on_400 = bool(
         getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400", True)
     )
-    min_llm_batch_size = max(
+    min_llm_batch_size_env = max(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE", 20) or 20),
         1,
     )
+    min_llm_batch_size = min(max(int(llm_batch_size), 1), min_llm_batch_size_env)
     max_shrink_rounds = max(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
         0,
@@ -4295,7 +5387,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_start_dt": start_default,
         "logs_sum_end_dt": end_default,
         "logs_sum_db_batch": max(int(deps.db_batch_size), 1),
-        "logs_sum_llm_batch": max(int(deps.db_batch_size), 1),
+        "logs_sum_llm_batch": max(int(deps.llm_batch_size), 1),
         "logs_sum_parallel_map": False,  # kept for backward compatibility with old sessions
         "logs_sum_map_workers": 1,  # sequential only
         "logs_sum_max_retries": int(deps.max_retries),
@@ -4364,7 +5456,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         st.session_state["logs_sum_start_dt"] = mapped["logs_sum_start_dt"] or start_default
         st.session_state["logs_sum_end_dt"] = mapped["logs_sum_end_dt"] or end_default
         st.session_state["logs_sum_db_batch"] = max(int(mapped["logs_sum_db_batch"]), 1)
-        st.session_state["logs_sum_llm_batch"] = max(int(mapped["logs_sum_db_batch"]), 1)
+        st.session_state["logs_sum_llm_batch"] = max(int(mapped["logs_sum_llm_batch"]), 1)
         st.session_state["logs_sum_parallel_map"] = False
         st.session_state["logs_sum_map_workers"] = 1
         st.session_state["logs_sum_max_retries"] = int(mapped["logs_sum_max_retries"])
@@ -4447,6 +5539,55 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         else:
             st.caption("Сохранённых сессий пока нет.")
 
+        st.markdown("Импорт Единого Файла Отчёта")
+        bundle_file = st.file_uploader(
+            "Файл report.bundle.json / report.json",
+            type=["json"],
+            key="logs_sum_bundle_uploader",
+            disabled=is_running,
+            help=(
+                "Загрузи единый JSON-файл отчёта, и страница восстановит входные параметры "
+                "и финальный отчёт для просмотра."
+            ),
+        )
+        import_bundle_clicked = st.button(
+            "Открыть Файл В Программе",
+            key="logs_sum_import_bundle",
+            use_container_width=True,
+            disabled=is_running,
+        )
+        if import_bundle_clicked:
+            if bundle_file is None:
+                st.warning("Выбери JSON-файл отчёта для импорта.")
+            else:
+                try:
+                    raw_bytes = bundle_file.getvalue()
+                    parsed_payload = json.loads(raw_bytes.decode("utf-8"))
+                    imported_request, imported_result = _extract_request_result_from_bundle(parsed_payload)
+                    if not imported_request and not imported_result:
+                        raise ValueError(
+                            "Формат файла не поддерживается. Нужен report.bundle.json или report.json."
+                        )
+                    imported_state = _state_from_imported_result(imported_result)
+                    imported_state["events"] = list(
+                        imported_state.get("events") or []
+                    ) + ["Импортировано из единого файла отчёта."]
+                    prefill_params = _build_saved_params_from_import_request(
+                        request_payload=imported_request,
+                        center_default=center_default,
+                        start_default=start_default,
+                        end_default=end_default,
+                        default_query=default_query,
+                    )
+                    st.session_state[PENDING_PREFILL_SESSION_KEY] = prefill_params
+                    st.session_state[LAST_STATE_SESSION_KEY] = imported_state
+                    st.session_state[RUNNING_SESSION_KEY] = False
+                    st.session_state.pop(RUN_PARAMS_SESSION_KEY, None)
+                    st.success("Файл загружен. Показываю параметры и итоговый отчёт.")
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Не удалось импортировать файл отчёта: {exc}")
+
         st.markdown("---")
         st.markdown("SQL Запросы Логов")
         if st.button(
@@ -4505,13 +5646,27 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             st.rerun()
 
         st.markdown("Алерты/Инциденты")
+        alert_time_defaults = _default_alert_time_values(
+            center_dt_text=str(st.session_state.get("logs_sum_center_dt", "")),
+            start_dt_text=str(st.session_state.get("logs_sum_start_dt", "")),
+            end_dt_text=str(st.session_state.get("logs_sum_end_dt", "")),
+            center_default=center_default,
+            start_default=start_default,
+            end_default=end_default,
+        )
         if st.button(
             "+ Добавить алерт",
             key="logs_sum_add_alert",
             use_container_width=True,
             disabled=is_running,
         ):
-            st.session_state[alerts_state_key].append(_new_alert_item())
+            st.session_state[alerts_state_key].append(
+                _new_alert_item(
+                    time_point=alert_time_defaults["time_point"],
+                    time_start=alert_time_defaults["time_start"],
+                    time_end=alert_time_defaults["time_end"],
+                )
+            )
             st.rerun()
 
         remove_alert_id: Optional[str] = None
@@ -4535,11 +5690,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     else "Один момент"
                 )
             if point_key not in st.session_state:
-                st.session_state[point_key] = str(item.get("time_point", ""))
+                st.session_state[point_key] = (
+                    str(item.get("time_point", "")).strip() or alert_time_defaults["time_point"]
+                )
             if start_key not in st.session_state:
-                st.session_state[start_key] = str(item.get("time_start", ""))
+                st.session_state[start_key] = (
+                    str(item.get("time_start", "")).strip() or alert_time_defaults["time_start"]
+                )
             if end_key not in st.session_state:
-                st.session_state[end_key] = str(item.get("time_end", ""))
+                st.session_state[end_key] = (
+                    str(item.get("time_end", "")).strip() or alert_time_defaults["time_end"]
+                )
 
             col_alert, col_remove = st.columns([10, 2])
             with col_alert:
@@ -4713,7 +5874,23 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             key="logs_sum_db_batch",
             disabled=is_running,
         )
-        model_candidates = list(MODEL_CONTEXT_PRESETS.keys())
+        st.number_input(
+            "Лимит строк на 1 LLM MAP batch",
+            min_value=10,
+            max_value=100_000,
+            step=10,
+            key="logs_sum_llm_batch",
+            disabled=is_running,
+            help=(
+                "Верхняя граница строк для одного MAP-вызова LLM. "
+                "Пайплайн никогда не отправит больше этого значения. "
+                "Если LLM вернёт overflow/400, размер батча будет автоматически уменьшаться."
+            ),
+        )
+        api_model_candidates, api_models_error = _fetch_llm_model_candidates()
+        model_candidates = list(api_model_candidates)
+        if not model_candidates:
+            model_candidates = list(MODEL_CONTEXT_PRESETS.keys())
         current_model = str(st.session_state.get("logs_sum_model_id") or "").strip()
         if current_model and current_model not in model_candidates:
             model_candidates.insert(0, current_model)
@@ -4734,6 +5911,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         st.caption(
             f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
         )
+        if api_model_candidates:
+            st.caption(f"Список моделей загружен из LLM API (`{len(api_model_candidates)}` шт.).")
+        elif api_models_error:
+            st.caption(f"LLM API модели недоступны: {api_models_error} Используем fallback список.")
         st.caption("MAP обрабатывается последовательно (workers = 1).")
         st.number_input(
             "Ретраи LLM (при ошибке)",
@@ -4807,7 +5988,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     start_dt_text = str(st.session_state.get("logs_sum_start_dt", start_default))
     end_dt_text = str(st.session_state.get("logs_sum_end_dt", end_default))
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
-    llm_batch_size = max(int(db_batch_size), 1)
+    llm_batch_size = max(int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1))), 1)
     llm_model_id = str(st.session_state.get("logs_sum_model_id") or getattr(settings, "LLM_MODEL_ID", "")).strip()
     logs_timestamp_column = _normalize_timestamp_column_name(
         getattr(deps, "logs_timestamp_column", "timestamp")
@@ -5175,6 +6356,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             f"Старт: режим выборки логов по датам ({effective_period_start_iso} -> {period_end_iso})."
         )
     initial_events.append(f"Колонка времени логов: `{logs_timestamp_column}`")
+    initial_events.append(
+        "LLM MAP batch: "
+        f"стартовый лимит `{llm_batch_size}` строк, "
+        "при overflow/400 будет авто-уменьшение."
+    )
 
     state: Dict[str, Any] = {
         "status": "queued",
@@ -5234,7 +6420,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "stats": None,
         "error": None,
         "result_json_path": None,
+        "result_bundle_path": None,
         "result_summary_path": None,
+        "result_html_path": None,
         "result_structured_md_path": None,
         "result_freeform_md_path": None,
         "result_structured_txt_path": None,
@@ -5304,6 +6492,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "structured_sections",
                 "freeform_final_summary",
                 "freeform_sections",
+                "result_json_path",
+                "result_bundle_path",
+                "result_summary_path",
+                "result_html_path",
+                "result_structured_md_path",
+                "result_freeform_md_path",
+                "result_structured_txt_path",
+                "result_freeform_txt_path",
             ):
                 if checkpoint_state.get(key) is not None:
                     state[key] = checkpoint_state.get(key)
@@ -5353,8 +6549,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     request_payload = {
         "sql_query": sql_query_clean,
+        "logs_queries": list(logs_queries),
         "sql_queries_count": len(query_specs),
         "metrics_query": metrics_query_clean,
+        "metrics_queries": list(metrics_queries),
         "metrics_queries_count": len(metrics_query_specs),
         "logs_fetch_mode": logs_fetch_mode,
         "logs_tail_limit": int(deps.logs_tail_limit),
@@ -7212,7 +8410,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         result_state=state,
     )
     state["result_json_path"] = saved.get("json_path")
+    state["result_bundle_path"] = saved.get("bundle_path")
     state["result_summary_path"] = saved.get("summary_path")
+    state["result_html_path"] = saved.get("html_path")
     state["result_structured_md_path"] = saved.get("structured_md_path")
     state["result_freeform_md_path"] = saved.get("freeform_md_path")
     state["result_structured_txt_path"] = saved.get("structured_txt_path")

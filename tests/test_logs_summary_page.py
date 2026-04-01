@@ -1,6 +1,7 @@
 import unittest
 import zipfile
 import io
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -8,14 +9,23 @@ from unittest.mock import patch
 from settings import settings
 from ui.pages.logs_summary_page import (
     FINAL_REPORT_SECTIONS,
+    PORTABLE_BUNDLE_TYPE,
+    _build_portable_report_bundle,
+    _build_saved_params_from_import_request,
+    _build_models_url,
     _build_config,
     _extract_root_cause_hypotheses_block,
     _ensure_report_topics_present,
+    _extract_request_result_from_bundle,
+    _extract_model_ids_from_payload,
+    _fetch_llm_model_candidates,
     _format_table_timestamps,
+    _build_stage1_progress_snapshot,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
+    _default_alert_time_values,
     _build_sectional_freeform_prompt,
     _build_sectional_structured_prompt,
     _build_zip_artifacts_bytes,
@@ -32,6 +42,7 @@ from ui.pages.logs_summary_page import (
     _normalize_alert_items,
     _normalize_summary_text,
     _render_alerts_context,
+    _state_from_imported_result,
     _summary_origin_label,
     _write_json_file,
     _save_logs_summary_result,
@@ -146,6 +157,42 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("logs_processing_seconds", state["stats"])
         self.assertIn("logs_processing_human", state["stats"])
         self.assertEqual(state["stats"]["logs_processing_seconds"], 12.34)
+
+    def test_build_stage1_progress_snapshot_uses_rows_when_total_known(self) -> None:
+        snapshot = _build_stage1_progress_snapshot(
+            {
+                "status": "map",
+                "logs_processed": 250,
+                "logs_total": 1000,
+                "elapsed_seconds": 10,
+                "eta_seconds_left": 30,
+                "eta_finish_at": "2026-03-18T10:00:00+03:00",
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 0.25, places=6)
+        self.assertIn("250/1,000", snapshot["label"])
+        self.assertIn("elapsed:", snapshot["runtime_line"])
+        self.assertIn("rate:", snapshot["runtime_line"])
+        self.assertIn("eta:", snapshot["runtime_line"])
+        self.assertIn("finish:", snapshot["runtime_line"])
+
+    def test_build_stage1_progress_snapshot_uses_timestamp_coverage_without_rows_total(self) -> None:
+        snapshot = _build_stage1_progress_snapshot(
+            {
+                "status": "map",
+                "period_start": "2026-03-18T00:00:00+03:00",
+                "period_end": "2026-03-18T01:00:00+03:00",
+                "last_batch_ts": "2026-03-18T00:30:00+03:00",
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 0.5, places=6)
+        self.assertIn("покрытие периода 50.0%", snapshot["label"])
+
+    def test_build_stage1_progress_snapshot_hidden_outside_first_stage(self) -> None:
+        snapshot = _build_stage1_progress_snapshot({"status": "reduce"})
+        self.assertFalse(snapshot["show"])
 
     def test_ui_freeform_prompt_uses_custom_template(self) -> None:
         with patch.object(
@@ -377,8 +424,122 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             self.assertIn("freeform_md_path", saved)
             self.assertTrue(Path(saved["structured_md_path"]).exists())
             self.assertTrue(Path(saved["freeform_md_path"]).exists())
+            self.assertIn("html_path", saved)
+            html_path = Path(saved["html_path"])
+            self.assertTrue(html_path.exists())
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("<!doctype html>", html_text.lower())
+            self.assertIn("Итоговый Отчёт По Саммаризации Логов", html_text)
+            self.assertIn("tab-timeline", html_text)
+            self.assertIn("timelineRows", html_text)
+            self.assertIn("bundle_path", saved)
+            bundle_path = Path(saved["bundle_path"])
+            self.assertTrue(bundle_path.exists())
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertEqual(bundle.get("bundle_type"), PORTABLE_BUNDLE_TYPE)
+            self.assertIn("request", bundle)
+            self.assertIn("result", bundle)
             self.assertIn("structured_txt_path", saved)
             self.assertIn("freeform_txt_path", saved)
+
+    def test_extract_request_result_from_bundle_supports_portable_and_legacy_json(self) -> None:
+        portable = {
+            "bundle_type": PORTABLE_BUNDLE_TYPE,
+            "request": {"sql_query": "SELECT 1"},
+            "result": {"final_summary": "ok"},
+        }
+        request, result = _extract_request_result_from_bundle(portable)
+        self.assertEqual(request.get("sql_query"), "SELECT 1")
+        self.assertEqual(result.get("final_summary"), "ok")
+
+        legacy = {
+            "saved_at": "2026-04-01T00:00:00+03:00",
+            "request": {"sql_query": "SELECT 2"},
+            "result": {"final_summary": "legacy"},
+        }
+        request_legacy, result_legacy = _extract_request_result_from_bundle(legacy)
+        self.assertEqual(request_legacy.get("sql_query"), "SELECT 2")
+        self.assertEqual(result_legacy.get("final_summary"), "legacy")
+
+    def test_extract_request_result_from_bundle_invalid_returns_empty(self) -> None:
+        request, result = _extract_request_result_from_bundle({"foo": "bar"})
+        self.assertEqual(request, {})
+        self.assertEqual(result, {})
+
+    def test_build_portable_report_bundle_contains_schema_and_payload(self) -> None:
+        bundle = _build_portable_report_bundle(
+            request_payload={"sql_query": "SELECT 1"},
+            result_state={"final_summary": "ok"},
+        )
+        self.assertEqual(bundle.get("bundle_type"), PORTABLE_BUNDLE_TYPE)
+        self.assertEqual(bundle.get("bundle_version"), 1)
+        self.assertEqual(bundle.get("request", {}).get("sql_query"), "SELECT 1")
+        self.assertEqual(bundle.get("result", {}).get("final_summary"), "ok")
+
+    def test_state_from_imported_result_clears_local_paths(self) -> None:
+        imported = _state_from_imported_result(
+            {
+                "status": "done",
+                "result_json_path": "/tmp/a.json",
+                "result_bundle_path": "/tmp/a.bundle.json",
+                "result_summary_path": "/tmp/a.md",
+                "result_html_path": "/tmp/a.html",
+                "final_summary": "summary",
+            }
+        )
+        self.assertEqual(imported.get("status"), "done")
+        self.assertIsNone(imported.get("result_json_path"))
+        self.assertIsNone(imported.get("result_bundle_path"))
+        self.assertIsNone(imported.get("result_summary_path"))
+        self.assertIsNone(imported.get("result_html_path"))
+        self.assertEqual(imported.get("final_summary"), "summary")
+
+    def test_build_saved_params_from_import_request_prefills_form_fields(self) -> None:
+        saved_params = _build_saved_params_from_import_request(
+            request_payload={
+                "logs_queries": ["SELECT * FROM logs_a"],
+                "metrics_queries": ["SELECT * FROM metrics_a"],
+                "alerts": [{"title": "a1"}],
+                "user_goal": "incident goal",
+                "period_mode": "window",
+                "period_start": "2026-03-18T10:00:00+03:00",
+                "period_end": "2026-03-18T11:00:00+03:00",
+                "window_minutes": 45,
+                "db_batch_size": 1200,
+                "llm_batch_size": 300,
+                "llm_model_id": "model-x",
+                "enable_no_logs_hypothesis": True,
+            },
+            center_default="2026-03-01T00:00:00+03:00",
+            start_default="2026-03-01T00:00:00+03:00",
+            end_default="2026-03-01T01:00:00+03:00",
+            default_query="SELECT default_query",
+        )
+        self.assertEqual(saved_params["logs_queries"], ["SELECT * FROM logs_a"])
+        self.assertEqual(saved_params["metrics_queries"], ["SELECT * FROM metrics_a"])
+        self.assertEqual(saved_params["period_mode"], "Окно вокруг даты (±N минут)")
+        self.assertEqual(saved_params["db_batch_size"], 1200)
+        self.assertEqual(saved_params["llm_batch_size"], 300)
+        self.assertEqual(saved_params["llm_model_id"], "model-x")
+        self.assertTrue(saved_params["enable_no_logs_hypothesis"])
+
+    def test_build_saved_params_from_import_request_legacy_sql_fields(self) -> None:
+        saved_params = _build_saved_params_from_import_request(
+            request_payload={
+                "sql_query": "SELECT * FROM logs_legacy",
+                "metrics_query": "SELECT * FROM metrics_legacy",
+                "period_mode": "start_end",
+                "period_start": "2026-03-18T10:00:00+03:00",
+                "period_end": "2026-03-18T11:00:00+03:00",
+            },
+            center_default="2026-03-01T00:00:00+03:00",
+            start_default="2026-03-01T00:00:00+03:00",
+            end_default="2026-03-01T01:00:00+03:00",
+            default_query="SELECT default_query",
+        )
+        self.assertEqual(saved_params["logs_queries"], ["SELECT * FROM logs_legacy"])
+        self.assertEqual(saved_params["metrics_queries"], ["SELECT * FROM metrics_legacy"])
+        self.assertEqual(saved_params["period_mode"], "Явный диапазон (start/end)")
 
     def test_save_logs_summary_result_does_not_truncate_structured_text(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -624,6 +785,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertTrue(isinstance(mapped.get("alerts"), list))
         self.assertGreaterEqual(len(mapped["alerts"]), 1)
         self.assertEqual(mapped["logs_sum_window_minutes"], 45)
+        self.assertEqual(mapped["logs_sum_llm_batch"], 321)
         self.assertFalse(mapped["logs_sum_parallel_map"])
         self.assertEqual(mapped["logs_sum_map_workers"], 1)
         self.assertTrue(mapped["logs_sum_demo_mode"])
@@ -635,6 +797,41 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             default_query="SELECT fallback_query",
         )
         self.assertEqual(mapped["logs_queries"], ["SELECT fallback_query"])
+
+    def test_form_values_from_saved_params_keeps_alert_time_fields_for_resume_buttons(self) -> None:
+        saved_params = {
+            "logs_queries": ["SELECT 1"],
+            "alerts": [
+                {
+                    "id": "a1",
+                    "title": "point_alert",
+                    "time_mode": "point",
+                    "time_point": "2026-03-18T18:42:00+03:00",
+                    "details": "node down",
+                },
+                {
+                    "id": "a2",
+                    "title": "range_alert",
+                    "time_mode": "range",
+                    "time_start": "2026-03-18T18:42:00+03:00",
+                    "time_end": "2026-03-18T19:10:00+03:00",
+                    "details": "fs low",
+                },
+            ],
+        }
+        mapped = _form_values_from_saved_params(
+            saved_params=saved_params,
+            default_query="SELECT fallback_query",
+        )
+        alerts = mapped["alerts"]
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual(alerts[0]["title"], "point_alert")
+        self.assertEqual(alerts[0]["time_mode"], "point")
+        self.assertEqual(alerts[0]["time_point"], "2026-03-18T18:42:00+03:00")
+        self.assertEqual(alerts[1]["title"], "range_alert")
+        self.assertEqual(alerts[1]["time_mode"], "range")
+        self.assertEqual(alerts[1]["time_start"], "2026-03-18T18:42:00+03:00")
+        self.assertEqual(alerts[1]["time_end"], "2026-03-18T19:10:00+03:00")
 
     def test_extract_alerts_from_items_keeps_point_and_range(self) -> None:
         items = _normalize_alert_items(
@@ -664,6 +861,80 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("alert_range", rendered)
         self.assertIn("период:", rendered)
 
+    def test_default_alert_time_values_prefill_from_request_fields(self) -> None:
+        values = _default_alert_time_values(
+            center_dt_text="2026-03-27T14:30:00+03:00",
+            start_dt_text="2026-03-27T13:30:00+03:00",
+            end_dt_text="2026-03-27T15:30:00+03:00",
+            center_default="2026-03-01T00:00:00+03:00",
+            start_default="2026-03-01T00:00:00+03:00",
+            end_default="2026-03-01T01:00:00+03:00",
+        )
+        self.assertEqual(values["time_point"], "2026-03-27T14:30:00+03:00")
+        self.assertEqual(values["time_start"], "2026-03-27T13:30:00+03:00")
+        self.assertEqual(values["time_end"], "2026-03-27T15:30:00+03:00")
+
+    def test_default_alert_time_values_uses_defaults_when_fields_empty(self) -> None:
+        values = _default_alert_time_values(
+            center_dt_text="",
+            start_dt_text="",
+            end_dt_text="",
+            center_default="2026-03-27T14:30:00+03:00",
+            start_default="2026-03-27T13:30:00+03:00",
+            end_default="2026-03-27T15:30:00+03:00",
+        )
+        self.assertEqual(values["time_point"], "2026-03-27T14:30:00+03:00")
+        self.assertEqual(values["time_start"], "2026-03-27T13:30:00+03:00")
+        self.assertEqual(values["time_end"], "2026-03-27T15:30:00+03:00")
+
+    def test_build_models_url_from_chat_completions(self) -> None:
+        url = _build_models_url("https://phoenix.example/api/v1/chat/completions")
+        self.assertEqual(url, "https://phoenix.example/api/v1/models")
+
+    def test_extract_model_ids_from_payload(self) -> None:
+        payload = {
+            "data": [
+                {"id": "model-a"},
+                {"name": "model-b"},
+                {"model": "model-c"},
+                {"id": "model-a"},
+            ]
+        }
+        self.assertEqual(
+            _extract_model_ids_from_payload(payload),
+            ["model-a", "model-b", "model-c"],
+        )
+
+    def test_fetch_llm_model_candidates_from_api(self) -> None:
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            @staticmethod
+            def json():
+                return {"data": [{"id": "m1"}, {"id": "m2"}]}
+
+        captured: Dict[str, Any] = {}
+
+        def _fake_get(url: str, *, headers=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["timeout"] = timeout
+            return _Resp()
+
+        with patch.object(settings, "OPENAI_API_BASE_DB", "https://phoenix.example/api/v1/chat/completions"), patch.object(
+            settings, "OPENAI_API_KEY_DB", "token-123"
+        ), patch("ui.pages.logs_summary_page.requests.get", side_effect=_fake_get):
+            models, err = _fetch_llm_model_candidates(timeout_seconds=7.0)
+
+        self.assertEqual(models, ["m1", "m2"])
+        self.assertEqual(err, "")
+        self.assertEqual(captured["url"], "https://phoenix.example/api/v1/models")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer token-123")
+        self.assertEqual(float(captured["timeout"]), 7.0)
+
     def test_build_config_passes_new_algorithm(self) -> None:
         deps = type(
             "_Deps",
@@ -691,6 +962,24 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(cfg["page_limit"], 1000)
         self.assertEqual(cfg["llm_chunk_rows"], 250)
         self.assertEqual(cfg["map_workers"], 3)
+
+    def test_build_config_clamps_min_llm_chunk_rows_to_user_cap(self) -> None:
+        deps = type(
+            "_Deps",
+            (),
+            {
+                "summarizer_config_cls": staticmethod(lambda **kwargs: kwargs),
+            },
+        )()
+        overrides = {
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE": 200,
+        }
+        with patch.multiple(settings, **overrides):
+            cfg = _build_config(deps, db_batch_size=5000, llm_batch_size=120, map_workers=1)
+
+        self.assertEqual(cfg["llm_chunk_rows"], 120)
+        # Even if env min is larger, lower bound must not exceed the user cap.
+        self.assertEqual(cfg["min_llm_chunk_rows"], 120)
 
     def test_collect_timeline_events_from_map_batches(self) -> None:
         state = {
@@ -740,12 +1029,18 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             base = Path(tmp_dir)
             report = base / "report.md"
+            report_bundle = base / "report.bundle.json"
+            report_html = base / "report.html"
             checkpoint = base / "checkpoint.json"
             report.write_text("report", encoding="utf-8")
+            report_bundle.write_text('{"bundle_type":"logs_summary_portable_report"}', encoding="utf-8")
+            report_html.write_text("<html></html>", encoding="utf-8")
             checkpoint.write_text("{}", encoding="utf-8")
             blob = _build_zip_artifacts_bytes(
                 {
                     "result_summary_path": str(report),
+                    "result_bundle_path": str(report_bundle),
+                    "result_html_path": str(report_html),
                     "checkpoint_path": str(checkpoint),
                 }
             )
@@ -753,6 +1048,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             with zipfile.ZipFile(io.BytesIO(blob), "r") as zf:
                 names = set(zf.namelist())
             self.assertIn("report/report.md", names)
+            self.assertIn("report/report.bundle.json", names)
+            self.assertIn("report/report.html", names)
             self.assertIn("runtime/checkpoint.json", names)
 
 
