@@ -732,8 +732,7 @@ def _build_stage1_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
             ratio = max(min(done_span / total_span, 1.0), 0.0)
             label = f"Загрузка логов + MAP: покрытие периода {ratio * 100:.1f}%"
         else:
-            batch_total = _as_int(state.get("estimated_batch_total"))
-            batch_done = len(state.get("map_batches") or [])
+            batch_done, batch_total = _resolve_map_batches_progress(state)
             if batch_total > 0:
                 ratio = max(min(float(batch_done) / float(batch_total), 1.0), 0.0)
                 label = f"Загрузка логов + MAP: батчи {batch_done}/{batch_total} ({ratio * 100:.1f}%)"
@@ -772,6 +771,28 @@ def _build_stage1_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "ratio": max(min(float(ratio or 0.0), 1.0), 0.0),
         "label": label,
         "runtime_line": runtime_line,
+    }
+
+
+def _build_report_generation_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    total = max(_safe_int(state.get("report_progress_total"), 0), 0)
+    done = max(_safe_int(state.get("report_progress_current"), 0), 0)
+    label = str(state.get("report_progress_label") or "").strip()
+    active = bool(state.get("report_progress_active", False))
+    if total <= 0 and done <= 0 and not active:
+        return {"show": False, "ratio": 0.0, "label": ""}
+    if total <= 0:
+        total = max(done, 1)
+    done = min(max(done, 0), total)
+    ratio = max(min(float(done) / float(total), 1.0), 0.0)
+    if not label:
+        label = f"Генерация итогового отчёта: {done}/{total}"
+    else:
+        label = f"{label} ({done}/{total})"
+    return {
+        "show": True,
+        "ratio": ratio,
+        "label": label,
     }
 
 
@@ -2041,6 +2062,9 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "progress_samples",
         "stats",
         "map_batches",
+        "map_batches_done_total",
+        "map_batches_total",
+        "source_batch_offset",
         "resume_batch_offset",
         "resume_stats_offset",
         "final_summary",
@@ -2061,6 +2085,10 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "llm_calls_failed",
         "llm_last_error",
         "llm_timeline",
+        "report_progress_current",
+        "report_progress_total",
+        "report_progress_label",
+        "report_progress_active",
         "events",
         "query_errors",
     )
@@ -2166,9 +2194,16 @@ def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any
         state[key] = None
     state.setdefault("events", [])
     state.setdefault("map_batches", [])
+    state.setdefault("map_batches_done_total", len(state.get("map_batches") or []))
+    state.setdefault("map_batches_total", _safe_int(state.get("map_batches_done_total"), 0))
+    state.setdefault("source_batch_offset", _safe_int(state.get("map_batches_done_total"), 0))
     state.setdefault("reduce_nodes", [])
     state.setdefault("structured_sections", [])
     state.setdefault("freeform_sections", [])
+    state.setdefault("report_progress_current", 0)
+    state.setdefault("report_progress_total", 0)
+    state.setdefault("report_progress_label", "")
+    state.setdefault("report_progress_active", False)
     state.setdefault("stats", {})
     state.setdefault("final_summary_origin", "imported_bundle")
     return state
@@ -3077,6 +3112,32 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if pd.isna(parsed):
         return float(default)
     return float(parsed)
+
+
+def _resolve_map_batches_progress(
+    state: Dict[str, Any],
+    map_batches: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[int, int]:
+    batches = map_batches if isinstance(map_batches, list) else state.get("map_batches")
+    if not isinstance(batches, list):
+        batches = []
+
+    done = _safe_int(state.get("map_batches_done_total"), 0)
+    if done <= 0 and batches:
+        done = max(
+            max((_safe_int(item.get("batch_index"), -1) for item in batches), default=-1) + 1,
+            len(batches),
+        )
+
+    total = max(
+        _safe_int(state.get("map_batches_total"), 0),
+        _safe_int(state.get("estimated_batch_total"), 0),
+    )
+    if total <= 0 and batches:
+        total = max((_safe_int(item.get("batch_index"), -1) for item in batches), default=-1) + 1
+    if total < done:
+        total = done
+    return max(done, 0), max(total, 0)
 
 
 def _json_dict_from_text(raw: Any) -> Dict[str, Any]:
@@ -4826,11 +4887,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         # --- Alerts panel (always on top) ---
         st.markdown("### Панель Статуса Алертов")
         alert_rows = _build_alert_panel_state(state)
-        batch_total = _safe_int(
-            state.get("estimated_batch_total"),
-            max((_safe_int(item.get("batch_total"), 0) for item in map_batches), default=0),
-        )
-        done_batches = len(map_batches)
+        done_batches, batch_total = _resolve_map_batches_progress(state, map_batches)
         if batch_total > 0:
             st.caption(f"Батчи: {done_batches}/{batch_total} обработано")
         elif done_batches > 0:
@@ -4960,6 +5017,14 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             runtime_line = str(stage1_progress.get("runtime_line") or "").strip()
             if runtime_line:
                 st.caption(runtime_line)
+
+        report_progress = _build_report_generation_progress_snapshot(state)
+        if bool(report_progress.get("show")):
+            st.markdown("### Прогресс Генерации Итогового Отчёта")
+            st.progress(
+                float(report_progress.get("ratio", 0.0)),
+                text=str(report_progress.get("label") or ""),
+            )
 
         # --- Details area for active stage ---
         st.markdown("### Детали Текущего Этапа")
@@ -6404,6 +6469,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "events": initial_events,
         "query_errors": list(preview_query_errors) + list(preview_metrics_errors),
         "map_batches": [],
+        "map_batches_done_total": 0,
+        "map_batches_total": 0,
+        "source_batch_offset": 0,
         "batch_plan": [],
         "batch_split_count": 0,
         "reduce_nodes": [],
@@ -6458,6 +6526,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "progress_samples": [],
         "eta_seconds_left": None,
         "eta_finish_at": None,
+        "report_progress_current": 0,
+        "report_progress_total": 0,
+        "report_progress_label": "",
+        "report_progress_active": False,
     }
 
     if is_resume_continue:
@@ -6484,6 +6556,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "llm_timeline",
                 "batch_plan",
                 "batch_split_count",
+                "map_batches_done_total",
+                "map_batches_total",
+                "source_batch_offset",
                 "reduce_nodes",
                 "reduce_split_count",
                 "verification",
@@ -6500,6 +6575,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "result_freeform_md_path",
                 "result_structured_txt_path",
                 "result_freeform_txt_path",
+                "report_progress_current",
+                "report_progress_total",
+                "report_progress_label",
+                "report_progress_active",
             ):
                 if checkpoint_state.get(key) is not None:
                     state[key] = checkpoint_state.get(key)
@@ -6541,6 +6620,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["resume_batch_offset"] = len(
             _load_map_summaries_from_jsonl(str(map_summaries_jsonl_path))
         )
+        if _safe_int(state.get("map_batches_done_total"), 0) < int(state["resume_batch_offset"]):
+            state["map_batches_done_total"] = int(state["resume_batch_offset"])
+        if _safe_int(state.get("map_batches_total"), 0) < _safe_int(state.get("map_batches_done_total"), 0):
+            state["map_batches_total"] = _safe_int(state.get("map_batches_done_total"), 0)
+        state["source_batch_offset"] = _safe_int(state.get("map_batches_done_total"), 0)
         state["active_step"] = (
             f"Восстановление с прогресса: last_ts={state.get('last_batch_ts') or 'n/a'}"
         )
@@ -6993,7 +7077,25 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "map"
                 state["llm_phase_hint"] = "map"
                 state["active_step"] = "Читаем логи и готовим MAP-батчи"
-                state["estimated_batch_total"] = payload.get("batch_total")
+                current_done = _safe_int(
+                    state.get("map_batches_done_total"),
+                    _safe_int(state.get("resume_batch_offset"), 0),
+                )
+                state["map_batches_done_total"] = max(
+                    current_done,
+                    _safe_int(state.get("resume_batch_offset"), 0),
+                )
+                state["source_batch_offset"] = _safe_int(state.get("map_batches_done_total"), 0)
+                incoming_total = _safe_int(payload.get("batch_total"), 0)
+                if incoming_total > 0:
+                    state["estimated_batch_total"] = incoming_total
+                    total_candidate = _safe_int(state.get("source_batch_offset"), 0) + incoming_total
+                    state["map_batches_total"] = max(
+                        _safe_int(state.get("map_batches_total"), 0),
+                        total_candidate,
+                    )
+                else:
+                    state["estimated_batch_total"] = None
                 state["use_new_algorithm"] = bool(payload.get("use_new_algorithm", False))
                 state["batch_plan"] = []
                 events.append("Map этап запущен")
@@ -7006,10 +7108,19 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             elif event == "map_batch_start":
                 state["status"] = "map"
                 state["llm_phase_hint"] = "map"
-                resume_batch_offset = int(pd.to_numeric(state.get("resume_batch_offset"), errors="coerce") or 0)
+                source_batch_offset = _safe_int(
+                    state.get("source_batch_offset"),
+                    _safe_int(state.get("resume_batch_offset"), 0),
+                )
                 local_batch_index = int(payload.get("batch_index", 0))
-                idx = resume_batch_offset + local_batch_index + 1
+                idx = source_batch_offset + local_batch_index + 1
                 total = payload.get("batch_total")
+                total_int = _safe_int(total, 0)
+                if total_int > 0:
+                    state["map_batches_total"] = max(
+                        _safe_int(state.get("map_batches_total"), 0),
+                        source_batch_offset + total_int,
+                    )
                 retries_label = "∞" if int(max_retries) < 0 else str(max_retries)
                 state["active_step"] = (
                     f"LLM анализирует MAP-batch {idx}/{total}"
@@ -7067,10 +7178,23 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
-                resume_batch_offset = int(pd.to_numeric(state.get("resume_batch_offset"), errors="coerce") or 0)
+                source_batch_offset = _safe_int(
+                    state.get("source_batch_offset"),
+                    _safe_int(state.get("resume_batch_offset"), 0),
+                )
                 local_batch_index = int(payload.get("batch_index", 0))
-                global_batch_index_zero = resume_batch_offset + local_batch_index
+                global_batch_index_zero = source_batch_offset + local_batch_index
                 global_batch_index_one = global_batch_index_zero + 1
+                state["map_batches_done_total"] = max(
+                    _safe_int(state.get("map_batches_done_total"), 0),
+                    global_batch_index_one,
+                )
+                local_total_int = _safe_int(payload.get("batch_total"), 0)
+                if local_total_int > 0:
+                    state["map_batches_total"] = max(
+                        _safe_int(state.get("map_batches_total"), 0),
+                        source_batch_offset + local_total_int,
+                    )
 
                 # Track the timestamp of the last processed batch for timestamp-based
                 # progress bar and ETA — no pre-counting of rows required.
@@ -7175,6 +7299,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["status"] = "reduce"
                 state["llm_phase_hint"] = "reduce"
                 state["active_step"] = "MAP завершён, готовим REDUCE"
+                source_batch_offset = _safe_int(
+                    state.get("source_batch_offset"),
+                    _safe_int(state.get("resume_batch_offset"), 0),
+                )
+                local_total_int = _safe_int(payload.get("batch_total"), 0)
+                if local_total_int > 0:
+                    finished_total = source_batch_offset + local_total_int
+                    state["map_batches_done_total"] = max(
+                        _safe_int(state.get("map_batches_done_total"), 0),
+                        finished_total,
+                    )
+                    state["map_batches_total"] = max(
+                        _safe_int(state.get("map_batches_total"), 0),
+                        finished_total,
+                    )
                 events.append("Map этап завершен")
                 # Warn if processing stopped early due to DB errors
                 if state.get("query_errors"):
@@ -8148,13 +8287,42 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state["final_summary_origin"] = "final_recovery_join"
                 state["final_summary"] = final_summary_for_report
 
+        report_steps_total = len(FINAL_REPORT_SECTIONS) * 2 + 4
+
+        def _set_report_progress(
+            label: str,
+            *,
+            step_inc: int = 0,
+            mark_active: Optional[bool] = None,
+            render_now: bool = False,
+        ) -> None:
+            total = max(
+                _safe_int(state.get("report_progress_total"), 0),
+                report_steps_total,
+                1,
+            )
+            current = _safe_int(state.get("report_progress_current"), 0)
+            current = min(max(current + max(step_inc, 0), 0), total)
+            state["report_progress_total"] = total
+            state["report_progress_current"] = current
+            state["report_progress_label"] = str(label or "").strip()
+            if mark_active is not None:
+                state["report_progress_active"] = bool(mark_active)
+            if render_now:
+                _render_logs_summary_chat(analysis_placeholder, state, deps)
+
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
+            state["report_progress_total"] = report_steps_total
+            state["report_progress_current"] = 0
+            state["report_progress_active"] = True
+            _set_report_progress("Подготовка итогового отчёта", render_now=True)
             try:
                 events = state.setdefault("events", [])
                 state["structured_sections"] = []
                 events.append("Готовим структурированный финальный отчет по секциям")
                 state["llm_phase_hint"] = "final_structured"
                 state["active_source_label"] = "final_structured"
+                _set_report_progress("Структурированный отчёт: старт", render_now=True)
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
 
                 def _on_structured_section_start(
@@ -8164,6 +8332,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 ) -> None:
                     state["active_step"] = (
                         f"Структурированный отчёт: секция {section_idx}/{section_total} — {title}"
+                    )
+                    _set_report_progress(
+                        f"Структурированный отчёт: секция {section_idx}/{section_total}",
+                        render_now=False,
                     )
                     _push_live_event(
                         f"LLM пишет structured секцию {section_idx}/{section_total}: {title}",
@@ -8175,6 +8347,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     section_total: int,
                     title: str,
                 ) -> None:
+                    _set_report_progress(
+                        f"Структурированный отчёт: секция {section_idx}/{section_total} готова",
+                        step_inc=1,
+                        render_now=False,
+                    )
                     _push_live_event(
                         f"Structured секция готова {section_idx}/{section_total}: {title}",
                         render_now=True,
@@ -8199,10 +8376,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     events.append("Структурированный финальный отчет готов")
                 else:
                     events.append("Структурированный секционный отчет пустой, оставляем reduce summary")
+                _set_report_progress("Структурированный отчёт: этап завершён", step_inc=1, render_now=True)
             except Exception as structured_exc:  # noqa: BLE001
                 deps.logger.warning("structured sectional report generation failed: %s", structured_exc)
                 state.setdefault("events", []).append(
                     "Не удалось сгенерировать структурированный секционный отчет, оставляем reduce summary"
+                )
+                _set_report_progress(
+                    "Структурированный отчёт: ошибка, продолжаем дальше",
+                    step_inc=1,
+                    render_now=True,
                 )
 
             try:
@@ -8212,10 +8395,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 events.append("Готовим расширенный финальный отчет в свободном формате")
                 state["llm_phase_hint"] = "final_freeform"
                 state["active_source_label"] = "final_freeform"
+                _set_report_progress("Свободный отчёт: старт", render_now=True)
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
                 def _on_section_start(section_idx: int, section_total: int, title: str) -> None:
                     state["active_step"] = (
                         f"Финальный отчёт: секция {section_idx}/{section_total} — {title}"
+                    )
+                    _set_report_progress(
+                        f"Свободный отчёт: секция {section_idx}/{section_total}",
+                        render_now=False,
                     )
                     _push_live_event(
                         f"LLM пишет секцию {section_idx}/{section_total}: {title}",
@@ -8223,6 +8411,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
 
                 def _on_section_done(section_idx: int, section_total: int, title: str) -> None:
+                    _set_report_progress(
+                        f"Свободный отчёт: секция {section_idx}/{section_total} готова",
+                        step_inc=1,
+                        render_now=False,
+                    )
                     _push_live_event(
                         f"Секция готова {section_idx}/{section_total}: {title}",
                         render_now=True,
@@ -8246,6 +8439,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     events.append("Свободный финальный отчет готов")
                 else:
                     events.append("Свободный финальный отчет пустой, используем основной")
+                _set_report_progress("Свободный отчёт: этап завершён", step_inc=1, render_now=True)
             except Exception as freeform_exc:  # noqa: BLE001
                 deps.logger.warning("freeform final report generation failed: %s", freeform_exc)
                 state.setdefault("events", []).append(
@@ -8279,6 +8473,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state.setdefault("events", []).append(
                         "Не удалось сгенерировать свободный финальный отчет"
                     )
+                _set_report_progress(
+                    "Свободный отчёт: ошибка, продолжаем сохранение артефактов",
+                    step_inc=1,
+                    render_now=True,
+                )
 
         topic_titles = [title for title, _ in FINAL_REPORT_SECTIONS]
         preferred_structured_sections = (
@@ -8321,6 +8520,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state.setdefault("events", []).append(
                 "Синхронизация топиков: добавили недостающие разделы в свободный отчет"
             )
+        if _safe_int(state.get("report_progress_total"), 0) > 0:
+            _set_report_progress("Синхронизация топиков завершена", step_inc=1, render_now=True)
 
         final_structured_now = _normalize_summary_text(state.get("final_summary"))
         if final_structured_now:
@@ -8389,6 +8590,13 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 final_summaries_dir / "final_freeform_sections.md",
                 "\n".join(section_lines).strip(),
             )
+        if _safe_int(state.get("report_progress_total"), 0) > 0:
+            _set_report_progress(
+                "Финальные артефакты сохранены",
+                step_inc=1,
+                mark_active=False,
+                render_now=True,
+            )
         _estimate_eta(state, "done", {})
         _enrich_stats_with_elapsed(state)
         _persist_checkpoint(session_checkpoint_path, state)
@@ -8397,6 +8605,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         state["status"] = "error"
         state["active_step"] = "Ошибка выполнения"
         state["error"] = str(exc)
+        if _safe_int(state.get("report_progress_total"), 0) > 0:
+            state["report_progress_active"] = False
+            if not str(state.get("report_progress_label") or "").strip():
+                state["report_progress_label"] = "Генерация итогового отчёта прервана"
         _estimate_eta(state, "error", {})
         _enrich_stats_with_elapsed(state)
         _persist_checkpoint(session_checkpoint_path, state)

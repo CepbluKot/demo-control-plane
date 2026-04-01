@@ -13,6 +13,7 @@ from ui.pages.logs_summary_page import (
     _build_portable_report_bundle,
     _build_saved_params_from_import_request,
     _build_models_url,
+    _build_report_generation_progress_snapshot,
     _build_config,
     _extract_root_cause_hypotheses_block,
     _ensure_report_topics_present,
@@ -190,9 +191,39 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertAlmostEqual(float(snapshot["ratio"]), 0.5, places=6)
         self.assertIn("покрытие периода 50.0%", snapshot["label"])
 
+    def test_build_stage1_progress_snapshot_uses_non_truncated_done_batches_counter(self) -> None:
+        snapshot = _build_stage1_progress_snapshot(
+            {
+                "status": "map",
+                "estimated_batch_total": 120,
+                "map_batches_done_total": 75,
+                "map_batches": [{"batch_index": i} for i in range(10)],  # UI keeps only tail
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 75.0 / 120.0, places=6)
+        self.assertIn("батчи 75/120", snapshot["label"])
+
     def test_build_stage1_progress_snapshot_hidden_outside_first_stage(self) -> None:
         snapshot = _build_stage1_progress_snapshot({"status": "reduce"})
         self.assertFalse(snapshot["show"])
+
+    def test_build_report_generation_progress_snapshot_hidden_when_not_started(self) -> None:
+        snapshot = _build_report_generation_progress_snapshot({})
+        self.assertFalse(snapshot["show"])
+
+    def test_build_report_generation_progress_snapshot_builds_ratio_and_label(self) -> None:
+        snapshot = _build_report_generation_progress_snapshot(
+            {
+                "report_progress_current": 5,
+                "report_progress_total": 20,
+                "report_progress_label": "Свободный отчёт: секция 5/13 готова",
+                "report_progress_active": True,
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 0.25, places=6)
+        self.assertIn("(5/20)", snapshot["label"])
 
     def test_ui_freeform_prompt_uses_custom_template(self) -> None:
         with patch.object(
