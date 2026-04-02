@@ -1155,6 +1155,27 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             self.assertIn("report/report.html", names)
             self.assertIn("runtime/checkpoint.json", names)
 
+    def test_build_zip_artifacts_bytes_can_filter_by_prefix(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            report = base / "report.md"
+            checkpoint = base / "checkpoint.json"
+            report.write_text("report", encoding="utf-8")
+            checkpoint.write_text("{}", encoding="utf-8")
+
+            blob = _build_zip_artifacts_bytes(
+                {
+                    "result_summary_path": str(report),
+                    "checkpoint_path": str(checkpoint),
+                },
+                include_prefixes=("report/",),
+            )
+            self.assertIsNotNone(blob)
+            with zipfile.ZipFile(io.BytesIO(blob), "r") as zf:
+                names = set(zf.namelist())
+            self.assertIn("report/report.md", names)
+            self.assertNotIn("runtime/checkpoint.json", names)
+
 
 if __name__ == "__main__":
     unittest.main()

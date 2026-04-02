@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from uuid import uuid4
 import zipfile
 
@@ -3447,8 +3447,8 @@ def _build_alert_panel_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     return panel_rows
 
 
-def _build_zip_artifacts_bytes(state: Dict[str, Any]) -> Optional[bytes]:
-    artifact_candidates = [
+def _artifact_candidates_from_state(state: Dict[str, Any]) -> List[tuple[str, Any]]:
+    return [
         ("report/report.json", state.get("result_json_path")),
         ("report/report.bundle.json", state.get("result_bundle_path")),
         ("report/report.md", state.get("result_summary_path")),
@@ -3471,8 +3471,23 @@ def _build_zip_artifacts_bytes(state: Dict[str, Any]) -> Optional[bytes]:
         ("runtime/checkpoint.json", state.get("checkpoint_path")),
         ("runtime/rebuild_reduce.md", state.get("rebuild_reduce_path")),
     ]
+
+
+def _build_zip_artifacts_bytes(
+    state: Dict[str, Any],
+    *,
+    include_prefixes: Optional[Sequence[str]] = None,
+) -> Optional[bytes]:
+    artifact_candidates = _artifact_candidates_from_state(state)
+    normalized_prefixes = [
+        str(prefix or "").strip()
+        for prefix in (include_prefixes or [])
+        if str(prefix or "").strip()
+    ]
     items: List[tuple[str, bytes]] = []
     for name, raw_path in artifact_candidates:
+        if normalized_prefixes and not any(name.startswith(prefix) for prefix in normalized_prefixes):
+            continue
         path = Path(str(raw_path or "").strip())
         if not str(raw_path or "").strip() or not path.exists() or not path.is_file():
             continue
@@ -4891,15 +4906,46 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     st.warning(str(err))
 
         st.markdown("Артефакты")
-        zip_bytes = _build_zip_artifacts_bytes(state)
-        if zip_bytes is not None:
-            st.download_button(
-                label="Скачать Всё (ZIP)",
-                data=zip_bytes,
-                file_name=f"logs_summary_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+        zip_all_bytes = _build_zip_artifacts_bytes(state)
+        zip_reports_bytes = _build_zip_artifacts_bytes(state, include_prefixes=("report/",))
+        zip_runtime_bytes = _build_zip_artifacts_bytes(
+            state,
+            include_prefixes=("summaries/", "runtime/"),
+        )
+        zip_cols = st.columns(3)
+        with zip_cols[0]:
+            if zip_all_bytes is not None:
+                st.download_button(
+                    label="Скачать Всё (ZIP)",
+                    data=zip_all_bytes,
+                    file_name=f"logs_summary_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Нет файлов для общего ZIP.")
+        with zip_cols[1]:
+            if zip_reports_bytes is not None:
+                st.download_button(
+                    label="Скачать Все Отчёты (ZIP)",
+                    data=zip_reports_bytes,
+                    file_name=f"logs_reports_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Нет файлов отчётов.")
+        with zip_cols[2]:
+            if zip_runtime_bytes is not None:
+                st.download_button(
+                    label="Скачать Тех. Артефакты (ZIP)",
+                    data=zip_runtime_bytes,
+                    file_name=f"logs_runtime_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Нет runtime/map/reduce файлов.")
 
         json_bytes = _read_file_bytes(state.get("result_json_path"))
         bundle_bytes = _read_file_bytes(state.get("result_bundle_path"))
@@ -8811,6 +8857,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 state["final_summary"] = final_summary_for_report
 
         report_steps_total = len(FINAL_REPORT_SECTIONS) * 2 + 4 + (2 if use_instructor else 0)
+        final_summary_for_instructor_input = final_summary_for_report
 
         def _set_report_progress(
             label: str,
@@ -9078,6 +9125,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     llm_timeout=float(max(llm_timeout, 10)),
                     llm_max_retries=int(max_retries),
                     model_supports_tool_calling=bool(model_supports_tool_calling),
+                    verified_summary_json=final_summary_for_instructor_input,
+                    alerts=state.get("alerts") if isinstance(state.get("alerts"), list) else [],
                 )
                 instructor_structured = _normalize_summary_text(
                     instructor_bundle.get("structured_report")

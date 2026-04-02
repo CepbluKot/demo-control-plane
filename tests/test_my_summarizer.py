@@ -7,8 +7,6 @@ import pandas as pd
 import requests
 
 from my_summarizer import (
-    InstructorFinalReportSection,
-    InstructorFinalReports,
     MapBatchSummaryModel,
     PeriodLogSummarizer,
     SummarizerConfig,
@@ -21,6 +19,27 @@ from my_summarizer import (
     generate_final_reports_with_instructor,
     regenerate_reduce_summary_from_map_summaries,
     summarize_logs,
+)
+from report_schema import (
+    AlertExplanation,
+    AlertsSection,
+    AnalysisLimitations,
+    CausalChain,
+    CausalChainsSection,
+    ChronologyEvent,
+    ChronologySection,
+    CoverageSection,
+    FreeformReport,
+    ImpactAssessment,
+    ImpactSection,
+    IncidentReport,
+    LimitationsSection,
+    MetricsSection,
+    ReportPartAnalytical,
+    ReportPartDescriptive,
+    SummarySection,
+    ReportSummary,
+    DataCoverage,
 )
 from schemas import IncidentSummary
 from settings import settings
@@ -1695,67 +1714,248 @@ class TestMySummarizer(unittest.TestCase):
         map_start_payload = next(payload for event, payload in progress_events if event == "map_start")
         self.assertNotIn("token_budget", map_start_payload)
 
-    def test_generate_final_reports_with_instructor_returns_model_reports(self) -> None:
-        parsed = InstructorFinalReports(
-            structured_report="STRUCTURED_V2",
-            freeform_report="FREEFORM_V2",
-            notes="ok",
+    def test_generate_final_reports_with_instructor_full_attempt_success(self) -> None:
+        report = IncidentReport(
+            summary=ReportSummary(text="full summary"),
+            data_coverage=DataCoverage(period_start="2026-03-25T10:00:00+03:00", period_end="2026-03-25T11:00:00+03:00"),
+            chronology=[],
+            causal_chains=[],
+            alert_explanations=[],
+            hypotheses=[],
+            conflicts=[],
+            gaps=[],
+            recommendations=[],
         )
+
+        def _fake_call(*, prompt, response_model, stage):  # noqa: ANN001
+            _ = (prompt, stage)
+            if response_model is IncidentReport:
+                return report, 2
+            if response_model is FreeformReport:
+                return FreeformReport(text="freeform from instructor"), 1
+            raise AssertionError("unexpected response_model")
+
         with patch.object(
             PeriodLogSummarizer,
             "_call_structured_with_instructor",
-            return_value=(parsed, 2),
-        ) as mocked_call:
-            out = generate_final_reports_with_instructor(
-                base_structured_report="old-structured",
-                base_freeform_report="old-freeform",
-                user_goal="incident context",
-                period_start="2026-03-25T10:00:00+03:00",
-                period_end="2026-03-25T11:00:00+03:00",
-                stats={"rows": 10},
-                metrics_context="cpu up",
-                section_titles=["1. Context", "2. Summary"],
-                llm_timeout=600.0,
-                llm_max_retries=-1,
-                model_supports_tool_calling=True,
-            )
-
-        self.assertEqual(out["structured_report"], "STRUCTURED_V2")
-        self.assertEqual(out["freeform_report"], "FREEFORM_V2")
-        self.assertEqual(out["notes"], "ok")
-        self.assertEqual(out["attempts"], 2)
-        mocked_call.assert_called_once()
-
-    def test_generate_final_reports_with_instructor_builds_reports_from_sections(self) -> None:
-        parsed = InstructorFinalReports(
-            structured_report="",
-            freeform_report="",
-            structured_sections=[
-                InstructorFinalReportSection(title="Structured Block", text="Structured text"),
-            ],
-            freeform_sections=[
-                InstructorFinalReportSection(title="Freeform Block", text="Freeform text"),
-            ],
-        )
-        with patch.object(
-            PeriodLogSummarizer,
-            "_call_structured_with_instructor",
-            return_value=(parsed, 1),
+            side_effect=_fake_call,
         ):
             out = generate_final_reports_with_instructor(
-                base_structured_report="old-structured",
-                base_freeform_report="old-freeform",
+                base_structured_report='{"context":{"batch_id":"b1","time_range_start":"2026-03-25T10:00:00+03:00","time_range_end":"2026-03-25T11:00:00+03:00","total_log_entries":1,"source_query":[],"source_services":[]}}',
+                base_freeform_report="",
                 user_goal="incident context",
                 period_start="2026-03-25T10:00:00+03:00",
                 period_end="2026-03-25T11:00:00+03:00",
-                section_titles=["1. Context"],
+                alerts=[{"title": "alert-1", "details": "cpu"}],
             )
 
-        self.assertIn("## Structured Block", out["structured_report"])
-        self.assertIn("Structured text", out["structured_report"])
-        self.assertIn("## Freeform Block", out["freeform_report"])
-        self.assertIn("Freeform text", out["freeform_report"])
-        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(out["algorithm_stage"], "attempt_1_full")
+        self.assertIn("## 2. Резюме Инцидента", out["structured_report"])
+        self.assertIn("freeform from instructor", out["freeform_report"])
+        self.assertGreaterEqual(int(out["attempts"]), 3)
+        self.assertIn("incident_report", out)
+
+    def test_generate_final_reports_with_instructor_falls_back_to_split_attempt(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        split_part_1 = ReportPartAnalytical(
+            causal_chains=[],
+            alert_explanations=[],
+            hypotheses=[],
+            recommendations=[],
+        )
+        split_part_2 = ReportPartDescriptive(
+            summary=ReportSummary(text="split summary"),
+            data_coverage=DataCoverage(period_start="2026-03-25T10:00:00+03:00", period_end="2026-03-25T11:00:00+03:00"),
+            chronology=[],
+            conflicts=[],
+            gaps=[],
+        )
+        call_order = []
+
+        def _fake_call(*, prompt, response_model, stage):  # noqa: ANN001
+            _ = prompt
+            call_order.append(stage)
+            if stage == "final_report_full":
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request",
+                    response=_Resp(),
+                )
+            if response_model is ReportPartAnalytical:
+                return split_part_1, 1
+            if response_model is ReportPartDescriptive:
+                return split_part_2, 1
+            if response_model is FreeformReport:
+                return FreeformReport(text="freeform split"), 1
+            raise AssertionError("unexpected response_model")
+
+        with patch.object(
+            PeriodLogSummarizer,
+            "_call_structured_with_instructor",
+            side_effect=_fake_call,
+        ):
+            out = generate_final_reports_with_instructor(
+                base_structured_report='{"context":{"batch_id":"b1","time_range_start":"2026-03-25T10:00:00+03:00","time_range_end":"2026-03-25T11:00:00+03:00","total_log_entries":1,"source_query":[],"source_services":[]}}',
+                base_freeform_report="",
+                user_goal="incident context",
+                period_start="2026-03-25T10:00:00+03:00",
+                period_end="2026-03-25T11:00:00+03:00",
+            )
+
+        self.assertEqual(out["algorithm_stage"], "attempt_2_split")
+        self.assertIn("split summary", out["structured_report"])
+        self.assertIn("attempt_1_full=fail", out["notes"])
+        self.assertIn("attempt_2_split=ok", out["notes"])
+        self.assertIn("final_report_part1", "|".join(call_order))
+
+    def test_generate_final_reports_with_instructor_falls_back_to_sectional_attempt(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        minimal_summary_json = json.dumps(
+            {
+                "context": {
+                    "batch_id": "b-1",
+                    "time_range_start": "2026-03-25T10:00:00+03:00",
+                    "time_range_end": "2026-03-25T11:00:00+03:00",
+                    "total_log_entries": 10,
+                    "source_query": ["SELECT 1"],
+                    "source_services": ["svc-a"],
+                }
+            },
+            ensure_ascii=False,
+        )
+
+        def _fake_call(*, prompt, response_model, stage):  # noqa: ANN001
+            _ = prompt
+            if stage in {"final_report_full", "final_report_part1", "final_report_part2"}:
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request",
+                    response=_Resp(),
+                )
+            if response_model is ChronologySection:
+                return (
+                    ChronologySection(
+                        chronology=[
+                            ChronologyEvent(
+                                id="evt-001",
+                                timestamp="2026-03-25T10:15:00.123456+03:00",
+                                source="svc-a",
+                                description="error spike",
+                                severity="high",
+                                evidence_type="FACT",
+                                evidence_quote="timeout to db",
+                                tags=["timeout"],
+                            )
+                        ]
+                    ),
+                    1,
+                )
+            if response_model is CausalChainsSection:
+                return (
+                    CausalChainsSection(
+                        causal_chains=[
+                            CausalChain(
+                                id="c-1",
+                                cause_event_id="evt-001",
+                                effect_event_id="evt-001",
+                                mechanism="same-event simplified chain",
+                                confidence=0.5,
+                            )
+                        ]
+                    ),
+                    1,
+                )
+            if response_model is AlertsSection:
+                return (
+                    AlertsSection(
+                        alert_explanations=[
+                            AlertExplanation(
+                                alert_id="A1",
+                                status="PARTIALLY_EXPLAINED",
+                                related_events=["evt-001"],
+                                explanation="partial signal",
+                            )
+                        ]
+                    ),
+                    1,
+                )
+            if response_model is CoverageSection:
+                return (
+                    CoverageSection(
+                        data_coverage=DataCoverage(
+                            period_start="2026-03-25T10:00:00+03:00",
+                            period_end="2026-03-25T11:00:00+03:00",
+                            sql_queries=["SELECT 1"],
+                            services_covered=["svc-a"],
+                            services_missing=[],
+                            logs_processed=10,
+                            notes="ok",
+                        )
+                    ),
+                    1,
+                )
+            if response_model is ImpactSection:
+                return (
+                    ImpactSection(
+                        impact=ImpactAssessment(
+                            affected_services=["svc-a"],
+                            affected_operations=[],
+                            error_counts=["timeouts=3"],
+                            duration="5m",
+                            severity_assessment="high",
+                        )
+                    ),
+                    1,
+                )
+            if response_model is LimitationsSection:
+                return (
+                    LimitationsSection(
+                        limitations=AnalysisLimitations(
+                            overall_confidence="medium",
+                            rationale="limited logs",
+                            limitations=["partial period"],
+                            low_confidence_hypotheses=[],
+                        )
+                    ),
+                    1,
+                )
+            if response_model is SummarySection:
+                return (SummarySection(summary=ReportSummary(text="sectional summary")), 1)
+            if response_model is FreeformReport:
+                return (FreeformReport(text="sectional freeform"), 1)
+            # for optional sections, force fallback defaults
+            raise requests.exceptions.HTTPError(
+                "400 Client Error: Bad Request",
+                response=_Resp(),
+            )
+
+        with patch.object(
+            PeriodLogSummarizer,
+            "_call_structured_with_instructor",
+            side_effect=_fake_call,
+        ):
+            out = generate_final_reports_with_instructor(
+                base_structured_report=minimal_summary_json,
+                base_freeform_report="",
+                user_goal="incident context",
+                period_start="2026-03-25T10:00:00+03:00",
+                period_end="2026-03-25T11:00:00+03:00",
+                alerts=[{"title": "A1", "details": "alert details"}],
+            )
+
+        self.assertEqual(out["algorithm_stage"], "attempt_3_sectional")
+        self.assertIn("attempt_2_split=fail", out["notes"])
+        self.assertIn("attempt_3_sectional=ok", out["notes"])
+        self.assertIn("## 4. Полная Хронология Событий", out["structured_report"])
+        self.assertIn("A1", out["structured_report"])
+        self.assertIn("sectional summary", out["structured_report"])
+        self.assertIn("sectional freeform", out["freeform_report"])
+        self.assertEqual(
+            out["incident_report"]["summary"]["text"],
+            "sectional summary",
+        )
 
 
 if __name__ == "__main__":

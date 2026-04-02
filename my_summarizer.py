@@ -25,6 +25,36 @@ from schemas import Impact as IncidentImpact
 from schemas import IncidentSummary
 from schemas import Recommendation as IncidentRecommendation
 from schemas import TimelineEvent as IncidentTimelineEvent
+from report_schema import (
+    AlertsSection,
+    CausalChainsSection,
+    ChronologySection,
+    ConflictsSection,
+    CoverageSection,
+    FreeformReport,
+    GapDescription,
+    GapsSection,
+    ImpactSection,
+    IncidentReport,
+    MetricsReportSection,
+    MetricsSection,
+    HypothesesSection,
+    ReportPartAnalytical,
+    ReportPartDescriptive,
+    RecommendationsSection,
+    SummarySection,
+    LimitationsSection,
+    ReportSummary,
+    DataCoverage,
+    ChronologyEvent,
+    CausalChain,
+    AlertExplanation,
+    ReportHypothesis,
+    ConflictDescription,
+    ImpactAssessment,
+    ReportRecommendation,
+    AnalysisLimitations,
+)
 from settings import settings
 
 try:
@@ -3684,6 +3714,419 @@ def _sections_to_markdown(sections: Sequence[InstructorFinalReportSection]) -> s
     return "\n".join(parts).strip()
 
 
+def _normalize_alert_status_for_report(status: str) -> str:
+    raw = str(status or "").strip().upper()
+    if raw == "EXPLAINED":
+        return "EXPLAINED"
+    if raw in {"PARTIALLY", "PARTIALLY_EXPLAINED"}:
+        return "PARTIALLY_EXPLAINED"
+    return "NOT_EXPLAINED"
+
+
+def _render_alerts_list_text(alerts: Sequence[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for idx, item in enumerate(alerts, start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        details = str(item.get("details") or "").strip()
+        time_mode = str(item.get("time_mode") or "").strip()
+        timestamp = str(item.get("timestamp") or "").strip()
+        start = str(item.get("start") or "").strip()
+        end = str(item.get("end") or "").strip()
+        head = title or f"alert_{idx}"
+        payload = details if details else "(без деталей)"
+        if time_mode == "range":
+            time_block = f"{start} -> {end}".strip()
+        else:
+            time_block = timestamp
+        if time_block:
+            lines.append(f"{idx}. {head} | time={time_block} | {payload}")
+        else:
+            lines.append(f"{idx}. {head} | {payload}")
+    return "\n".join(lines).strip()
+
+
+def _build_empty_incident_summary(
+    *,
+    period_start: str,
+    period_end: str,
+) -> IncidentSummary:
+    return IncidentSummary(
+        context=IncidentContext(
+            batch_id="final-report-input",
+            time_range_start=period_start,
+            time_range_end=period_end,
+            total_log_entries=0,
+            source_query=[],
+            source_services=[],
+        ),
+        timeline=[],
+        causal_links=[],
+        alert_refs=[],
+        hypotheses=[],
+        pinned_facts=[],
+        gaps=[],
+        impact=IncidentImpact(),
+        conflicts=[],
+        data_quality=IncidentDataQuality(
+            is_empty=True,
+            noise_ratio=1.0,
+            notes="IncidentSummary недоступен, использован пустой fallback.",
+        ),
+        preliminary_recommendations=[],
+    )
+
+
+def _report_from_summary_defaults(
+    *,
+    summary: IncidentSummary,
+    user_goal: str,
+    alerts: Sequence[Dict[str, Any]],
+    metrics_context: str,
+) -> IncidentReport:
+    alert_ids_from_ui = [
+        str(item.get("title") or f"alert_{idx + 1}").strip()
+        for idx, item in enumerate(alerts)
+        if isinstance(item, dict)
+    ]
+    alert_ids_from_ui = [item for item in alert_ids_from_ui if item]
+    alert_by_id: Dict[str, IncidentAlertRef] = {
+        str(item.alert_id): item for item in summary.alert_refs
+    }
+    all_alert_ids = list(dict.fromkeys(alert_ids_from_ui + list(alert_by_id.keys())))
+    alert_explanations: List[AlertExplanation] = []
+    for alert_id in all_alert_ids:
+        matched = alert_by_id.get(alert_id)
+        if matched is None:
+            alert_explanations.append(
+                AlertExplanation(
+                    alert_id=alert_id,
+                    status="NOT_EXPLAINED",
+                    related_events=[],
+                    explanation="В IncidentSummary нет прямой привязки этого алерта.",
+                )
+            )
+            continue
+        alert_explanations.append(
+            AlertExplanation(
+                alert_id=alert_id,
+                status=_normalize_alert_status_for_report(matched.status),
+                related_events=[str(eid) for eid in (matched.related_events or []) if str(eid).strip()],
+                explanation=str(matched.explanation or "").strip(),
+            )
+        )
+
+    chronology = [
+        ChronologyEvent(
+            id=str(item.id),
+            timestamp=str(item.timestamp),
+            source=str(item.source),
+            description=str(item.description),
+            severity=item.severity,
+            evidence_type=item.evidence_type,
+            evidence_quote=str(item.evidence_quote or "") if item.evidence_quote else None,
+            tags=[str(tag) for tag in (item.tags or []) if str(tag).strip()],
+        )
+        for item in summary.timeline
+    ]
+    causal_chains = [
+        CausalChain(
+            id=str(item.id),
+            cause_event_id=str(item.cause_event_id),
+            effect_event_id=str(item.effect_event_id),
+            mechanism=str(item.mechanism),
+            confidence=float(item.confidence),
+        )
+        for item in summary.causal_links
+    ]
+    hypotheses = [
+        ReportHypothesis(
+            id=str(item.id),
+            related_alert_ids=[str(aid) for aid in (item.related_alert_ids or []) if str(aid).strip()],
+            title=str(item.title),
+            description=str(item.description),
+            confidence=float(item.confidence),
+            confidence_rationale=(
+                "Оценка confidence основана на количестве supporting/contradicting событий "
+                "в текущем сводном IncidentSummary."
+            ),
+            supporting_events=[str(eid) for eid in (item.supporting_events or []) if str(eid).strip()],
+            contradicting_events=[str(eid) for eid in (item.contradicting_events or []) if str(eid).strip()],
+            status=item.status,
+        )
+        for item in summary.hypotheses
+    ]
+    conflicts = [
+        ConflictDescription(
+            id=str(item.id),
+            description=str(item.description),
+            side_a=str(item.side_a.description),
+            side_b=str(item.side_b.description),
+            side_a_events=[str(eid) for eid in (item.side_a.supporting_events or []) if str(eid).strip()],
+            side_b_events=[str(eid) for eid in (item.side_b.supporting_events or []) if str(eid).strip()],
+            resolution=str(item.resolution or "") or None,
+        )
+        for item in summary.conflicts
+    ]
+    gaps = [
+        GapDescription(
+            id=str(item.id),
+            description=str(item.description),
+            between_events=[str(eid) for eid in (item.between_events or []) if str(eid).strip()],
+            missing_data=str(item.missing_data),
+        )
+        for item in summary.gaps
+    ]
+    impact_duration = ""
+    if summary.impact.degradation_period is not None:
+        impact_duration = (
+            f"{summary.impact.degradation_period.start} -> "
+            f"{summary.impact.degradation_period.end}"
+        )
+    impact = ImpactAssessment(
+        affected_services=[str(item) for item in (summary.impact.affected_services or []) if str(item).strip()],
+        affected_operations=[str(item) for item in (summary.impact.affected_operations or []) if str(item).strip()],
+        error_counts=[str(item) for item in (summary.impact.error_counts or []) if str(item).strip()],
+        duration=impact_duration,
+        severity_assessment=(
+            "high"
+            if any(item.severity in {"critical", "high"} for item in summary.timeline)
+            else "medium"
+        ),
+    )
+    recommendations = [
+        ReportRecommendation(
+            id=str(item.id),
+            priority=item.priority,
+            action=str(item.action),
+            rationale=str(item.rationale or ""),
+            expected_effect="Снижение вероятности повторения инцидента.",
+            related_hypothesis_ids=[str(hid) for hid in (item.related_hypothesis_ids or []) if str(hid).strip()],
+        )
+        for item in summary.preliminary_recommendations
+    ]
+    low_conf_hyp = [
+        str(item.title)
+        for item in summary.hypotheses
+        if float(item.confidence) < 0.5
+    ]
+    max_conf = max((float(item.confidence) for item in summary.hypotheses), default=0.0)
+    if max_conf >= 0.8:
+        overall_confidence = "high"
+    elif max_conf >= 0.5:
+        overall_confidence = "medium"
+    else:
+        overall_confidence = "low"
+    limitations = AnalysisLimitations(
+        overall_confidence=overall_confidence,  # type: ignore[arg-type]
+        rationale=(
+            "Оценка построена на полноте timeline/causal_links/hypotheses и "
+            "доступности объяснений по алертам."
+        ),
+        limitations=[
+            item
+            for item in [
+                str(summary.data_quality.notes or "").strip(),
+                *[
+                    f"Gap {gap.id}: {gap.missing_data}"
+                    for gap in gaps[:8]
+                    if str(gap.missing_data).strip()
+                ],
+            ]
+            if item
+        ],
+        low_confidence_hypotheses=low_conf_hyp,
+    )
+    metrics_provided = bool(str(metrics_context or "").strip())
+    metrics = MetricsSection(
+        metrics_provided=metrics_provided,
+        anomalies=[],
+        normal_metrics=[],
+        recommendation_if_missing=(
+            ""
+            if metrics_provided
+            else (
+                "Метрики не предоставлены. Для более полного анализа добавьте: CPU, memory, "
+                "latency(p95/p99), error rate, saturation по ключевым сервисам."
+            )
+        ),
+    )
+    summary_text = (
+        "Инцидент проанализирован на основе верифицированного IncidentSummary. "
+        f"Обработано событий: {len(chronology)}; гипотез: {len(hypotheses)}; "
+        f"алертов в контексте: {len(all_alert_ids)}. "
+        "Наиболее вероятная первопричина определяется по гипотезе с максимальным confidence."
+    )
+    if not chronology:
+        summary_text = (
+            "Значимые события в хронологии не обнаружены. "
+            "Данных недостаточно для уверенного определения первопричины."
+        )
+    return IncidentReport(
+        summary=ReportSummary(text=summary_text),
+        data_coverage=DataCoverage(
+            period_start=str(summary.context.time_range_start),
+            period_end=str(summary.context.time_range_end),
+            sql_queries=[str(item) for item in (summary.context.source_query or []) if str(item).strip()],
+            services_covered=[str(item) for item in (summary.context.source_services or []) if str(item).strip()],
+            services_missing=[],
+            logs_processed=max(int(summary.context.total_log_entries), 0),
+            notes=str(summary.data_quality.notes or ""),
+        ),
+        chronology=chronology,
+        causal_chains=causal_chains,
+        alert_explanations=alert_explanations,
+        metrics=metrics,
+        hypotheses=hypotheses,
+        conflicts=conflicts,
+        gaps=gaps,
+        impact=impact,
+        recommendations=recommendations,
+        limitations=limitations,
+    )
+
+
+def _format_report_section_items(title: str, rows: Sequence[str]) -> str:
+    cleaned = [str(item).strip() for item in rows if str(item).strip()]
+    if not cleaned:
+        return f"## {title}\n\nДанных недостаточно."
+    return f"## {title}\n\n" + "\n".join(f"- {item}" for item in cleaned)
+
+
+def _render_structured_sections_from_report(
+    report: IncidentReport,
+    *,
+    user_context: str,
+) -> List[Dict[str, str]]:
+    sections: List[Dict[str, str]] = []
+    sections.append(
+        {
+            "title": "1. Контекст Инцидента Из UI (Дословно)",
+            "text": str(user_context or "").strip() or "Контекст инцидента в UI не задан.",
+        }
+    )
+    sections.append({"title": "2. Резюме Инцидента", "text": str(report.summary.text or "").strip()})
+    coverage_lines = [
+        f"Период: {report.data_coverage.period_start} -> {report.data_coverage.period_end}",
+        f"SQL: {', '.join(report.data_coverage.sql_queries) if report.data_coverage.sql_queries else 'n/a'}",
+        f"Сервисы покрыты: {', '.join(report.data_coverage.services_covered) if report.data_coverage.services_covered else 'n/a'}",
+        f"Сервисы не покрыты: {', '.join(report.data_coverage.services_missing) if report.data_coverage.services_missing else 'n/a'}",
+        f"Обработано логов: {report.data_coverage.logs_processed}",
+        f"Notes: {report.data_coverage.notes or 'n/a'}",
+    ]
+    sections.append({"title": "3. Покрытие Данных", "text": "\n".join(coverage_lines)})
+    chronology_lines = [
+        (
+            f"[{item.timestamp}] ({item.source}) [{item.severity}] "
+            f"[{item.evidence_type}] {item.description}"
+            + (
+                f" | quote: {item.evidence_quote}"
+                if item.evidence_type == "FACT" and str(item.evidence_quote or "").strip()
+                else ""
+            )
+        )
+        for item in report.chronology
+    ]
+    sections.append({"title": "4. Полная Хронология Событий", "text": _format_report_section_items("4", chronology_lines).split("\n\n", 1)[1]})
+    causal_lines = [
+        (
+            f"{item.cause_event_id} -> {item.effect_event_id} "
+            f"(confidence={item.confidence:.2f}) | {item.mechanism}"
+        )
+        for item in report.causal_chains
+    ]
+    sections.append({"title": "5. Причинно-Следственные Цепочки", "text": _format_report_section_items("5", causal_lines).split("\n\n", 1)[1]})
+    alert_lines = [
+        (
+            f"{item.alert_id}: {item.status} | events={', '.join(item.related_events) if item.related_events else 'n/a'}"
+            + (f" | {item.explanation}" if str(item.explanation).strip() else "")
+        )
+        for item in report.alert_explanations
+    ]
+    sections.append({"title": "6. Связь С Каждым Инцидентом/Алертом Из UI", "text": _format_report_section_items("6", alert_lines).split("\n\n", 1)[1]})
+    metrics_lines: List[str] = []
+    if report.metrics.metrics_provided:
+        for item in report.metrics.anomalies:
+            metrics_lines.append(
+                f"{item.metric_name}: {item.normal_value} -> {item.anomaly_value} | "
+                f"{item.period_start}..{item.period_end} | {item.correlation_with_events}"
+            )
+        if report.metrics.normal_metrics:
+            metrics_lines.append("Метрики в норме: " + ", ".join(report.metrics.normal_metrics))
+    else:
+        metrics_lines.append(
+            report.metrics.recommendation_if_missing
+            or "Метрики не предоставлены."
+        )
+    sections.append({"title": "7. Аномалии Метрик И Корреляции С Логами", "text": _format_report_section_items("7", metrics_lines).split("\n\n", 1)[1]})
+    hyp_lines = [
+        (
+            f"{item.title} (confidence={item.confidence:.2f}, status={item.status}) | "
+            f"alerts={', '.join(item.related_alert_ids) if item.related_alert_ids else 'n/a'} | "
+            f"{item.description}"
+        )
+        for item in report.hypotheses
+    ]
+    sections.append({"title": "8. Гипотезы Первопричин", "text": _format_report_section_items("8", hyp_lines).split("\n\n", 1)[1]})
+    conflict_lines = [
+        f"{item.id}: {item.description} | A={item.side_a} | B={item.side_b}"
+        + (f" | resolution={item.resolution}" if str(item.resolution or "").strip() else "")
+        for item in report.conflicts
+    ]
+    sections.append({"title": "9. Конфликтующие Версии", "text": _format_report_section_items("9", conflict_lines).split("\n\n", 1)[1]})
+    gap_lines = [
+        f"{item.id}: {item.description} | between={', '.join(item.between_events) if item.between_events else 'n/a'} | need={item.missing_data}"
+        for item in report.gaps
+    ]
+    sections.append({"title": "10. Разрывы В Цепочках", "text": _format_report_section_items("10", gap_lines).split("\n\n", 1)[1]})
+    impact_lines = [
+        f"Затронутые сервисы: {', '.join(report.impact.affected_services) if report.impact.affected_services else 'n/a'}",
+        f"Затронутые операции: {', '.join(report.impact.affected_operations) if report.impact.affected_operations else 'n/a'}",
+        f"Error counts: {', '.join(report.impact.error_counts) if report.impact.error_counts else 'n/a'}",
+        f"Длительность: {report.impact.duration or 'n/a'}",
+        f"Severity: {report.impact.severity_assessment or 'n/a'}",
+    ]
+    sections.append({"title": "11. Масштаб И Влияние", "text": "\n".join(impact_lines)})
+    rec_lines = [
+        (
+            f"{item.priority}: {item.action}"
+            + (f" | why={item.rationale}" if str(item.rationale).strip() else "")
+            + (f" | effect={item.expected_effect}" if str(item.expected_effect).strip() else "")
+        )
+        for item in report.recommendations
+    ]
+    sections.append({"title": "12. Рекомендации Для SRE", "text": _format_report_section_items("12", rec_lines).split("\n\n", 1)[1]})
+    limits_lines = [
+        f"overall_confidence={report.limitations.overall_confidence}",
+        f"rationale={report.limitations.rationale or 'n/a'}",
+        (
+            "limitations: "
+            + (", ".join(report.limitations.limitations) if report.limitations.limitations else "n/a")
+        ),
+        (
+            "low_confidence_hypotheses: "
+            + (
+                ", ".join(report.limitations.low_confidence_hypotheses)
+                if report.limitations.low_confidence_hypotheses
+                else "n/a"
+            )
+        ),
+        report.limitations.note,
+    ]
+    sections.append({"title": "13. Уровень Уверенности И Ограничения Анализа", "text": "\n".join(limits_lines)})
+    return sections
+
+
+def _render_report_sections_to_markdown(sections: Sequence[Dict[str, str]]) -> str:
+    lines: List[str] = []
+    for item in sections:
+        title = str(item.get("title") or "").strip() or "Untitled"
+        text = _normalize_summary_text(item.get("text") or "")
+        lines.extend([f"## {title}", "", text or "Данных недостаточно.", ""])
+    return "\n".join(lines).strip()
+
+
 def generate_final_reports_with_instructor(
     *,
     base_structured_report: str,
@@ -3697,12 +4140,10 @@ def generate_final_reports_with_instructor(
     llm_timeout: float = 600.0,
     llm_max_retries: int = -1,
     model_supports_tool_calling: bool = True,
+    verified_summary_json: str = "",
+    alerts: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Optional post-processing stage:
-    after default final report generation, build an alternative final report
-    using Instructor + Pydantic (for A/B testing quality).
-    """
+    """Build final report through Instructor using 3-level fallback algorithm."""
     helper = PeriodLogSummarizer(
         db_fetch_page=lambda **_: [],
         llm_call=lambda _prompt: "",
@@ -3715,62 +4156,495 @@ def generate_final_reports_with_instructor(
             "llm_max_retries": int(llm_max_retries),
         },
     )
-    titles = [str(item).strip() for item in (section_titles or []) if str(item).strip()]
-    titles_block = (
-        "\n".join(f"- {idx + 1}. {title}" for idx, title in enumerate(titles))
-        if titles
-        else "Без фиксированного списка."
+    alerts_payload: List[Dict[str, Any]] = [
+        dict(item) for item in (alerts or []) if isinstance(item, dict)
+    ]
+    alerts_text = _render_alerts_list_text(alerts_payload)
+    user_context_text = _normalize_summary_text(user_goal) or "Контекст инцидента в UI не задан."
+    source_summary_text = _normalize_summary_text(verified_summary_json) or _normalize_summary_text(base_structured_report)
+    parsed_summary = helper._parse_incident_summary_text(
+        source_summary_text,
+        fallback_batch_id="final-report-input",
+        fallback_start=period_start,
+        fallback_end=period_end,
     )
-    prompt = "\n".join(
+    if parsed_summary is None:
+        parsed_summary = _build_empty_incident_summary(period_start=period_start, period_end=period_end)
+    summary_json = helper._incident_summary_to_json(parsed_summary)
+    attempts_total = 0
+    notes: List[str] = []
+    stage_used = "attempt_1_full"
+    report_obj: Optional[IncidentReport] = None
+
+    full_prompt = "\n".join(
         [
-            "Сформируй ДВЕ версии итогового расследования в строгом JSON формате response_model:",
-            "1) structured_report / structured_sections",
-            "2) freeform_report / freeform_sections",
+            "Ты генерируешь финальный отчёт о расследовании инцидента для SRE-команды.",
+            "Верни строго IncidentReport (пункты 2-13).",
+            "Пункт 1 (контекст из UI) добавляется программно.",
+            "summary (пункт 2) пиши последним и с полной картиной.",
+            "Для каждого алерта из UI верни explanation со статусом EXPLAINED/PARTIALLY_EXPLAINED/NOT_EXPLAINED.",
+            "Гипотезы обязательно привязывай к related_alert_ids.",
             "",
-            "Обе версии должны покрывать одинаковые ключевые темы и быть согласованными.",
-            "Нельзя терять связь с инцидентами из пользовательского контекста.",
-            "В хронологии и цепочках обязательно указывай полные даты/время с timezone.",
+            "Контекст инцидента:",
+            user_context_text,
             "",
-            "ОЖИДАЕМЫЕ СЕКЦИИ:",
-            titles_block,
+            "Алерты из UI:",
+            alerts_text or "n/a",
             "",
-            "КОНТЕКСТ ИНЦИДЕНТА (UI):",
-            str(user_goal or "").strip() or "n/a",
+            f"Период: [{period_start}, {period_end})",
+            f"Metrics context: {str(metrics_context or '').strip() or 'n/a'}",
+            f"Stats: {json.dumps(stats or {}, ensure_ascii=False, default=str)}",
             "",
-            f"ПЕРИОД: [{period_start}, {period_end})",
-            f"METRICS CONTEXT: {str(metrics_context or '').strip() or 'n/a'}",
-            f"STATS: {json.dumps(stats or {}, ensure_ascii=False, default=str)}",
-            "",
-            "ТЕКУЩИЙ STRUCTURED REPORT (база):",
-            str(base_structured_report or "").strip() or "n/a",
-            "",
-            "ТЕКУЩИЙ FREEFORM REPORT (база):",
-            str(base_freeform_report or "").strip() or "n/a",
-            "",
-            "Важно:",
-            "- structured_sections и freeform_sections: список секций (title + text).",
-            "- structured_report и freeform_report: полные markdown-тексты.",
-            "- Если текста нет, собери его из секций.",
+            "Верифицированное structured summary:",
+            summary_json,
         ]
     )
-    parsed, attempts = helper._call_structured_with_instructor(
-        prompt=prompt,
-        response_model=InstructorFinalReports,
-        stage="final_report",
+    try:
+        report_obj, attempts = helper._call_structured_with_instructor(
+            prompt=full_prompt,
+            response_model=IncidentReport,
+            stage="final_report_full",
+        )
+        attempts_total += max(attempts, 1)
+        notes.append("attempt_1_full=ok")
+    except Exception as full_exc:  # noqa: BLE001
+        notes.append(f"attempt_1_full=fail:{full_exc}")
+        stage_used = "attempt_2_split"
+        try:
+            part1_prompt = "\n".join(
+                [
+                    "Сгенерируй ТОЛЬКО аналитические разделы отчёта в формате ReportPartAnalytical.",
+                    "Нужны causal_chains, alert_explanations, hypotheses, recommendations, limitations.",
+                    "",
+                    "Контекст:",
+                    user_context_text,
+                    "",
+                    "Алерты из UI:",
+                    alerts_text or "n/a",
+                    "",
+                    "Structured summary:",
+                    summary_json,
+                ]
+            )
+            part1, attempts = helper._call_structured_with_instructor(
+                prompt=part1_prompt,
+                response_model=ReportPartAnalytical,
+                stage="final_report_part1",
+            )
+            attempts_total += max(attempts, 1)
+            part2_prompt = "\n".join(
+                [
+                    "Сгенерируй ТОЛЬКО описательные разделы отчёта в формате ReportPartDescriptive.",
+                    "Используй аналитический контекст ниже.",
+                    "",
+                    "Контекст:",
+                    user_context_text,
+                    "",
+                    "Алерты из UI:",
+                    alerts_text or "n/a",
+                    "",
+                    "Structured summary:",
+                    summary_json,
+                    "",
+                    "Analytical part JSON:",
+                    json.dumps(part1.model_dump(mode='json'), ensure_ascii=False, indent=2),
+                ]
+            )
+            part2, attempts = helper._call_structured_with_instructor(
+                prompt=part2_prompt,
+                response_model=ReportPartDescriptive,
+                stage="final_report_part2",
+            )
+            attempts_total += max(attempts, 1)
+            report_obj = IncidentReport(
+                summary=part2.summary,
+                data_coverage=part2.data_coverage,
+                chronology=part2.chronology,
+                causal_chains=part1.causal_chains,
+                alert_explanations=part1.alert_explanations,
+                metrics=part2.metrics,
+                hypotheses=part1.hypotheses,
+                conflicts=part2.conflicts,
+                gaps=part2.gaps,
+                impact=part2.impact,
+                recommendations=part1.recommendations,
+                limitations=part1.limitations,
+            )
+            notes.append("attempt_2_split=ok")
+        except Exception as split_exc:  # noqa: BLE001
+            notes.append(f"attempt_2_split=fail:{split_exc}")
+            stage_used = "attempt_3_sectional"
+            defaults = _report_from_summary_defaults(
+                summary=parsed_summary,
+                user_goal=user_context_text,
+                alerts=alerts_payload,
+                metrics_context=metrics_context,
+            )
+
+            def _section_call(
+                *,
+                prompt: str,
+                response_model: Type[TModel],
+                stage: str,
+                trim_prompt: str = "",
+            ) -> Optional[TModel]:
+                nonlocal attempts_total
+                try:
+                    parsed, attempts = helper._call_structured_with_instructor(
+                        prompt=prompt,
+                        response_model=response_model,
+                        stage=stage,
+                    )
+                    attempts_total += max(attempts, 1)
+                    notes.append(f"{stage}=ok")
+                    return parsed
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"{stage}=fail:{exc}")
+                    if trim_prompt and _is_400_bad_request_exception(exc):
+                        try:
+                            parsed, attempts = helper._call_structured_with_instructor(
+                                prompt=trim_prompt,
+                                response_model=response_model,
+                                stage=f"{stage}_trimmed",
+                            )
+                            attempts_total += max(attempts, 1)
+                            notes.append(f"{stage}_trimmed=ok")
+                            return parsed
+                        except Exception as trim_exc:  # noqa: BLE001
+                            notes.append(f"{stage}_trimmed=fail:{trim_exc}")
+                    return None
+
+            timeline_sorted = sorted(
+                parsed_summary.timeline,
+                key=lambda item: float(item.importance),
+                reverse=True,
+            )
+            timeline_top = timeline_sorted[:20]
+            chronology_prompt = (
+                "Сформируй раздел chronology в формате ChronologySection.\n"
+                "Сортировка строго по времени, укажи точные timestamps.\n\n"
+                "Timeline JSON:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.timeline], ensure_ascii=False, indent=2)
+            )
+            chronology_trim_prompt = (
+                "Сформируй раздел chronology в формате ChronologySection.\n"
+                "Используй top events по importance.\n\n"
+                "Timeline top JSON:\n"
+                + json.dumps([item.model_dump(mode="json") for item in timeline_top], ensure_ascii=False, indent=2)
+            )
+            chronology_section = _section_call(
+                prompt=chronology_prompt,
+                response_model=ChronologySection,
+                stage="section_chronology",
+                trim_prompt=chronology_trim_prompt,
+            )
+
+            causal_prompt = (
+                "Сформируй раздел causal_chains в формате CausalChainsSection.\n"
+                "Нужен механизм связи для каждой цепочки.\n\n"
+                "causal_links:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.causal_links], ensure_ascii=False, indent=2)
+                + "\n\ncontext events:\n"
+                + json.dumps([item.model_dump(mode="json") for item in timeline_top], ensure_ascii=False, indent=2)
+            )
+            causal_trim_prompt = (
+                "Сформируй раздел causal_chains в формате CausalChainsSection из top-20 элементов.\n\n"
+                + json.dumps(
+                    [item.model_dump(mode="json") for item in parsed_summary.causal_links[:20]],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            causal_section = _section_call(
+                prompt=causal_prompt,
+                response_model=CausalChainsSection,
+                stage="section_causal",
+                trim_prompt=causal_trim_prompt,
+            )
+
+            alerts_prompt = (
+                "Сформируй раздел alert_explanations в формате AlertsSection.\n"
+                "Статусы: EXPLAINED/PARTIALLY_EXPLAINED/NOT_EXPLAINED.\n\n"
+                "alerts from ui:\n"
+                + (alerts_text or "n/a")
+                + "\n\nalert_refs json:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.alert_refs], ensure_ascii=False, indent=2)
+            )
+            alerts_section = _section_call(
+                prompt=alerts_prompt,
+                response_model=AlertsSection,
+                stage="section_alerts",
+            )
+
+            hypotheses_sorted = sorted(
+                parsed_summary.hypotheses,
+                key=lambda item: float(item.confidence),
+                reverse=True,
+            )
+            hypotheses_prompt = (
+                "Сформируй раздел hypotheses в формате HypothesesSection.\n"
+                "Ранжируй по confidence, обязательно сохрани related_alert_ids.\n\n"
+                "hypotheses:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.hypotheses], ensure_ascii=False, indent=2)
+            )
+            hypotheses_trim_prompt = (
+                "Сформируй раздел hypotheses в формате HypothesesSection из top-20 гипотез.\n\n"
+                + json.dumps([item.model_dump(mode="json") for item in hypotheses_sorted[:20]], ensure_ascii=False, indent=2)
+            )
+            hypotheses_section = _section_call(
+                prompt=hypotheses_prompt,
+                response_model=HypothesesSection,
+                stage="section_hypotheses",
+                trim_prompt=hypotheses_trim_prompt,
+            )
+
+            recommendations_prompt = (
+                "Сформируй раздел recommendations в формате RecommendationsSection.\n"
+                "Группируй P0/P1/P2, действия должны быть actionable.\n\n"
+                "recommendations:\n"
+                + json.dumps(
+                    [item.model_dump(mode="json") for item in parsed_summary.preliminary_recommendations],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n\nhypotheses:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.hypotheses], ensure_ascii=False, indent=2)
+            )
+            recommendations_section = _section_call(
+                prompt=recommendations_prompt,
+                response_model=RecommendationsSection,
+                stage="section_recommendations",
+            )
+
+            limitations_prompt = (
+                "Сформируй раздел limitations в формате LimitationsSection.\n"
+                "Нужна честная оценка ограничений и уверенности.\n\n"
+                "data_quality:\n"
+                + json.dumps(parsed_summary.data_quality.model_dump(mode="json"), ensure_ascii=False, indent=2)
+                + "\n\ngaps:\n"
+                + json.dumps([item.model_dump(mode="json") for item in parsed_summary.gaps], ensure_ascii=False, indent=2)
+                + "\n\nhypotheses_confidence:\n"
+                + json.dumps(
+                    [{"id": item.id, "title": item.title, "confidence": item.confidence} for item in parsed_summary.hypotheses],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            limitations_section = _section_call(
+                prompt=limitations_prompt,
+                response_model=LimitationsSection,
+                stage="section_limitations",
+            )
+
+            impact_prompt = (
+                "Сформируй раздел impact в формате ImpactSection.\n\n"
+                "impact json:\n"
+                + json.dumps(parsed_summary.impact.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            )
+            impact_section = _section_call(
+                prompt=impact_prompt,
+                response_model=ImpactSection,
+                stage="section_impact",
+            )
+
+            gaps_section: Optional[GapsSection] = None
+            if parsed_summary.gaps:
+                gaps_prompt = (
+                    "Сформируй раздел gaps в формате GapsSection.\n\n"
+                    + json.dumps([item.model_dump(mode="json") for item in parsed_summary.gaps], ensure_ascii=False, indent=2)
+                )
+                gaps_section = _section_call(
+                    prompt=gaps_prompt,
+                    response_model=GapsSection,
+                    stage="section_gaps",
+                )
+
+            conflicts_section: Optional[ConflictsSection] = None
+            if parsed_summary.conflicts:
+                conflicts_prompt = (
+                    "Сформируй раздел conflicts в формате ConflictsSection.\n\n"
+                    + json.dumps([item.model_dump(mode="json") for item in parsed_summary.conflicts], ensure_ascii=False, indent=2)
+                )
+                conflicts_section = _section_call(
+                    prompt=conflicts_prompt,
+                    response_model=ConflictsSection,
+                    stage="section_conflicts",
+                )
+
+            coverage_prompt = (
+                "Сформируй раздел data_coverage в формате CoverageSection.\n\n"
+                "context:\n"
+                + json.dumps(parsed_summary.context.model_dump(mode="json"), ensure_ascii=False, indent=2)
+                + "\n\ndata_quality:\n"
+                + json.dumps(parsed_summary.data_quality.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            )
+            coverage_section = _section_call(
+                prompt=coverage_prompt,
+                response_model=CoverageSection,
+                stage="section_coverage",
+            )
+
+            metrics_section: Optional[MetricsReportSection] = None
+            if str(metrics_context or "").strip():
+                metrics_prompt = (
+                    "Сформируй раздел metrics в формате MetricsReportSection.\n\n"
+                    f"metrics_context:\n{metrics_context}"
+                )
+                metrics_section = _section_call(
+                    prompt=metrics_prompt,
+                    response_model=MetricsReportSection,
+                    stage="section_metrics",
+                )
+
+            assembled = IncidentReport(
+                summary=defaults.summary,
+                data_coverage=(
+                    coverage_section.data_coverage
+                    if coverage_section is not None
+                    else defaults.data_coverage
+                ),
+                chronology=(
+                    chronology_section.chronology
+                    if chronology_section is not None
+                    else defaults.chronology
+                ),
+                causal_chains=(
+                    causal_section.causal_chains
+                    if causal_section is not None
+                    else defaults.causal_chains
+                ),
+                alert_explanations=(
+                    alerts_section.alert_explanations
+                    if alerts_section is not None
+                    else defaults.alert_explanations
+                ),
+                metrics=(
+                    metrics_section.metrics
+                    if metrics_section is not None
+                    else defaults.metrics
+                ),
+                hypotheses=(
+                    hypotheses_section.hypotheses
+                    if hypotheses_section is not None
+                    else defaults.hypotheses
+                ),
+                conflicts=(
+                    conflicts_section.conflicts
+                    if conflicts_section is not None
+                    else defaults.conflicts
+                ),
+                gaps=(
+                    gaps_section.gaps
+                    if gaps_section is not None
+                    else defaults.gaps
+                ),
+                impact=(
+                    impact_section.impact
+                    if impact_section is not None
+                    else defaults.impact
+                ),
+                recommendations=(
+                    recommendations_section.recommendations
+                    if recommendations_section is not None
+                    else defaults.recommendations
+                ),
+                limitations=(
+                    limitations_section.limitations
+                    if limitations_section is not None
+                    else defaults.limitations
+                ),
+            )
+            summary_prompt = "\n".join(
+                [
+                    "Сформируй summary в формате SummarySection.",
+                    "Summary должен быть написан ПОСЛЕДНИМ и учитывать все секции.",
+                    "",
+                    "sections_json:",
+                    json.dumps(assembled.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                ]
+            )
+            summary_section = _section_call(
+                prompt=summary_prompt,
+                response_model=SummarySection,
+                stage="section_summary_last",
+            )
+            if summary_section is not None:
+                assembled = IncidentReport(
+                    summary=summary_section.summary,
+                    data_coverage=assembled.data_coverage,
+                    chronology=assembled.chronology,
+                    causal_chains=assembled.causal_chains,
+                    alert_explanations=assembled.alert_explanations,
+                    metrics=assembled.metrics,
+                    hypotheses=assembled.hypotheses,
+                    conflicts=assembled.conflicts,
+                    gaps=assembled.gaps,
+                    impact=assembled.impact,
+                    recommendations=assembled.recommendations,
+                    limitations=assembled.limitations,
+                )
+            report_obj = assembled
+            notes.append("attempt_3_sectional=ok")
+
+    if report_obj is None:
+        report_obj = _report_from_summary_defaults(
+            summary=parsed_summary,
+            user_goal=user_context_text,
+            alerts=alerts_payload,
+            metrics_context=metrics_context,
+        )
+        notes.append("fallback=programmatic_defaults")
+
+    structured_sections = _render_structured_sections_from_report(
+        report_obj,
+        user_context=user_context_text,
     )
-    structured_text = _normalize_summary_text(parsed.structured_report)
-    freeform_text = _normalize_summary_text(parsed.freeform_report)
-    if not structured_text and parsed.structured_sections:
-        structured_text = _sections_to_markdown(parsed.structured_sections)
-    if not freeform_text and parsed.freeform_sections:
-        freeform_text = _sections_to_markdown(parsed.freeform_sections)
+    structured_text = _render_report_sections_to_markdown(structured_sections)
+
+    freeform_text = ""
+    freeform_section_items: List[Dict[str, str]] = []
+    freeform_prompt = "\n".join(
+        [
+            "Напиши связный narrative-отчёт для SRE (1-2 страницы),",
+            "используя структурированный IncidentReport ниже.",
+            "Обязательно сохрани связь с алертами из UI и цепочки событий.",
+            "",
+            "Контекст инцидента (дословно):",
+            user_context_text,
+            "",
+            "IncidentReport JSON:",
+            json.dumps(report_obj.model_dump(mode="json"), ensure_ascii=False, indent=2),
+        ]
+    )
+    try:
+        freeform_obj, attempts = helper._call_structured_with_instructor(
+            prompt=freeform_prompt,
+            response_model=FreeformReport,
+            stage="final_report_freeform",
+        )
+        attempts_total += max(attempts, 1)
+        freeform_text = _normalize_summary_text(freeform_obj.text)
+        notes.append("freeform=ok")
+    except Exception as freeform_exc:  # noqa: BLE001
+        notes.append(f"freeform=fail:{freeform_exc}")
+        freeform_text = _normalize_summary_text(base_freeform_report)
+    if not freeform_text:
+        freeform_text = (
+            "Краткий narrative-отчёт:\n\n"
+            + _normalize_summary_text(report_obj.summary.text)
+            + "\n\nДетали и доказательства смотрите в структурированном отчёте."
+        )
+    freeform_section_items = [{"title": "Narrative", "text": freeform_text}]
+
     return {
         "structured_report": structured_text,
         "freeform_report": freeform_text,
-        "structured_sections": [item.model_dump(mode="json") for item in parsed.structured_sections],
-        "freeform_sections": [item.model_dump(mode="json") for item in parsed.freeform_sections],
-        "notes": _normalize_summary_text(parsed.notes),
-        "attempts": int(max(attempts, 1)),
+        "structured_sections": structured_sections,
+        "freeform_sections": freeform_section_items,
+        "notes": "; ".join([item for item in notes if item]),
+        "attempts": int(max(attempts_total, 1)),
+        "algorithm_stage": stage_used,
+        "incident_report": report_obj.model_dump(mode="json"),
     }
 
 
