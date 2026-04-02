@@ -1242,6 +1242,82 @@ class TestMySummarizer(unittest.TestCase):
         self.assertGreaterEqual(int(result.llm_calls), 3)
         self.assertEqual(len(llm_prompts), 1)
 
+    def test_map_summary_invalid_grammar_falls_back_to_legacy_and_disables_map_instructor(self) -> None:
+        valid_map_json = json.dumps(
+            {
+                "context": {
+                    "batch_id": "tmp",
+                    "time_range_start": "2026-03-25T10:00:00+00:00",
+                    "time_range_end": "2026-03-25T10:00:01+00:00",
+                    "total_log_entries": 1,
+                    "source_query": [],
+                    "source_services": [],
+                },
+                "timeline": [],
+                "causal_links": [],
+                "alert_refs": [],
+                "hypotheses": [],
+                "pinned_facts": [],
+                "gaps": [],
+                "impact": {},
+                "conflicts": [],
+                "data_quality": {
+                    "is_empty": True,
+                    "noise_ratio": 1.0,
+                    "has_gaps": False,
+                    "gap_periods": [],
+                    "notes": "",
+                },
+                "preliminary_recommendations": [],
+            },
+            ensure_ascii=False,
+        )
+        progress_events = []
+        llm_calls = []
+
+        def _fake_llm(_prompt: str) -> str:
+            llm_calls.append("call")
+            return valid_map_json
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(use_instructor=True),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            side_effect=RuntimeError("Hosted_vllmException - Invalid grammar request with cache hit"),
+        ) as mocked_instructor:
+            items_first, calls_first = summarizer._summarize_rows_with_auto_shrink(
+                rows_chunk=[{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line-1"}],
+                columns=["timestamp", "message"],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                batch_number=1,
+                total_batches=1,
+            )
+            items_second, calls_second = summarizer._summarize_rows_with_auto_shrink(
+                rows_chunk=[{"timestamp": "2026-03-25T10:00:01+00:00", "message": "line-2"}],
+                columns=["timestamp", "message"],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                batch_number=2,
+                total_batches=2,
+            )
+
+        self.assertEqual(mocked_instructor.call_count, 1)
+        self.assertTrue(summarizer._instructor_map_disabled_due_grammar)
+        self.assertEqual(len(items_first), 1)
+        self.assertEqual(len(items_second), 1)
+        self.assertGreaterEqual(calls_first, 2)
+        self.assertEqual(calls_second, 1)
+        self.assertEqual(len(llm_calls), 2)
+        event_names = [event for event, _ in progress_events]
+        self.assertIn("map_instructor_fallback", event_names)
+
     def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
         summary_payload = {
             "context": {

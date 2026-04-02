@@ -4162,7 +4162,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         alert_rows = _build_alert_panel_state(state)
 
         st.markdown("Интерактивный Отчёт")
-        tab_summary, tab_timeline, tab_chains, tab_alerts, tab_hypotheses, tab_recs, tab_more = st.tabs(
+        tab_summary, tab_timeline, tab_chains, tab_alerts, tab_hypotheses, tab_recs, tab_batches, tab_more = st.tabs(
             [
                 "Резюме",
                 "Хронология",
@@ -4170,6 +4170,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                 "Алерты",
                 "Гипотезы",
                 "Рекомендации",
+                "Батчи (MAP)",
                 "Ещё",
             ]
         )
@@ -4401,6 +4402,130 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     deps.render_pretty_summary_text(body, height=max(260, min(final_height, 520)))
                 else:
                     st.info("Рекомендации пока недоступны.")
+
+        with tab_batches:
+            st.caption("Подробный просмотр каждого MAP-батча и извлечённых из него данных.")
+            if not map_batches:
+                st.info("MAP-батчи пока недоступны.")
+            for item in map_batches:
+                batch_idx = _safe_int(item.get("batch_index"), 0) + 1
+                total = _safe_int(item.get("batch_total"), batch_total)
+                payload = _summary_payload_from_batch(item)
+                data_quality = payload.get("data_quality") if isinstance(payload, dict) else {}
+                is_empty = bool((data_quality or {}).get("is_empty", False))
+                noise_ratio = _safe_float((data_quality or {}).get("noise_ratio"), float("nan"))
+                timeline = payload.get("timeline") if isinstance(payload, dict) else []
+                hypotheses = payload.get("hypotheses") if isinstance(payload, dict) else []
+                alert_refs = payload.get("alert_refs") if isinstance(payload, dict) else []
+                status_icon = "✓"
+                status_text = "готов"
+                if is_empty:
+                    status_icon = "—"
+                    status_text = "пустой"
+                elif (data_quality or {}).get("notes"):
+                    notes = str((data_quality or {}).get("notes") or "").lower()
+                    if "validation error" in notes or "raw llm" in notes:
+                        status_icon = "⚠"
+                        status_text = "degraded"
+                period = f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}"
+                summary_line = (
+                    f"{status_icon} Батч {batch_idx}/{total or '?'} | {period} | "
+                    f"событий: {len(timeline) if isinstance(timeline, list) else 0}"
+                )
+                if not pd.isna(noise_ratio):
+                    summary_line += f" | шум: {float(noise_ratio) * 100:.1f}%"
+                duration_sec = _safe_float(item.get("processing_seconds"), float("nan"))
+                if not pd.isna(duration_sec) and duration_sec > 0:
+                    summary_line += f" | {duration_sec:.1f}s"
+                summary_line += f" | {status_text}"
+                with st.expander(summary_line, expanded=False):
+                    has_structured_payload = isinstance(payload, dict) and bool(payload)
+                    dq_notes = str((data_quality or {}).get("notes") or "").strip()
+                    if dq_notes:
+                        st.caption("Data quality notes:")
+                        deps.render_scrollable_text(dq_notes, height=120)
+                    if not has_structured_payload:
+                        st.info(
+                            "LLM вернула неструктурированный summary для этого батча. "
+                            "Сырые логи батча доступны во вкладке `Логи Батча`."
+                        )
+                    tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
+                        ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                    )
+                    with tab_events:
+                        if isinstance(timeline, list) and timeline:
+                            events_df = pd.DataFrame(timeline)
+                            keep_cols = [
+                                col
+                                for col in [
+                                    "id",
+                                    "timestamp",
+                                    "source",
+                                    "description",
+                                    "severity",
+                                    "importance",
+                                    "evidence_type",
+                                    "tags",
+                                ]
+                                if col in events_df.columns
+                            ]
+                            st.dataframe(
+                                _format_table_timestamps(events_df[keep_cols] if keep_cols else events_df),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=220,
+                            )
+                        elif str(item.get("batch_summary") or "").strip():
+                            deps.render_pretty_summary_text(
+                                item.get("batch_summary", ""),
+                                height=max(deps.summary_text_height, 220),
+                            )
+                        else:
+                            st.info("События в этом батче не найдены.")
+                    with tab_hyp:
+                        if isinstance(hypotheses, list) and hypotheses:
+                            for hyp in hypotheses:
+                                if not isinstance(hyp, dict):
+                                    continue
+                                st.markdown(
+                                    f"- **{hyp.get('title', 'Гипотеза')}** "
+                                    f"(confidence: `{_safe_float(hyp.get('confidence'), 0.0):.2f}`)"
+                                )
+                                if hyp.get("description"):
+                                    st.caption(str(hyp.get("description")))
+                        else:
+                            st.info("Гипотезы в этом батче отсутствуют.")
+                    with tab_alerts:
+                        if isinstance(alert_refs, list) and alert_refs:
+                            alert_df = pd.DataFrame(alert_refs)
+                            keep_cols = [c for c in ["alert_id", "status", "related_events", "explanation"] if c in alert_df.columns]
+                            st.dataframe(
+                                alert_df[keep_cols] if keep_cols else alert_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=180,
+                            )
+                        else:
+                            st.info("Статусы алертов в этом батче не указаны.")
+                    with tab_logs:
+                        batch_logs = item.get("batch_logs")
+                        if isinstance(batch_logs, list) and batch_logs:
+                            logs_df = pd.DataFrame(batch_logs)
+                            if "timestamp" in logs_df.columns:
+                                preferred_cols = ["timestamp"]
+                                preferred_cols.extend(
+                                    col for col in logs_df.columns if col not in preferred_cols
+                                )
+                                logs_df = logs_df[preferred_cols]
+                            st.caption(f"Логов в батче: {len(logs_df.index)}")
+                            st.dataframe(
+                                _format_table_timestamps(logs_df),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=280,
+                            )
+                        else:
+                            st.info("Сырые логи батча не сохранены.")
 
         with tab_more:
             subtab_metrics, subtab_conflicts, subtab_gaps, subtab_scale, subtab_limits, subtab_coverage, subtab_context = st.tabs(
@@ -5382,245 +5507,265 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 text=str(report_progress.get("label") or ""),
             )
 
-        # --- Details area for active stage ---
-        st.markdown("### Детали Текущего Этапа")
-        if current_stage_idx == 0:
-            st.markdown("#### Получение Логов")
-            batch_plan = state.get("batch_plan")
-            if not isinstance(batch_plan, list):
-                batch_plan = []
-            if not batch_plan and map_batches:
-                # fallback plan from already processed map batches
-                for item in map_batches:
-                    logs_count = _safe_int(item.get("batch_logs_count"), 0)
-                    batch_plan.append(
-                        {
-                            "batch_id": _safe_int(item.get("batch_index"), 0) + 1,
-                            "period": f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}",
-                            "rows": logs_count,
-                            "tokens": "disabled",
-                            "status": "Готов",
-                        }
-                    )
-            if batch_plan:
-                plan_df = pd.DataFrame(batch_plan)
-                st.dataframe(plan_df, use_container_width=True, hide_index=True, height=260)
-                split_count = _safe_int(state.get("batch_split_count"), 0)
-                if batch_total > 0:
-                    st.caption(
-                        f"{batch_total} батчей → {batch_total + split_count} LLM-вызовов "
-                        f"(разбитых батчей: {split_count})"
-                    )
-                else:
-                    total_batches = len(plan_df.index)
-                    st.caption(
-                        f"{total_batches} батчей → {total_batches + split_count} LLM-вызовов "
-                        f"(разбитых батчей: {split_count})"
-                    )
-            else:
-                st.info("План батчинга появится после старта map-фазы.")
-
-        elif current_stage_idx == 1:
-            st.markdown("#### Саммаризация (MAP)")
-            if not map_batches:
-                st.info("Map-батчи ещё не обработаны.")
-            for item in map_batches:
-                batch_idx = _safe_int(item.get("batch_index"), 0) + 1
-                total = _safe_int(item.get("batch_total"), batch_total)
-                payload = _summary_payload_from_batch(item)
-                data_quality = payload.get("data_quality") if isinstance(payload, dict) else {}
-                is_empty = bool((data_quality or {}).get("is_empty", False))
-                noise_ratio = _safe_float((data_quality or {}).get("noise_ratio"), float("nan"))
-                timeline = payload.get("timeline") if isinstance(payload, dict) else []
-                hypotheses = payload.get("hypotheses") if isinstance(payload, dict) else []
-                alert_refs = payload.get("alert_refs") if isinstance(payload, dict) else []
-                status_icon = "✓"
-                status_text = "готов"
-                if is_empty:
-                    status_icon = "—"
-                    status_text = "пустой"
-                elif (data_quality or {}).get("notes"):
-                    notes = str((data_quality or {}).get("notes") or "").lower()
-                    if "validation error" in notes or "raw llm" in notes:
-                        status_icon = "⚠"
-                        status_text = "degraded"
-                period = f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}"
-                summary_line = (
-                    f"{status_icon} Батч {batch_idx}/{total or '?'} | {period} | "
-                    f"событий: {len(timeline) if isinstance(timeline, list) else 0}"
-                )
-                if not pd.isna(noise_ratio):
-                    summary_line += f" | шум: {float(noise_ratio) * 100:.1f}%"
-                duration_sec = _safe_float(item.get("processing_seconds"), float("nan"))
-                if not pd.isna(duration_sec) and duration_sec > 0:
-                    summary_line += f" | {duration_sec:.1f}s"
-                summary_line += f" | {status_text}"
-                with st.expander(summary_line, expanded=False):
-                    has_structured_payload = isinstance(payload, dict) and bool(payload)
-                    dq_notes = str((data_quality or {}).get("notes") or "").strip()
-                    if dq_notes:
-                        st.caption("Data quality notes:")
-                        deps.render_scrollable_text(dq_notes, height=120)
-                    if not has_structured_payload:
-                        st.info(
-                            "LLM вернула неструктурированный summary для этого батча. "
-                            "Сырые логи батча доступны во вкладке `Логи Батча`."
+        # --- Details area with stage tabs (click-to-switch) ---
+        def _render_stage_details(stage_idx: int) -> None:
+            stage_label = stage_labels[stage_idx] if 0 <= stage_idx < len(stage_labels) else ""
+            if stage_idx == 0:
+                st.markdown("#### Получение Логов")
+                batch_plan = state.get("batch_plan")
+                if not isinstance(batch_plan, list):
+                    batch_plan = []
+                if not batch_plan and map_batches:
+                    # fallback plan from already processed map batches
+                    for item in map_batches:
+                        logs_count = _safe_int(item.get("batch_logs_count"), 0)
+                        batch_plan.append(
+                            {
+                                "batch_id": _safe_int(item.get("batch_index"), 0) + 1,
+                                "period": f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}",
+                                "rows": logs_count,
+                                "tokens": "disabled",
+                                "status": "Готов",
+                            }
                         )
-                    tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
-                        ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                if batch_plan:
+                    plan_df = pd.DataFrame(batch_plan)
+                    st.dataframe(plan_df, use_container_width=True, hide_index=True, height=260)
+                    split_count = _safe_int(state.get("batch_split_count"), 0)
+                    if batch_total > 0:
+                        st.caption(
+                            f"{batch_total} батчей → {batch_total + split_count} LLM-вызовов "
+                            f"(разбитых батчей: {split_count})"
+                        )
+                    else:
+                        total_batches = len(plan_df.index)
+                        st.caption(
+                            f"{total_batches} батчей → {total_batches + split_count} LLM-вызовов "
+                            f"(разбитых батчей: {split_count})"
+                        )
+                else:
+                    st.info("План батчинга появится после старта map-фазы.")
+
+            elif stage_idx == 1:
+                st.markdown("#### Саммаризация (MAP)")
+                if not map_batches:
+                    st.info("Map-батчи ещё не обработаны.")
+                for item in map_batches:
+                    batch_idx = _safe_int(item.get("batch_index"), 0) + 1
+                    total = _safe_int(item.get("batch_total"), batch_total)
+                    payload = _summary_payload_from_batch(item)
+                    data_quality = payload.get("data_quality") if isinstance(payload, dict) else {}
+                    is_empty = bool((data_quality or {}).get("is_empty", False))
+                    noise_ratio = _safe_float((data_quality or {}).get("noise_ratio"), float("nan"))
+                    timeline = payload.get("timeline") if isinstance(payload, dict) else []
+                    hypotheses = payload.get("hypotheses") if isinstance(payload, dict) else []
+                    alert_refs = payload.get("alert_refs") if isinstance(payload, dict) else []
+                    status_icon = "✓"
+                    status_text = "готов"
+                    if is_empty:
+                        status_icon = "—"
+                        status_text = "пустой"
+                    elif (data_quality or {}).get("notes"):
+                        notes = str((data_quality or {}).get("notes") or "").lower()
+                        if "validation error" in notes or "raw llm" in notes:
+                            status_icon = "⚠"
+                            status_text = "degraded"
+                    period = f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}"
+                    summary_line = (
+                        f"{status_icon} Батч {batch_idx}/{total or '?'} | {period} | "
+                        f"событий: {len(timeline) if isinstance(timeline, list) else 0}"
                     )
-                    with tab_events:
-                        if isinstance(timeline, list) and timeline:
-                            events_df = pd.DataFrame(timeline)
-                            keep_cols = [
-                                col for col in
-                                ["id", "timestamp", "source", "description", "severity", "importance", "evidence_type", "tags"]
-                                if col in events_df.columns
-                            ]
+                    if not pd.isna(noise_ratio):
+                        summary_line += f" | шум: {float(noise_ratio) * 100:.1f}%"
+                    duration_sec = _safe_float(item.get("processing_seconds"), float("nan"))
+                    if not pd.isna(duration_sec) and duration_sec > 0:
+                        summary_line += f" | {duration_sec:.1f}s"
+                    summary_line += f" | {status_text}"
+                    with st.expander(summary_line, expanded=False):
+                        has_structured_payload = isinstance(payload, dict) and bool(payload)
+                        dq_notes = str((data_quality or {}).get("notes") or "").strip()
+                        if dq_notes:
+                            st.caption("Data quality notes:")
+                            deps.render_scrollable_text(dq_notes, height=120)
+                        if not has_structured_payload:
+                            st.info(
+                                "LLM вернула неструктурированный summary для этого батча. "
+                                "Сырые логи батча доступны во вкладке `Логи Батча`."
+                            )
+                        tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
+                            ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                        )
+                        with tab_events:
+                            if isinstance(timeline, list) and timeline:
+                                events_df = pd.DataFrame(timeline)
+                                keep_cols = [
+                                    col
+                                    for col in [
+                                        "id",
+                                        "timestamp",
+                                        "source",
+                                        "description",
+                                        "severity",
+                                        "importance",
+                                        "evidence_type",
+                                        "tags",
+                                    ]
+                                    if col in events_df.columns
+                                ]
+                                st.dataframe(
+                                    _format_table_timestamps(events_df[keep_cols] if keep_cols else events_df),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=220,
+                                )
+                            elif str(item.get("batch_summary") or "").strip():
+                                deps.render_pretty_summary_text(
+                                    item.get("batch_summary", ""),
+                                    height=max(deps.summary_text_height, 220),
+                                )
+                            else:
+                                st.info("События в этом батче не найдены.")
+                        with tab_hyp:
+                            if isinstance(hypotheses, list) and hypotheses:
+                                for hyp in hypotheses:
+                                    if not isinstance(hyp, dict):
+                                        continue
+                                    st.markdown(
+                                        f"- **{hyp.get('title', 'Гипотеза')}** "
+                                        f"(confidence: `{_safe_float(hyp.get('confidence'), 0.0):.2f}`)"
+                                    )
+                                    if hyp.get("description"):
+                                        st.caption(str(hyp.get("description")))
+                            else:
+                                st.info("Гипотезы в этом батче отсутствуют.")
+                        with tab_alerts:
+                            if isinstance(alert_refs, list) and alert_refs:
+                                alert_df = pd.DataFrame(alert_refs)
+                                keep_cols = [
+                                    c for c in ["alert_id", "status", "related_events", "explanation"] if c in alert_df.columns
+                                ]
+                                st.dataframe(
+                                    alert_df[keep_cols] if keep_cols else alert_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=180,
+                                )
+                            else:
+                                st.info("Статусы алертов в этом батче не указаны.")
+                        with tab_logs:
+                            batch_logs = item.get("batch_logs")
+                            if isinstance(batch_logs, list) and batch_logs:
+                                logs_df = pd.DataFrame(batch_logs)
+                                if "timestamp" in logs_df.columns:
+                                    preferred_cols = ["timestamp"]
+                                    preferred_cols.extend(
+                                        col for col in logs_df.columns if col not in preferred_cols
+                                    )
+                                    logs_df = logs_df[preferred_cols]
+                                st.caption(f"Логов в батче: {len(logs_df.index)}")
+                                st.dataframe(
+                                    _format_table_timestamps(logs_df),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=280,
+                                )
+                            else:
+                                st.info("Сырые логи батча не сохранены.")
+
+            elif stage_label.startswith("Reduce L"):
+                st.markdown("#### Reduce")
+                if not reduce_nodes:
+                    st.info("Reduce-узлы появятся после завершения map-фазы.")
+                else:
+                    rounds: Dict[int, List[Dict[str, Any]]] = {}
+                    for node in reduce_nodes:
+                        round_idx = _safe_int(node.get("round"), 1)
+                        rounds.setdefault(round_idx, []).append(node)
+                    for round_idx in sorted(rounds.keys()):
+                        st.markdown(f"**Уровень {round_idx}**")
+                        nodes = sorted(rounds[round_idx], key=lambda x: _safe_int(x.get("group"), 0))
+                        for node in nodes:
+                            icon = "✓" if str(node.get("status")) == "done" else ("●" if str(node.get("status")) == "active" else "○")
+                            group_idx = _safe_int(node.get("group"), 0)
+                            group_size = _safe_int(node.get("group_size"), 0)
+                            summary = (
+                                f"{icon} R{round_idx}-G{group_idx} | size={group_size} | status={node.get('status')}"
+                            )
+                            with st.expander(summary, expanded=False):
+                                in_events = _safe_int(node.get("input_events"), 0)
+                                out_events = _safe_int(node.get("output_events"), 0)
+                                in_hyp = _safe_int(node.get("input_hypotheses"), 0)
+                                out_hyp = _safe_int(node.get("output_hypotheses"), 0)
+                                gaps_closed = _safe_int(node.get("gaps_closed"), 0)
+                                new_links = _safe_int(node.get("new_causal_links"), 0)
+                                in_tokens = _safe_int(node.get("input_tokens"), 0)
+                                out_tokens = _safe_int(node.get("output_tokens"), 0)
+                                compression_pct = _safe_float(node.get("compression_pct"), float("nan"))
+                                st.markdown(
+                                    "\n".join(
+                                        [
+                                            f"- group_size: `{group_size}`",
+                                            f"- Вход события/гипотезы: `{in_events}` / `{in_hyp}`",
+                                            f"- Выход события/гипотезы: `{out_events}` / `{out_hyp}`",
+                                            f"- Закрыто gaps: `{gaps_closed}`",
+                                            f"- Новые causal links: `{new_links}`",
+                                            f"- Токены вход/выход: `{in_tokens}` / `{out_tokens}`",
+                                            (
+                                                f"- Сжатие: `{compression_pct:.1f}%`"
+                                                if not pd.isna(compression_pct)
+                                                else "- Сжатие: `n/a`"
+                                            ),
+                                        ]
+                                    )
+                                )
+                                if node.get("split_reason"):
+                                    st.warning(f"split: {node.get('split_reason')}")
+                                if node.get("error"):
+                                    st.error(str(node.get("error")))
+                    split_count = _safe_int(state.get("reduce_split_count"), 0)
+                    if split_count > 0:
+                        st.warning(f"Split узлов из-за overflow/timeout: {split_count}")
+
+            elif stage_label == "Верификация":
+                st.markdown("#### Верификация")
+                verification = state.get("verification")
+                if isinstance(verification, dict):
+                    st.caption(str(verification.get("summary") or ""))
+                    selected_logs = verification.get("selected_logs") or []
+                    if isinstance(selected_logs, list) and selected_logs:
+                        with st.expander("Логи, выбранные для контрольного прохода", expanded=False):
                             st.dataframe(
-                                _format_table_timestamps(events_df[keep_cols] if keep_cols else events_df),
+                                _format_table_timestamps(pd.DataFrame(selected_logs)),
                                 use_container_width=True,
                                 hide_index=True,
                                 height=220,
                             )
-                        elif str(item.get("batch_summary") or "").strip():
-                            deps.render_pretty_summary_text(
-                                item.get("batch_summary", ""),
-                                height=max(deps.summary_text_height, 220),
-                            )
-                        else:
-                            st.info("События в этом батче не найдены.")
-                    with tab_hyp:
-                        if isinstance(hypotheses, list) and hypotheses:
-                            for hyp in hypotheses:
-                                if not isinstance(hyp, dict):
-                                    continue
-                                st.markdown(
-                                    f"- **{hyp.get('title', 'Гипотеза')}** "
-                                    f"(confidence: `{_safe_float(hyp.get('confidence'), 0.0):.2f}`)"
-                                )
-                                if hyp.get("description"):
-                                    st.caption(str(hyp.get("description")))
-                        else:
-                            st.info("Гипотезы в этом батче отсутствуют.")
-                    with tab_alerts:
-                        if isinstance(alert_refs, list) and alert_refs:
-                            alert_df = pd.DataFrame(alert_refs)
-                            keep_cols = [c for c in ["alert_id", "status", "related_events", "explanation"] if c in alert_df.columns]
-                            st.dataframe(
-                                alert_df[keep_cols] if keep_cols else alert_df,
-                                use_container_width=True,
-                                hide_index=True,
-                                height=180,
-                            )
-                        else:
-                            st.info("Статусы алертов в этом батче не указаны.")
-                    with tab_logs:
-                        batch_logs = item.get("batch_logs")
-                        if isinstance(batch_logs, list) and batch_logs:
-                            logs_df = pd.DataFrame(batch_logs)
-                            if "timestamp" in logs_df.columns:
-                                preferred_cols = ["timestamp"]
-                                preferred_cols.extend(
-                                    col for col in logs_df.columns if col not in preferred_cols
-                                )
-                                logs_df = logs_df[preferred_cols]
-                            st.caption(f"Логов в батче: {len(logs_df.index)}")
-                            st.dataframe(
-                                _format_table_timestamps(logs_df),
-                                use_container_width=True,
-                                hide_index=True,
-                                height=280,
-                            )
-                        else:
-                            st.info("Сырые логи батча не сохранены.")
-
-        elif "Reduce" in stage_labels[current_stage_idx]:
-            st.markdown("#### Reduce")
-            if not reduce_nodes:
-                st.info("Reduce-узлы появятся после завершения map-фазы.")
-            else:
-                rounds: Dict[int, List[Dict[str, Any]]] = {}
-                for node in reduce_nodes:
-                    round_idx = _safe_int(node.get("round"), 1)
-                    rounds.setdefault(round_idx, []).append(node)
-                for round_idx in sorted(rounds.keys()):
-                    st.markdown(f"**Уровень {round_idx}**")
-                    nodes = sorted(rounds[round_idx], key=lambda x: _safe_int(x.get("group"), 0))
-                    for node in nodes:
-                        icon = "✓" if str(node.get("status")) == "done" else ("●" if str(node.get("status")) == "active" else "○")
-                        group_idx = _safe_int(node.get("group"), 0)
-                        group_size = _safe_int(node.get("group_size"), 0)
-                        summary = (
-                            f"{icon} R{round_idx}-G{group_idx} | size={group_size} | status={node.get('status')}"
-                        )
-                        with st.expander(summary, expanded=False):
-                            in_events = _safe_int(node.get("input_events"), 0)
-                            out_events = _safe_int(node.get("output_events"), 0)
-                            in_hyp = _safe_int(node.get("input_hypotheses"), 0)
-                            out_hyp = _safe_int(node.get("output_hypotheses"), 0)
-                            gaps_closed = _safe_int(node.get("gaps_closed"), 0)
-                            new_links = _safe_int(node.get("new_causal_links"), 0)
-                            in_tokens = _safe_int(node.get("input_tokens"), 0)
-                            out_tokens = _safe_int(node.get("output_tokens"), 0)
-                            compression_pct = _safe_float(node.get("compression_pct"), float("nan"))
-                            st.markdown(
-                                "\n".join(
-                                    [
-                                        f"- group_size: `{group_size}`",
-                                        f"- Вход события/гипотезы: `{in_events}` / `{in_hyp}`",
-                                        f"- Выход события/гипотезы: `{out_events}` / `{out_hyp}`",
-                                        f"- Закрыто gaps: `{gaps_closed}`",
-                                        f"- Новые causal links: `{new_links}`",
-                                        f"- Токены вход/выход: `{in_tokens}` / `{out_tokens}`",
-                                        (
-                                            f"- Сжатие: `{compression_pct:.1f}%`"
-                                            if not pd.isna(compression_pct)
-                                            else "- Сжатие: `n/a`"
-                                        ),
-                                    ]
-                                )
-                            )
-                            if node.get("split_reason"):
-                                st.warning(f"split: {node.get('split_reason')}")
-                            if node.get("error"):
-                                st.error(str(node.get("error")))
-                split_count = _safe_int(state.get("reduce_split_count"), 0)
-                if split_count > 0:
-                    st.warning(f"Split узлов из-за overflow/timeout: {split_count}")
-
-        elif stage_labels[current_stage_idx] == "Верификация":
-            st.markdown("#### Верификация")
-            verification = state.get("verification")
-            if isinstance(verification, dict):
-                st.caption(str(verification.get("summary") or ""))
-                selected_logs = verification.get("selected_logs") or []
-                if isinstance(selected_logs, list) and selected_logs:
-                    with st.expander("Логи, выбранные для контрольного прохода", expanded=False):
-                        st.dataframe(
-                            _format_table_timestamps(pd.DataFrame(selected_logs)),
-                            use_container_width=True,
-                            hide_index=True,
-                            height=220,
-                        )
-                corrections = verification.get("corrections") or []
-                if corrections:
-                    st.dataframe(pd.DataFrame(corrections), use_container_width=True, hide_index=True)
+                    corrections = verification.get("corrections") or []
+                    if corrections:
+                        st.dataframe(pd.DataFrame(corrections), use_container_width=True, hide_index=True)
+                    else:
+                        st.success("Поправок не требуется.")
                 else:
-                    st.success("Поправок не требуется.")
-            else:
-                st.info("Этап верификации будет отображаться здесь после его запуска.")
+                    st.info("Этап верификации будет отображаться здесь после его запуска.")
 
-        else:
-            st.markdown("#### Отчёт")
-            final_summary_ready = bool(_normalize_summary_text(state.get("final_summary")))
-            final_report_ready = bool(state.get("final_report_ready", False))
-            if final_report_ready and final_summary_ready:
-                st.success("Итоговый отчёт сформирован. Ниже доступен интерактивный разбор.")
-            elif final_summary_ready:
-                st.info("Данные получены, выполняем финальную саммаризацию. Пожалуйста, дождитесь завершения.")
             else:
-                st.info("Отчёт пока формируется.")
+                st.markdown("#### Отчёт")
+                final_summary_ready = bool(_normalize_summary_text(state.get("final_summary")))
+                final_report_ready = bool(state.get("final_report_ready", False))
+                if final_report_ready and final_summary_ready:
+                    st.success("Итоговый отчёт сформирован. Ниже доступен интерактивный разбор.")
+                elif final_summary_ready:
+                    st.info("Данные получены, выполняем финальную саммаризацию. Пожалуйста, дождитесь завершения.")
+                else:
+                    st.info("Отчёт пока формируется.")
+
+        st.markdown("### Детали Этапов")
+        detail_tabs = st.tabs(stage_labels)
+        for idx, detail_tab in enumerate(detail_tabs):
+            with detail_tab:
+                if idx == current_stage_idx:
+                    st.caption("Это текущий активный этап пайплайна.")
+                _render_stage_details(idx)
 
         # Compact runtime metrics for observability.
         stats = state.get("stats") or {}

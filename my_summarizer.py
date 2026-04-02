@@ -1288,6 +1288,15 @@ def _is_400_bad_request_exception(exc: Exception) -> bool:
     )
 
 
+def _is_invalid_grammar_request_exception(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    return (
+        "invalid grammar request" in text
+        or "hosted_vllmexception - invalid grammar request" in text
+        or "grammar request with cache hit" in text
+    )
+
+
 def _make_llm_call(
     max_retries: int = -1,
     retry_delay: float = 10.0,
@@ -1442,6 +1451,9 @@ class PeriodLogSummarizer:
         self.prompt_context = prompt_context or {}
         self._instructor_client_cache: Dict[str, Any] = {}
         self._instructor_force_json_mode: bool = False
+        # Some gateways reject JSON grammar for large schemas (MAP model).
+        # If that happens once, MAP switches to legacy JSON text parsing for this run.
+        self._instructor_map_disabled_due_grammar: bool = False
 
     def _instructor_enabled(self) -> bool:
         return (
@@ -1588,6 +1600,16 @@ class PeriodLogSummarizer:
                     logger.warning(
                         "Instructor mode TOOLS is unsupported by current gateway. "
                         "Switching to JSON mode for subsequent structured calls."
+                    )
+                    self._instructor_force_json_mode = True
+                    continue
+                if (
+                    _is_invalid_grammar_request_exception(exc)
+                    and self._instructor_tool_calling_enabled()
+                ):
+                    logger.warning(
+                        "Instructor structured call got invalid grammar in TOOLS mode. "
+                        "Switching to JSON mode and retrying."
                     )
                     self._instructor_force_json_mode = True
                     continue
@@ -2208,7 +2230,7 @@ class PeriodLogSummarizer:
         auto_shrink = bool(getattr(self.config, "auto_shrink_on_400", True))
         instructor_path_used = False
         try:
-            if self._instructor_enabled():
+            if self._instructor_enabled() and not self._instructor_map_disabled_due_grammar:
                 instructor_path_used = True
                 structured_model, instructor_attempts = self._call_structured_with_instructor(
                     prompt=prompt,
@@ -2243,6 +2265,56 @@ class PeriodLogSummarizer:
                 depth,
                 exc,
             )
+            if instructor_path_used and _is_invalid_grammar_request_exception(exc):
+                logger.warning(
+                    "MAP batch %s: Instructor grammar is unsupported by gateway for MAP schema. "
+                    "Switching MAP to legacy mode for this run.",
+                    batch_number,
+                )
+                self._instructor_map_disabled_due_grammar = True
+                self._emit_progress(
+                    "map_instructor_fallback",
+                    {
+                        "batch_number": batch_number,
+                        "depth": depth,
+                        "reason": "invalid_grammar_request",
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
+                        "error": str(exc),
+                    },
+                )
+                try:
+                    llm_text = self.llm_call(prompt)
+                    raw_llm_text = (llm_text or "").strip()
+                    llm_calls = 2  # failed instructor attempt + legacy llm call
+                    chunk_summary, chunk_summary_structured, schema_retry_calls = self._normalize_map_summary_response(
+                        raw_summary_text=raw_llm_text,
+                        rows_chunk=rows_chunk,
+                        batch_number=batch_number,
+                        batch_period_start=batch_period_start,
+                        batch_period_end=batch_period_end,
+                        allow_schema_retry=True,
+                    )
+                    llm_calls += schema_retry_calls
+                    return (
+                        [
+                            {
+                                "summary": chunk_summary,
+                                "summary_structured": chunk_summary_structured,
+                                "rows": list(rows_chunk),
+                                "batch_period_start": batch_period_start,
+                                "batch_period_end": batch_period_end,
+                            }
+                        ],
+                        llm_calls,
+                    )
+                except Exception as legacy_exc:  # noqa: BLE001
+                    logger.warning(
+                        "MAP batch %s: legacy fallback after instructor grammar failure also failed: %s",
+                        batch_number,
+                        legacy_exc,
+                    )
+                    exc = legacy_exc
             can_shrink_on_exc = (
                 auto_shrink
                 and _is_400_bad_request_exception(exc)
