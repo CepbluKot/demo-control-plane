@@ -217,6 +217,13 @@ def _chain_section_requirement(stage: str) -> str:
 def _append_chain_requirement(prompt_text: str, stage: str) -> str:
     base = str(prompt_text or "").strip()
     chain_block = _chain_section_requirement(stage)
+    russian_language_block = "\n".join(
+        [
+            "ОБЯЗАТЕЛЬНОЕ ЯЗЫКОВОЕ ТРЕБОВАНИЕ:",
+            "Ответ должен быть полностью на русском языке.",
+            "Допустимы английские термины только для имён полей JSON, enum-значений и общепринятых тех-терминов.",
+        ]
+    )
     incident_link_block = "\n".join(
         [
             "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: СВЯЗЬ С ИНЦИДЕНТОМ ИЗ UI",
@@ -248,9 +255,13 @@ def _append_chain_requirement(prompt_text: str, stage: str) -> str:
         ]
     )
     if not base:
-        return f"{chain_block}\n\n{incident_link_block}\n\n{root_cause_hypotheses_block}"
+        return (
+            f"{chain_block}\n\n{russian_language_block}\n\n{incident_link_block}\n\n"
+            f"{root_cause_hypotheses_block}"
+        )
     return (
-        f"{base}\n\n{chain_block}\n\n{incident_link_block}\n\n{root_cause_hypotheses_block}"
+        f"{base}\n\n{chain_block}\n\n{russian_language_block}\n\n{incident_link_block}\n\n"
+        f"{root_cause_hypotheses_block}"
     )
 
 
@@ -1297,6 +1308,15 @@ def _is_invalid_grammar_request_exception(exc: Exception) -> bool:
     )
 
 
+def _is_instructor_empty_choices_exception(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    return (
+        ("nonetype" in text and "choices" in text and "failed_attempts" in text)
+        or ("object has no attribute 'choices'" in text)
+        or ('object has no attribute "choices"' in text)
+    )
+
+
 def _make_llm_call(
     max_retries: int = -1,
     retry_delay: float = 10.0,
@@ -1612,6 +1632,23 @@ class PeriodLogSummarizer:
                         "Switching to JSON mode and retrying."
                     )
                     self._instructor_force_json_mode = True
+                    continue
+                if _is_instructor_empty_choices_exception(exc):
+                    if attempt_no >= 2:
+                        logger.warning(
+                            "Instructor returned malformed payload (choices=None) repeatedly | "
+                            "stage=%s | attempts=%s. Escalating to caller for fallback.",
+                            stage,
+                            attempt_no,
+                        )
+                        raise
+                    logger.warning(
+                        "Instructor returned malformed payload (choices=None) | "
+                        "stage=%s | attempt=%s. Retrying once before fallback.",
+                        stage,
+                        attempt_no,
+                    )
+                    time.sleep(2.0)
                     continue
                 is_read_timeout = _is_read_timeout_exception(exc)
                 is_non_retryable = _is_non_retryable_llm_exception(exc)
@@ -2271,11 +2308,20 @@ class PeriodLogSummarizer:
                 depth,
                 exc,
             )
-            if instructor_path_used and _is_invalid_grammar_request_exception(exc):
+            if instructor_path_used and (
+                _is_invalid_grammar_request_exception(exc)
+                or _is_instructor_empty_choices_exception(exc)
+            ):
+                fallback_reason = (
+                    "invalid_grammar_request"
+                    if _is_invalid_grammar_request_exception(exc)
+                    else "instructor_empty_choices_payload"
+                )
                 logger.warning(
-                    "MAP batch %s: Instructor grammar is unsupported by gateway for MAP schema. "
+                    "MAP batch %s: Instructor structured MAP is unstable (%s). "
                     "Switching MAP to legacy mode for this run.",
                     batch_number,
+                    fallback_reason,
                 )
                 self._instructor_map_disabled_due_grammar = True
                 self._emit_progress(
@@ -2283,7 +2329,7 @@ class PeriodLogSummarizer:
                     {
                         "batch_number": batch_number,
                         "depth": depth,
-                        "reason": "invalid_grammar_request",
+                        "reason": fallback_reason,
                         "batch_period_start": batch_period_start,
                         "batch_period_end": batch_period_end,
                         "error": str(exc),
@@ -2939,11 +2985,11 @@ class PeriodLogSummarizer:
             # Schema-repair retry for legacy non-instructor path.
             retry_prompt = "\n".join(
                 [
-                    "Return STRICT JSON only (no markdown, no explanations).",
-                    "The JSON must validate against IncidentSummary schema.",
-                    "Fix invalid references and required fields.",
+                    "Верни СТРОГО один JSON-объект (без markdown, без пояснений).",
+                    "JSON должен валидироваться по схеме IncidentSummary.",
+                    "Исправь невалидные ссылки и обязательные поля.",
                     "",
-                    "Previous invalid response:",
+                    "Предыдущий невалидный ответ:",
                     raw,
                 ]
             )
@@ -3513,7 +3559,7 @@ class PeriodLogSummarizer:
         anti_rules = _resolve_anti_hallucination_rules()
         summaries_text = []
         for idx, text in enumerate(summaries, start=1):
-            summaries_text.append(f"[BATCH {idx}]")
+            summaries_text.append(f"[БАТЧ {idx}]")
             summaries_text.append(text)
             summaries_text.append("")
         rendered_summaries = "\n".join(summaries_text).strip()
@@ -3575,7 +3621,7 @@ class PeriodLogSummarizer:
             f"SQL: {_ctx_value(self.prompt_context, 'sql_query', '')}",
             f"Период: [{period_start}, {period_end})",
             f"Reduce round: {reduce_round}",
-            f"Количество map-summary: {len(summaries)}",
+            f"Количество map-саммари: {len(summaries)}",
         ]
         if extra_prompt_context:
             lines += [
@@ -3598,7 +3644,7 @@ class PeriodLogSummarizer:
             "7) ПРОБЕЛЫ В ДАННЫХ И РАЗРЫВЫ ЦЕПОЧЕК",
             "8) ФОРМАТ ВЫВОДА ЦЕПОЧКИ: оформи красиво с узлами и стрелками.",
             "",
-            "Частичные summary:",
+            "Частичные саммари:",
             rendered_summaries,
         ]
         return _append_chain_requirement("\n".join(lines).strip(), "reduce")
@@ -3616,7 +3662,7 @@ class PeriodLogSummarizer:
         map_items = [_normalize_summary_text(item) for item in (map_summaries or [])]
         map_items = [item for item in map_items if item]
         map_summaries_text = "\n\n".join(
-            f"[MAP SUMMARY #{idx + 1}]\n{item}" for idx, item in enumerate(map_items)
+            f"[MAP САММАРИ #{idx + 1}]\n{item}" for idx, item in enumerate(map_items)
         )
         freeform_template = _read_prompt_setting("CONTROL_PLANE_LLM_FREEFORM_PROMPT_TEMPLATE")
         if freeform_template:
@@ -3651,7 +3697,7 @@ class PeriodLogSummarizer:
             "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
             anti_rules,
             *((["", "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:", extra_prompt_context]) if extra_prompt_context else []),
-            *((["", "MAP SUMMARY ПО БАТЧАМ ЛОГОВ:", map_summaries_text]) if map_summaries_text else []),
+            *((["", "MAP САММАРИ ПО БАТЧАМ ЛОГОВ:", map_summaries_text]) if map_summaries_text else []),
             "",
             f"Период: [{period_start}, {period_end})",
             "",
@@ -4271,10 +4317,10 @@ def generate_final_reports_with_instructor(
             alerts_text or "n/a",
             "",
             f"Период: [{period_start}, {period_end})",
-            f"Metrics context: {str(metrics_context or '').strip() or 'n/a'}",
-            f"Stats: {json.dumps(stats or {}, ensure_ascii=False, default=str)}",
+            f"Контекст метрик: {str(metrics_context or '').strip() or 'n/a'}",
+            f"Статистика: {json.dumps(stats or {}, ensure_ascii=False, default=str)}",
             "",
-            "Верифицированное structured summary:",
+            "Верифицированное структурированное саммари:",
             summary_json,
         ]
     )
@@ -4301,7 +4347,7 @@ def generate_final_reports_with_instructor(
                     "Алерты из UI:",
                     alerts_text or "n/a",
                     "",
-                    "Structured summary:",
+                    "Структурированное саммари:",
                     summary_json,
                 ]
             )
@@ -4322,10 +4368,10 @@ def generate_final_reports_with_instructor(
                     "Алерты из UI:",
                     alerts_text or "n/a",
                     "",
-                    "Structured summary:",
+                    "Структурированное саммари:",
                     summary_json,
                     "",
-                    "Analytical part JSON:",
+                    "JSON аналитической части:",
                     json.dumps(part1.model_dump(mode='json'), ensure_ascii=False, indent=2),
                 ]
             )
@@ -4402,13 +4448,13 @@ def generate_final_reports_with_instructor(
             chronology_prompt = (
                 "Сформируй раздел chronology в формате ChronologySection.\n"
                 "Сортировка строго по времени, укажи точные timestamps.\n\n"
-                "Timeline JSON:\n"
+                "JSON timeline:\n"
                 + json.dumps([item.model_dump(mode="json") for item in parsed_summary.timeline], ensure_ascii=False, indent=2)
             )
             chronology_trim_prompt = (
                 "Сформируй раздел chronology в формате ChronologySection.\n"
                 "Используй top events по importance.\n\n"
-                "Timeline top JSON:\n"
+                "JSON top-событий хронологии:\n"
                 + json.dumps([item.model_dump(mode="json") for item in timeline_top], ensure_ascii=False, indent=2)
             )
             chronology_section = _section_call(
@@ -4421,9 +4467,9 @@ def generate_final_reports_with_instructor(
             causal_prompt = (
                 "Сформируй раздел causal_chains в формате CausalChainsSection.\n"
                 "Нужен механизм связи для каждой цепочки.\n\n"
-                "causal_links:\n"
+                "JSON causal_links:\n"
                 + json.dumps([item.model_dump(mode="json") for item in parsed_summary.causal_links], ensure_ascii=False, indent=2)
-                + "\n\ncontext events:\n"
+                + "\n\nJSON контекстных событий:\n"
                 + json.dumps([item.model_dump(mode="json") for item in timeline_top], ensure_ascii=False, indent=2)
             )
             causal_trim_prompt = (
@@ -4444,9 +4490,9 @@ def generate_final_reports_with_instructor(
             alerts_prompt = (
                 "Сформируй раздел alert_explanations в формате AlertsSection.\n"
                 "Статусы: EXPLAINED/PARTIALLY_EXPLAINED/NOT_EXPLAINED.\n\n"
-                "alerts from ui:\n"
+                "Алерты из UI:\n"
                 + (alerts_text or "n/a")
-                + "\n\nalert_refs json:\n"
+                + "\n\nJSON alert_refs:\n"
                 + json.dumps([item.model_dump(mode="json") for item in parsed_summary.alert_refs], ensure_ascii=False, indent=2)
             )
             alerts_section = _section_call(
@@ -4638,7 +4684,7 @@ def generate_final_reports_with_instructor(
                     "Сформируй summary в формате SummarySection.",
                     "Summary должен быть написан ПОСЛЕДНИМ и учитывать все секции.",
                     "",
-                    "sections_json:",
+                    "JSON секций:",
                     json.dumps(assembled.model_dump(mode="json"), ensure_ascii=False, indent=2),
                 ]
             )
@@ -4684,14 +4730,15 @@ def generate_final_reports_with_instructor(
     freeform_section_items: List[Dict[str, str]] = []
     freeform_prompt = "\n".join(
         [
-            "Напиши связный narrative-отчёт для SRE (1-2 страницы),",
+            "Напиши связный отчёт в свободной форме для SRE (1-2 страницы),",
             "используя структурированный IncidentReport ниже.",
             "Обязательно сохрани связь с алертами из UI и цепочки событий.",
+            "Пиши только на русском языке.",
             "",
             "Контекст инцидента (дословно):",
             user_context_text,
             "",
-            "IncidentReport JSON:",
+            "JSON IncidentReport:",
             json.dumps(report_obj.model_dump(mode="json"), ensure_ascii=False, indent=2),
         ]
     )
@@ -4709,11 +4756,11 @@ def generate_final_reports_with_instructor(
         freeform_text = _normalize_summary_text(base_freeform_report)
     if not freeform_text:
         freeform_text = (
-            "Краткий narrative-отчёт:\n\n"
+            "Краткий отчёт в свободной форме:\n\n"
             + _normalize_summary_text(report_obj.summary.text)
             + "\n\nДетали и доказательства смотрите в структурированном отчёте."
         )
-    freeform_section_items = [{"title": "Narrative", "text": freeform_text}]
+    freeform_section_items = [{"title": "Свободная Форма", "text": freeform_text}]
 
     return {
         "structured_report": structured_text,

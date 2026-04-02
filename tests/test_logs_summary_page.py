@@ -14,6 +14,7 @@ from ui.pages.logs_summary_page import (
     _build_saved_params_from_import_request,
     _build_models_url,
     _build_report_generation_progress_snapshot,
+    _build_reduce_l1_progress_snapshot,
     _build_config,
     _extract_root_cause_hypotheses_block,
     _ensure_report_topics_present,
@@ -40,6 +41,7 @@ from ui.pages.logs_summary_page import (
     _generate_sectional_structured_summary,
     _load_map_summaries_from_jsonl,
     _load_map_summaries_from_jsonl_for_source,
+    _load_recent_batches_from_jsonl,
     _normalize_alert_items,
     _normalize_summary_text,
     _render_alerts_context,
@@ -249,6 +251,42 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertTrue(snapshot["show"])
         self.assertAlmostEqual(float(snapshot["ratio"]), 0.25, places=6)
         self.assertIn("(5/20)", snapshot["label"])
+
+    def test_build_reduce_l1_progress_snapshot_waiting_in_reduce(self) -> None:
+        snapshot = _build_reduce_l1_progress_snapshot(
+            {
+                "status": "reduce",
+                "reduce_nodes": [],
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 0.0, places=6)
+        self.assertIn("ожидание первых групп", snapshot["label"])
+
+    def test_build_reduce_l1_progress_snapshot_counts_done_groups(self) -> None:
+        snapshot = _build_reduce_l1_progress_snapshot(
+            {
+                "status": "reduce",
+                "reduce_nodes": [
+                    {"round": 1, "group": 1, "group_total": 3, "status": "done"},
+                    {"round": 1, "group": 2, "group_total": 3, "status": "active"},
+                    {"round": 1, "group": 3, "group_total": 3, "status": "split"},
+                    {"round": 2, "group": 1, "group_total": 1, "status": "done"},
+                ],
+            }
+        )
+        self.assertTrue(snapshot["show"])
+        self.assertAlmostEqual(float(snapshot["ratio"]), 2.0 / 3.0, places=6)
+        self.assertIn("Reduce L1: 2/3", snapshot["label"])
+
+    def test_build_reduce_l1_progress_snapshot_hidden_outside_reduce(self) -> None:
+        snapshot = _build_reduce_l1_progress_snapshot(
+            {
+                "status": "map",
+                "reduce_nodes": [],
+            }
+        )
+        self.assertFalse(snapshot["show"])
 
     def test_ui_freeform_prompt_uses_custom_template(self) -> None:
         with patch.object(
@@ -1108,6 +1146,32 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], "evt-1")
         self.assertEqual(rows[0]["batch_index"], 1)
+
+    def test_load_recent_batches_from_jsonl_default_keeps_all_items(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batches.jsonl"
+            with open(path, "w", encoding="utf-8") as f:
+                for idx in range(15):
+                    f.write(
+                        json.dumps(
+                            {
+                                "event": "map_batch",
+                                "batch_index": idx,
+                                "batch_total": 15,
+                                "batch_summary": f"summary-{idx}",
+                                "batch_logs_count": 1,
+                                "batch_period_start": "2026-03-18T00:00:00+00:00",
+                                "batch_period_end": "2026-03-18T00:01:00+00:00",
+                                "batch_logs": [{"timestamp": "2026-03-18T00:00:00+00:00"}],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            loaded = _load_recent_batches_from_jsonl(str(path))
+            self.assertEqual(len(loaded), 15)
+            self.assertEqual(int(loaded[0]["batch_index"]), 0)
+            self.assertEqual(int(loaded[-1]["batch_index"]), 14)
 
     def test_build_causal_graph_dot(self) -> None:
         dot = _build_causal_graph_dot(

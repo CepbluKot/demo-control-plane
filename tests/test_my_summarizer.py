@@ -742,9 +742,9 @@ class TestMySummarizer(unittest.TestCase):
             batch_number=1,
             total_batches=3,
         )
-        self.assertIn("Output format (STRICT, mandatory)", prompt)
-        self.assertIn("Return ONLY one valid JSON object.", prompt)
-        self.assertIn("Top-level keys must be exactly", prompt)
+        self.assertIn("Формат ответа (строго)", prompt)
+        self.assertIn("Верни ТОЛЬКО один валидный JSON-объект.", prompt)
+        self.assertIn("Top-level keys", prompt)
 
     def test_truncate_with_zero_limit_keeps_text(self) -> None:
         text = "a" * 5000
@@ -766,8 +766,8 @@ class TestMySummarizer(unittest.TestCase):
             structured_summary="structured summary",
             map_summaries=["map one", "map two"],
         )
-        self.assertIn("MAP SUMMARY ПО БАТЧАМ ЛОГОВ", prompt)
-        self.assertIn("[MAP SUMMARY #1]", prompt)
+        self.assertIn("MAP САММАРИ ПО БАТЧАМ ЛОГОВ", prompt)
+        self.assertIn("[MAP САММАРИ #1]", prompt)
         self.assertIn("map one", prompt)
         self.assertIn("map two", prompt)
         self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
@@ -790,7 +790,7 @@ class TestMySummarizer(unittest.TestCase):
                 map_summaries=["map one"],
             )
         self.assertIn("CUSTOM FREEFORM", prompt)
-        self.assertIn("maps=[MAP SUMMARY #1]", prompt)
+        self.assertIn("maps=[MAP САММАРИ #1]", prompt)
         self.assertIn("final=structured summary", prompt)
 
     def test_regenerate_reduce_summary_from_map_summaries(self) -> None:
@@ -1317,6 +1317,69 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(len(llm_calls), 2)
         event_names = [event for event, _ in progress_events]
         self.assertIn("map_instructor_fallback", event_names)
+
+    def test_map_summary_instructor_empty_choices_falls_back_to_legacy(self) -> None:
+        valid_map_json = json.dumps(
+            {
+                "context": {
+                    "batch_id": "tmp",
+                    "time_range_start": "2026-03-25T10:00:00+00:00",
+                    "time_range_end": "2026-03-25T10:00:01+00:00",
+                    "total_log_entries": 1,
+                    "source_query": [],
+                    "source_services": [],
+                },
+                "timeline": [],
+                "causal_links": [],
+                "alert_refs": [],
+                "hypotheses": [],
+                "pinned_facts": [],
+                "gaps": [],
+                "impact": {},
+                "conflicts": [],
+                "data_quality": {
+                    "is_empty": True,
+                    "noise_ratio": 1.0,
+                    "has_gaps": False,
+                    "gap_periods": [],
+                    "notes": "",
+                },
+                "preliminary_recommendations": [],
+            },
+            ensure_ascii=False,
+        )
+        progress_events = []
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: valid_map_json,
+            config=SummarizerConfig(use_instructor=True),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            side_effect=RuntimeError("'NoneType' object has no attribute 'choices'"),
+        ):
+            items, calls = summarizer._summarize_rows_with_auto_shrink(
+                rows_chunk=[{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line-1"}],
+                columns=["timestamp", "message"],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                batch_number=1,
+                total_batches=1,
+            )
+
+        self.assertEqual(len(items), 1)
+        self.assertGreaterEqual(calls, 2)
+        fallback_payloads = [
+            payload for event, payload in progress_events if event == "map_instructor_fallback"
+        ]
+        self.assertTrue(fallback_payloads)
+        self.assertEqual(
+            str(fallback_payloads[0].get("reason")),
+            "instructor_empty_choices_payload",
+        )
 
     def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
         summary_payload = {

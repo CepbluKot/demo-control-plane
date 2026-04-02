@@ -27,7 +27,8 @@ from settings import settings
 
 
 MAX_EVENT_LINES = 160
-MAX_RENDERED_BATCHES = 10
+# 0 means "no truncation" (keep all MAP batches in UI state).
+MAX_RENDERED_BATCHES = 0
 MAX_LOG_ROWS_PREVIEW = 80
 MAX_METRICS_ROWS_TOTAL = 50_000  # cap across all metric queries to avoid OOM
 MAX_LLM_TIMELINE_ROWS = 400
@@ -778,6 +779,39 @@ def _build_stage1_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "ratio": max(min(float(ratio or 0.0), 1.0), 0.0),
         "label": label,
         "runtime_line": runtime_line,
+    }
+
+
+def _build_reduce_l1_progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(state.get("status", "queued")).strip().lower()
+    reduce_nodes = state.get("reduce_nodes")
+    if not isinstance(reduce_nodes, list):
+        reduce_nodes = []
+
+    round_nodes = [
+        item
+        for item in reduce_nodes
+        if isinstance(item, dict) and _safe_int(item.get("round"), 0) == 1
+    ]
+    if not round_nodes:
+        if status == "reduce":
+            return {
+                "show": True,
+                "ratio": 0.0,
+                "label": "Reduce L1: ожидание первых групп",
+            }
+        return {"show": False, "ratio": 0.0, "label": ""}
+
+    total_from_nodes = max((_safe_int(item.get("group_total"), 0) for item in round_nodes), default=0)
+    total = total_from_nodes if total_from_nodes > 0 else len(round_nodes)
+    done_statuses = {"done", "split", "error"}
+    done = sum(1 for item in round_nodes if str(item.get("status") or "").strip().lower() in done_statuses)
+    done = min(max(done, 0), max(total, 1))
+    ratio = max(min(float(done) / float(max(total, 1)), 1.0), 0.0)
+    return {
+        "show": True,
+        "ratio": ratio,
+        "label": f"Reduce L1: {done}/{total} групп ({ratio * 100:.1f}%)",
     }
 
 
@@ -1918,13 +1952,16 @@ def _load_map_summaries_from_jsonl_for_source(path: str, source_name: str) -> Li
 def _load_recent_batches_from_jsonl(
     path: str,
     *,
-    max_items: int = MAX_RENDERED_BATCHES,
+    max_items: Optional[int] = MAX_RENDERED_BATCHES,
     max_logs_preview: int = MAX_LOG_ROWS_PREVIEW,
 ) -> List[Dict[str, Any]]:
     p = Path(str(path or ""))
     if not p.exists() or not p.is_file():
         return []
-    recent: deque[Dict[str, Any]] = deque(maxlen=max(int(max_items), 1))
+    max_items_int = int(max_items) if max_items is not None else 0
+    unlimited = max_items_int <= 0
+    recent: deque[Dict[str, Any]] = deque(maxlen=max(max_items_int, 1))
+    all_items: List[Dict[str, Any]] = []
     try:
         with open(p, "r", encoding="utf-8") as f:
             for line in f:
@@ -1940,19 +1977,23 @@ def _load_recent_batches_from_jsonl(
                 batch_logs = payload.get("batch_logs", [])
                 if not isinstance(batch_logs, list):
                     batch_logs = []
-                recent.append(
-                    {
-                        "batch_index": payload.get("batch_index"),
-                        "batch_total": payload.get("batch_total"),
-                        "batch_summary": payload.get("batch_summary"),
-                        "batch_logs_count": payload.get("batch_logs_count"),
-                        "batch_period_start": payload.get("batch_period_start"),
-                        "batch_period_end": payload.get("batch_period_end"),
-                        "batch_logs": batch_logs,
-                    }
-                )
+                item = {
+                    "batch_index": payload.get("batch_index"),
+                    "batch_total": payload.get("batch_total"),
+                    "batch_summary": payload.get("batch_summary"),
+                    "batch_logs_count": payload.get("batch_logs_count"),
+                    "batch_period_start": payload.get("batch_period_start"),
+                    "batch_period_end": payload.get("batch_period_end"),
+                    "batch_logs": batch_logs,
+                }
+                if unlimited:
+                    all_items.append(item)
+                else:
+                    recent.append(item)
     except Exception:
         return []
+    if unlimited:
+        return all_items
     return list(recent)
 
 
@@ -5474,7 +5515,11 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             if label.startswith("Reduce L"):
                 round_idx = _safe_int(label.replace("Reduce L", ""), 1)
                 round_nodes = [x for x in reduce_nodes if _safe_int(x.get("round"), 0) == round_idx]
-                done_round_nodes = [x for x in round_nodes if str(x.get("status")) == "done"]
+                done_round_nodes = [
+                    x
+                    for x in round_nodes
+                    if str(x.get("status") or "").strip().lower() in {"done", "split", "error"}
+                ]
                 if round_nodes:
                     progress_suffix = f" ({len(done_round_nodes)}/{len(round_nodes)})"
             col.markdown(
@@ -5502,6 +5547,14 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             runtime_line = str(stage1_progress.get("runtime_line") or "").strip()
             if runtime_line:
                 st.caption(runtime_line)
+
+        reduce_l1_progress = _build_reduce_l1_progress_snapshot(state)
+        if bool(reduce_l1_progress.get("show")):
+            st.markdown("### Прогресс Reduce L1")
+            st.progress(
+                float(reduce_l1_progress.get("ratio", 0.0)),
+                text=str(reduce_l1_progress.get("label") or ""),
+            )
 
         report_progress = _build_report_generation_progress_snapshot(state)
         if bool(report_progress.get("show")):
@@ -5688,6 +5741,20 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     for round_idx in sorted(rounds.keys()):
                         st.markdown(f"**Уровень {round_idx}**")
                         nodes = sorted(rounds[round_idx], key=lambda x: _safe_int(x.get("group"), 0))
+                        round_total = max((_safe_int(item.get("group_total"), 0) for item in nodes), default=0)
+                        if round_total <= 0:
+                            round_total = len(nodes)
+                        round_done = sum(
+                            1
+                            for item in nodes
+                            if str(item.get("status") or "").strip().lower() in {"done", "split", "error"}
+                        )
+                        round_done = min(max(round_done, 0), max(round_total, 1))
+                        round_ratio = max(min(float(round_done) / float(max(round_total, 1)), 1.0), 0.0)
+                        st.progress(
+                            round_ratio,
+                            text=f"Reduce L{round_idx}: {round_done}/{round_total} групп ({round_ratio * 100:.1f}%)",
+                        )
                         for node in nodes:
                             icon = "✓" if str(node.get("status")) == "done" else ("●" if str(node.get("status")) == "active" else "○")
                             group_idx = _safe_int(node.get("group"), 0)
@@ -7227,12 +7294,13 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 merged_events.extend(initial_events)
                 state["events"] = merged_events[-MAX_EVENT_LINES:]
             prev_map_batches = checkpoint_state.get("map_batches")
-            if isinstance(prev_map_batches, list) and prev_map_batches:
-                state["map_batches"] = prev_map_batches[-MAX_RENDERED_BATCHES:]
-            elif live_batches_path.exists():
+            loaded_batches: List[Dict[str, Any]] = []
+            if live_batches_path.exists():
                 loaded_batches = _load_recent_batches_from_jsonl(str(live_batches_path))
-                if loaded_batches:
-                    state["map_batches"] = loaded_batches[-MAX_RENDERED_BATCHES:]
+            if loaded_batches:
+                state["map_batches"] = loaded_batches
+            elif isinstance(prev_map_batches, list) and prev_map_batches:
+                state["map_batches"] = prev_map_batches
             saved_rows = int(pd.to_numeric(checkpoint_state.get("logs_processed"), errors="coerce") or 0)
             state["resume_rows_offset"] = max(saved_rows, 0)
             state["logs_processed"] = max(saved_rows, int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0))
@@ -7948,8 +8016,6 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 }
                 map_batches = state.setdefault("map_batches", [])
                 map_batches.append(batch_item)
-                if len(map_batches) > MAX_RENDERED_BATCHES:
-                    state["map_batches"] = map_batches[-MAX_RENDERED_BATCHES:]
 
                 batch_plan = state.setdefault("batch_plan", [])
                 if isinstance(batch_plan, list):
