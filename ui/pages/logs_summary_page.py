@@ -2112,6 +2112,14 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "structured_sections",
         "freeform_final_summary",
         "freeform_sections",
+        "instructor_structured_summary",
+        "instructor_freeform_summary",
+        "instructor_structured_sections",
+        "instructor_freeform_sections",
+        "instructor_report_status",
+        "instructor_report_error",
+        "instructor_report_notes",
+        "instructor_report_attempts",
         "final_report_ready",
         "result_json_path",
         "result_bundle_path",
@@ -2121,6 +2129,10 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "result_freeform_md_path",
         "result_structured_txt_path",
         "result_freeform_txt_path",
+        "result_instructor_structured_md_path",
+        "result_instructor_freeform_md_path",
+        "result_instructor_structured_txt_path",
+        "result_instructor_freeform_txt_path",
         "llm_calls_started",
         "llm_calls_succeeded",
         "llm_calls_failed",
@@ -2221,6 +2233,10 @@ def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any
         "result_freeform_md_path",
         "result_structured_txt_path",
         "result_freeform_txt_path",
+        "result_instructor_structured_md_path",
+        "result_instructor_freeform_md_path",
+        "result_instructor_structured_txt_path",
+        "result_instructor_freeform_txt_path",
         "rebuild_reduce_path",
         "live_events_path",
         "live_batches_path",
@@ -2241,6 +2257,14 @@ def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any
     state.setdefault("reduce_nodes", [])
     state.setdefault("structured_sections", [])
     state.setdefault("freeform_sections", [])
+    state.setdefault("instructor_structured_sections", [])
+    state.setdefault("instructor_freeform_sections", [])
+    state.setdefault("instructor_structured_summary", "")
+    state.setdefault("instructor_freeform_summary", "")
+    state.setdefault("instructor_report_status", "imported")
+    state.setdefault("instructor_report_error", "")
+    state.setdefault("instructor_report_notes", "")
+    state.setdefault("instructor_report_attempts", 0)
     state.setdefault(
         "final_report_ready",
         bool(_normalize_summary_text(state.get("final_summary")))
@@ -3015,6 +3039,10 @@ def _save_logs_summary_result(
     freeform_md_path = output_dir / f"logs_summary_freeform_{stamp}.md"
     structured_txt_path = output_dir / f"logs_summary_structured_{stamp}.txt"
     freeform_txt_path = output_dir / f"logs_summary_freeform_{stamp}.txt"
+    instructor_structured_md_path = output_dir / f"logs_summary_instructor_structured_{stamp}.md"
+    instructor_freeform_md_path = output_dir / f"logs_summary_instructor_freeform_{stamp}.md"
+    instructor_structured_txt_path = output_dir / f"logs_summary_instructor_structured_{stamp}.txt"
+    instructor_freeform_txt_path = output_dir / f"logs_summary_instructor_freeform_{stamp}.txt"
 
     payload = {
         "saved_at": datetime.now(MSK).isoformat(),
@@ -3036,10 +3064,22 @@ def _save_logs_summary_result(
 
     structured_summary = str(result_state.get("final_summary") or "").strip()
     freeform_summary = str(result_state.get("freeform_final_summary") or "").strip()
+    instructor_structured_summary = str(
+        result_state.get("instructor_structured_summary") or ""
+    ).strip()
+    instructor_freeform_summary = str(
+        result_state.get("instructor_freeform_summary") or ""
+    ).strip()
     structured_fence = _md_fence_for_text(structured_summary)
     freeform_fence = _md_fence_for_text(freeform_summary)
     combined_structured_fence = _md_fence_for_text(structured_summary or "N/A")
     combined_freeform_fence = _md_fence_for_text(freeform_summary or "N/A")
+    combined_instructor_structured_fence = _md_fence_for_text(
+        instructor_structured_summary or "N/A"
+    )
+    combined_instructor_freeform_fence = _md_fence_for_text(
+        instructor_freeform_summary or "N/A"
+    )
     if structured_summary:
         _write_text_file(
             structured_md_path,
@@ -3078,6 +3118,46 @@ def _save_logs_summary_result(
         structured_txt_path.write_text(structured_summary, encoding="utf-8")
     if freeform_summary:
         freeform_txt_path.write_text(freeform_summary, encoding="utf-8")
+    if instructor_structured_summary:
+        _write_text_file(
+            instructor_structured_md_path,
+            "\n".join(
+                [
+                    "# Итоговое расследование (Instructor, Structured)",
+                    "",
+                    f"- saved_at: `{payload['saved_at']}`",
+                    f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    f"- summary_origin: `{result_state.get('final_summary_origin')}`",
+                    "",
+                    f"{_md_fence_for_text(instructor_structured_summary)}text",
+                    instructor_structured_summary,
+                    _md_fence_for_text(instructor_structured_summary),
+                ]
+            ),
+        )
+        instructor_structured_txt_path.write_text(
+            instructor_structured_summary, encoding="utf-8"
+        )
+    if instructor_freeform_summary:
+        _write_text_file(
+            instructor_freeform_md_path,
+            "\n".join(
+                [
+                    "# Итоговое расследование (Instructor, Freeform)",
+                    "",
+                    f"- saved_at: `{payload['saved_at']}`",
+                    f"- period: `{result_state.get('period_start')}` -> `{result_state.get('period_end')}`",
+                    f"- summary_origin: `{result_state.get('final_summary_origin')}`",
+                    "",
+                    f"{_md_fence_for_text(instructor_freeform_summary)}text",
+                    instructor_freeform_summary,
+                    _md_fence_for_text(instructor_freeform_summary),
+                ]
+            ),
+        )
+        instructor_freeform_txt_path.write_text(
+            instructor_freeform_summary, encoding="utf-8"
+        )
 
     _write_text_file(
         report_html_path,
@@ -3105,6 +3185,18 @@ def _save_logs_summary_result(
         (freeform_summary or "N/A"),
         combined_freeform_fence,
         "",
+        "## Final Summary (Instructor Structured)",
+        "",
+        f"{combined_instructor_structured_fence}text",
+        (instructor_structured_summary or "N/A"),
+        combined_instructor_structured_fence,
+        "",
+        "## Final Summary (Instructor Freeform)",
+        "",
+        f"{combined_instructor_freeform_fence}text",
+        (instructor_freeform_summary or "N/A"),
+        combined_instructor_freeform_fence,
+        "",
         "## Stats",
         "",
         f"- logs_processed: `{result_state.get('logs_processed')}`",
@@ -3125,6 +3217,26 @@ def _save_logs_summary_result(
         (f"- freeform md: `{freeform_md_path}`" if freeform_summary else ""),
         (f"- structured txt: `{structured_txt_path}`" if structured_summary else ""),
         (f"- freeform txt: `{freeform_txt_path}`" if freeform_summary else ""),
+        (
+            f"- instructor structured md: `{instructor_structured_md_path}`"
+            if instructor_structured_summary
+            else ""
+        ),
+        (
+            f"- instructor freeform md: `{instructor_freeform_md_path}`"
+            if instructor_freeform_summary
+            else ""
+        ),
+        (
+            f"- instructor structured txt: `{instructor_structured_txt_path}`"
+            if instructor_structured_summary
+            else ""
+        ),
+        (
+            f"- instructor freeform txt: `{instructor_freeform_txt_path}`"
+            if instructor_freeform_summary
+            else ""
+        ),
     ]
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -3143,6 +3255,12 @@ def _save_logs_summary_result(
         result["structured_txt_path"] = str(structured_txt_path)
     if freeform_summary:
         result["freeform_txt_path"] = str(freeform_txt_path)
+    if instructor_structured_summary:
+        result["instructor_structured_md_path"] = str(instructor_structured_md_path)
+        result["instructor_structured_txt_path"] = str(instructor_structured_txt_path)
+    if instructor_freeform_summary:
+        result["instructor_freeform_md_path"] = str(instructor_freeform_md_path)
+        result["instructor_freeform_txt_path"] = str(instructor_freeform_txt_path)
     return result
 
 
@@ -3339,6 +3457,10 @@ def _build_zip_artifacts_bytes(state: Dict[str, Any]) -> Optional[bytes]:
         ("report/freeform.md", state.get("result_freeform_md_path")),
         ("report/structured.txt", state.get("result_structured_txt_path")),
         ("report/freeform.txt", state.get("result_freeform_txt_path")),
+        ("report/instructor_structured.md", state.get("result_instructor_structured_md_path")),
+        ("report/instructor_freeform.md", state.get("result_instructor_freeform_md_path")),
+        ("report/instructor_structured.txt", state.get("result_instructor_structured_txt_path")),
+        ("report/instructor_freeform.txt", state.get("result_instructor_freeform_txt_path")),
         ("summaries/map_summaries.jsonl", state.get("map_summaries_jsonl_path")),
         ("summaries/reduce_summaries.jsonl", state.get("reduce_summaries_jsonl_path")),
         ("summaries/llm_calls.jsonl", state.get("llm_calls_jsonl_path")),
@@ -3996,6 +4118,22 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
 
         final_summary = _normalize_summary_text(state.get("final_summary"))
         freeform_summary = _normalize_summary_text(state.get("freeform_final_summary"))
+        instructor_structured_summary = _normalize_summary_text(
+            state.get("instructor_structured_summary")
+        )
+        instructor_freeform_summary = _normalize_summary_text(
+            state.get("instructor_freeform_summary")
+        )
+        instructor_status = str(state.get("instructor_report_status") or "").strip()
+        instructor_error = _normalize_summary_text(state.get("instructor_report_error"))
+        instructor_attempts = _safe_int(state.get("instructor_report_attempts"), 0)
+        if instructor_status:
+            caption = f"Instructor-отчёт: `{instructor_status}`"
+            if instructor_attempts > 0:
+                caption += f", attempts={instructor_attempts}"
+            st.caption(caption)
+        if instructor_error:
+            st.caption(f"Instructor ошибка: {instructor_error}")
 
         report_sections_map = _get_report_sections_map(state)
         if not report_sections_map:
@@ -4317,6 +4455,16 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             if freeform_summary:
                 st.markdown("Итоговое расследование в свободном формате")
                 deps.render_scrollable_text(freeform_summary, height=max(final_height, 620))
+            if instructor_structured_summary:
+                st.markdown("Итоговое расследование (Instructor, structured)")
+                deps.render_scrollable_text(
+                    instructor_structured_summary, height=max(final_height, 520)
+                )
+            if instructor_freeform_summary:
+                st.markdown("Итоговое расследование (Instructor, freeform)")
+                deps.render_scrollable_text(
+                    instructor_freeform_summary, height=max(final_height, 620)
+                )
 
         structured_hypotheses = _extract_root_cause_hypotheses_block(final_summary)
         freeform_hypotheses = _extract_root_cause_hypotheses_block(freeform_summary)
@@ -4449,6 +4597,18 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         state["result_freeform_md_path"] = saved_after_rebuild.get("freeform_md_path")
                         state["result_structured_txt_path"] = saved_after_rebuild.get("structured_txt_path")
                         state["result_freeform_txt_path"] = saved_after_rebuild.get("freeform_txt_path")
+                        state["result_instructor_structured_md_path"] = saved_after_rebuild.get(
+                            "instructor_structured_md_path"
+                        )
+                        state["result_instructor_freeform_md_path"] = saved_after_rebuild.get(
+                            "instructor_freeform_md_path"
+                        )
+                        state["result_instructor_structured_txt_path"] = saved_after_rebuild.get(
+                            "instructor_structured_txt_path"
+                        )
+                        state["result_instructor_freeform_txt_path"] = saved_after_rebuild.get(
+                            "instructor_freeform_txt_path"
+                        )
                         checkpoint_raw = str(state.get("checkpoint_path") or "").strip()
                         if checkpoint_raw:
                             _persist_checkpoint(Path(checkpoint_raw), state)
@@ -4701,6 +4861,18 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             state["result_freeform_md_path"] = saved_after_rebuild.get("freeform_md_path")
                             state["result_structured_txt_path"] = saved_after_rebuild.get("structured_txt_path")
                             state["result_freeform_txt_path"] = saved_after_rebuild.get("freeform_txt_path")
+                            state["result_instructor_structured_md_path"] = saved_after_rebuild.get(
+                                "instructor_structured_md_path"
+                            )
+                            state["result_instructor_freeform_md_path"] = saved_after_rebuild.get(
+                                "instructor_freeform_md_path"
+                            )
+                            state["result_instructor_structured_txt_path"] = saved_after_rebuild.get(
+                                "instructor_structured_txt_path"
+                            )
+                            state["result_instructor_freeform_txt_path"] = saved_after_rebuild.get(
+                                "instructor_freeform_txt_path"
+                            )
                             checkpoint_raw = str(state.get("checkpoint_path") or "").strip()
                             if checkpoint_raw:
                                 _persist_checkpoint(Path(checkpoint_raw), state)
@@ -4737,6 +4909,18 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         freeform_md_bytes = _read_file_bytes(state.get("result_freeform_md_path"))
         structured_txt_bytes = _read_file_bytes(state.get("result_structured_txt_path"))
         freeform_txt_bytes = _read_file_bytes(state.get("result_freeform_txt_path"))
+        instructor_structured_md_bytes = _read_file_bytes(
+            state.get("result_instructor_structured_md_path")
+        )
+        instructor_freeform_md_bytes = _read_file_bytes(
+            state.get("result_instructor_freeform_md_path")
+        )
+        instructor_structured_txt_bytes = _read_file_bytes(
+            state.get("result_instructor_structured_txt_path")
+        )
+        instructor_freeform_txt_bytes = _read_file_bytes(
+            state.get("result_instructor_freeform_txt_path")
+        )
         map_jsonl_bytes = _read_file_bytes(state.get("map_summaries_jsonl_path"))
         reduce_jsonl_bytes = _read_file_bytes(state.get("reduce_summaries_jsonl_path"))
         llm_jsonl_bytes = _read_file_bytes(state.get("llm_calls_jsonl_path"))
@@ -4767,6 +4951,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             "- `report.html (интерактивный)` — интерактивная страница, похожая на финальный UI.",
                             "- `structured.md` — только структурированный итоговый отчёт.",
                             "- `freeform.md` — только свободная narrative-версия отчёта.",
+                            "- `instructor_structured.md` — тестовая structured-версия, собранная через Instructor.",
+                            "- `instructor_freeform.md` — тестовая freeform-версия, собранная через Instructor.",
                         ]
                     )
                 )
@@ -4818,6 +5004,28 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     mime="text/markdown",
                     use_container_width=True,
                 )
+            if (
+                instructor_structured_md_bytes is not None
+                and state.get("result_instructor_structured_md_path")
+            ):
+                st.download_button(
+                    label="Скачать instructor_structured.md",
+                    data=instructor_structured_md_bytes,
+                    file_name=Path(str(state.get("result_instructor_structured_md_path"))).name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            if (
+                instructor_freeform_md_bytes is not None
+                and state.get("result_instructor_freeform_md_path")
+            ):
+                st.download_button(
+                    label="Скачать instructor_freeform.md",
+                    data=instructor_freeform_md_bytes,
+                    file_name=Path(str(state.get("result_instructor_freeform_md_path"))).name,
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
         with artifact_tabs[1]:
             with st.expander("Что в этих файлах", expanded=False):
                 st.markdown(
@@ -4825,6 +5033,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         [
                             "- `structured.txt` — plain text структурированного отчёта (без markdown).",
                             "- `freeform.txt` — plain text свободного narrative-отчёта.",
+                            "- `instructor_structured.txt` — plain text Instructor structured-отчёта.",
+                            "- `instructor_freeform.txt` — plain text Instructor freeform-отчёта.",
                             "- `rebuild_reduce.md` — отчёт пересборки reduce (если запускалась пересборка).",
                         ]
                     )
@@ -4842,6 +5052,28 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     label="Скачать freeform.txt",
                     data=freeform_txt_bytes,
                     file_name=Path(str(state.get("result_freeform_txt_path"))).name,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            if (
+                instructor_structured_txt_bytes is not None
+                and state.get("result_instructor_structured_txt_path")
+            ):
+                st.download_button(
+                    label="Скачать instructor_structured.txt",
+                    data=instructor_structured_txt_bytes,
+                    file_name=Path(str(state.get("result_instructor_structured_txt_path"))).name,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            if (
+                instructor_freeform_txt_bytes is not None
+                and state.get("result_instructor_freeform_txt_path")
+            ):
+                st.download_button(
+                    label="Скачать instructor_freeform.txt",
+                    data=instructor_freeform_txt_bytes,
+                    file_name=Path(str(state.get("result_instructor_freeform_txt_path"))).name,
                     mime="text/plain",
                     use_container_width=True,
                 )
@@ -6668,6 +6900,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "structured_sections": [],
         "freeform_final_summary": None,
         "freeform_sections": [],
+        "instructor_structured_summary": None,
+        "instructor_freeform_summary": None,
+        "instructor_structured_sections": [],
+        "instructor_freeform_sections": [],
+        "instructor_report_status": "",
+        "instructor_report_error": "",
+        "instructor_report_notes": "",
+        "instructor_report_attempts": 0,
         "final_report_ready": False,
         "metrics_rows": 0,
         "metrics_services": [],
@@ -6682,6 +6922,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "result_freeform_md_path": None,
         "result_structured_txt_path": None,
         "result_freeform_txt_path": None,
+        "result_instructor_structured_md_path": None,
+        "result_instructor_freeform_md_path": None,
+        "result_instructor_structured_txt_path": None,
+        "result_instructor_freeform_txt_path": None,
         "rebuild_reduce_path": None,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
@@ -6754,6 +6998,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "structured_sections",
                 "freeform_final_summary",
                 "freeform_sections",
+                "instructor_structured_summary",
+                "instructor_freeform_summary",
+                "instructor_structured_sections",
+                "instructor_freeform_sections",
+                "instructor_report_status",
+                "instructor_report_error",
+                "instructor_report_notes",
+                "instructor_report_attempts",
                 "final_report_ready",
                 "result_json_path",
                 "result_bundle_path",
@@ -6763,6 +7015,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "result_freeform_md_path",
                 "result_structured_txt_path",
                 "result_freeform_txt_path",
+                "result_instructor_structured_md_path",
+                "result_instructor_freeform_md_path",
+                "result_instructor_structured_txt_path",
+                "result_instructor_freeform_txt_path",
                 "report_progress_current",
                 "report_progress_total",
                 "report_progress_label",
@@ -8554,7 +8810,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state["final_summary_origin"] = "final_recovery_join"
                 state["final_summary"] = final_summary_for_report
 
-        report_steps_total = len(FINAL_REPORT_SECTIONS) * 2 + 4
+        report_steps_total = len(FINAL_REPORT_SECTIONS) * 2 + 4 + (2 if use_instructor else 0)
 
         def _set_report_progress(
             label: str,
@@ -8790,6 +9046,95 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         if _safe_int(state.get("report_progress_total"), 0) > 0:
             _set_report_progress("Синхронизация топиков завершена", step_inc=1, render_now=True)
 
+        # Additional experimental stage (does not replace default reports):
+        # generate one more final report pair via Instructor for A/B testing.
+        if use_instructor and final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
+            try:
+                state["llm_phase_hint"] = "final_instructor_report"
+                state["active_source_label"] = "final_instructor_report"
+                state["instructor_report_status"] = "running"
+                state["instructor_report_error"] = ""
+                _set_report_progress(
+                    "Instructor-отчёт: старт",
+                    step_inc=1,
+                    render_now=True,
+                )
+                state.setdefault("events", []).append(
+                    "Запускаем дополнительную Instructor-генерацию финального отчёта (для сравнения)."
+                )
+                from my_summarizer import (  # noqa: PLC0415
+                    generate_final_reports_with_instructor,
+                )
+
+                instructor_bundle = generate_final_reports_with_instructor(
+                    base_structured_report=_normalize_summary_text(state.get("final_summary")),
+                    base_freeform_report=_normalize_summary_text(state.get("freeform_final_summary")),
+                    user_goal=goal_text,
+                    period_start=period_start_iso,
+                    period_end=period_end_iso,
+                    stats=state.get("stats") or {},
+                    metrics_context=metrics_context_text,
+                    section_titles=[title for title, _ in FINAL_REPORT_SECTIONS],
+                    llm_timeout=float(max(llm_timeout, 10)),
+                    llm_max_retries=int(max_retries),
+                    model_supports_tool_calling=bool(model_supports_tool_calling),
+                )
+                instructor_structured = _normalize_summary_text(
+                    instructor_bundle.get("structured_report")
+                )
+                instructor_freeform = _normalize_summary_text(
+                    instructor_bundle.get("freeform_report")
+                )
+                state["instructor_structured_summary"] = instructor_structured
+                state["instructor_freeform_summary"] = instructor_freeform
+                state["instructor_structured_sections"] = list(
+                    instructor_bundle.get("structured_sections") or []
+                )
+                state["instructor_freeform_sections"] = list(
+                    instructor_bundle.get("freeform_sections") or []
+                )
+                state["instructor_report_notes"] = _normalize_summary_text(
+                    instructor_bundle.get("notes")
+                )
+                state["instructor_report_attempts"] = _safe_int(
+                    instructor_bundle.get("attempts"),
+                    0,
+                )
+                if instructor_structured or instructor_freeform:
+                    state["instructor_report_status"] = "done"
+                    state.setdefault("events", []).append(
+                        "Instructor-версия финального отчёта готова."
+                    )
+                else:
+                    state["instructor_report_status"] = "empty"
+                    state.setdefault("events", []).append(
+                        "Instructor-версия финального отчёта вернула пустой результат."
+                    )
+                _set_report_progress(
+                    "Instructor-отчёт: этап завершён",
+                    step_inc=1,
+                    render_now=True,
+                )
+            except Exception as instructor_exc:  # noqa: BLE001
+                deps.logger.warning(
+                    "instructor final report generation failed: %s",
+                    instructor_exc,
+                )
+                state["instructor_report_status"] = "error"
+                state["instructor_report_error"] = str(instructor_exc)
+                state.setdefault("events", []).append(
+                    "Instructor-генерация финального отчёта завершилась ошибкой; основной отчёт сохранён."
+                )
+                _set_report_progress(
+                    "Instructor-отчёт: ошибка, продолжаем сохранение",
+                    step_inc=1,
+                    render_now=True,
+                )
+        elif not use_instructor:
+            state["instructor_report_status"] = "disabled"
+        else:
+            state["instructor_report_status"] = "skipped_no_data"
+
         final_structured_now = _normalize_summary_text(state.get("final_summary"))
         if final_structured_now:
             _write_text_file(
@@ -8899,6 +9244,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     state["result_freeform_md_path"] = saved.get("freeform_md_path")
     state["result_structured_txt_path"] = saved.get("structured_txt_path")
     state["result_freeform_txt_path"] = saved.get("freeform_txt_path")
+    state["result_instructor_structured_md_path"] = saved.get("instructor_structured_md_path")
+    state["result_instructor_freeform_md_path"] = saved.get("instructor_freeform_md_path")
+    state["result_instructor_structured_txt_path"] = saved.get("instructor_structured_txt_path")
+    state["result_instructor_freeform_txt_path"] = saved.get("instructor_freeform_txt_path")
     _persist_checkpoint(session_checkpoint_path, state)
     st.session_state[LAST_STATE_SESSION_KEY] = state
     st.session_state[RUNNING_SESSION_KEY] = False

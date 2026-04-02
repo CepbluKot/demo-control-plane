@@ -7,6 +7,8 @@ import pandas as pd
 import requests
 
 from my_summarizer import (
+    InstructorFinalReportSection,
+    InstructorFinalReports,
     MapBatchSummaryModel,
     PeriodLogSummarizer,
     SummarizerConfig,
@@ -16,6 +18,7 @@ from my_summarizer import (
     _render_logs_query,
     build_cross_source_reduce_prompt,
     communicate_with_llm,
+    generate_final_reports_with_instructor,
     regenerate_reduce_summary_from_map_summaries,
     summarize_logs,
 )
@@ -1691,6 +1694,68 @@ class TestMySummarizer(unittest.TestCase):
         )
         map_start_payload = next(payload for event, payload in progress_events if event == "map_start")
         self.assertNotIn("token_budget", map_start_payload)
+
+    def test_generate_final_reports_with_instructor_returns_model_reports(self) -> None:
+        parsed = InstructorFinalReports(
+            structured_report="STRUCTURED_V2",
+            freeform_report="FREEFORM_V2",
+            notes="ok",
+        )
+        with patch.object(
+            PeriodLogSummarizer,
+            "_call_structured_with_instructor",
+            return_value=(parsed, 2),
+        ) as mocked_call:
+            out = generate_final_reports_with_instructor(
+                base_structured_report="old-structured",
+                base_freeform_report="old-freeform",
+                user_goal="incident context",
+                period_start="2026-03-25T10:00:00+03:00",
+                period_end="2026-03-25T11:00:00+03:00",
+                stats={"rows": 10},
+                metrics_context="cpu up",
+                section_titles=["1. Context", "2. Summary"],
+                llm_timeout=600.0,
+                llm_max_retries=-1,
+                model_supports_tool_calling=True,
+            )
+
+        self.assertEqual(out["structured_report"], "STRUCTURED_V2")
+        self.assertEqual(out["freeform_report"], "FREEFORM_V2")
+        self.assertEqual(out["notes"], "ok")
+        self.assertEqual(out["attempts"], 2)
+        mocked_call.assert_called_once()
+
+    def test_generate_final_reports_with_instructor_builds_reports_from_sections(self) -> None:
+        parsed = InstructorFinalReports(
+            structured_report="",
+            freeform_report="",
+            structured_sections=[
+                InstructorFinalReportSection(title="Structured Block", text="Structured text"),
+            ],
+            freeform_sections=[
+                InstructorFinalReportSection(title="Freeform Block", text="Freeform text"),
+            ],
+        )
+        with patch.object(
+            PeriodLogSummarizer,
+            "_call_structured_with_instructor",
+            return_value=(parsed, 1),
+        ):
+            out = generate_final_reports_with_instructor(
+                base_structured_report="old-structured",
+                base_freeform_report="old-freeform",
+                user_goal="incident context",
+                period_start="2026-03-25T10:00:00+03:00",
+                period_end="2026-03-25T11:00:00+03:00",
+                section_titles=["1. Context"],
+            )
+
+        self.assertIn("## Structured Block", out["structured_report"])
+        self.assertIn("Structured text", out["structured_report"])
+        self.assertIn("## Freeform Block", out["freeform_report"])
+        self.assertIn("Freeform text", out["freeform_report"])
+        self.assertEqual(out["attempts"], 1)
 
 
 if __name__ == "__main__":

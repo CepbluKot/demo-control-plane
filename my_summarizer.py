@@ -550,6 +550,29 @@ class MapBatchSummaryModel(BaseModel):
         return self
 
 
+class InstructorFinalReportSection(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str
+    text: str
+
+
+class InstructorFinalReports(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    structured_sections: List[InstructorFinalReportSection] = Field(default_factory=list)
+    freeform_sections: List[InstructorFinalReportSection] = Field(default_factory=list)
+    structured_report: str = ""
+    freeform_report: str = ""
+    notes: str = ""
+
+    @model_validator(mode="after")
+    def _validate_non_empty(self) -> "InstructorFinalReports":
+        if not str(self.structured_report or "").strip() and not self.structured_sections:
+            raise ValueError("structured report is empty")
+        if not str(self.freeform_report or "").strip() and not self.freeform_sections:
+            raise ValueError("freeform report is empty")
+        return self
+
+
 def _normalize_summary_text(value: Any) -> str:
     text = str(value or "").strip()
     if text.lower() in {"none", "null", "nan"}:
@@ -3650,6 +3673,105 @@ def build_cross_source_reduce_prompt(
         source_summaries_text,
     ]
     return _append_chain_requirement("\n".join(lines).strip(), "cross")
+
+
+def _sections_to_markdown(sections: Sequence[InstructorFinalReportSection]) -> str:
+    parts: List[str] = []
+    for section in sections:
+        title = str(getattr(section, "title", "") or "").strip() or "Untitled"
+        text = _normalize_summary_text(getattr(section, "text", ""))
+        parts.extend([f"## {title}", "", text or "Данных недостаточно.", ""])
+    return "\n".join(parts).strip()
+
+
+def generate_final_reports_with_instructor(
+    *,
+    base_structured_report: str,
+    base_freeform_report: str,
+    user_goal: str,
+    period_start: str,
+    period_end: str,
+    stats: Optional[Dict[str, Any]] = None,
+    metrics_context: str = "",
+    section_titles: Optional[Sequence[str]] = None,
+    llm_timeout: float = 600.0,
+    llm_max_retries: int = -1,
+    model_supports_tool_calling: bool = True,
+) -> Dict[str, Any]:
+    """
+    Optional post-processing stage:
+    after default final report generation, build an alternative final report
+    using Instructor + Pydantic (for A/B testing quality).
+    """
+    helper = PeriodLogSummarizer(
+        db_fetch_page=lambda **_: [],
+        llm_call=lambda _prompt: "",
+        config=SummarizerConfig(
+            use_instructor=True,
+            model_supports_tool_calling=bool(model_supports_tool_calling),
+        ),
+        prompt_context={
+            "llm_timeout": float(max(llm_timeout, 1.0)),
+            "llm_max_retries": int(llm_max_retries),
+        },
+    )
+    titles = [str(item).strip() for item in (section_titles or []) if str(item).strip()]
+    titles_block = (
+        "\n".join(f"- {idx + 1}. {title}" for idx, title in enumerate(titles))
+        if titles
+        else "Без фиксированного списка."
+    )
+    prompt = "\n".join(
+        [
+            "Сформируй ДВЕ версии итогового расследования в строгом JSON формате response_model:",
+            "1) structured_report / structured_sections",
+            "2) freeform_report / freeform_sections",
+            "",
+            "Обе версии должны покрывать одинаковые ключевые темы и быть согласованными.",
+            "Нельзя терять связь с инцидентами из пользовательского контекста.",
+            "В хронологии и цепочках обязательно указывай полные даты/время с timezone.",
+            "",
+            "ОЖИДАЕМЫЕ СЕКЦИИ:",
+            titles_block,
+            "",
+            "КОНТЕКСТ ИНЦИДЕНТА (UI):",
+            str(user_goal or "").strip() or "n/a",
+            "",
+            f"ПЕРИОД: [{period_start}, {period_end})",
+            f"METRICS CONTEXT: {str(metrics_context or '').strip() or 'n/a'}",
+            f"STATS: {json.dumps(stats or {}, ensure_ascii=False, default=str)}",
+            "",
+            "ТЕКУЩИЙ STRUCTURED REPORT (база):",
+            str(base_structured_report or "").strip() or "n/a",
+            "",
+            "ТЕКУЩИЙ FREEFORM REPORT (база):",
+            str(base_freeform_report or "").strip() or "n/a",
+            "",
+            "Важно:",
+            "- structured_sections и freeform_sections: список секций (title + text).",
+            "- structured_report и freeform_report: полные markdown-тексты.",
+            "- Если текста нет, собери его из секций.",
+        ]
+    )
+    parsed, attempts = helper._call_structured_with_instructor(
+        prompt=prompt,
+        response_model=InstructorFinalReports,
+        stage="final_report",
+    )
+    structured_text = _normalize_summary_text(parsed.structured_report)
+    freeform_text = _normalize_summary_text(parsed.freeform_report)
+    if not structured_text and parsed.structured_sections:
+        structured_text = _sections_to_markdown(parsed.structured_sections)
+    if not freeform_text and parsed.freeform_sections:
+        freeform_text = _sections_to_markdown(parsed.freeform_sections)
+    return {
+        "structured_report": structured_text,
+        "freeform_report": freeform_text,
+        "structured_sections": [item.model_dump(mode="json") for item in parsed.structured_sections],
+        "freeform_sections": [item.model_dump(mode="json") for item in parsed.freeform_sections],
+        "notes": _normalize_summary_text(parsed.notes),
+        "attempts": int(max(attempts, 1)),
+    }
 
 
 def regenerate_reduce_summary_from_map_summaries(

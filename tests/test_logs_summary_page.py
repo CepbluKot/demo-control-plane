@@ -498,6 +498,38 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             self.assertIn("structured_txt_path", saved)
             self.assertIn("freeform_txt_path", saved)
 
+    def test_save_logs_summary_result_writes_instructor_reports_when_present(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            saved = _save_logs_summary_result(
+                output_dir=Path(tmp_dir),
+                request_payload={"x": 1},
+                result_state={
+                    "status": "done",
+                    "mode": "db",
+                    "period_start": "2026-03-18T00:00:00Z",
+                    "period_end": "2026-03-18T01:00:00Z",
+                    "final_summary": "structured summary",
+                    "freeform_final_summary": "freeform summary",
+                    "instructor_structured_summary": "instructor structured summary",
+                    "instructor_freeform_summary": "instructor freeform summary",
+                    "logs_processed": 10,
+                    "logs_total": 10,
+                    "stats": {"llm_calls": 2},
+                    "error": None,
+                },
+            )
+            self.assertIn("instructor_structured_md_path", saved)
+            self.assertIn("instructor_freeform_md_path", saved)
+            self.assertIn("instructor_structured_txt_path", saved)
+            self.assertIn("instructor_freeform_txt_path", saved)
+            self.assertTrue(Path(saved["instructor_structured_md_path"]).exists())
+            self.assertTrue(Path(saved["instructor_freeform_md_path"]).exists())
+            md_text = Path(saved["summary_path"]).read_text(encoding="utf-8")
+            self.assertIn("Final Summary (Instructor Structured)", md_text)
+            self.assertIn("instructor structured summary", md_text)
+            self.assertIn("Final Summary (Instructor Freeform)", md_text)
+            self.assertIn("instructor freeform summary", md_text)
+
     def test_extract_request_result_from_bundle_supports_portable_and_legacy_json(self) -> None:
         portable = {
             "bundle_type": PORTABLE_BUNDLE_TYPE,
@@ -672,6 +704,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "eta_seconds_left": 99,
                 "log_seconds_per_second": 12.5,
                 "final_summary_origin": "manual_rereduce",
+                "instructor_report_status": "done",
+                "instructor_structured_summary": "s2",
                 "events": ["x"],
             }
         )
@@ -684,6 +718,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(payload["state"]["eta_seconds_left"], 99)
         self.assertEqual(payload["state"]["log_seconds_per_second"], 12.5)
         self.assertEqual(payload["state"]["final_summary_origin"], "manual_rereduce")
+        self.assertEqual(payload["state"]["instructor_report_status"], "done")
+        self.assertEqual(payload["state"]["instructor_structured_summary"], "s2")
 
     def test_discover_resume_sessions_reads_run_params(self) -> None:
         with TemporaryDirectory() as tmp_dir:
