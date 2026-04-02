@@ -1665,10 +1665,16 @@ class PeriodLogSummarizer:
     ) -> List[List[Dict[str, Any]]]:
         if not rows:
             return []
-        # New algorithm works without local token estimation and does not pre-split
-        # batches by estimated token size. Split-on-overflow is handled only after
-        # actual LLM 400/timeouts.
-        return [rows]
+        _ = columns  # reserved for future split rules by column content.
+        # Updated behavior: we still do not estimate tokens locally, but we MUST
+        # honor explicit row cap per single MAP LLM call.
+        max_rows_per_call = max(int(getattr(self.config, "llm_chunk_rows", 200) or 200), 1)
+        if len(rows) <= max_rows_per_call:
+            return [rows]
+        return [
+            rows[i : i + max_rows_per_call]
+            for i in range(0, len(rows), max_rows_per_call)
+        ]
 
     @staticmethod
     def _normalize_incident_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2575,7 +2581,8 @@ class PeriodLogSummarizer:
                 )
 
                 if bool(getattr(self.config, "use_new_algorithm", False)):
-                    # Updated algorithm: one DB page == one map batch (no local token pre-splitting).
+                    # Updated algorithm: one DB page is fetched as-is, then split only by
+                    # explicit row cap (`llm_chunk_rows`) without local token estimation.
                     base_chunks: List[List[Dict[str, Any]]] = [list(page)]
                 else:
                     base_chunks = [

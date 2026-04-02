@@ -4081,6 +4081,10 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
         )
 
         stats = state.get("stats") or {}
+        map_batches = state.get("map_batches")
+        if not isinstance(map_batches, list):
+            map_batches = []
+        _done_batches, batch_total = _resolve_map_batches_progress(state, map_batches)
         rows_processed = int(pd.to_numeric(state.get("logs_processed"), errors="coerce") or 0)
         rows_total = pd.to_numeric(state.get("logs_total"), errors="coerce")
         llm_calls = int(pd.to_numeric(stats.get("llm_calls", 0), errors="coerce") or 0)

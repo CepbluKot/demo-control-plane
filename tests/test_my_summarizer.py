@@ -1698,16 +1698,19 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("timeline", parsed)
         self.assertFalse(bool(parsed.get("data_quality", {}).get("is_empty", True)))
 
-    def test_new_algorithm_map_does_not_pre_split_rows_locally(self) -> None:
+    def test_new_algorithm_map_respects_llm_chunk_rows_limit(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "ok",
-            config=SummarizerConfig(use_new_algorithm=True),
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=2),
         )
         rows = [{"timestamp": f"2026-03-25T10:00:0{i}+00:00", "message": f"log-{i}"} for i in range(5)]
         chunks = summarizer._split_rows_for_map(rows=rows, columns=["timestamp", "message"])
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0], rows)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual([len(chunk) for chunk in chunks], [2, 2, 1])
+        self.assertEqual(chunks[0], rows[:2])
+        self.assertEqual(chunks[1], rows[2:4])
+        self.assertEqual(chunks[2], rows[4:])
 
     def test_new_algorithm_reduce_groups_use_fixed_group_size(self) -> None:
         def _mk_summary_obj(batch_id: str):
