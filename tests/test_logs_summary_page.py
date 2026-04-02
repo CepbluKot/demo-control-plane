@@ -47,6 +47,7 @@ from ui.pages.logs_summary_page import (
     _summary_origin_label,
     _write_json_file,
     _save_logs_summary_result,
+    _split_demo_logs_by_source,
 )
 import pandas as pd
 
@@ -119,6 +120,30 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             str(formatted.loc[0, "end_time"]),
             "2026-03-18 03:00:01.987654 MSK",
         )
+
+    def test_split_demo_logs_by_source_partitions_rows_without_loss(self) -> None:
+        demo_logs = [
+            {"timestamp": "2026-03-18T00:00:00Z", "message": "m1"},
+            {"timestamp": "2026-03-18T00:00:01Z", "message": "m2"},
+            {"timestamp": "2026-03-18T00:00:02Z", "message": "m3"},
+            {"timestamp": "2026-03-18T00:00:03Z", "message": "m4"},
+            {"timestamp": "2026-03-18T00:00:04Z", "message": "m5"},
+        ]
+        grouped = _split_demo_logs_by_source(demo_logs, ["query_1", "query_2"])
+        self.assertEqual(sorted(grouped.keys()), ["query_1", "query_2"])
+        self.assertEqual(len(grouped["query_1"]), 3)
+        self.assertEqual(len(grouped["query_2"]), 2)
+        merged_messages = [row["message"] for row in grouped["query_1"] + grouped["query_2"]]
+        self.assertEqual(sorted(merged_messages), ["m1", "m2", "m3", "m4", "m5"])
+
+    def test_split_demo_logs_by_source_single_label_keeps_all_rows(self) -> None:
+        demo_logs = [
+            {"timestamp": "2026-03-18T00:00:00Z", "message": "m1"},
+            {"timestamp": "2026-03-18T00:00:01Z", "message": "m2"},
+        ]
+        grouped = _split_demo_logs_by_source(demo_logs, ["query_1"])
+        self.assertEqual(list(grouped.keys()), ["query_1"])
+        self.assertEqual([row["message"] for row in grouped["query_1"]], ["m1", "m2"])
 
     def test_summary_origin_label_maps_known_and_unknown_values(self) -> None:
         self.assertEqual(
@@ -524,6 +549,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIsNone(imported.get("result_summary_path"))
         self.assertIsNone(imported.get("result_html_path"))
         self.assertEqual(imported.get("final_summary"), "summary")
+        self.assertTrue(imported.get("final_report_ready"))
 
     def test_build_saved_params_from_import_request_prefills_form_fields(self) -> None:
         saved_params = _build_saved_params_from_import_request(
@@ -539,6 +565,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "db_batch_size": 1200,
                 "llm_batch_size": 300,
                 "llm_model_id": "model-x",
+                "use_instructor": False,
+                "model_supports_tool_calling": False,
                 "enable_no_logs_hypothesis": True,
             },
             center_default="2026-03-01T00:00:00+03:00",
@@ -552,6 +580,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(saved_params["db_batch_size"], 1200)
         self.assertEqual(saved_params["llm_batch_size"], 300)
         self.assertEqual(saved_params["llm_model_id"], "model-x")
+        self.assertFalse(saved_params["use_instructor"])
+        self.assertFalse(saved_params["model_supports_tool_calling"])
         self.assertTrue(saved_params["enable_no_logs_hypothesis"])
 
     def test_build_saved_params_from_import_request_legacy_sql_fields(self) -> None:
@@ -800,6 +830,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "end_dt_text": "2026-03-30T11:00:00+03:00",
                 "db_batch_size": 1234,
                 "llm_batch_size": 321,
+                "use_instructor": False,
+                "model_supports_tool_calling": False,
                 "map_workers": 4,
                 "max_retries": 7,
                 "llm_timeout": 111,
@@ -817,6 +849,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertGreaterEqual(len(mapped["alerts"]), 1)
         self.assertEqual(mapped["logs_sum_window_minutes"], 45)
         self.assertEqual(mapped["logs_sum_llm_batch"], 321)
+        self.assertFalse(mapped["logs_sum_use_instructor"])
+        self.assertFalse(mapped["logs_sum_model_supports_tool_calling"])
         self.assertFalse(mapped["logs_sum_parallel_map"])
         self.assertEqual(mapped["logs_sum_map_workers"], 1)
         self.assertTrue(mapped["logs_sum_demo_mode"])
@@ -981,6 +1015,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT": 33,
             "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD": 0.81,
             "CONTROL_PLANE_LLM_USE_INSTRUCTOR": False,
+            "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING": False,
         }
         with patch.multiple(settings, **overrides):
             cfg = _build_config(deps, db_batch_size=1000, llm_batch_size=250, map_workers=3)
@@ -990,6 +1025,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(cfg["compression_target_pct"], 33)
         self.assertAlmostEqual(float(cfg["compression_importance_threshold"]), 0.81, places=6)
         self.assertFalse(cfg["use_instructor"])
+        self.assertFalse(cfg["model_supports_tool_calling"])
         self.assertEqual(cfg["page_limit"], 1000)
         self.assertEqual(cfg["llm_chunk_rows"], 250)
         self.assertEqual(cfg["map_workers"], 3)

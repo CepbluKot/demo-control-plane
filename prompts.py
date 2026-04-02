@@ -90,6 +90,23 @@ Analyze the log entries and produce a structured summary. Follow these rules pre
 ### Preliminary recommendations
 - If a specific fix is obvious from the data, record it. These are drafts — they'll be re-evaluated later.
 - action must be concrete and actionable: "Increase PostgreSQL connection pool from 50 to 150 on api-gateway", not "Look at the database".
+
+## Output format (STRICT, mandatory)
+- Return ONLY one valid JSON object.
+- No markdown fences, no prose before/after JSON, no comments.
+- Top-level keys must be exactly:
+  context, timeline, causal_links, alert_refs, hypotheses, pinned_facts, gaps, impact, conflicts, data_quality, preliminary_recommendations
+- Keep references valid:
+  - every `cause_event_id`/`effect_event_id` must exist in `timeline[*].id`
+  - `alert_refs[*].related_events` must reference existing timeline ids
+  - `hypotheses[*].supporting_events` / `contradicting_events` must reference existing timeline ids
+  - `preliminary_recommendations[*].related_hypothesis_ids` must reference existing hypothesis ids
+- Allowed enum values:
+  - evidence_type: FACT | HYPOTHESIS
+  - severity: critical | high | medium | low
+  - alert status: EXPLAINED | PARTIALLY | NOT_EXPLAINED | NOT_SEEN_IN_BATCH
+  - hypothesis status: active | merged | conflicting | dismissed
+  - recommendation priority: P0 | P1 | P2
 """
 
 MAP_USER_PROMPT = """\

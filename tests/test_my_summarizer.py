@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 
 from my_summarizer import (
+    MapBatchSummaryModel,
     PeriodLogSummarizer,
     SummarizerConfig,
     _make_llm_call,
@@ -18,6 +19,7 @@ from my_summarizer import (
     regenerate_reduce_summary_from_map_summaries,
     summarize_logs,
 )
+from schemas import IncidentSummary
 from settings import settings
 
 
@@ -98,6 +100,42 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("max_tokens", calls[0]["json"])
         self.assertNotIn("max_tokens", calls[1]["json"])
+
+    def test_communicate_with_llm_includes_exact_response_body_in_http_error(self) -> None:
+        class _FakeResponse:
+            def __init__(self):
+                self.status_code = 400
+                self.url = "https://example.test/v1/chat/completions"
+                self.text = '{"error":{"message":"context too large","code":"bad_request"}}'
+
+            def raise_for_status(self):
+                raise requests.exceptions.HTTPError(
+                    "400 Client Error: Bad Request for url: https://example.test/v1/chat/completions",
+                    response=self,
+                )
+
+            def json(self):
+                return {"error": {"message": "context too large", "code": "bad_request"}}
+
+        config_overrides = {
+            "OPENAI_API_BASE_DB": "https://example.test/v1",
+            "OPENAI_API_KEY_DB": "secret",
+            "LLM_MODEL_ID": "demo-model",
+            "CONTROL_PLANE_LLM_MAX_TOKENS": 0,
+            "CONTROL_PLANE_LLM_CONTINUE_ON_LENGTH": True,
+            "CONTROL_PLANE_LLM_CONTINUE_MAX_ROUNDS": 2,
+        }
+        with patch.multiple(settings, **config_overrides), patch(
+            "my_summarizer.requests.post",
+            return_value=_FakeResponse(),
+        ):
+            with self.assertRaises(requests.exceptions.HTTPError) as cm:
+                communicate_with_llm("prompt", timeout=10.0)
+
+        msg = str(cm.exception)
+        self.assertIn("400 Client Error: Bad Request", msg)
+        self.assertIn("RESPONSE_BODY:", msg)
+        self.assertIn('"context too large"', msg)
 
     def test_make_llm_call_does_not_retry_non_retryable_400(self) -> None:
         class _Resp:
@@ -663,6 +701,29 @@ class TestMySummarizer(unittest.TestCase):
         )
         self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
 
+    def test_new_algorithm_map_prompt_requires_strict_json_output(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_new_algorithm=True),
+        )
+        prompt = summarizer._build_chunk_prompt(
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            columns=["timestamp", "message"],
+            rows=[
+                {
+                    "timestamp": "2026-03-18T00:00:01Z",
+                    "message": "error timeout to redis",
+                }
+            ],
+            batch_number=1,
+            total_batches=3,
+        )
+        self.assertIn("Output format (STRICT, mandatory)", prompt)
+        self.assertIn("Return ONLY one valid JSON object.", prompt)
+        self.assertIn("Top-level keys must be exactly", prompt)
+
     def test_truncate_with_zero_limit_keeps_text(self) -> None:
         text = "a" * 5000
         out = PeriodLogSummarizer._truncate(text, 0)
@@ -1092,6 +1153,128 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(payload["context"]["batch_id"], "batch-000001")
         self.assertEqual(payload["context"]["source_query"], ["SELECT * FROM logs"])
 
+    def test_map_summary_uses_instructor_structured_path_when_enabled(self) -> None:
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line"}]
+
+        map_model = MapBatchSummaryModel.model_validate(
+            {
+                "context": {
+                    "batch_id": "tmp",
+                    "time_range_start": "2026-03-25T10:00:00+00:00",
+                    "time_range_end": "2026-03-25T10:00:01+00:00",
+                    "total_log_entries": 1,
+                    "source_query": [],
+                    "source_services": [],
+                },
+                "timeline": [],
+                "causal_links": [],
+                "alert_refs": [],
+                "hypotheses": [],
+                "pinned_facts": [],
+                "gaps": [],
+                "impact": {},
+                "conflicts": [],
+                "data_quality": {
+                    "is_empty": True,
+                    "noise_ratio": 1.0,
+                    "has_gaps": False,
+                    "gap_periods": [],
+                    "notes": "",
+                },
+                "preliminary_recommendations": [],
+            }
+        )
+        llm_prompts: list[str] = []
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=lambda prompt: llm_prompts.append(prompt) or "FREEFORM",
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=200,
+                keep_map_summaries_in_result=True,
+                use_instructor=True,
+            ),
+            prompt_context={"sql_query": "SELECT * FROM logs"},
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            return_value=(map_model, 2),
+        ) as mocked_instructor:
+            result = summarizer.summarize_period(
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                columns=["timestamp", "message"],
+            )
+
+        self.assertTrue(mocked_instructor.called)
+        payload = json.loads(result.summary)
+        self.assertEqual(payload["context"]["batch_id"], "batch-000001")
+        self.assertEqual(payload["context"]["source_query"], ["SELECT * FROM logs"])
+        # One map structured call (2 attempts) + freeform call.
+        self.assertGreaterEqual(int(result.llm_calls), 3)
+        self.assertEqual(len(llm_prompts), 1)
+
+    def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
+        summary_payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        inp = IncidentSummary.model_validate(summary_payload)
+        out = IncidentSummary.model_validate(
+            {
+                **summary_payload,
+                "context": {
+                    **summary_payload["context"],
+                    "batch_id": "reduce-r1-g1",
+                },
+            }
+        )
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "legacy-path-should-not-be-used",
+            config=SummarizerConfig(use_instructor=True, use_new_algorithm=True),
+        )
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            return_value=(out, 1),
+        ) as mocked_instructor:
+            reduced, calls = summarizer._reduce_structured_group(
+                summaries=[inp, inp],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                reduce_round=1,
+                group_index=1,
+                group_total=1,
+                sources=None,
+            )
+
+        self.assertTrue(mocked_instructor.called)
+        self.assertEqual(calls, 1)
+        self.assertEqual(reduced.context.batch_id, "reduce-r1-g1")
+
     def test_map_summary_invalid_json_is_converted_to_degraded_structured_payload(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
             _ = (columns, period_start, period_end, limit)
@@ -1099,6 +1282,7 @@ class TestMySummarizer(unittest.TestCase):
                 return []
             return [{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line"}]
 
+        progress_events = []
         summarizer = PeriodLogSummarizer(
             db_fetch_page=_fake_fetch_page,
             llm_call=lambda _prompt: "not a json response",
@@ -1107,6 +1291,7 @@ class TestMySummarizer(unittest.TestCase):
                 llm_chunk_rows=200,
                 keep_map_summaries_in_result=True,
             ),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
         )
         result = summarizer.summarize_period(
             period_start="2026-03-25T10:00:00+00:00",
@@ -1118,6 +1303,75 @@ class TestMySummarizer(unittest.TestCase):
         notes_text = str(payload["data_quality"].get("notes", ""))
         self.assertTrue(notes_text)
         self.assertIn("Raw LLM map summary", notes_text)
+        event_names = [event for event, _ in progress_events]
+        self.assertIn("map_schema_retry", event_names)
+        self.assertIn("map_schema_degraded", event_names)
+        degraded_payload = next(
+            payload for event, payload in progress_events if event == "map_schema_degraded"
+        )
+        self.assertIn("raw_preview", degraded_payload)
+        self.assertIn("raw_len", degraded_payload)
+
+    def test_map_summary_schema_can_recover_after_retry(self) -> None:
+        def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit)
+            if offset > 0:
+                return []
+            return [{"timestamp": "2026-03-25T10:00:00+00:00", "message": "line"}]
+
+        valid_payload = json.dumps(
+            {
+                "context": {
+                    "batch_id": "batch-000001",
+                    "time_range_start": "2026-03-25T10:00:00+00:00",
+                    "time_range_end": "2026-03-25T10:00:01+00:00",
+                    "total_log_entries": 1,
+                    "source_query": [],
+                    "source_services": [],
+                },
+                "timeline": [],
+                "causal_links": [],
+                "alert_refs": [],
+                "hypotheses": [],
+                "pinned_facts": [],
+                "gaps": [],
+                "impact": {},
+                "conflicts": [],
+                "data_quality": {
+                    "is_empty": True,
+                    "noise_ratio": 1.0,
+                    "has_gaps": False,
+                    "gap_periods": [],
+                    "notes": "",
+                },
+                "preliminary_recommendations": [],
+            },
+            ensure_ascii=False,
+        )
+        llm_responses = iter(["not a json response", valid_payload])
+        progress_events = []
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fake_fetch_page,
+            llm_call=lambda _prompt: next(llm_responses),
+            config=SummarizerConfig(
+                page_limit=1000,
+                llm_chunk_rows=200,
+                keep_map_summaries_in_result=True,
+            ),
+            on_progress=lambda event, payload: progress_events.append((event, payload)),
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message"],
+        )
+        payload = json.loads(result.summary)
+        self.assertIn("data_quality", payload)
+        event_names = [event for event, _ in progress_events]
+        self.assertIn("map_schema_retry", event_names)
+        self.assertIn("map_schema_recovered", event_names)
+        self.assertNotIn("map_schema_degraded", event_names)
 
     def test_new_algorithm_reduce_uses_premerged_alert_refs(self) -> None:
         def _mk_summary(

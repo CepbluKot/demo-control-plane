@@ -79,6 +79,13 @@ MODEL_CONTEXT_PRESETS: Dict[str, int] = {
     "gpt-4o-mini": 128_000,
     "PNX.QWEN3 235b a22b instruct": 200_000,
 }
+
+
+def _default_llm_timeout_seconds() -> int:
+    return max(
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 600) or 600),
+        10,
+    )
 FINAL_REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
     (
         REPORT_CONTEXT_SECTION_TITLE,
@@ -1813,6 +1820,24 @@ def _build_demo_logs_for_window(
     return rows
 
 
+def _split_demo_logs_by_source(
+    demo_logs: List[Dict[str, Any]],
+    source_labels: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    labels = [str(label or "").strip() for label in source_labels if str(label or "").strip()]
+    if not labels:
+        return {}
+    if len(labels) == 1:
+        return {labels[0]: [dict(row) for row in demo_logs]}
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {label: [] for label in labels}
+    labels_count = len(labels)
+    for idx, row in enumerate(demo_logs):
+        label = labels[idx % labels_count]
+        grouped[label].append(dict(row))
+    return grouped
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1996,6 +2021,18 @@ def _form_values_from_saved_params(
         "logs_sum_user_goal": rendered_goal,
         "alerts": normalized_alerts,
         "logs_sum_model_id": str(saved_params.get("llm_model_id", getattr(settings, "LLM_MODEL_ID", ""))).strip(),
+        "logs_sum_use_instructor": bool(
+            saved_params.get(
+                "use_instructor",
+                getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True),
+            )
+        ),
+        "logs_sum_model_supports_tool_calling": bool(
+            saved_params.get(
+                "model_supports_tool_calling",
+                getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
+            )
+        ),
         "logs_sum_period_mode": str(
             saved_params.get("period_mode", "Явный диапазон (start/end)")
         ),
@@ -2012,7 +2049,10 @@ def _form_values_from_saved_params(
         "logs_sum_parallel_map": False,
         "logs_sum_map_workers": 1,
         "logs_sum_max_retries": _to_int(saved_params.get("max_retries", -1), -1),
-        "logs_sum_llm_timeout": _to_int(saved_params.get("llm_timeout", 600), 600),
+        "logs_sum_llm_timeout": _to_int(
+            saved_params.get("llm_timeout", _default_llm_timeout_seconds()),
+            _default_llm_timeout_seconds(),
+        ),
         "logs_sum_demo_mode": bool(saved_params.get("demo_mode", False)),
         "logs_sum_demo_logs_count": _to_int(saved_params.get("demo_logs_count", 4000), 4000),
         "logs_sum_enable_no_logs_hypothesis": bool(
@@ -2072,6 +2112,7 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "structured_sections",
         "freeform_final_summary",
         "freeform_sections",
+        "final_report_ready",
         "result_json_path",
         "result_bundle_path",
         "result_summary_path",
@@ -2200,6 +2241,11 @@ def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any
     state.setdefault("reduce_nodes", [])
     state.setdefault("structured_sections", [])
     state.setdefault("freeform_sections", [])
+    state.setdefault(
+        "final_report_ready",
+        bool(_normalize_summary_text(state.get("final_summary")))
+        or bool(_normalize_summary_text(state.get("freeform_final_summary"))),
+    )
     state.setdefault("report_progress_current", 0)
     state.setdefault("report_progress_total", 0)
     state.setdefault("report_progress_label", "")
@@ -2268,8 +2314,20 @@ def _build_saved_params_from_import_request(
             1000,
         ),
         "llm_model_id": str(request.get("llm_model_id") or getattr(settings, "LLM_MODEL_ID", "")).strip(),
+        "use_instructor": bool(
+            request.get(
+                "use_instructor",
+                getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True),
+            )
+        ),
+        "model_supports_tool_calling": bool(
+            request.get(
+                "model_supports_tool_calling",
+                getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
+            )
+        ),
         "max_retries": _safe_int(request.get("max_retries"), -1),
-        "llm_timeout": _safe_int(request.get("llm_timeout"), 600),
+        "llm_timeout": _safe_int(request.get("llm_timeout"), _default_llm_timeout_seconds()),
         "demo_mode": bool(request.get("demo_mode", False)),
         "demo_logs_count": _safe_int(request.get("demo_logs_count"), 4000),
         "enable_no_logs_hypothesis": bool(request.get("enable_no_logs_hypothesis", False)),
@@ -4372,6 +4430,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             state["freeform_final_summary"] = rebuilt_freeform
                             state["freeform_sections"] = rebuilt_freeform_sections
                         state.setdefault("events", []).append("Режим: пересборка только финального отчёта")
+                        state["final_report_ready"] = True
                         request_payload_for_save = {}
                         request_path = Path(str(state.get("request_path") or ""))
                         loaded_request = _read_json_file(request_path)
@@ -4457,6 +4516,22 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                         )
                                         or deps.map_workers
                                     ),
+                                    use_instructor=bool(
+                                        state.get(
+                                            "use_instructor",
+                                            getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True),
+                                        )
+                                    ),
+                                    model_supports_tool_calling=bool(
+                                        state.get(
+                                            "model_supports_tool_calling",
+                                            getattr(
+                                                settings,
+                                                "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING",
+                                                True,
+                                            ),
+                                        )
+                                    ),
                                 ),
                                 prompt_context={
                                     "incident_start": str(state.get("period_start") or ""),
@@ -4468,6 +4543,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                     "sql_query": str(state.get("query") or ""),
                                     "time_column": str(state.get("logs_timestamp_column") or "timestamp"),
                                     "data_type": "",
+                                    "llm_timeout": int(timeout_value),
+                                    "llm_max_retries": int(retries_value),
                                 },
                             )
                         rebuilt_summary = _normalize_summary_text(rebuilt_summary)
@@ -4585,6 +4662,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 state.setdefault("events", []).append(
                                     "Manual re-reduce: добавили недостающие топики в свободный отчет"
                                 )
+                            state["final_report_ready"] = True
                             rebuild_path = (
                                 Path(map_summaries_path).parent
                                 / f"rebuild_reduce_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.md"
@@ -5100,10 +5178,19 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     summary_line += f" | {duration_sec:.1f}s"
                 summary_line += f" | {status_text}"
                 with st.expander(summary_line, expanded=False):
-                    if not isinstance(payload, dict) or not payload:
-                        deps.render_pretty_summary_text(item.get("batch_summary", ""), height=max(deps.summary_text_height, 220))
-                        continue
-                    tab_events, tab_hyp, tab_alerts = st.tabs(["События", "Гипотезы", "Алерты"])
+                    has_structured_payload = isinstance(payload, dict) and bool(payload)
+                    dq_notes = str((data_quality or {}).get("notes") or "").strip()
+                    if dq_notes:
+                        st.caption("Data quality notes:")
+                        deps.render_scrollable_text(dq_notes, height=120)
+                    if not has_structured_payload:
+                        st.info(
+                            "LLM вернула неструктурированный summary для этого батча. "
+                            "Сырые логи батча доступны во вкладке `Логи Батча`."
+                        )
+                    tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
+                        ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                    )
                     with tab_events:
                         if isinstance(timeline, list) and timeline:
                             events_df = pd.DataFrame(timeline)
@@ -5117,6 +5204,11 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                 use_container_width=True,
                                 hide_index=True,
                                 height=220,
+                            )
+                        elif str(item.get("batch_summary") or "").strip():
+                            deps.render_pretty_summary_text(
+                                item.get("batch_summary", ""),
+                                height=max(deps.summary_text_height, 220),
                             )
                         else:
                             st.info("События в этом батче не найдены.")
@@ -5145,6 +5237,25 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             )
                         else:
                             st.info("Статусы алертов в этом батче не указаны.")
+                    with tab_logs:
+                        batch_logs = item.get("batch_logs")
+                        if isinstance(batch_logs, list) and batch_logs:
+                            logs_df = pd.DataFrame(batch_logs)
+                            if "timestamp" in logs_df.columns:
+                                preferred_cols = ["timestamp"]
+                                preferred_cols.extend(
+                                    col for col in logs_df.columns if col not in preferred_cols
+                                )
+                                logs_df = logs_df[preferred_cols]
+                            st.caption(f"Логов в батче: {len(logs_df.index)}")
+                            st.dataframe(
+                                _format_table_timestamps(logs_df),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=280,
+                            )
+                        else:
+                            st.info("Сырые логи батча не сохранены.")
 
         elif "Reduce" in stage_labels[current_stage_idx]:
             st.markdown("#### Reduce")
@@ -5224,8 +5335,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
 
         else:
             st.markdown("#### Отчёт")
-            if _normalize_summary_text(state.get("final_summary")):
+            final_summary_ready = bool(_normalize_summary_text(state.get("final_summary")))
+            final_report_ready = bool(state.get("final_report_ready", False))
+            if final_report_ready and final_summary_ready:
                 st.success("Итоговый отчёт сформирован. Ниже доступен интерактивный разбор.")
+            elif final_summary_ready:
+                st.info("Данные получены, выполняем финальную саммаризацию. Пожалуйста, дождитесь завершения.")
             else:
                 st.info("Отчёт пока формируется.")
 
@@ -5264,7 +5379,15 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
             st.error(f"Ошибка выполнения: {state['error']}")
 
 
-def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size: int, map_workers: int = 1) -> Any:
+def _build_config(
+    deps: LogsSummaryPageDeps,
+    db_batch_size: int,
+    llm_batch_size: int,
+    map_workers: int = 1,
+    *,
+    use_instructor: Optional[bool] = None,
+    model_supports_tool_calling: Optional[bool] = None,
+) -> Any:
     max_cell_chars = int(
         getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
     )
@@ -5304,7 +5427,12 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
     compression_importance_threshold = float(
         getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7) or 0.7
     )
-    use_instructor = bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True))
+    if use_instructor is None:
+        use_instructor = bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True))
+    if model_supports_tool_calling is None:
+        model_supports_tool_calling = bool(
+            getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
+        )
     try:
         return deps.summarizer_config_cls(
             page_limit=db_batch_size,
@@ -5322,7 +5450,8 @@ def _build_config(deps: LogsSummaryPageDeps, db_batch_size: int, llm_batch_size:
             reduce_target_token_pct=reduce_target_token_pct,
             compression_target_pct=compression_target_pct,
             compression_importance_threshold=compression_importance_threshold,
-            use_instructor=use_instructor,
+            use_instructor=bool(use_instructor),
+            model_supports_tool_calling=bool(model_supports_tool_calling),
         )
     except TypeError:
         return deps.summarizer_config_cls(
@@ -5446,6 +5575,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     widget_defaults: Dict[str, Any] = {
         "logs_sum_user_goal": "",
         "logs_sum_model_id": str(getattr(settings, "LLM_MODEL_ID", "") or ""),
+        "logs_sum_use_instructor": bool(
+            getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)
+        ),
+        "logs_sum_model_supports_tool_calling": bool(
+            getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
+        ),
         "logs_sum_period_mode": "Явный диапазон (start/end)",
         "logs_sum_center_dt": center_default,
         "logs_sum_window_minutes": max(int(deps.loopback_minutes), 1),
@@ -5515,6 +5650,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         )
         st.session_state["logs_sum_user_goal"] = mapped["logs_sum_user_goal"]
         st.session_state["logs_sum_model_id"] = str(mapped.get("logs_sum_model_id") or widget_defaults["logs_sum_model_id"])
+        st.session_state["logs_sum_use_instructor"] = bool(
+            mapped.get("logs_sum_use_instructor", widget_defaults["logs_sum_use_instructor"])
+        )
+        st.session_state["logs_sum_model_supports_tool_calling"] = bool(
+            mapped.get(
+                "logs_sum_model_supports_tool_calling",
+                widget_defaults["logs_sum_model_supports_tool_calling"],
+            )
+        )
         st.session_state["logs_sum_period_mode"] = mapped["logs_sum_period_mode"]
         st.session_state["logs_sum_window_minutes"] = max(int(mapped["logs_sum_window_minutes"]), 1)
         st.session_state["logs_sum_center_dt"] = mapped["logs_sum_center_dt"] or center_default
@@ -5972,6 +6116,24 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             disabled=is_running,
             help="Модель используется только на стороне API; локальный подсчёт токенов отключён.",
         )
+        st.checkbox(
+            "Использовать Instructor для строгой структуры",
+            key="logs_sum_use_instructor",
+            disabled=is_running,
+            help=(
+                "Когда включено, MAP/REDUCE структурируются через Instructor + Pydantic "
+                "(валидация схемы без ручного JSON-parse)."
+            ),
+        )
+        st.checkbox(
+            "Модель поддерживает tool-calling",
+            key="logs_sum_model_supports_tool_calling",
+            disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
+            help=(
+                "Включи, если gateway корректно поддерживает tool/function calling. "
+                "Если выключено — Instructor работает в JSON-режиме."
+            ),
+        )
         selected_model_for_budget = str(st.session_state.get("logs_sum_model_id") or "").strip()
         st.caption(
             f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
@@ -6055,6 +6217,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(st.session_state.get("logs_sum_db_batch", max(int(deps.db_batch_size), 1)))
     llm_batch_size = max(int(st.session_state.get("logs_sum_llm_batch", max(int(deps.llm_batch_size), 1))), 1)
     llm_model_id = str(st.session_state.get("logs_sum_model_id") or getattr(settings, "LLM_MODEL_ID", "")).strip()
+    use_instructor = bool(
+        st.session_state.get(
+            "logs_sum_use_instructor",
+            getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True),
+        )
+    )
+    model_supports_tool_calling = bool(
+        st.session_state.get(
+            "logs_sum_model_supports_tool_calling",
+            getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
+        )
+    )
     logs_timestamp_column = _normalize_timestamp_column_name(
         getattr(deps, "logs_timestamp_column", "timestamp")
     )
@@ -6136,6 +6310,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "llm_model_id": llm_model_id,
+            "use_instructor": use_instructor,
+            "model_supports_tool_calling": model_supports_tool_calling,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -6175,6 +6351,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "db_batch_size": db_batch_size,
             "llm_batch_size": llm_batch_size,
             "llm_model_id": llm_model_id,
+            "use_instructor": use_instructor,
+            "model_supports_tool_calling": model_supports_tool_calling,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -6205,6 +6383,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     db_batch_size = int(active_params.get("db_batch_size", db_batch_size))
     llm_batch_size = max(int(active_params.get("llm_batch_size", db_batch_size)), 1)
     llm_model_id = str(active_params.get("llm_model_id", llm_model_id)).strip() or llm_model_id
+    use_instructor = bool(active_params.get("use_instructor", use_instructor))
+    model_supports_tool_calling = bool(
+        active_params.get("model_supports_tool_calling", model_supports_tool_calling)
+    )
     logs_timestamp_column = _normalize_timestamp_column_name(
         active_params.get("logs_timestamp_column", logs_timestamp_column)
     )
@@ -6221,6 +6403,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     resume_from_ts = str(active_params.get("resume_from_ts", "")).strip()
     resume_ts_missing = bool(active_params.get("resume_ts_missing", False))
     active_params["llm_model_id"] = llm_model_id
+    active_params["use_instructor"] = use_instructor
+    active_params["model_supports_tool_calling"] = model_supports_tool_calling
     active_params["llm_batch_size"] = llm_batch_size
     active_params["map_workers"] = 1
 
@@ -6452,6 +6636,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
         "llm_model_id": llm_model_id,
+        "use_instructor": use_instructor,
+        "model_supports_tool_calling": model_supports_tool_calling,
         "map_workers": map_workers,
         "max_retries": max_retries,
         "llm_timeout": llm_timeout,
@@ -6482,6 +6668,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "structured_sections": [],
         "freeform_final_summary": None,
         "freeform_sections": [],
+        "final_report_ready": False,
         "metrics_rows": 0,
         "metrics_services": [],
         "metrics_context_text": "",
@@ -6567,6 +6754,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "structured_sections",
                 "freeform_final_summary",
                 "freeform_sections",
+                "final_report_ready",
                 "result_json_path",
                 "result_bundle_path",
                 "result_summary_path",
@@ -6629,6 +6817,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             f"Восстановление с прогресса: last_ts={state.get('last_batch_ts') or 'n/a'}"
         )
 
+    state["final_report_ready"] = False
     _render_logs_summary_chat(analysis_placeholder, state, deps)
 
     request_payload = {
@@ -6656,6 +6845,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "db_batch_size": db_batch_size,
         "llm_batch_size": llm_batch_size,
         "llm_model_id": llm_model_id,
+        "use_instructor": use_instructor,
+        "model_supports_tool_calling": model_supports_tool_calling,
         "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
@@ -6671,6 +6862,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     try:
         demo_logs: List[Dict[str, Any]] = []
+        demo_logs_by_source: Dict[str, List[Dict[str, Any]]] = {}
         total_rows_estimate: Optional[int] = None
         columns = list(DEFAULT_SUMMARY_COLUMNS)
         if demo_mode:
@@ -6679,6 +6871,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 period_end_dt=period_end_dt,
                 total_logs=demo_logs_count,
             )
+            demo_labels = [
+                str(spec.get("label", f"query_{idx + 1}"))
+                for idx, spec in enumerate(query_specs)
+            ]
+            demo_logs_by_source = _split_demo_logs_by_source(demo_logs, demo_labels)
             if demo_logs:
                 columns = _choose_summary_columns(list(demo_logs[0].keys()))
             total_rows_estimate = len(demo_logs)
@@ -7165,6 +7362,43 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     "Batch auto-shrink: "
                     f"400 Bad Request, уменьшаем размер batch {old_size} -> {new_size}"
                 )
+            elif event == "map_schema_retry":
+                batch_number = _safe_int(payload.get("batch_number"), 0)
+                attempt = _safe_int(payload.get("attempt"), 0)
+                reason = str(payload.get("reason") or "").strip()
+                preview = str(payload.get("raw_preview") or "").strip()
+                state["active_step"] = (
+                    f"MAP batch {batch_number}: LLM вернула невалидную структуру, "
+                    f"исправляем формат (попытка {attempt})"
+                )
+                events.append(
+                    f"MAP batch {batch_number}: schema-retry #{attempt}. "
+                    f"Причина: {reason or 'неизвестно'}"
+                )
+                if preview:
+                    events.append(f"MAP batch {batch_number}: raw preview -> {preview}")
+            elif event == "map_schema_recovered":
+                batch_number = _safe_int(payload.get("batch_number"), 0)
+                attempt = _safe_int(payload.get("attempt"), 0)
+                events.append(
+                    f"MAP batch {batch_number}: schema восстановлена (попытка {attempt})"
+                )
+            elif event == "map_schema_degraded":
+                batch_number = _safe_int(payload.get("batch_number"), 0)
+                reason = str(payload.get("reason") or "").strip()
+                preview = str(payload.get("raw_preview") or "").strip()
+                raw_len = _safe_int(payload.get("raw_len"), 0)
+                state["active_step"] = (
+                    f"MAP batch {batch_number}: LLM ответ невалиден, сохраняем degraded-структуру"
+                )
+                events.append(
+                    f"MAP batch {batch_number}: degraded schema fallback. "
+                    f"Причина: {reason or 'неизвестно'}"
+                )
+                if raw_len > 0:
+                    events.append(f"MAP batch {batch_number}: raw response length={raw_len}")
+                if preview:
+                    events.append(f"MAP batch {batch_number}: raw preview -> {preview}")
             elif event == "map_parallel_disabled":
                 workers = int(pd.to_numeric(payload.get("map_workers_requested"), errors="coerce") or 0)
                 events.append(
@@ -7695,6 +7929,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         llm_call = _llm_call_with_context
 
+        def _build_runtime_config() -> Any:
+            return _build_config(
+                deps,
+                db_batch_size,
+                llm_batch_size,
+                map_workers,
+                use_instructor=use_instructor,
+                model_supports_tool_calling=model_supports_tool_calling,
+            )
+
         def _maybe_generate_no_logs_hypothesis() -> None:
             if not bool(enable_no_logs_hypothesis):
                 return
@@ -7743,7 +7987,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         f"{str(no_logs_exc)}"
                     )
 
-        if multi_query_mode and not demo_mode:
+        if multi_query_mode:
             # ---------------------------------------------------------------
             # Two-level summarization:
             #   1. For each source: independent MAP→REDUCE (own fetch, own summarizer).
@@ -7772,6 +8016,13 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 ) -> List[Dict[str, Any]]:
                     safe_limit = max(int(limit), 1)
                     safe_offset = max(int(offset), 0)
+                    if demo_mode:
+                        source_rows = demo_logs_by_source.get(label, [])
+                        return [
+                            dict(row)
+                            for row in source_rows[safe_offset : safe_offset + safe_limit]
+                        ]
+
                     query = _build_query_for_template(
                         template=_tmpl,
                         uses_template=_uses_tpl,
@@ -7832,12 +8083,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     "sql_query": str(spec.get("template", "")),
                     "time_column": logs_timestamp_column,
                     "data_type": "",
+                    "llm_timeout": llm_timeout,
+                    "llm_max_retries": max_retries,
                 }
                 try:
                     src_summarizer = deps.period_log_summarizer_cls(
                         db_fetch_page=_make_source_fetch_page(spec, src_label),
                         llm_call=llm_call,
-                        config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                        config=_build_runtime_config(),
                         on_progress=_on_progress,
                         prompt_context=_src_prompt_context,
                     )
@@ -7845,7 +8098,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     src_summarizer = deps.period_log_summarizer_cls(
                         db_fetch_page=_make_source_fetch_page(spec, src_label),
                         llm_call=llm_call,
-                        config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                        config=_build_runtime_config(),
                         on_progress=_on_progress,
                     )
                 try:
@@ -7883,9 +8136,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                     period_start=str(period_start_iso or ""),
                                     period_end=str(period_end_iso or ""),
                                     llm_call=llm_call,
-                                    config=_build_config(
-                                        deps, db_batch_size, llm_batch_size, map_workers
-                                    ),
+                                    config=_build_runtime_config(),
                                     prompt_context={
                                         "incident_start": period_start_iso,
                                         "incident_end": period_end_iso,
@@ -7896,6 +8147,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                         "sql_query": str(spec.get("template", "")),
                                         "time_column": logs_timestamp_column,
                                         "data_type": "",
+                                        "llm_timeout": llm_timeout,
+                                        "llm_max_retries": max_retries,
                                     },
                                 )
                             )
@@ -7935,6 +8188,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "sql_query": sql_query_clean,
                         "time_column": logs_timestamp_column,
                         "data_type": "",
+                        "llm_timeout": llm_timeout,
+                        "llm_max_retries": max_retries,
                     },
                 )
                 try:
@@ -7974,7 +8229,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=str(period_start_iso or ""),
                             period_end=str(period_end_iso or ""),
                             llm_call=llm_call,
-                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                            config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -7985,6 +8240,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
+                                "llm_timeout": llm_timeout,
+                                "llm_max_retries": max_retries,
                             },
                         )
                         final_summary_text = _normalize_summary_text(rebuilt_multi)
@@ -8028,6 +8285,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
+            state["final_report_ready"] = False
             state["final_summary"] = _normalize_summary_text(final_summary_text) or "Нет логов за указанный период."
             state["final_summary_origin"] = final_summary_origin
             stats_offset = state.get("resume_stats_offset") if isinstance(state.get("resume_stats_offset"), dict) else {}
@@ -8057,12 +8315,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "sql_query": sql_query_clean,
                 "time_column": logs_timestamp_column,
                 "data_type": "",
+                "llm_timeout": llm_timeout,
+                "llm_max_retries": max_retries,
             }
             try:
                 summarizer = deps.period_log_summarizer_cls(
                     db_fetch_page=_db_fetch_page,
                     llm_call=llm_call,
-                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                    config=_build_runtime_config(),
                     on_progress=_on_progress,
                     prompt_context=_single_prompt_context,
                 )
@@ -8070,7 +8330,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 summarizer = deps.period_log_summarizer_cls(
                     db_fetch_page=_db_fetch_page,
                     llm_call=llm_call,
-                    config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                    config=_build_runtime_config(),
                     on_progress=_on_progress,
                 )
             try:
@@ -8089,6 +8349,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
             state["status"] = "done"
             state["active_step"] = "Суммаризация завершена"
+            state["final_report_ready"] = False
             normalized_final_summary = _normalize_summary_text(getattr(result, "summary", None))
             single_final_origin = (
                 "single_reduce_direct"
@@ -8114,7 +8375,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=str(period_start_iso or ""),
                             period_end=str(period_end_iso or ""),
                             llm_call=llm_call,
-                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                            config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -8125,6 +8386,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
+                                "llm_timeout": llm_timeout,
+                                "llm_max_retries": max_retries,
                             },
                         )
                         rebuilt_single_norm = _normalize_summary_text(rebuilt_single)
@@ -8186,7 +8449,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=period_start_iso,
                             period_end=period_end_iso,
                             llm_call=llm_call,
-                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                            config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -8197,6 +8460,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
+                                "llm_timeout": llm_timeout,
+                                "llm_max_retries": max_retries,
                             },
                         )
                     )
@@ -8261,7 +8526,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start=period_start_iso,
                             period_end=period_end_iso,
                             llm_call=llm_call,
-                            config=_build_config(deps, db_batch_size, llm_batch_size, map_workers),
+                            config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
                                 "incident_end": period_end_iso,
@@ -8272,6 +8537,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
+                                "llm_timeout": llm_timeout,
+                                "llm_max_retries": max_retries,
                             },
                         )
                     )
@@ -8590,6 +8857,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 final_summaries_dir / "final_freeform_sections.md",
                 "\n".join(section_lines).strip(),
             )
+        state["final_report_ready"] = True
+        state["active_step"] = "Итоговый отчёт сформирован"
         if _safe_int(state.get("report_progress_total"), 0) > 0:
             _set_report_progress(
                 "Финальные артефакты сохранены",
@@ -8604,6 +8873,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     except Exception as exc:  # noqa: BLE001
         state["status"] = "error"
         state["active_step"] = "Ошибка выполнения"
+        state["final_report_ready"] = False
         state["error"] = str(exc)
         if _safe_int(state.get("report_progress_total"), 0) > 0:
             state["report_progress_active"] = False

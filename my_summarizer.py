@@ -9,7 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Type, TypeVar
 
 import pandas as pd
 import requests
@@ -31,6 +31,11 @@ try:
     import instructor  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - optional dependency
     instructor = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency (comes transitively with instructor)
+    from openai import OpenAI  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore[assignment]
 
 
 LOGS_SQL_COLUMNS: tuple[str, ...] = ("timestamp", "value")
@@ -62,6 +67,7 @@ DEFAULT_SUMMARY_COLUMNS: tuple[str, ...] = (
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
 _EARLIEST_PERIOD_START = "1970-01-01T00:00:00+00:00"
+TModel = TypeVar("TModel", bound=BaseModel)
 class DBPageFetcher(Protocol):
     def __call__(
         self,
@@ -111,7 +117,10 @@ class SummarizerConfig:
     reduce_target_token_pct: int = 50
     compression_target_pct: int = 50
     compression_importance_threshold: float = 0.7
-    use_instructor: bool = True
+    use_instructor: bool = False
+    # If False, instructor works in JSON mode (no tool/function calling).
+    # Needed for OpenAI-compatible gateways that do not support tool-calling parser.
+    model_supports_tool_calling: bool = True
 
 
 @dataclass
@@ -548,6 +557,38 @@ def _normalize_summary_text(value: Any) -> str:
     return text
 
 
+def _preview_text(value: Any, max_chars: int = 1200) -> str:
+    text = str(value or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncated]"
+
+
+def _payload_for_progress_log(payload: Dict[str, Any]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key, value in (payload or {}).items():
+        if key == "batch_logs" and isinstance(value, list):
+            safe["batch_logs_count"] = len(value)
+            if value:
+                try:
+                    safe["batch_logs_sample"] = {
+                        k: _preview_text(v, max_chars=300)
+                        for k, v in dict(value[0]).items()
+                    }
+                except Exception:
+                    safe["batch_logs_sample"] = "<unavailable>"
+            continue
+        if isinstance(value, str):
+            safe[key] = _preview_text(value, max_chars=1200)
+        elif isinstance(value, list):
+            safe[key] = f"<list:{len(value)}>"
+        elif isinstance(value, dict):
+            safe[key] = "<dict>"
+        else:
+            safe[key] = value
+    return safe
+
+
 def has_required_env() -> bool:
     return bool(str(settings.OPENAI_API_BASE_DB).strip()) and bool(str(settings.OPENAI_API_KEY_DB).strip())
 
@@ -559,6 +600,70 @@ def _build_chat_completions_url(api_base: str) -> str:
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
     return f"{base}/v1/chat/completions"
+
+
+def _build_openai_base_url(api_base: str) -> str:
+    base = api_base.strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base[: -len("/chat/completions")]
+    if base.endswith("/v1"):
+        return base
+    return f"{base}/v1"
+
+
+def _default_llm_system_prompt() -> str:
+    return (
+        "Ты — senior SRE-аналитик инцидентов. Анализируй логи и метрики строго на основе данных.\n"
+        "Принципы:\n"
+        "1) Только факты: каждое утверждение подтверждай timestamp/сообщением/значением.\n"
+        "2) Маркировка: [ФАКТ] — прямое подтверждение, [ГИПОТЕЗА] — предположение.\n"
+        "3) Если данных недостаточно — пиши \"данных недостаточно\", не додумывай.\n"
+        "4) Хронология обязательна: строй цепочку событий по времени.\n"
+        "5) Главный результат: причинно-следственные цепочки (триггер→распространение→последствия→алерты).\n"
+        "6) Если звенья не связаны данными — отмечай разрывы цепочки и нужные данные для закрытия.\n"
+        "7) Возможны несколько независимых цепочек/инцидентов: не склеивай их без механизма связи.\n"
+        "8) Отделяй [РЕЛЕВАНТНО] события от [ФОН]/[НЕЯСНО].\n"
+        "9) Для агрегированных логов: строка=группа событий, cnt=масштаб, argMin-поля=пример.\n"
+        "10) Корреляция по времени не равна причинности."
+    )
+
+
+def _resolve_llm_system_prompt() -> str:
+    custom_system_prompt = str(getattr(settings, "CONTROL_PLANE_LLM_SYSTEM_PROMPT", "")).strip()
+    return custom_system_prompt or _default_llm_system_prompt()
+
+
+def _response_body_text(response: Any) -> str:
+    try:
+        text = getattr(response, "text", None)
+        if text is None:
+            content = getattr(response, "content", b"")
+            if isinstance(content, (bytes, bytearray)):
+                text = bytes(content).decode("utf-8", errors="replace")
+            else:
+                text = str(content)
+        return str(text or "")
+    except Exception as exc:  # noqa: BLE001
+        return f"<response body unavailable: {exc}>"
+
+
+def _raise_for_status_with_body(response: Any) -> None:
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as exc:
+        status = getattr(response, "status_code", None)
+        url = getattr(response, "url", None)
+        body_text = _response_body_text(response)
+        logger.error(
+            "LLM HTTP error status=%s url=%s response_body=%s",
+            status,
+            url or "<unknown>",
+            body_text,
+        )
+        enriched = str(exc)
+        if body_text:
+            enriched = f"{enriched}\nRESPONSE_BODY:\n{body_text}"
+        raise requests.exceptions.HTTPError(enriched, response=response) from exc
 
 
 def _extract_message_content(value: Any) -> str:
@@ -648,6 +753,10 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
                 "LLM gateway returned 400 with max_tokens=%s; retrying the same call without max_tokens.",
                 configured_max_tokens,
             )
+            logger.warning(
+                "LLM 400 response body (with max_tokens): %s",
+                _response_body_text(response),
+            )
             payload_without_max = dict(payload)
             payload_without_max.pop("max_tokens", None)
             response = requests.post(
@@ -656,7 +765,7 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
                 headers=headers,
                 timeout=timeout,
             )
-        response.raise_for_status()
+        _raise_for_status_with_body(response)
         data = response.json()
         chunk_text, finish_reason = _parse_chat_completion_response(data)
         collected_parts.append(str(chunk_text or ""))
@@ -1075,6 +1184,12 @@ def _is_llm_error_stub(summary_text: str) -> bool:
 def _is_read_timeout_exception(exc: Exception) -> bool:
     if isinstance(exc, requests.exceptions.ReadTimeout):
         return True
+    exc_type_name = type(exc).__name__.lower()
+    if "timeout" in exc_type_name and "read" in exc_type_name:
+        return True
+    # OpenAI Python client timeout class
+    if "apitimeouterror" in exc_type_name:
+        return True
     text = str(exc).strip().lower()
     return (
         "read timed out" in text
@@ -1084,6 +1199,10 @@ def _is_read_timeout_exception(exc: Exception) -> bool:
 
 
 def _is_non_retryable_llm_exception(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        if 400 <= status_code < 500 and status_code not in (408, 409, 429):
+            return True
     if isinstance(exc, requests.exceptions.HTTPError):
         response = getattr(exc, "response", None)
         status_code = getattr(response, "status_code", None)
@@ -1093,19 +1212,27 @@ def _is_non_retryable_llm_exception(exc: Exception) -> bool:
             if 400 <= status_code < 500 and status_code not in (408, 409, 429):
                 return True
     text = str(exc).strip().lower()
+    if "error code: 400" in text and "badrequesterror" in text:
+        return True
     if "400 client error" in text and "bad request" in text:
         return True
     return False
 
 
 def _is_400_bad_request_exception(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code == 400:
+        return True
     if isinstance(exc, requests.exceptions.HTTPError):
         response = getattr(exc, "response", None)
         status_code = getattr(response, "status_code", None)
         if isinstance(status_code, int) and status_code == 400:
             return True
     text = str(exc).strip().lower()
-    return "400 client error" in text and "bad request" in text
+    return (
+        ("400 client error" in text and "bad request" in text)
+        or ("error code: 400" in text and "badrequesterror" in text)
+    )
 
 
 def _make_llm_call(
@@ -1121,22 +1248,7 @@ def _make_llm_call(
             "OPENAI_API_BASE_DB и OPENAI_API_KEY_DB обязательны для LLM-суммаризации."
         )
 
-    default_system_prompt = (
-        "Ты — senior SRE-аналитик инцидентов. Анализируй логи и метрики строго на основе данных.\n"
-        "Принципы:\n"
-        "1) Только факты: каждое утверждение подтверждай timestamp/сообщением/значением.\n"
-        "2) Маркировка: [ФАКТ] — прямое подтверждение, [ГИПОТЕЗА] — предположение.\n"
-        "3) Если данных недостаточно — пиши \"данных недостаточно\", не додумывай.\n"
-        "4) Хронология обязательна: строй цепочку событий по времени.\n"
-        "5) Главный результат: причинно-следственные цепочки (триггер→распространение→последствия→алерты).\n"
-        "6) Если звенья не связаны данными — отмечай разрывы цепочки и нужные данные для закрытия.\n"
-        "7) Возможны несколько независимых цепочек/инцидентов: не склеивай их без механизма связи.\n"
-        "8) Отделяй [РЕЛЕВАНТНО] события от [ФОН]/[НЕЯСНО].\n"
-        "9) Для агрегированных логов: строка=группа событий, cnt=масштаб, argMin-поля=пример.\n"
-        "10) Корреляция по времени не равна причинности."
-    )
-    custom_system_prompt = str(getattr(settings, "CONTROL_PLANE_LLM_SYSTEM_PROMPT", "")).strip()
-    _system_prompt = custom_system_prompt or default_system_prompt
+    _system_prompt = _resolve_llm_system_prompt()
 
     def _llm_call(prompt: str) -> str:
         last_exc: Optional[Exception] = None
@@ -1275,6 +1387,180 @@ class PeriodLogSummarizer:
         self.config = config or SummarizerConfig()
         self.on_progress = on_progress
         self.prompt_context = prompt_context or {}
+        self._instructor_client_cache: Dict[str, Any] = {}
+        self._instructor_force_json_mode: bool = False
+
+    def _instructor_enabled(self) -> bool:
+        return (
+            bool(getattr(self.config, "use_instructor", True))
+            and bool(instructor is not None)
+            and bool(OpenAI is not None)
+            and has_required_env()
+        )
+
+    def _instructor_tool_calling_enabled(self) -> bool:
+        if self._instructor_force_json_mode:
+            return False
+        cfg_value = getattr(self.config, "model_supports_tool_calling", None)
+        if cfg_value is None:
+            return bool(getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True))
+        return bool(cfg_value)
+
+    def _resolve_instructor_mode(self) -> Any:
+        mode_enum = getattr(instructor, "Mode", None)
+        if mode_enum is None:
+            return None
+        if self._instructor_tool_calling_enabled() and hasattr(mode_enum, "TOOLS"):
+            return getattr(mode_enum, "TOOLS")
+        if hasattr(mode_enum, "JSON"):
+            return getattr(mode_enum, "JSON")
+        return None
+
+    def _get_instructor_client(self) -> Any:
+        if not self._instructor_enabled():
+            raise RuntimeError("Instructor runtime is unavailable for structured calls.")
+        mode = self._resolve_instructor_mode()
+        cache_key = "|".join(
+            [
+                str(_build_openai_base_url(str(settings.OPENAI_API_BASE_DB))),
+                str(settings.LLM_MODEL_ID),
+                str(mode),
+            ]
+        )
+        cached = self._instructor_client_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        base_url = _build_openai_base_url(str(settings.OPENAI_API_BASE_DB))
+        api_key = str(settings.OPENAI_API_KEY_DB)
+        openai_client = OpenAI(base_url=base_url, api_key=api_key)
+        if mode is not None:
+            client = instructor.from_openai(openai_client, mode=mode)
+        else:
+            client = instructor.from_openai(openai_client)
+        self._instructor_client_cache[cache_key] = client
+        return client
+
+    def _tool_calling_parser_error(self, exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        return "tool_choice" in text and "tool-call-parser" in text
+
+    def _structured_call_timeout_base(self) -> float:
+        prompt_timeout = self.prompt_context.get("llm_timeout")
+        timeout_value = pd.to_numeric(prompt_timeout, errors="coerce")
+        if pd.isna(timeout_value):
+            timeout_value = pd.to_numeric(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 600),
+                errors="coerce",
+            )
+        try:
+            return max(float(timeout_value), 1.0)
+        except Exception:
+            return 600.0
+
+    def _structured_call_retry_limit(self) -> int:
+        prompt_retries = self.prompt_context.get("llm_max_retries")
+        retries_value = pd.to_numeric(prompt_retries, errors="coerce")
+        if pd.isna(retries_value):
+            retries_value = pd.to_numeric(
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES", -1),
+                errors="coerce",
+            )
+        try:
+            return int(retries_value)
+        except Exception:
+            return -1
+
+    def _call_structured_with_instructor(
+        self,
+        *,
+        prompt: str,
+        response_model: Type[TModel],
+        stage: str,
+    ) -> Tuple[TModel, int]:
+        if not self._instructor_enabled():
+            raise RuntimeError("Instructor is disabled or unavailable.")
+
+        retries = self._structured_call_retry_limit()
+        infinite_retries = retries < 0
+        configured_total_attempts = -1 if infinite_retries else (max(retries, 0) + 1)
+        base_timeout = self._structured_call_timeout_base()
+        current_timeout = base_timeout
+        attempt_no = 0
+        last_exc: Optional[Exception] = None
+        while True:
+            attempt_no += 1
+            mode_label = "TOOLS" if self._instructor_tool_calling_enabled() else "JSON"
+            logger.info(
+                "Instructor structured call start | stage=%s | model=%s | mode=%s | attempt=%s/%s | timeout=%.1fs",
+                stage,
+                str(settings.LLM_MODEL_ID),
+                mode_label,
+                attempt_no,
+                "∞" if configured_total_attempts < 0 else configured_total_attempts,
+                current_timeout,
+            )
+            started = time.monotonic()
+            try:
+                client = self._get_instructor_client()
+                result = client.chat.completions.create(
+                    model=str(settings.LLM_MODEL_ID),
+                    response_model=response_model,
+                    messages=[
+                        {"role": "system", "content": _resolve_llm_system_prompt()},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_retries=0,
+                    timeout=current_timeout,
+                )
+                elapsed = max(time.monotonic() - started, 0.0)
+                logger.info(
+                    "Instructor structured call done | stage=%s | attempt=%s | elapsed=%.2fs",
+                    stage,
+                    attempt_no,
+                    elapsed,
+                )
+                return result, attempt_no
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                elapsed = max(time.monotonic() - started, 0.0)
+                logger.warning(
+                    "Instructor structured call failed | stage=%s | attempt=%s | elapsed=%.2fs | error=%s",
+                    stage,
+                    attempt_no,
+                    elapsed,
+                    exc,
+                )
+                if self._tool_calling_parser_error(exc) and self._instructor_tool_calling_enabled():
+                    logger.warning(
+                        "Instructor mode TOOLS is unsupported by current gateway. "
+                        "Switching to JSON mode for subsequent structured calls."
+                    )
+                    self._instructor_force_json_mode = True
+                    continue
+                is_read_timeout = _is_read_timeout_exception(exc)
+                is_non_retryable = _is_non_retryable_llm_exception(exc)
+                if is_non_retryable:
+                    raise
+                can_retry = is_read_timeout or infinite_retries or attempt_no <= max(retries, 0)
+                if not can_retry:
+                    break
+                if is_read_timeout:
+                    next_timeout = current_timeout + base_timeout
+                    logger.warning(
+                        "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs",
+                        stage,
+                        attempt_no,
+                        current_timeout,
+                        next_timeout,
+                    )
+                    current_timeout = next_timeout
+                retry_delay = 10.0
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Instructor structured call failed without explicit exception")
 
     def _render_rows_as_text(
         self,
@@ -1430,6 +1716,18 @@ class PeriodLogSummarizer:
                 summary_json=self._incident_summary_to_json(current),
             )
             prompt = f"{system_text}\n\n{user_text}"
+            if self._instructor_enabled():
+                try:
+                    parsed, attempts = self._call_structured_with_instructor(
+                        prompt=prompt,
+                        response_model=IncidentSummary,
+                        stage="compression",
+                    )
+                    llm_calls += max(attempts, 1)
+                    current = parsed
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Compression structured call failed, fallback to legacy parsing: %s", exc)
             raw = str(self.llm_call(prompt) or "").strip()
             llm_calls += 1
             parsed = self._parse_incident_summary_text(
@@ -1572,6 +1870,25 @@ class PeriodLogSummarizer:
         batch_period_end: Optional[str],
     ) -> Tuple[MapBatchSummaryModel, Optional[str]]:
         payload = self._extract_json_payload(raw_summary_text)
+        return self._normalize_map_summary_payload_from_dict(
+            payload=payload,
+            raw_summary_text=raw_summary_text,
+            rows_chunk=rows_chunk,
+            batch_number=batch_number,
+            batch_period_start=batch_period_start,
+            batch_period_end=batch_period_end,
+        )
+
+    def _normalize_map_summary_payload_from_dict(
+        self,
+        *,
+        payload: Optional[Dict[str, Any]],
+        raw_summary_text: str,
+        rows_chunk: List[Dict[str, Any]],
+        batch_number: int,
+        batch_period_start: Optional[str],
+        batch_period_end: Optional[str],
+    ) -> Tuple[MapBatchSummaryModel, Optional[str]]:
         parse_error: Optional[str] = None
         if payload is None:
             parse_error = "LLM map summary is not valid JSON."
@@ -1679,6 +1996,13 @@ class PeriodLogSummarizer:
             batch_period_start=batch_period_start,
             batch_period_end=batch_period_end,
         )
+        if parse_error:
+            logger.warning(
+                "MAP batch %s: initial schema parse failed: %s | raw_preview=%s",
+                batch_number,
+                parse_error,
+                _preview_text(raw_summary_text, max_chars=900),
+            )
         llm_extra_calls = 0
         max_schema_retries = 2
         if parse_error and allow_schema_retry:
@@ -1690,6 +2014,9 @@ class PeriodLogSummarizer:
                         "batch_number": int(batch_number),
                         "attempt": attempt,
                         "reason": parse_error,
+                        "batch_period_start": batch_period_start,
+                        "batch_period_end": batch_period_end,
+                        "raw_preview": _preview_text(current_text, max_chars=900),
                     },
                 )
                 retry_prompt = self._map_schema_retry_prompt(
@@ -1698,6 +2025,13 @@ class PeriodLogSummarizer:
                 )
                 current_text = str(self.llm_call(retry_prompt) or "")
                 llm_extra_calls += 1
+                logger.info(
+                    "MAP batch %s: schema-repair attempt %s/%s finished; reply_len=%s",
+                    batch_number,
+                    attempt,
+                    max_schema_retries,
+                    len(current_text),
+                )
                 model, parse_error = self._normalize_map_summary_payload(
                     raw_summary_text=current_text,
                     rows_chunk=rows_chunk,
@@ -1706,6 +2040,21 @@ class PeriodLogSummarizer:
                     batch_period_end=batch_period_end,
                 )
                 if not parse_error:
+                    self._emit_progress(
+                        "map_schema_recovered",
+                        {
+                            "batch_number": int(batch_number),
+                            "attempt": attempt,
+                            "batch_period_start": batch_period_start,
+                            "batch_period_end": batch_period_end,
+                        },
+                    )
+                    logger.info(
+                        "MAP batch %s: schema recovered on attempt %s/%s",
+                        batch_number,
+                        attempt,
+                        max_schema_retries,
+                    )
                     break
         if parse_error:
             self._emit_progress(
@@ -1713,7 +2062,17 @@ class PeriodLogSummarizer:
                 {
                     "batch_number": int(batch_number),
                     "reason": parse_error,
+                    "batch_period_start": batch_period_start,
+                    "batch_period_end": batch_period_end,
+                    "raw_preview": _preview_text(raw_summary_text, max_chars=1200),
+                    "raw_len": len(str(raw_summary_text or "")),
                 },
+            )
+            logger.warning(
+                "MAP batch %s: schema degraded after retries; reason=%s | raw_preview=%s",
+                batch_number,
+                parse_error,
+                _preview_text(raw_summary_text, max_chars=900),
             )
         json_text = self._truncate(
             self._render_map_summary_json(model),
@@ -1721,7 +2080,41 @@ class PeriodLogSummarizer:
         )
         return json_text, model.model_dump(mode="json"), llm_extra_calls
 
+    def _normalize_map_model_from_instructor(
+        self,
+        *,
+        model: MapBatchSummaryModel,
+        rows_chunk: List[Dict[str, Any]],
+        batch_number: int,
+        batch_period_start: Optional[str],
+        batch_period_end: Optional[str],
+    ) -> Tuple[str, Dict[str, Any]]:
+        normalized, parse_error = self._normalize_map_summary_payload_from_dict(
+            payload=model.model_dump(mode="json"),
+            raw_summary_text="",
+            rows_chunk=rows_chunk,
+            batch_number=batch_number,
+            batch_period_start=batch_period_start,
+            batch_period_end=batch_period_end,
+        )
+        if parse_error:
+            logger.warning(
+                "MAP batch %s: instructor payload normalization warning: %s",
+                batch_number,
+                parse_error,
+            )
+        json_text = self._truncate(
+            self._render_map_summary_json(normalized),
+            self.config.max_summary_chars,
+        )
+        return json_text, normalized.model_dump(mode="json")
+
     def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
+        logger.info(
+            "summarizer.progress event=%s payload=%s",
+            event,
+            _payload_for_progress_log(payload),
+        )
         if self.on_progress is None:
             return
         self.on_progress(event, payload)
@@ -1760,9 +2153,43 @@ class PeriodLogSummarizer:
         min_chunk = max(int(getattr(self.config, "min_llm_chunk_rows", 20) or 20), 1)
         max_shrink_rounds = max(int(getattr(self.config, "max_shrink_rounds", 6) or 6), 0)
         auto_shrink = bool(getattr(self.config, "auto_shrink_on_400", True))
+        instructor_path_used = False
         try:
+            if self._instructor_enabled():
+                instructor_path_used = True
+                structured_model, instructor_attempts = self._call_structured_with_instructor(
+                    prompt=prompt,
+                    response_model=MapBatchSummaryModel,
+                    stage="map",
+                )
+                chunk_summary, chunk_summary_structured = self._normalize_map_model_from_instructor(
+                    model=structured_model,
+                    rows_chunk=rows_chunk,
+                    batch_number=batch_number,
+                    batch_period_start=batch_period_start,
+                    batch_period_end=batch_period_end,
+                )
+                return (
+                    [
+                        {
+                            "summary": chunk_summary,
+                            "summary_structured": chunk_summary_structured,
+                            "rows": list(rows_chunk),
+                            "batch_period_start": batch_period_start,
+                            "batch_period_end": batch_period_end,
+                        }
+                    ],
+                    max(instructor_attempts, 1),
+                )
             llm_text = self.llm_call(prompt)
         except Exception as exc:
+            logger.warning(
+                "MAP batch %s: LLM call failed | rows=%s | depth=%s | error=%s",
+                batch_number,
+                len(rows_chunk),
+                depth,
+                exc,
+            )
             can_shrink_on_exc = (
                 auto_shrink
                 and _is_400_bad_request_exception(exc)
@@ -1787,6 +2214,13 @@ class PeriodLogSummarizer:
                     "error": str(exc),
                 },
             )
+            logger.info(
+                "MAP batch %s: auto-shrink on exception | depth=%s | %s -> %s",
+                batch_number,
+                depth,
+                len(rows_chunk),
+                next_size,
+            )
             merged_items: List[Dict[str, Any]] = []
             llm_calls = 1
             for start in range(0, len(rows_chunk), next_size):
@@ -1803,6 +2237,10 @@ class PeriodLogSummarizer:
                 merged_items.extend(sub_items)
                 llm_calls += sub_calls
             return merged_items, llm_calls
+
+        if instructor_path_used:
+            # Defensive: instructor path returns above; keep guard explicit.
+            raise RuntimeError("Instructor MAP path reached unexpected branch.")
 
         raw_llm_text = (llm_text or "").strip()
         llm_calls = 1
@@ -1863,6 +2301,13 @@ class PeriodLogSummarizer:
                 "batch_period_end": batch_period_end,
             },
         )
+        logger.info(
+            "MAP batch %s: auto-shrink on 400 fallback text | depth=%s | %s -> %s",
+            batch_number,
+            depth,
+            len(rows_chunk),
+            next_size,
+        )
 
         merged_items: List[Dict[str, Any]] = []
         for sub_start in range(0, len(rows_chunk), next_size):
@@ -1922,7 +2367,22 @@ class PeriodLogSummarizer:
                 "use_new_algorithm": bool(getattr(self.config, "use_new_algorithm", False)),
                 "use_instructor": bool(getattr(self.config, "use_instructor", True)),
                 "instructor_runtime_available": bool(instructor is not None),
+                "model_supports_tool_calling": bool(
+                    getattr(self.config, "model_supports_tool_calling", True)
+                ),
             },
+        )
+        logger.info(
+            "MAP start | period=[%s, %s) | page_limit=%s | llm_chunk_rows=%s | min_llm_chunk_rows=%s | auto_shrink_on_400=%s | max_shrink_rounds=%s | map_workers=%s | use_new_algorithm=%s",
+            period_start,
+            period_end,
+            self.config.page_limit,
+            self.config.llm_chunk_rows,
+            int(getattr(self.config, "min_llm_chunk_rows", 20) or 20),
+            bool(getattr(self.config, "auto_shrink_on_400", True)),
+            int(getattr(self.config, "max_shrink_rounds", 6) or 6),
+            int(getattr(self.config, "map_workers", 1) or 1),
+            bool(getattr(self.config, "use_new_algorithm", False)),
         )
 
         # Each pending entry: (Future | None, batch_index, rows_count, bp_start, bp_end, rows_snapshot)
@@ -1938,12 +2398,16 @@ class PeriodLogSummarizer:
         pending_items: List[_PendingItem] = []
         parallel = self.config.map_workers > 1 and not bool(
             getattr(self.config, "auto_shrink_on_400", True)
-        )
+        ) and not self._instructor_enabled()
         if self.config.map_workers > 1 and not parallel:
             self._emit_progress(
                 "map_parallel_disabled",
                 {
-                    "reason": "auto_shrink_on_400",
+                    "reason": (
+                        "auto_shrink_on_400"
+                        if bool(getattr(self.config, "auto_shrink_on_400", True))
+                        else "instructor_structured_mode"
+                    ),
                     "map_workers_requested": int(self.config.map_workers),
                 },
             )
@@ -1977,6 +2441,13 @@ class PeriodLogSummarizer:
                         "rows_total": total_rows_estimate,
                     },
                 )
+                logger.info(
+                    "Page fetched | page_index=%s | page_rows=%s | rows_fetched=%s | next_offset=%s",
+                    pages_fetched,
+                    len(page),
+                    rows_processed,
+                    offset,
+                )
 
                 if bool(getattr(self.config, "use_new_algorithm", False)):
                     # Updated algorithm: one DB page == one map batch (no local token pre-splitting).
@@ -2006,6 +2477,14 @@ class PeriodLogSummarizer:
                                 "rows_processed": rows_mapped,
                                 "rows_total": total_rows_estimate,
                             },
+                        )
+                        logger.info(
+                            "MAP batch start | batch=%s/%s | rows=%s | period=%s..%s",
+                            next_batch_index + 1,
+                            estimated_batch_total if estimated_batch_total is not None else "dynamic",
+                            len(rows_chunk),
+                            batch_period_start,
+                            batch_period_end,
                         )
                         prompt = self._build_chunk_prompt(
                             period_start=period_start,
@@ -2063,6 +2542,16 @@ class PeriodLogSummarizer:
                                         "rows_processed": rows_mapped,
                                         "rows_total": total_rows_estimate,
                                     },
+                                )
+                                logger.info(
+                                    "MAP batch done | batch=%s/%s | rows=%s | llm_calls_total=%s | timeline=%s | hypotheses=%s | alerts=%s",
+                                    current_batch_index + 1,
+                                    estimated_batch_total if estimated_batch_total is not None else "dynamic",
+                                    len(item_rows),
+                                    llm_calls,
+                                    len(item_summary_structured.get("timeline") or []),
+                                    len(item_summary_structured.get("hypotheses") or []),
+                                    len(item_summary_structured.get("alert_refs") or []),
                                 )
                                 map_batch_index += 1
                             continue  # skip appending to pending_items again
@@ -2134,6 +2623,16 @@ class PeriodLogSummarizer:
                         "rows_total": total_rows_estimate,
                     },
                 )
+                logger.info(
+                    "MAP batch done (parallel) | batch=%s/%s | rows=%s | llm_calls_total=%s | timeline=%s | hypotheses=%s | alerts=%s",
+                    batch_idx + 1,
+                    estimated_batch_total if estimated_batch_total is not None else "dynamic",
+                    nrows,
+                    llm_calls,
+                    len(chunk_summary_structured.get("timeline") or []),
+                    len(chunk_summary_structured.get("hypotheses") or []),
+                    len(chunk_summary_structured.get("alert_refs") or []),
+                )
 
         if not map_summaries:
             self._emit_progress(
@@ -2163,6 +2662,12 @@ class PeriodLogSummarizer:
                 "rows_total": total_rows_estimate,
             },
         )
+        logger.info(
+            "MAP done | batches=%s | rows_mapped=%s | llm_calls=%s",
+            map_batch_index,
+            rows_mapped,
+            llm_calls,
+        )
         self._emit_progress(
             "reduce_start",
             {
@@ -2186,6 +2691,12 @@ class PeriodLogSummarizer:
             },
         )
         llm_calls += reduce_calls
+        logger.info(
+            "REDUCE done | reduce_calls=%s | reduce_rounds=%s | llm_calls_total=%s",
+            reduce_calls,
+            reduce_rounds,
+            llm_calls,
+        )
 
         # Freeform narrative: one more LLM pass to produce a human-readable story for SRE team
         freeform_summary = ""
@@ -2274,8 +2785,49 @@ class PeriodLogSummarizer:
 
         calls = 0
         try:
+            if self._instructor_enabled():
+                parsed, calls = self._call_structured_with_instructor(
+                    prompt=prompt,
+                    response_model=IncidentSummary,
+                    stage="reduce",
+                )
+                return parsed, calls
+
             raw = str(self.llm_call(prompt) or "").strip()
             calls += 1
+            parsed = self._parse_incident_summary_text(
+                raw,
+                fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
+                fallback_start=period_start,
+                fallback_end=period_end,
+            )
+            if parsed is not None:
+                return parsed, calls
+
+            # Schema-repair retry for legacy non-instructor path.
+            retry_prompt = "\n".join(
+                [
+                    "Return STRICT JSON only (no markdown, no explanations).",
+                    "The JSON must validate against IncidentSummary schema.",
+                    "Fix invalid references and required fields.",
+                    "",
+                    "Previous invalid response:",
+                    raw,
+                ]
+            )
+            raw_retry = str(self.llm_call(retry_prompt) or "").strip()
+            calls += 1
+            parsed_retry = self._parse_incident_summary_text(
+                raw_retry,
+                fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
+                fallback_start=period_start,
+                fallback_end=period_end,
+            )
+            if parsed_retry is not None:
+                return parsed_retry, calls
+
+            # If response is plain text, keep compatibility by giving control back to legacy reducer.
+            raise ValueError("structured_reduce_invalid_json")
         except Exception as exc:  # noqa: BLE001
             if (
                 self._is_context_overflow_error(exc)
@@ -2322,40 +2874,6 @@ class PeriodLogSummarizer:
                 )
                 return combined, calls + left_calls + right_calls + compression_calls + combined_calls
             raise
-
-        parsed = self._parse_incident_summary_text(
-            raw,
-            fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
-            fallback_start=period_start,
-            fallback_end=period_end,
-        )
-        if parsed is not None:
-            return parsed, calls
-
-        # Schema-repair retry (Instructor-like behavior, but through existing llm_call).
-        retry_prompt = "\n".join(
-            [
-                "Return STRICT JSON only (no markdown, no explanations).",
-                "The JSON must validate against IncidentSummary schema.",
-                "Fix invalid references and required fields.",
-                "",
-                "Previous invalid response:",
-                raw,
-            ]
-        )
-        raw_retry = str(self.llm_call(retry_prompt) or "").strip()
-        calls += 1
-        parsed_retry = self._parse_incident_summary_text(
-            raw_retry,
-            fallback_batch_id=f"reduce-r{reduce_round}-g{group_index}",
-            fallback_start=period_start,
-            fallback_end=period_end,
-        )
-        if parsed_retry is not None:
-            return parsed_retry, calls
-
-        # If response is plain text, keep compatibility by giving control back to legacy reducer.
-        raise ValueError("structured_reduce_invalid_json")
 
     def _reduce_summaries_structured(
         self,
@@ -3178,6 +3696,10 @@ def regenerate_reduce_summary_from_map_summaries(
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
             ),
+            use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),
+            model_supports_tool_calling=bool(
+                getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
+            ),
         ),
         on_progress=on_progress,
         prompt_context=prompt_context or {},
@@ -3265,6 +3787,10 @@ def summarize_logs(
             ),
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
+            ),
+            use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),
+            model_supports_tool_calling=bool(
+                getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
             ),
         ),
         on_progress=on_progress,

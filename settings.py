@@ -184,6 +184,7 @@ class Settings(BaseSettings):
     CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT: int = 50
     CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD: float = 0.7
     CONTROL_PLANE_LLM_USE_INSTRUCTOR: bool = True
+    CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING: bool = True
     CONTROL_PLANE_LLM_USE_NEW_ALGORITHM: bool = True
     CONTROL_PLANE_UI_LOGS_SUMMARY_USE_NEW_ALGORITHM: bool = True
     # If model stops with finish_reason=length/max_tokens, request continuation chunks.
