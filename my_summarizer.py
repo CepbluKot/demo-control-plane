@@ -1283,6 +1283,25 @@ def _is_non_retryable_llm_exception(exc: Exception) -> bool:
     return False
 
 
+def _is_transient_gateway_exception(exc: Exception) -> bool:
+    transient_statuses = {502, 503, 504}
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in transient_statuses:
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and status_code in transient_statuses:
+            return True
+    text = str(exc or "").strip().lower()
+    return (
+        "502 bad gateway" in text
+        or "503 service temporarily unavailable" in text
+        or "504 gateway timeout" in text
+        or ("bad gateway" in text and "nginx" in text)
+    )
+
+
 def _is_400_bad_request_exception(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int) and status_code == 400:
@@ -1309,11 +1328,35 @@ def _is_invalid_grammar_request_exception(exc: Exception) -> bool:
 
 
 def _is_instructor_empty_choices_exception(exc: Exception) -> bool:
-    text = str(exc or "").strip().lower()
+    parts: List[str] = []
+
+    def _collect(value: Any) -> None:
+        if value is None:
+            return
+        try:
+            parts.append(str(value))
+        except Exception:
+            pass
+        try:
+            parts.append(repr(value))
+        except Exception:
+            pass
+
+    _collect(exc)
+    for attr_name in ("last_exception", "__cause__", "__context__"):
+        _collect(getattr(exc, attr_name, None))
+    for arg in getattr(exc, "args", ()) or ():
+        _collect(arg)
+        if isinstance(arg, BaseException):
+            _collect(getattr(arg, "__cause__", None))
+            _collect(getattr(arg, "__context__", None))
+
+    text = "\n".join(parts).strip().lower()
     return (
         ("nonetype" in text and "choices" in text and "failed_attempts" in text)
         or ("object has no attribute 'choices'" in text)
         or ('object has no attribute "choices"' in text)
+        or ("none" in text and "choices" in text and "instructor" in text)
     )
 
 
@@ -1517,7 +1560,9 @@ class PeriodLogSummarizer:
             return cached
         base_url = _build_openai_base_url(str(settings.OPENAI_API_BASE_DB))
         api_key = str(settings.OPENAI_API_KEY_DB)
-        openai_client = OpenAI(base_url=base_url, api_key=api_key)
+        # Disable SDK-level automatic retries: retry policy is controlled explicitly
+        # in `_call_structured_with_instructor` to keep timings predictable in UI.
+        openai_client = OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
         if mode is not None:
             client = instructor.from_openai(openai_client, mode=mode)
         else:
@@ -1634,21 +1679,41 @@ class PeriodLogSummarizer:
                     self._instructor_force_json_mode = True
                     continue
                 if _is_instructor_empty_choices_exception(exc):
-                    if attempt_no >= 2:
-                        logger.warning(
-                            "Instructor returned malformed payload (choices=None) repeatedly | "
-                            "stage=%s | attempts=%s. Escalating to caller for fallback.",
-                            stage,
-                            attempt_no,
-                        )
-                        raise
                     logger.warning(
                         "Instructor returned malformed payload (choices=None) | "
-                        "stage=%s | attempt=%s. Retrying once before fallback.",
+                        "stage=%s | attempt=%s. Resetting instructor client cache and retrying.",
                         stage,
                         attempt_no,
                     )
-                    time.sleep(2.0)
+                    self._instructor_client_cache.clear()
+                    if self._instructor_tool_calling_enabled() and attempt_no >= 3:
+                        logger.warning(
+                            "Instructor malformed payload repeats in TOOLS mode | "
+                            "stage=%s | attempt=%s. Switching to JSON mode.",
+                            stage,
+                            attempt_no,
+                        )
+                        self._instructor_force_json_mode = True
+                    can_retry_empty = infinite_retries or attempt_no <= max(retries, 0)
+                    if not can_retry_empty:
+                        break
+                    retry_delay = min(10.0, 1.0 + float(min(attempt_no, 9)))
+                    time.sleep(retry_delay)
+                    continue
+                if _is_transient_gateway_exception(exc):
+                    self._instructor_client_cache.clear()
+                    retry_delay = min(60.0, 3.0 * float(2 ** min(max(attempt_no - 1, 0), 4)))
+                    logger.warning(
+                        "Instructor gateway error (502/503/504) | stage=%s | attempt=%s | "
+                        "retry_in=%.1fs | action=retry",
+                        stage,
+                        attempt_no,
+                        retry_delay,
+                    )
+                    can_retry_gateway = infinite_retries or attempt_no <= max(retries, 0)
+                    if not can_retry_gateway:
+                        break
+                    time.sleep(retry_delay)
                     continue
                 is_read_timeout = _is_read_timeout_exception(exc)
                 is_non_retryable = _is_non_retryable_llm_exception(exc)
@@ -2854,6 +2919,12 @@ class PeriodLogSummarizer:
                 "rows_total": total_rows_estimate,
             },
         )
+        logger.info(
+            "REDUCE start | input_map_summaries=%s | rows_mapped=%s | llm_calls_total=%s",
+            len(map_summaries),
+            rows_mapped,
+            llm_calls,
+        )
         final_summary, reduce_calls, reduce_rounds = self._reduce_summaries(
             chunk_summaries=map_summaries,
             period_start=period_start,
@@ -2880,6 +2951,12 @@ class PeriodLogSummarizer:
         freeform_summary = ""
         if final_summary and final_summary != "Нет логов за указанный период.":
             self._emit_progress("freeform_start", {"rows_processed": rows_mapped})
+            logger.info(
+                "FREEFORM start | rows_mapped=%s | reduce_rounds=%s | summary_len=%s",
+                rows_mapped,
+                reduce_rounds,
+                len(final_summary),
+            )
             try:
                 freeform_prompt = self._build_freeform_prompt(
                     period_start=period_start,
@@ -2889,11 +2966,25 @@ class PeriodLogSummarizer:
                 )
                 freeform_summary = self.llm_call(freeform_prompt).strip()
                 llm_calls += 1
+                logger.info(
+                    "FREEFORM done | output_len=%s | llm_calls_total=%s",
+                    len(freeform_summary),
+                    llm_calls,
+                )
             except Exception:
-                logger.warning("Freeform narrative generation failed, skipping")
+                logger.exception("FREEFORM failed | fallback=skip_freeform")
             self._emit_progress("freeform_done", {"freeform_summary": freeform_summary})
 
         result_map_summaries = map_summaries if self.config.keep_map_summaries_in_result else []
+        logger.info(
+            "SUMMARIZE done | pages=%s | rows_processed=%s | rows_mapped=%s | map_batches=%s | reduce_rounds=%s | llm_calls_total=%s",
+            pages_fetched,
+            rows_processed,
+            rows_mapped,
+            len(map_summaries),
+            reduce_rounds,
+            llm_calls,
+        )
         return SummarizationResult(
             summary=final_summary,
             freeform_summary=freeform_summary,
@@ -2918,7 +3009,22 @@ class PeriodLogSummarizer:
         sources: Optional[List[str]] = None,
         depth: int = 0,
     ) -> tuple[IncidentSummary, int]:
+        logger.info(
+            "REDUCE group start | round=%s | group=%s/%s | depth=%s | size=%s",
+            reduce_round,
+            group_index,
+            group_total,
+            depth,
+            len(summaries),
+        )
         if len(summaries) == 1:
+            logger.info(
+                "REDUCE group done (passthrough) | round=%s | group=%s/%s | depth=%s",
+                reduce_round,
+                group_index,
+                group_total,
+                depth,
+            )
             return summaries[0], 0
         if depth > 12:
             # Safety net: deterministic fallback to guarantee convergence.
@@ -2948,6 +3054,13 @@ class PeriodLogSummarizer:
                 ),
                 preliminary_recommendations=[],
             )
+            logger.warning(
+                "REDUCE group deterministic fallback | round=%s | group=%s/%s | depth=%s",
+                reduce_round,
+                group_index,
+                group_total,
+                depth,
+            )
             return fallback, 0
 
         serialized_group = [self._incident_summary_to_json(item) for item in summaries]
@@ -2969,6 +3082,14 @@ class PeriodLogSummarizer:
                     response_model=IncidentSummary,
                     stage="reduce",
                 )
+                logger.info(
+                    "REDUCE group done (instructor) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    reduce_round,
+                    group_index,
+                    group_total,
+                    depth,
+                    calls,
+                )
                 return parsed, calls
 
             raw = str(self.llm_call(prompt) or "").strip()
@@ -2980,6 +3101,14 @@ class PeriodLogSummarizer:
                 fallback_end=period_end,
             )
             if parsed is not None:
+                logger.info(
+                    "REDUCE group done (legacy-parse) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    reduce_round,
+                    group_index,
+                    group_total,
+                    depth,
+                    calls,
+                )
                 return parsed, calls
 
             # Schema-repair retry for legacy non-instructor path.
@@ -3002,6 +3131,14 @@ class PeriodLogSummarizer:
                 fallback_end=period_end,
             )
             if parsed_retry is not None:
+                logger.info(
+                    "REDUCE group done (legacy-repair) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    reduce_round,
+                    group_index,
+                    group_total,
+                    depth,
+                    calls,
+                )
                 return parsed_retry, calls
 
             # If response is plain text, keep compatibility by giving control back to legacy reducer.
@@ -3011,7 +3148,17 @@ class PeriodLogSummarizer:
                 self._is_context_overflow_error(exc)
                 or _is_400_bad_request_exception(exc)
                 or _is_read_timeout_exception(exc)
+                or _is_transient_gateway_exception(exc)
             ) and len(summaries) > 1:
+                logger.warning(
+                    "REDUCE group split fallback | round=%s | group=%s/%s | depth=%s | size=%s | error=%s",
+                    reduce_round,
+                    group_index,
+                    group_total,
+                    depth,
+                    len(summaries),
+                    exc,
+                )
                 mid = max(len(summaries) // 2, 1)
                 left, left_calls = self._reduce_structured_group(
                     summaries=summaries[:mid],
@@ -3050,6 +3197,14 @@ class PeriodLogSummarizer:
                     sources=sources,
                     depth=depth + 1,
                 )
+                logger.info(
+                    "REDUCE group done (split-merge) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    reduce_round,
+                    group_index,
+                    group_total,
+                    depth,
+                    calls + left_calls + right_calls + compression_calls + combined_calls,
+                )
                 return combined, calls + left_calls + right_calls + compression_calls + combined_calls
             raise
 
@@ -3086,6 +3241,12 @@ class PeriodLogSummarizer:
                 0,
             )
 
+        logger.info(
+            "REDUCE structured start | input_items=%s | period=[%s, %s)",
+            len(parsed_inputs),
+            period_start,
+            period_end,
+        )
         llm_calls = 0
         reduce_rounds = 0
         current = parsed_inputs
@@ -3095,6 +3256,12 @@ class PeriodLogSummarizer:
                 raise RuntimeError("Exceeded max reduce rounds")
 
             groups = self._group_structured_summaries_by_budget(current)
+            logger.info(
+                "REDUCE round start | round=%s | current_items=%s | groups=%s",
+                reduce_rounds,
+                len(current),
+                len(groups),
+            )
 
             next_level: List[IncidentSummary] = []
             for group_index, group in enumerate(groups):
@@ -3134,8 +3301,20 @@ class PeriodLogSummarizer:
                     },
                 )
             current = next_level
+            logger.info(
+                "REDUCE round done | round=%s | produced_items=%s | llm_calls_total=%s",
+                reduce_rounds,
+                len(current),
+                llm_calls,
+            )
 
         final_text = self._incident_summary_to_json(current[0])
+        logger.info(
+            "REDUCE structured done | rounds=%s | llm_calls=%s | final_len=%s",
+            reduce_rounds,
+            llm_calls,
+            len(final_text),
+        )
         return final_text, llm_calls, reduce_rounds
 
     def _reduce_summaries(

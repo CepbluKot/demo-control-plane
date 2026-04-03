@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     CONTROL_PLANE_UI_LOGS_SUMMARY_MAP_WORKERS: int = 1
     CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES: int = -1
     CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT: int = 600
+    # Final report stage guards (bounded retries/timeout/context to avoid hangs on flaky gateways)
+    CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_MAX_RETRIES: int = 3
+    CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_LLM_TIMEOUT: int = 180
+    CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_CONTEXT_MAX_CHARS: int = 120000
     CONTROL_PLANE_HTTP_TIMEOUT_SECONDS: int = 600
 
     # Forecast metadata

@@ -10,6 +10,8 @@ from my_summarizer import (
     MapBatchSummaryModel,
     PeriodLogSummarizer,
     SummarizerConfig,
+    _is_instructor_empty_choices_exception,
+    _is_transient_gateway_exception,
     _make_llm_call,
     _build_db_fetch_page,
     _estimate_total_logs,
@@ -1380,6 +1382,148 @@ class TestMySummarizer(unittest.TestCase):
             str(fallback_payloads[0].get("reason")),
             "instructor_empty_choices_payload",
         )
+
+    def test_is_instructor_empty_choices_exception_detects_nested_last_exception(self) -> None:
+        outer = RuntimeError("instructor retry wrapper")
+        setattr(outer, "last_exception", AttributeError("'NoneType' object has no attribute 'choices'"))
+        self.assertTrue(_is_instructor_empty_choices_exception(outer))
+
+    def test_call_structured_with_instructor_retries_on_empty_choices_then_succeeds(self) -> None:
+        payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        expected = IncidentSummary.model_validate(payload)
+
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError(
+                        "<failed_attempts><last_exception>'NoneType' object has no attribute 'choices'</last_exception>"
+                    )
+                return expected
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=3
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=1.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ):
+            parsed, attempts = summarizer._call_structured_with_instructor(
+                prompt="test",
+                response_model=IncidentSummary,
+                stage="reduce",
+            )
+
+        self.assertEqual(parsed, expected)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(fake_completions.calls, 3)
+
+    def test_is_transient_gateway_exception_detects_nginx_html(self) -> None:
+        err = RuntimeError(
+            "<html><body><center><h1>503 Service Temporarily Unavailable</h1></center><hr><center>nginx</center></body></html>"
+        )
+        self.assertTrue(_is_transient_gateway_exception(err))
+
+    def test_call_structured_with_instructor_retries_on_gateway_error_then_succeeds(self) -> None:
+        payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        expected = IncidentSummary.model_validate(payload)
+
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>"
+                    )
+                return expected
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=2
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=1.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ) as mocked_sleep:
+            parsed, attempts = summarizer._call_structured_with_instructor(
+                prompt="test",
+                response_model=IncidentSummary,
+                stage="reduce",
+            )
+
+        self.assertEqual(parsed, expected)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(fake_completions.calls, 2)
+        mocked_sleep.assert_called()
 
     def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
         summary_payload = {

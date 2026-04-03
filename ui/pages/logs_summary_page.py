@@ -238,6 +238,44 @@ def _normalize_summary_text(value: Any) -> str:
     return text
 
 
+def _final_stage_context_max_chars() -> int:
+    raw = pd.to_numeric(
+        getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_CONTEXT_MAX_CHARS", 120_000),
+        errors="coerce",
+    )
+    if pd.isna(raw):
+        return 120_000
+    return max(int(raw), 0)
+
+
+def _compress_context_for_llm_prompt(
+    text: Any,
+    *,
+    block_name: str,
+    logger: Optional[logging.Logger] = None,
+) -> str:
+    normalized = _normalize_summary_text(text)
+    limit = _final_stage_context_max_chars()
+    if limit <= 0 or len(normalized) <= limit:
+        return normalized
+    head = max(int(limit * 0.6), 1)
+    tail = max(limit - head, 1)
+    compressed = (
+        normalized[:head]
+        + "\n\n[...КОНТЕКСТ СЖАТ ДЛЯ ПЕРЕДАЧИ В LLM, ПОЛНЫЙ ТЕКСТ СОХРАНЁН В АРТЕФАКТАХ...]\n\n"
+        + normalized[-tail:]
+    )
+    if logger is not None:
+        logger.info(
+            "FINAL_STAGE context compressed | block=%s | original_len=%s | compressed_len=%s | limit=%s",
+            block_name,
+            len(normalized),
+            len(compressed),
+            limit,
+        )
+    return compressed
+
+
 def _ensure_report_topics_present(
     summary_text: str,
     *,
@@ -3746,6 +3784,14 @@ def _build_freeform_summary_prompt(
     anti_rules = str(
         getattr(settings, "CONTROL_PLANE_LLM_ANTI_HALLUCINATION_RULES", "")
     ).strip()
+    final_summary_for_prompt = _compress_context_for_llm_prompt(
+        final_summary,
+        block_name="final_summary",
+    )
+    map_summaries_for_prompt = _compress_context_for_llm_prompt(
+        map_summaries_text,
+        block_name="map_summaries_text",
+    )
     custom_template = str(
         getattr(settings, "CONTROL_PLANE_LLM_UI_FINAL_REPORT_PROMPT_TEMPLATE", "")
     ).strip()
@@ -3783,8 +3829,8 @@ def _build_freeform_summary_prompt(
         rendered = _render_prompt_template(
             custom_template,
             {
-                "final_summary": final_summary,
-                "cross_source_summary": final_summary,
+                "final_summary": final_summary_for_prompt,
+                "cross_source_summary": final_summary_for_prompt,
                 "user_goal": goal_block,
                 "incident_description": goal_block,
                 "alerts_list": goal_block,
@@ -3794,7 +3840,7 @@ def _build_freeform_summary_prompt(
                 "period_end": period_end,
                 "stats": json.dumps(_json_safe(stats), ensure_ascii=False, indent=2),
                 "metrics_context": metrics_block,
-                "map_summaries_text": str(map_summaries_text or ""),
+                "map_summaries_text": str(map_summaries_for_prompt or ""),
                 "anti_hallucination_rules": anti_rules,
             },
         )
@@ -3821,9 +3867,9 @@ def _build_freeform_summary_prompt(
         f"Период: [{period_start}, {period_end})\n"
         f"Метрики: {metrics_block}\n\n"
         "MAP summary по батчам логов:\n"
-        f"{(map_summaries_text or 'Нет map-summary.')}\n\n"
+        f"{(map_summaries_for_prompt or 'Нет map-summary.')}\n\n"
         "Структурированный анализ логов:\n"
-        f"{final_summary}"
+        f"{final_summary_for_prompt}"
         f"{chain_block}{incident_link_block}{root_cause_hypotheses_block}"
     )
 
@@ -3967,14 +4013,32 @@ def _generate_sectional_structured_summary(
     metrics_context: str,
     on_section_start: Optional[Callable[[int, int, str], None]] = None,
     on_section_done: Optional[Callable[[int, int, str], None]] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[str, List[Dict[str, str]]]:
     sections: List[Dict[str, str]] = []
     total = len(FINAL_REPORT_SECTIONS)
     for idx, (title, requirement) in enumerate(FINAL_REPORT_SECTIONS, start=1):
+        if logger is not None:
+            logger.info(
+                "FINAL_REPORT section start | kind=structured | section=%s/%s | title=%s",
+                idx,
+                total,
+                title,
+            )
         if on_section_start is not None:
             on_section_start(idx, total, title)
         previous_text = "\n\n".join(
             f"## {item['title']}\n{item['text']}" for item in sections if item.get("text")
+        )
+        previous_text_for_prompt = _compress_context_for_llm_prompt(
+            previous_text,
+            block_name=f"structured_previous_sections_{idx}",
+            logger=logger,
+        )
+        base_summary_for_prompt = _compress_context_for_llm_prompt(
+            base_summary,
+            block_name=f"structured_base_summary_{idx}",
+            logger=logger,
         )
         section_text = _programmatic_section_text(
             section_title=title,
@@ -3987,18 +4051,36 @@ def _generate_sectional_structured_summary(
                 section_total=total,
                 section_title=title,
                 section_requirement=requirement,
-                previous_sections_text=previous_text,
-                base_summary=base_summary,
+                previous_sections_text=previous_text_for_prompt,
+                base_summary=base_summary_for_prompt,
                 user_goal=user_goal,
                 period_start=period_start,
                 period_end=period_end,
                 stats=stats,
                 metrics_context=metrics_context,
             )
-            section_text = _normalize_summary_text(llm_call(prompt))
+            try:
+                section_text = _normalize_summary_text(llm_call(prompt))
+            except Exception as section_exc:  # noqa: BLE001
+                if logger is not None:
+                    logger.exception(
+                        "FINAL_REPORT section failed | kind=structured | section=%s/%s | title=%s",
+                        idx,
+                        total,
+                        title,
+                    )
+                section_text = ""
             if not section_text:
                 section_text = "Данных недостаточно для уверенного вывода по этой секции."
         sections.append({"title": title, "text": section_text})
+        if logger is not None:
+            logger.info(
+                "FINAL_REPORT section done | kind=structured | section=%s/%s | title=%s | len=%s",
+                idx,
+                total,
+                title,
+                len(section_text),
+            )
         if on_section_done is not None:
             on_section_done(idx, total, title)
 
@@ -4022,14 +4104,32 @@ def _generate_sectional_freeform_summary(
     metrics_context: str,
     on_section_start: Optional[Callable[[int, int, str], None]] = None,
     on_section_done: Optional[Callable[[int, int, str], None]] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> tuple[str, List[Dict[str, str]]]:
     sections: List[Dict[str, str]] = []
     total = len(FINAL_REPORT_SECTIONS)
     for idx, (title, requirement) in enumerate(FINAL_REPORT_SECTIONS, start=1):
+        if logger is not None:
+            logger.info(
+                "FINAL_REPORT section start | kind=freeform | section=%s/%s | title=%s",
+                idx,
+                total,
+                title,
+            )
         if on_section_start is not None:
             on_section_start(idx, total, title)
         previous_text = "\n\n".join(
             f"## {item['title']}\n{item['text']}" for item in sections if item.get("text")
+        )
+        previous_text_for_prompt = _compress_context_for_llm_prompt(
+            previous_text,
+            block_name=f"freeform_previous_sections_{idx}",
+            logger=logger,
+        )
+        final_summary_for_prompt = _compress_context_for_llm_prompt(
+            final_summary,
+            block_name=f"freeform_final_summary_{idx}",
+            logger=logger,
         )
         section_text = _programmatic_section_text(
             section_title=title,
@@ -4042,18 +4142,36 @@ def _generate_sectional_freeform_summary(
                 section_total=total,
                 section_title=title,
                 section_requirement=requirement,
-                previous_sections_text=previous_text,
-                final_summary=final_summary,
+                previous_sections_text=previous_text_for_prompt,
+                final_summary=final_summary_for_prompt,
                 user_goal=user_goal,
                 period_start=period_start,
                 period_end=period_end,
                 stats=stats,
                 metrics_context=metrics_context,
             )
-            section_text = _normalize_summary_text(llm_call(prompt))
+            try:
+                section_text = _normalize_summary_text(llm_call(prompt))
+            except Exception as section_exc:  # noqa: BLE001
+                if logger is not None:
+                    logger.exception(
+                        "FINAL_REPORT section failed | kind=freeform | section=%s/%s | title=%s",
+                        idx,
+                        total,
+                        title,
+                    )
+                section_text = ""
             if not section_text:
                 section_text = "Данных недостаточно для уверенного вывода по этой секции."
         sections.append({"title": title, "text": section_text})
+        if logger is not None:
+            logger.info(
+                "FINAL_REPORT section done | kind=freeform | section=%s/%s | title=%s | len=%s",
+                idx,
+                total,
+                title,
+                len(section_text),
+            )
         if on_section_done is not None:
             on_section_done(idx, total, title)
 
@@ -8446,6 +8564,60 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         llm_call = _llm_call_with_context
 
+        final_stage_max_retries_raw = pd.to_numeric(
+            getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_MAX_RETRIES", 3),
+            errors="coerce",
+        )
+        final_stage_max_retries = int(final_stage_max_retries_raw) if not pd.isna(final_stage_max_retries_raw) else 3
+        if final_stage_max_retries < 0:
+            # Final stage must be bounded to avoid infinite hangs on flaky gateways.
+            final_stage_max_retries = 3
+        final_stage_timeout_raw = pd.to_numeric(
+            getattr(
+                settings,
+                "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_LLM_TIMEOUT",
+                min(float(llm_timeout), 180.0),
+            ),
+            errors="coerce",
+        )
+        final_stage_timeout = float(final_stage_timeout_raw) if not pd.isna(final_stage_timeout_raw) else min(float(llm_timeout), 180.0)
+        final_stage_timeout = max(final_stage_timeout, 30.0)
+        deps.logger.info(
+            "FINAL_STAGE guard config | timeout=%.1fs | max_retries=%s",
+            final_stage_timeout,
+            final_stage_max_retries,
+        )
+        final_stage_base_llm_call = deps.make_llm_call(
+            max_retries=final_stage_max_retries,
+            on_retry=_on_retry,
+            on_attempt=_on_llm_attempt,
+            on_result=_on_llm_result,
+            llm_timeout=final_stage_timeout,
+        )
+
+        def _final_stage_llm_call_with_context(prompt: str) -> str:
+            enriched_prompt = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
+            phase = f"{_infer_phase_hint()}_final"
+            try:
+                response = final_stage_base_llm_call(enriched_prompt)
+                _trace_llm_call(
+                    phase=phase,
+                    prompt_text=enriched_prompt,
+                    response_text=response,
+                    error_text=None,
+                )
+                return response
+            except Exception as exc:  # noqa: BLE001
+                _trace_llm_call(
+                    phase=phase,
+                    prompt_text=enriched_prompt,
+                    response_text=None,
+                    error_text=str(exc),
+                )
+                raise
+
+        final_stage_llm_call = _final_stage_llm_call_with_context
+
         def _build_runtime_config() -> Any:
             return _build_config(
                 deps,
@@ -8965,7 +9137,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             map_summaries=cached_map_summaries,
                             period_start=period_start_iso,
                             period_end=period_end_iso,
-                            llm_call=llm_call,
+                            llm_call=final_stage_llm_call,
                             config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
@@ -8977,8 +9149,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
-                                "llm_timeout": llm_timeout,
-                                "llm_max_retries": max_retries,
+                                "llm_timeout": final_stage_timeout,
+                                "llm_max_retries": final_stage_max_retries,
                             },
                         )
                     )
@@ -9042,7 +9214,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             map_summaries=recovered_map_summaries,
                             period_start=period_start_iso,
                             period_end=period_end_iso,
-                            llm_call=llm_call,
+                            llm_call=final_stage_llm_call,
                             config=_build_runtime_config(),
                             prompt_context={
                                 "incident_start": period_start_iso,
@@ -9054,8 +9226,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                                 "sql_query": sql_query_clean,
                                 "time_column": logs_timestamp_column,
                                 "data_type": "",
-                                "llm_timeout": llm_timeout,
-                                "llm_max_retries": max_retries,
+                                "llm_timeout": final_stage_timeout,
+                                "llm_max_retries": final_stage_max_retries,
                             },
                         )
                     )
@@ -9097,11 +9269,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 _render_logs_summary_chat(analysis_placeholder, state, deps)
 
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
+            deps.logger.info(
+                "FINAL_REPORT pipeline start | final_summary_len=%s | report_steps_total=%s | use_instructor=%s",
+                len(final_summary_for_report),
+                report_steps_total,
+                bool(use_instructor),
+            )
             state["report_progress_total"] = report_steps_total
             state["report_progress_current"] = 0
             state["report_progress_active"] = True
             _set_report_progress("Подготовка итогового отчёта", render_now=True)
             try:
+                deps.logger.info("FINAL_REPORT structured stage start")
                 events = state.setdefault("events", [])
                 state["structured_sections"] = []
                 events.append("Готовим структурированный финальный отчет по секциям")
@@ -9143,7 +9322,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
 
                 structured_summary, structured_sections = _generate_sectional_structured_summary(
-                    llm_call=llm_call,
+                    llm_call=final_stage_llm_call,
                     base_summary=final_summary_for_report,
                     user_goal=goal_text,
                     period_start=period_start_iso,
@@ -9152,6 +9331,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     metrics_context=metrics_context_text,
                     on_section_start=_on_structured_section_start,
                     on_section_done=_on_structured_section_done,
+                    logger=deps.logger,
                 )
                 structured_summary = _normalize_summary_text(structured_summary)
                 if structured_summary:
@@ -9159,11 +9339,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state["final_summary"] = structured_summary
                     state["structured_sections"] = structured_sections
                     events.append("Структурированный финальный отчет готов")
+                    deps.logger.info(
+                        "FINAL_REPORT structured stage done | sections=%s | summary_len=%s",
+                        len(structured_sections),
+                        len(structured_summary),
+                    )
                 else:
                     events.append("Структурированный секционный отчет пустой, оставляем reduce summary")
+                    deps.logger.warning("FINAL_REPORT structured stage done but empty output")
                 _set_report_progress("Структурированный отчёт: этап завершён", step_inc=1, render_now=True)
             except Exception as structured_exc:  # noqa: BLE001
-                deps.logger.warning("structured sectional report generation failed: %s", structured_exc)
+                deps.logger.exception("FINAL_REPORT structured stage failed")
                 state.setdefault("events", []).append(
                     "Не удалось сгенерировать структурированный секционный отчет, оставляем reduce summary"
                 )
@@ -9174,6 +9360,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 )
 
             try:
+                deps.logger.info("FINAL_REPORT freeform stage start")
                 events = state.setdefault("events", [])
                 state["final_summary"] = final_summary_for_report
                 state["freeform_sections"] = []
@@ -9207,7 +9394,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
 
                 freeform_summary, freeform_sections = _generate_sectional_freeform_summary(
-                    llm_call=llm_call,
+                    llm_call=final_stage_llm_call,
                     final_summary=final_summary_for_report,
                     user_goal=goal_text,
                     period_start=period_start_iso,
@@ -9216,17 +9403,24 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     metrics_context=metrics_context_text,
                     on_section_start=_on_section_start,
                     on_section_done=_on_section_done,
+                    logger=deps.logger,
                 )
                 freeform_summary = _normalize_summary_text(freeform_summary)
                 if freeform_summary:
                     state["freeform_final_summary"] = freeform_summary
                     state["freeform_sections"] = freeform_sections
                     events.append("Свободный финальный отчет готов")
+                    deps.logger.info(
+                        "FINAL_REPORT freeform stage done | sections=%s | summary_len=%s",
+                        len(freeform_sections),
+                        len(freeform_summary),
+                    )
                 else:
                     events.append("Свободный финальный отчет пустой, используем основной")
+                    deps.logger.warning("FINAL_REPORT freeform stage done but empty output")
                 _set_report_progress("Свободный отчёт: этап завершён", step_inc=1, render_now=True)
             except Exception as freeform_exc:  # noqa: BLE001
-                deps.logger.warning("freeform final report generation failed: %s", freeform_exc)
+                deps.logger.exception("FINAL_REPORT freeform stage failed | trying fallback")
                 state.setdefault("events", []).append(
                     "Секционная генерация отчета не удалась, пробуем резервный один запрос"
                 )
@@ -9247,14 +9441,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         stats=state.get("stats") or {},
                         metrics_context=metrics_context_text,
                     )
-                    fallback_freeform = _normalize_summary_text(llm_call(freeform_prompt))
+                    fallback_freeform = _normalize_summary_text(final_stage_llm_call(freeform_prompt))
                     if fallback_freeform:
                         state["freeform_final_summary"] = fallback_freeform
                         state.setdefault("events", []).append(
                             "Резервный freeform-отчет сгенерирован"
                         )
+                        deps.logger.info(
+                            "FINAL_REPORT freeform fallback done | summary_len=%s",
+                            len(fallback_freeform),
+                        )
                 except Exception as fallback_exc:  # noqa: BLE001
-                    deps.logger.warning("fallback freeform generation failed: %s", fallback_exc)
+                    deps.logger.exception("FINAL_REPORT freeform fallback failed")
                     state.setdefault("events", []).append(
                         "Не удалось сгенерировать свободный финальный отчет"
                     )
@@ -9305,6 +9503,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             state.setdefault("events", []).append(
                 "Синхронизация топиков: добавили недостающие разделы в свободный отчет"
             )
+        deps.logger.info(
+            "FINAL_REPORT topics sync done | missing_structured=%s | missing_freeform=%s",
+            len(missing_in_structured),
+            len(missing_in_freeform),
+        )
         if _safe_int(state.get("report_progress_total"), 0) > 0:
             _set_report_progress("Синхронизация топиков завершена", step_inc=1, render_now=True)
 
@@ -9312,6 +9515,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         # generate one more final report pair via Instructor for A/B testing.
         if use_instructor and final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             try:
+                deps.logger.info("FINAL_REPORT instructor stage start")
                 state["llm_phase_hint"] = "final_instructor_report"
                 state["active_source_label"] = "final_instructor_report"
                 state["instructor_report_status"] = "running"
@@ -9337,8 +9541,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     stats=state.get("stats") or {},
                     metrics_context=metrics_context_text,
                     section_titles=[title for title, _ in FINAL_REPORT_SECTIONS],
-                    llm_timeout=float(max(llm_timeout, 10)),
-                    llm_max_retries=int(max_retries),
+                    llm_timeout=float(max(final_stage_timeout, 10.0)),
+                    llm_max_retries=int(final_stage_max_retries),
                     model_supports_tool_calling=bool(model_supports_tool_calling),
                     verified_summary_json=final_summary_for_instructor_input,
                     alerts=state.get("alerts") if isinstance(state.get("alerts"), list) else [],
@@ -9369,21 +9573,25 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state.setdefault("events", []).append(
                         "Instructor-версия финального отчёта готова."
                     )
+                    deps.logger.info(
+                        "FINAL_REPORT instructor stage done | structured_len=%s | freeform_len=%s | attempts=%s",
+                        len(instructor_structured),
+                        len(instructor_freeform),
+                        _safe_int(instructor_bundle.get("attempts"), 0),
+                    )
                 else:
                     state["instructor_report_status"] = "empty"
                     state.setdefault("events", []).append(
                         "Instructor-версия финального отчёта вернула пустой результат."
                     )
+                    deps.logger.warning("FINAL_REPORT instructor stage done but empty output")
                 _set_report_progress(
                     "Instructor-отчёт: этап завершён",
                     step_inc=1,
                     render_now=True,
                 )
             except Exception as instructor_exc:  # noqa: BLE001
-                deps.logger.warning(
-                    "instructor final report generation failed: %s",
-                    instructor_exc,
-                )
+                deps.logger.exception("FINAL_REPORT instructor stage failed")
                 state["instructor_report_status"] = "error"
                 state["instructor_report_error"] = str(instructor_exc)
                 state.setdefault("events", []).append(
@@ -9413,6 +9621,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     ]
                 ),
             )
+            deps.logger.info("FINAL_REPORT artifact saved | file=final_structured.md | len=%s", len(final_structured_now))
         final_structured_sections = state.get("structured_sections")
         if isinstance(final_structured_sections, list) and final_structured_sections:
             _write_json_file(
@@ -9446,6 +9655,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     ]
                 ),
             )
+            deps.logger.info("FINAL_REPORT artifact saved | file=final_freeform.md | len=%s", len(final_freeform_now))
         final_freeform_sections = state.get("freeform_sections")
         if isinstance(final_freeform_sections, list) and final_freeform_sections:
             _write_json_file(

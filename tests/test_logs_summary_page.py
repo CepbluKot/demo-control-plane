@@ -472,6 +472,93 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("incident goal", prompts[0])
         self.assertIn("struct_body_1", prompts[1])
 
+    def test_generate_sectional_structured_summary_continues_when_llm_errors(self) -> None:
+        prompts: list[str] = []
+
+        def failing_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            raise RuntimeError("502 Bad Gateway")
+
+        merged, sections = _generate_sectional_structured_summary(
+            llm_call=failing_llm,
+            base_summary="Structured reduce summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
+        self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
+
+    def test_generate_sectional_structured_summary_compresses_only_prompt_context(self) -> None:
+        prompts: list[str] = []
+
+        def fake_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return "FULL_SECTION_TEXT_OUTPUT"
+
+        long_base = "BASE_" + ("X" * 5000)
+        with patch.object(
+            settings,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_CONTEXT_MAX_CHARS",
+            400,
+            create=True,
+        ):
+            merged, sections = _generate_sectional_structured_summary(
+                llm_call=fake_llm,
+                base_summary=long_base,
+                user_goal="incident goal",
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                stats={},
+                metrics_context="",
+            )
+        self.assertTrue(any("КОНТЕКСТ СЖАТ ДЛЯ ПЕРЕДАЧИ В LLM" in p for p in prompts))
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertIn("FULL_SECTION_TEXT_OUTPUT", merged)
+
+    def test_generate_sectional_freeform_summary_continues_when_llm_errors(self) -> None:
+        prompts: list[str] = []
+
+        def failing_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            raise RuntimeError("503 Service Temporarily Unavailable")
+
+        merged, sections = _generate_sectional_freeform_summary(
+            llm_call=failing_llm,
+            final_summary="Structured summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
+        self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
+
+    def test_build_freeform_summary_prompt_compresses_context_for_llm(self) -> None:
+        long_final = "FINAL_" + ("A" * 5000)
+        long_maps = "MAPS_" + ("B" * 5000)
+        with patch.object(
+            settings,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_CONTEXT_MAX_CHARS",
+            500,
+            create=True,
+        ):
+            prompt = _build_freeform_summary_prompt(
+                final_summary=long_final,
+                map_summaries_text=long_maps,
+                user_goal="incident goal",
+                period_start="2026-03-18T00:00:00Z",
+                period_end="2026-03-18T01:00:00Z",
+                stats={},
+                metrics_context="",
+            )
+        self.assertIn("КОНТЕКСТ СЖАТ ДЛЯ ПЕРЕДАЧИ В LLM", prompt)
+
     def test_no_logs_hypothesis_prompt_includes_period_and_goal(self) -> None:
         prompt = _build_no_logs_hypothesis_prompt(
             period_start="2026-03-18T00:00:00Z",
