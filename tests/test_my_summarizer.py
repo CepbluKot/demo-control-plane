@@ -11,6 +11,7 @@ from my_summarizer import (
     PeriodLogSummarizer,
     SummarizerConfig,
     _is_instructor_empty_choices_exception,
+    _is_read_timeout_exception,
     _is_transient_gateway_exception,
     _make_llm_call,
     _build_db_fetch_page,
@@ -52,6 +53,24 @@ class TestMySummarizer(unittest.TestCase):
         with patch("my_summarizer.has_required_env", return_value=False):
             with self.assertRaises(RuntimeError):
                 _make_llm_call()
+
+    def test_make_llm_call_uses_20min_default_timeout(self) -> None:
+        captured: list[float] = []
+
+        def _fake_communicate(*, message, system_prompt="", timeout=0.0):
+            _ = (message, system_prompt)
+            captured.append(float(timeout))
+            return "ok"
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_fake_communicate,
+        ):
+            llm_call = _make_llm_call(max_retries=0, retry_delay=0.0)
+            out = llm_call("test prompt")
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(captured, [1200.0])
 
     def test_make_llm_call_raises_after_retry_exhaustion(self) -> None:
         retries = []
@@ -187,6 +206,31 @@ class TestMySummarizer(unittest.TestCase):
                 llm_call("test prompt")
 
         self.assertEqual(retries, [])
+
+    def test_make_llm_call_doubles_timeout_on_read_timeout(self) -> None:
+        observed_timeouts: list[float] = []
+        calls = {"count": 0}
+
+        def _fake_communicate(*, message, system_prompt="", timeout=60.0):
+            _ = (message, system_prompt)
+            observed_timeouts.append(float(timeout))
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise requests.exceptions.ReadTimeout("read timeout")
+            return "ok"
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_fake_communicate,
+        ), patch(
+            "my_summarizer.time.sleep",
+            return_value=None,
+        ):
+            llm_call = _make_llm_call(max_retries=0, retry_delay=0.0, llm_timeout=5.0)
+            out = llm_call("test prompt")
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(observed_timeouts, [5.0, 10.0, 20.0])
 
     def test_summarizer_auto_shrinks_batch_on_400_bad_request(self) -> None:
         calls = {"map_large": 0, "map_small": 0}
@@ -1388,6 +1432,11 @@ class TestMySummarizer(unittest.TestCase):
         setattr(outer, "last_exception", AttributeError("'NoneType' object has no attribute 'choices'"))
         self.assertTrue(_is_instructor_empty_choices_exception(outer))
 
+    def test_is_read_timeout_exception_detects_nested_instructor_timeout(self) -> None:
+        outer = RuntimeError("instructor retry wrapper")
+        setattr(outer, "last_exception", RuntimeError("Request timed out."))
+        self.assertTrue(_is_read_timeout_exception(outer))
+
     def test_call_structured_with_instructor_retries_on_empty_choices_then_succeeds(self) -> None:
         payload = {
             "context": {
@@ -1524,6 +1573,71 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(fake_completions.calls, 2)
         mocked_sleep.assert_called()
+
+    def test_call_structured_with_instructor_doubles_timeout_on_read_timeout(self) -> None:
+        payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        expected = IncidentSummary.model_validate(payload)
+
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.timeouts: list[float] = []
+
+            def create(self, **kwargs):
+                self.calls += 1
+                self.timeouts.append(float(kwargs.get("timeout", 0.0)))
+                if self.calls == 1:
+                    raise requests.exceptions.ReadTimeout("read timeout")
+                return expected
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=1
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=3.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ):
+            parsed, attempts = summarizer._call_structured_with_instructor(
+                prompt="test",
+                response_model=IncidentSummary,
+                stage="reduce",
+            )
+
+        self.assertEqual(parsed, expected)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(fake_completions.calls, 2)
+        self.assertEqual(fake_completions.timeouts, [3.0, 6.0])
 
     def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
         summary_payload = {

@@ -772,7 +772,7 @@ def _parse_chat_completion_response(data: Any) -> Tuple[str, str]:
     return str(data), ""
 
 
-def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 600.0) -> str:
+def communicate_with_llm(message: str, system_prompt: str = "", timeout: float = 1200.0) -> str:
     if not has_required_env():
         raise RuntimeError("OPENAI_API_BASE_DB and OPENAI_API_KEY_DB are required")
 
@@ -1246,6 +1246,10 @@ def _is_llm_error_stub(summary_text: str) -> bool:
 
 
 def _is_read_timeout_exception(exc: Exception) -> bool:
+    nested_last_exc = getattr(exc, "last_exception", None)
+    if isinstance(nested_last_exc, Exception) and nested_last_exc is not exc:
+        if _is_read_timeout_exception(nested_last_exc):
+            return True
     if isinstance(exc, requests.exceptions.ReadTimeout):
         return True
     exc_type_name = type(exc).__name__.lower()
@@ -1259,6 +1263,8 @@ def _is_read_timeout_exception(exc: Exception) -> bool:
         "read timed out" in text
         or "read timeout" in text
         or "readtimeout" in text
+        or "request timed out" in text
+        or "timed out." in text
     )
 
 
@@ -1366,7 +1372,7 @@ def _make_llm_call(
     on_retry: Optional[Callable[[int, int, Exception], None]] = None,
     on_attempt: Optional[Callable[[int, int, float], None]] = None,
     on_result: Optional[Callable[[int, int, bool, float, Optional[str]], None]] = None,
-    llm_timeout: float = 600.0,
+    llm_timeout: float = 1200.0,
 ) -> LLMTextCaller:
     if not has_required_env():
         raise RuntimeError(
@@ -1441,9 +1447,9 @@ def _make_llm_call(
                 )
                 if can_retry:
                     if is_read_timeout:
-                        next_timeout = current_timeout + base_timeout
+                        next_timeout = current_timeout * 2.0
                         logger.warning(
-                            "LLM ReadTimeout on attempt %d; next timeout %.1fs (prev %.1fs)",
+                            "LLM ReadTimeout on attempt %d; next timeout %.1fs (prev %.1fs, strategy=x2)",
                             attempt_no,
                             next_timeout,
                             current_timeout,
@@ -1579,13 +1585,13 @@ class PeriodLogSummarizer:
         timeout_value = pd.to_numeric(prompt_timeout, errors="coerce")
         if pd.isna(timeout_value):
             timeout_value = pd.to_numeric(
-                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 600),
+                getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200),
                 errors="coerce",
             )
         try:
             return max(float(timeout_value), 1.0)
         except Exception:
-            return 600.0
+            return 1200.0
 
     def _structured_call_retry_limit(self) -> int:
         prompt_retries = self.prompt_context.get("llm_max_retries")
@@ -1723,9 +1729,9 @@ class PeriodLogSummarizer:
                 if not can_retry:
                     break
                 if is_read_timeout:
-                    next_timeout = current_timeout + base_timeout
+                    next_timeout = current_timeout * 2.0
                     logger.warning(
-                        "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs",
+                        "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | strategy=x2",
                         stage,
                         attempt_no,
                         current_timeout,
@@ -4441,7 +4447,7 @@ def generate_final_reports_with_instructor(
     stats: Optional[Dict[str, Any]] = None,
     metrics_context: str = "",
     section_titles: Optional[Sequence[str]] = None,
-    llm_timeout: float = 600.0,
+    llm_timeout: float = 1200.0,
     llm_max_retries: int = -1,
     model_supports_tool_calling: bool = True,
     verified_summary_json: str = "",

@@ -84,7 +84,7 @@ MODEL_CONTEXT_PRESETS: Dict[str, int] = {
 
 def _default_llm_timeout_seconds() -> int:
     return max(
-        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 600) or 600),
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200) or 1200),
         10,
     )
 FINAL_REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
@@ -902,7 +902,7 @@ class LogsSummaryPageDeps:
     logs_fetch_mode: str = "time_window"
     map_workers: int = 1
     max_retries: int = -1
-    llm_timeout: int = 600
+    llm_timeout: int = 1200
 
 
 @dataclass
@@ -6772,14 +6772,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         st.number_input(
             "Таймаут LLM (сек)",
             min_value=10,
-            max_value=600,
+            max_value=7200,
             step=10,
             key="logs_sum_llm_timeout",
             disabled=is_running,
             help=(
                 "Максимальное время ожидания одного LLM-ответа. "
                 "При зависании запрос упадёт по таймауту и уйдёт на retry. "
-                "Для ReadTimeout таймаут растёт прогрессивно (+base timeout на каждую ошибку), "
+                "Для ReadTimeout таймаут растёт экспоненциально (x2 на каждую ошибку), "
                 "повторы идут бесконечно."
             ),
         )
@@ -8572,16 +8572,8 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         if final_stage_max_retries < 0:
             # Final stage must be bounded to avoid infinite hangs on flaky gateways.
             final_stage_max_retries = 3
-        final_stage_timeout_raw = pd.to_numeric(
-            getattr(
-                settings,
-                "CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_LLM_TIMEOUT",
-                min(float(llm_timeout), 180.0),
-            ),
-            errors="coerce",
-        )
-        final_stage_timeout = float(final_stage_timeout_raw) if not pd.isna(final_stage_timeout_raw) else min(float(llm_timeout), 180.0)
-        final_stage_timeout = max(final_stage_timeout, 30.0)
+        # Final stage uses the same user-selected base timeout as other LLM stages.
+        final_stage_timeout = max(float(llm_timeout), 10.0)
         deps.logger.info(
             "FINAL_STAGE guard config | timeout=%.1fs | max_retries=%s",
             final_stage_timeout,

@@ -32,6 +32,7 @@ from ui.pages.logs_summary_page import (
     _build_sectional_structured_prompt,
     _build_zip_artifacts_bytes,
     _collect_timeline_events,
+    _default_llm_timeout_seconds,
     _discover_resume_sessions,
     _enrich_stats_with_elapsed,
     _extract_alerts_from_items,
@@ -55,6 +56,10 @@ import pandas as pd
 
 
 class TestLogsSummaryPageHelpers(unittest.TestCase):
+    def test_default_llm_timeout_seconds_is_20_minutes(self) -> None:
+        with patch.object(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200):
+            self.assertEqual(_default_llm_timeout_seconds(), 1200)
+
     def test_extract_root_cause_hypotheses_block_from_section(self) -> None:
         text = (
             "1) ХРОНОЛОГИЯ\n"
