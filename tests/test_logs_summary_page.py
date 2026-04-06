@@ -1166,7 +1166,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer token-123")
         self.assertEqual(float(captured["timeout"]), 7.0)
 
-    def test_build_config_passes_new_algorithm(self) -> None:
+    def test_build_config_forces_new_algorithm(self) -> None:
         deps = type(
             "_Deps",
             (),

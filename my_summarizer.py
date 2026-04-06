@@ -142,11 +142,14 @@ class SummarizerConfig:
     map_workers: int = 1
     # New pipeline mode (algorithm (1).md): no local token estimation,
     # split only on real overflow/timeouts + cascading structured reduce.
-    use_new_algorithm: bool = False
+    use_new_algorithm: bool = True
     # Reduce/compression target size in percents of input size.
     reduce_target_token_pct: int = 50
     compression_target_pct: int = 50
     compression_importance_threshold: float = 0.7
+    # For REDUCE structured calls: after this many transient gateway errors
+    # (502/503/504) inside one group-call, bubble exception up so group can split.
+    reduce_gateway_retry_cap: int = 3
     use_instructor: bool = False
     # If False, instructor works in JSON mode (no tool/function calling).
     # Needed for OpenAI-compatible gateways that do not support tool-calling parser.
@@ -1124,7 +1127,7 @@ def _build_db_fetch_page(
                 projected_rows.append({col: row.get(col) for col in columns})
             return projected_rows
 
-        # --- Legacy path ---
+        # Offset/limit mode.
         effective_period_start = (
             _EARLIEST_PERIOD_START if fetch_mode == "tail_n_logs" else period_start
         )
@@ -1612,6 +1615,7 @@ class PeriodLogSummarizer:
         prompt: str,
         response_model: Type[TModel],
         stage: str,
+        gateway_retry_cap: Optional[int] = None,
     ) -> Tuple[TModel, int]:
         if not self._instructor_enabled():
             raise RuntimeError("Instructor is disabled or unavailable.")
@@ -1623,6 +1627,7 @@ class PeriodLogSummarizer:
         current_timeout = base_timeout
         attempt_no = 0
         last_exc: Optional[Exception] = None
+        gateway_error_count = 0
         while True:
             attempt_no += 1
             mode_label = "TOOLS" if self._instructor_tool_calling_enabled() else "JSON"
@@ -1707,17 +1712,44 @@ class PeriodLogSummarizer:
                     time.sleep(retry_delay)
                     continue
                 if _is_transient_gateway_exception(exc):
+                    gateway_error_count += 1
                     self._instructor_client_cache.clear()
                     retry_delay = min(60.0, 3.0 * float(2 ** min(max(attempt_no - 1, 0), 4)))
+                    cap_limit = None
+                    if gateway_retry_cap is not None:
+                        try:
+                            cap_limit = max(int(gateway_retry_cap), 0)
+                        except Exception:
+                            cap_limit = None
                     logger.warning(
                         "Instructor gateway error (502/503/504) | stage=%s | attempt=%s | "
-                        "retry_in=%.1fs | action=retry",
+                        "retry_in=%.1fs | action=retry | gateway_errors=%s%s",
                         stage,
                         attempt_no,
                         retry_delay,
+                        gateway_error_count,
+                        (
+                            f"/{cap_limit}" if cap_limit is not None and cap_limit > 0 else ""
+                        ),
                     )
-                    can_retry_gateway = infinite_retries or attempt_no <= max(retries, 0)
+                    within_general_retries = infinite_retries or attempt_no <= max(retries, 0)
+                    within_gateway_cap = (
+                        True
+                        if cap_limit is None or cap_limit <= 0
+                        else gateway_error_count <= cap_limit
+                    )
+                    can_retry_gateway = within_general_retries and within_gateway_cap
                     if not can_retry_gateway:
+                        logger.warning(
+                            "Instructor gateway retry cap reached | stage=%s | attempt=%s | "
+                            "gateway_errors=%s%s | action=propagate_for_fallback",
+                            stage,
+                            attempt_no,
+                            gateway_error_count,
+                            (
+                                f"/{cap_limit}" if cap_limit is not None and cap_limit > 0 else ""
+                            ),
+                        )
                         break
                     time.sleep(retry_delay)
                     continue
@@ -2603,16 +2635,15 @@ class PeriodLogSummarizer:
         if bool(getattr(self.config, "auto_shrink_on_400", True)):
             # Real batch count can grow dynamically after split-on-400.
             estimated_batch_total = None
-        if bool(getattr(self.config, "use_new_algorithm", False)):
-            # Token-based map splitting can further split chunks dynamically.
-            estimated_batch_total = None
+        # Updated algorithm uses dynamic split/merge flow, so total batch count can grow.
+        estimated_batch_total = None
         seen_sources: List[str] = []  # ordered unique sources seen across all pages
         self._emit_progress(
             "map_start",
             {
                 "rows_processed": 0,
                 "rows_total": total_rows_estimate,
-                "use_new_algorithm": bool(getattr(self.config, "use_new_algorithm", False)),
+                "use_new_algorithm": True,
                 "use_instructor": bool(getattr(self.config, "use_instructor", True)),
                 "instructor_runtime_available": bool(instructor is not None),
                 "model_supports_tool_calling": bool(
@@ -2630,7 +2661,7 @@ class PeriodLogSummarizer:
             bool(getattr(self.config, "auto_shrink_on_400", True)),
             int(getattr(self.config, "max_shrink_rounds", 6) or 6),
             int(getattr(self.config, "map_workers", 1) or 1),
-            bool(getattr(self.config, "use_new_algorithm", False)),
+            True,
         )
 
         # Each pending entry: (Future | None, batch_index, rows_count, bp_start, bp_end, rows_snapshot)
@@ -2697,15 +2728,9 @@ class PeriodLogSummarizer:
                     offset,
                 )
 
-                if bool(getattr(self.config, "use_new_algorithm", False)):
-                    # Updated algorithm: one DB page is fetched as-is, then split only by
-                    # explicit row cap (`llm_chunk_rows`) without local token estimation.
-                    base_chunks: List[List[Dict[str, Any]]] = [list(page)]
-                else:
-                    base_chunks = [
-                        page[i : i + self.config.llm_chunk_rows]
-                        for i in range(0, len(page), self.config.llm_chunk_rows)
-                    ]
+                # Updated algorithm: one DB page is fetched as-is, then split only by
+                # explicit row cap (`llm_chunk_rows`) without local token estimation.
+                base_chunks: List[List[Dict[str, Any]]] = [list(page)]
 
                 for base_chunk in base_chunks:
                     rows_sub_chunks = self._split_rows_for_map(
@@ -3083,10 +3108,15 @@ class PeriodLogSummarizer:
         calls = 0
         try:
             if self._instructor_enabled():
+                gateway_retry_cap = max(
+                    int(getattr(self.config, "reduce_gateway_retry_cap", 3) or 3),
+                    0,
+                )
                 parsed, calls = self._call_structured_with_instructor(
                     prompt=prompt,
                     response_model=IncidentSummary,
                     stage="reduce",
+                    gateway_retry_cap=gateway_retry_cap,
                 )
                 logger.info(
                     "REDUCE group done (instructor) | round=%s | group=%s/%s | depth=%s | calls=%s",
@@ -3221,9 +3251,11 @@ class PeriodLogSummarizer:
         period_start: str,
         period_end: str,
         sources: Optional[List[str]] = None,
-    ) -> Optional[tuple[str, int, int]]:
-        if len(chunk_summaries) <= 1:
-            return None
+    ) -> tuple[str, int, int]:
+        if len(chunk_summaries) == 1:
+            return chunk_summaries[0], 0, 0
+        if len(chunk_summaries) <= 0:
+            return "Нет логов за указанный период.", 0, 0
         parsed_inputs: List[IncidentSummary] = []
         for idx, text in enumerate(chunk_summaries, start=1):
             parsed = self._parse_incident_summary_text(
@@ -3233,8 +3265,12 @@ class PeriodLogSummarizer:
                 fallback_end=period_end,
             )
             if parsed is None:
-                # Not a structured payload => keep legacy behavior.
-                return None
+                logger.warning(
+                    "REDUCE structured input skipped | item=%s/%s | reason=non_structured_map_summary",
+                    idx,
+                    len(chunk_summaries),
+                )
+                continue
             if not self._summary_is_empty(parsed):
                 parsed_inputs.append(parsed)
 
@@ -3292,8 +3328,10 @@ class PeriodLogSummarizer:
                     )
                 except ValueError as exc:
                     if str(exc) == "structured_reduce_invalid_json":
-                        # Fallback to legacy reducer for compatibility with plain-text LLM outputs.
-                        return None
+                        # Legacy reducer path is removed: fail fast with explicit error.
+                        raise RuntimeError(
+                            "REDUCE returned non-structured payload; legacy reducer is disabled."
+                        ) from exc
                     raise
                 llm_calls += group_calls
                 next_level.append(merged)
@@ -3331,180 +3369,12 @@ class PeriodLogSummarizer:
         period_end: str,
         sources: Optional[List[str]] = None,
     ) -> tuple[str, int, int]:
-        if bool(getattr(self.config, "use_new_algorithm", False)):
-            structured_result = self._reduce_summaries_structured(
-                chunk_summaries=chunk_summaries,
-                period_start=period_start,
-                period_end=period_end,
-                sources=sources,
-            )
-            if structured_result is not None:
-                return structured_result
-        if len(chunk_summaries) == 1:
-            return chunk_summaries[0], 0, 0
-        if not self.config.adaptive_reduce_on_overflow:
-            return self._reduce_summaries_fixed_groups(
-                chunk_summaries=chunk_summaries,
-                period_start=period_start,
-                period_end=period_end,
-                sources=sources,
-            )
-
-        # 1) Try single-pass reduce over all map batches first.
-        # 2) Only if it does not fit context (or context-overflow error), switch to adaptive shrinking.
-        current = list(chunk_summaries)
-        llm_calls = 0
-        first_round = 1
-        full_prompt = self._build_reduce_prompt(
+        return self._reduce_summaries_structured(
+            chunk_summaries=chunk_summaries,
             period_start=period_start,
             period_end=period_end,
-            reduce_round=first_round,
-            summaries=current,
             sources=sources,
         )
-        full_fits = self._prompt_fits_budget(full_prompt)
-        if full_fits:
-            self._emit_progress(
-                "reduce_group_start",
-                {
-                    "reduce_round": first_round,
-                    "group_index": 0,
-                    "group_total": 1,
-                },
-            )
-            try:
-                merged = self.llm_call(full_prompt).strip()
-                llm_calls += 1
-                if not merged:
-                    merged = "Пустой ответ LLM на reduce-этапе."
-                self._emit_progress(
-                    "reduce_group_done",
-                    {
-                        "reduce_round": first_round,
-                        "group_index": 0,
-                        "group_total": 1,
-                    },
-                )
-                return self._truncate(merged, self.config.max_summary_chars), llm_calls, 1
-            except Exception as exc:  # noqa: BLE001
-                if not (
-                    self._is_context_overflow_error(exc)
-                    or _is_400_bad_request_exception(exc)
-                ):
-                    raise
-                logger.warning("reduce full-merge overflow, fallback to adaptive mode: %s", exc)
-                self._emit_progress(
-                    "reduce_context_fallback",
-                    {
-                        "reduce_round": first_round,
-                        "reason": str(exc),
-                    },
-                )
-        else:
-            self._emit_progress(
-                "reduce_context_fallback",
-                {
-                    "reduce_round": first_round,
-                    "reason": (
-                        "full reduce prompt exceeds reduce_prompt_max_chars="
-                        f"{self.config.reduce_prompt_max_chars}"
-                    ),
-                },
-            )
-
-        # Adaptive mode: for each round try to merge the largest possible group.
-        round_idx = 0
-        while len(current) > 1:
-            round_idx += 1
-            if round_idx > self.config.max_reduce_rounds:
-                raise RuntimeError("Exceeded max reduce rounds")
-
-            next_level: List[str] = []
-            cursor = 0
-            group_index = 0
-            previous_len = len(current)
-            while cursor < len(current):
-                remaining = len(current) - cursor
-                used_size = remaining
-                merged_text: Optional[str] = None
-
-                while used_size >= 1:
-                    group = current[cursor : cursor + used_size]
-                    if used_size == 1:
-                        # Single summary cannot be reduced further; pass through.
-                        merged_text = self._truncate(
-                            str(group[0]),
-                            self.config.max_summary_chars,
-                        )
-                        break
-
-                    prompt = self._build_reduce_prompt(
-                        period_start=period_start,
-                        period_end=period_end,
-                        reduce_round=round_idx,
-                        summaries=group,
-                        sources=sources,
-                    )
-                    if not self._prompt_fits_budget(prompt):
-                        used_size -= 1
-                        continue
-
-                    self._emit_progress(
-                        "reduce_group_start",
-                        {
-                            "reduce_round": round_idx,
-                            "group_index": group_index,
-                            "group_total": previous_len,
-                            "group_size": used_size,
-                        },
-                    )
-                    try:
-                        merged = self.llm_call(prompt).strip()
-                        llm_calls += 1
-                        if not merged:
-                            merged = "Пустой ответ LLM на reduce-этапе."
-                        merged_text = self._truncate(merged, self.config.max_summary_chars)
-                        self._emit_progress(
-                            "reduce_group_done",
-                            {
-                                "reduce_round": round_idx,
-                                "group_index": group_index,
-                                "group_total": previous_len,
-                                "group_size": used_size,
-                            },
-                        )
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        if (
-                            self._is_context_overflow_error(exc)
-                            or _is_400_bad_request_exception(exc)
-                        ) and used_size > 1:
-                            used_size -= 1
-                            continue
-                        raise
-
-                if merged_text is None:
-                    # Safety net: force progress in pathological edge-cases.
-                    used_size = min(2, remaining)
-                    forced = "\n\n".join(str(x) for x in current[cursor : cursor + used_size])
-                    merged_text = self._truncate(forced, self.config.max_summary_chars)
-
-                next_level.append(merged_text)
-                cursor += max(used_size, 1)
-                group_index += 1
-
-            if len(next_level) >= previous_len:
-                # Guarantee convergence to a single summary.
-                compressed: List[str] = []
-                for i in range(0, len(next_level), 2):
-                    pair = next_level[i : i + 2]
-                    compressed.append(
-                        self._truncate("\n\n".join(pair), self.config.max_summary_chars)
-                    )
-                next_level = compressed
-            current = next_level
-
-        return current[0], llm_calls, round_idx
 
     def _reduce_summaries_fixed_groups(
         self,
@@ -3593,9 +3463,6 @@ class PeriodLogSummarizer:
         base_columns = [c for c in columns if c != "_source"]
         display_columns: List[str] = (["_source"] + base_columns) if has_source else list(base_columns)
 
-        critical_rows = [row for row in rows if self._row_problem_score(row, list(columns)) > 0]
-        extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
-        anti_rules = _resolve_anti_hallucination_rules()
         lower_cols = {str(c).lower() for c in display_columns}
         data_type = "aggregated" if {"start_time", "end_time", "cnt"}.issubset(lower_cols) else "raw"
         preferred_time = ("start_time", "timestamp", "time", "ts", "datetime", "end_time")
@@ -3604,16 +3471,6 @@ class PeriodLogSummarizer:
             self.prompt_context["data_type"] = data_type
         if not self.prompt_context.get("time_column"):
             self.prompt_context["time_column"] = time_column
-
-        source_stat = ""
-        if has_source:
-            source_counts: Dict[str, int] = {}
-            for row in rows:
-                src = str(row.get("_source") or "unknown")
-                source_counts[src] = source_counts.get(src, 0) + 1
-            source_stat = ", ".join(
-                f"{src}={cnt}" for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])
-            )
 
         log_lines: List[str] = []
         for idx, row in enumerate(rows, start=1):
@@ -3626,105 +3483,27 @@ class PeriodLogSummarizer:
                 rendered_parts.append(f"{col}={text}")
             log_lines.append(f"{idx}. " + " | ".join(rendered_parts))
         logs_text = "\n".join(log_lines) if log_lines else "Нет строк в батче."
-
-        if bool(getattr(self.config, "use_new_algorithm", False)):
-            user_context = _ctx_value(self.prompt_context, "incident_description", "")
-            alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
-            source_services = self._derive_source_services(rows)
-            source_query = str(self.prompt_context.get("sql_query") or "").strip()
-            batch_period_start, batch_period_end = _extract_batch_period(rows)
-            map_batch_id = f"batch-{int(batch_number or 1):06d}"
-            system_text = incident_prompts.MAP_SYSTEM_PROMPT.format(
-                user_context=user_context,
-                alerts_list=alerts_context,
-                batch_id=map_batch_id,
-                time_range_start=batch_period_start or period_start,
-                time_range_end=batch_period_end or period_end,
-                total_log_entries=len(rows),
-                source_services=", ".join(source_services) if source_services else "unknown",
-                source_query=source_query or "N/A",
-            )
-            user_text = incident_prompts.MAP_USER_PROMPT.format(
-                batch_id=map_batch_id,
-                log_entries=logs_text,
-            )
-            return f"{system_text}\n\n{user_text}"
-
-        map_template = _read_prompt_setting("CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE")
-        if map_template:
-            rendered = _render_prompt_template(
-                map_template,
-                {
-                    "period_start": period_start,
-                    "period_end": period_end,
-                    "incident_start": _ctx_value(self.prompt_context, "incident_start", period_start),
-                    "incident_end": _ctx_value(self.prompt_context, "incident_end", period_end),
-                    "incident_description": _ctx_value(self.prompt_context, "incident_description", ""),
-                    "alerts_list": _ctx_value(self.prompt_context, "alerts_list", ""),
-                    "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
-                    "source_name": _ctx_value(self.prompt_context, "source_name", source_stat or "query_1"),
-                    "sql_query": _ctx_value(self.prompt_context, "sql_query", ""),
-                    "batch_number": batch_number if batch_number is not None else "",
-                    "total_batches": total_batches if total_batches is not None else "",
-                    "batch_data": logs_text,
-                    "rows_count": len(rows),
-                    "problem_rows": len(critical_rows),
-                    "columns": ", ".join(display_columns),
-                    "time_column": _ctx_value(self.prompt_context, "time_column", time_column),
-                    "data_type": _ctx_value(self.prompt_context, "data_type", data_type),
-                    "source_distribution": source_stat,
-                    "extra_prompt_context": extra_prompt_context,
-                    "anti_hallucination_rules": anti_rules,
-                    "logs_text": logs_text,
-                },
-            ).strip()
-            return _append_chain_requirement(rendered, "map")
-
-        lines = [
-            "Это MAP-этап расследования инцидента. Анализируй только этот фрагмент логов.",
-            "Если выше есть контекст алертов/инцидента — используй его как приоритет.",
-            "",
-            f"Источник: {_ctx_value(self.prompt_context, 'source_name', source_stat or 'query_1')}",
-            f"SQL: {_ctx_value(self.prompt_context, 'sql_query', '')}",
-            f"Батч: {batch_number if batch_number is not None else ''}/{total_batches if total_batches is not None else ''}",
-            f"Период: [{period_start}, {period_end})",
-            f"Поле времени: {time_column}",
-            f"Тип данных: {data_type}",
-            f"Строк в куске: {len(rows)}",
-            f"Строк с problem-сигналами: {len(critical_rows)}",
-            f"Колонки: {', '.join(display_columns)}",
-        ]
-        if source_stat:
-            lines.append(f"Распределение по источникам: {source_stat}")
-        if extra_prompt_context:
-            lines += [
-                "",
-                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
-                extra_prompt_context,
-            ]
-        lines += [
-            "",
-            "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
-            anti_rules,
-            "",
-            "Верни СТРОГО один JSON-объект (без markdown, без пояснений) для map-summary.",
-            "ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ JSON:",
-            "context, timeline, causal_links, alert_refs, hypotheses, pinned_facts, gaps, impact, conflicts, data_quality, preliminary_recommendations",
-            "Требования к JSON:",
-            "- timeline[*].evidence_type: FACT или HYPOTHESIS",
-            "- timeline[*].severity: critical|high|medium|low",
-            "- importance/confidence/noise_ratio: число от 0 до 1",
-            "- timestamp: ISO8601 с timezone и максимальной доступной точностью",
-            "- все ссылки на события (event_id) должны существовать в timeline.id",
-            "- для status в alert_refs используй: EXPLAINED|PARTIALLY|NOT_EXPLAINED|NOT_SEEN_IN_BATCH",
-            "- для hypotheses.status используй: active|merged|conflicting|dismissed",
-            "- для recommendations.priority используй: P0|P1|P2",
-            "- НЕ фильтруй входные логи по типу (healthcheck/debug и т.п.): анализируй ровно переданный батч.",
-            "",
-            "Логи (хронологический порядок):",
-            logs_text,
-        ]
-        return _append_chain_requirement("\n".join(lines), "map")
+        user_context = _ctx_value(self.prompt_context, "incident_description", "")
+        alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
+        source_services = self._derive_source_services(rows)
+        source_query = str(self.prompt_context.get("sql_query") or "").strip()
+        batch_period_start, batch_period_end = _extract_batch_period(rows)
+        map_batch_id = f"batch-{int(batch_number or 1):06d}"
+        system_text = incident_prompts.MAP_SYSTEM_PROMPT.format(
+            user_context=user_context,
+            alerts_list=alerts_context,
+            batch_id=map_batch_id,
+            time_range_start=batch_period_start or period_start,
+            time_range_end=batch_period_end or period_end,
+            total_log_entries=len(rows),
+            source_services=", ".join(source_services) if source_services else "unknown",
+            source_query=source_query or "N/A",
+        )
+        user_text = incident_prompts.MAP_USER_PROMPT.format(
+            batch_id=map_batch_id,
+            log_entries=logs_text,
+        )
+        return f"{system_text}\n\n{user_text}"
 
     def _build_reduce_prompt(
         self,
@@ -3735,104 +3514,24 @@ class PeriodLogSummarizer:
         summaries: List[str],
         sources: Optional[List[str]] = None,
     ) -> str:
-        sources_line = (
-            f"Источники данных: {', '.join(sources)}. "
-            "Ищи причинно-следственные связи МЕЖДУ источниками."
-            if sources else ""
+        target_pct = max(min(int(getattr(self.config, "reduce_target_token_pct", 50) or 50), 90), 20)
+        user_context = _ctx_value(self.prompt_context, "incident_description", "")
+        alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
+        summaries_payload: List[Any] = []
+        for item in summaries:
+            parsed_item = self._extract_json_payload(str(item or ""))
+            summaries_payload.append(parsed_item if isinstance(parsed_item, dict) else str(item or ""))
+        system_text = incident_prompts.REDUCE_SYSTEM_PROMPT.format(
+            num_summaries=len(summaries),
+            user_context=user_context,
+            alerts_list=alerts_context,
+            target_token_pct=target_pct,
         )
-        extra_prompt_context = _read_prompt_setting("CONTROL_PLANE_LLM_EXTRA_PROMPT_CONTEXT")
-        anti_rules = _resolve_anti_hallucination_rules()
-        summaries_text = []
-        for idx, text in enumerate(summaries, start=1):
-            summaries_text.append(f"[БАТЧ {idx}]")
-            summaries_text.append(text)
-            summaries_text.append("")
-        rendered_summaries = "\n".join(summaries_text).strip()
-
-        if bool(getattr(self.config, "use_new_algorithm", False)):
-            target_pct = max(min(int(getattr(self.config, "reduce_target_token_pct", 50) or 50), 90), 20)
-            user_context = _ctx_value(self.prompt_context, "incident_description", "")
-            alerts_context = _ctx_value(self.prompt_context, "alerts_list", "")
-            summaries_payload: List[Any] = []
-            for item in summaries:
-                parsed_item = self._extract_json_payload(str(item or ""))
-                summaries_payload.append(parsed_item if isinstance(parsed_item, dict) else str(item or ""))
-            system_text = incident_prompts.REDUCE_SYSTEM_PROMPT.format(
-                num_summaries=len(summaries),
-                user_context=user_context,
-                alerts_list=alerts_context,
-                target_token_pct=target_pct,
-            )
-            user_text = incident_prompts.REDUCE_USER_PROMPT.format(
-                num_summaries=len(summaries),
-                summaries_json=json.dumps(summaries_payload, ensure_ascii=False),
-            )
-            return f"{system_text}\n\n{user_text}"
-
-        reduce_template = _read_prompt_setting("CONTROL_PLANE_LLM_REDUCE_PROMPT_TEMPLATE")
-        if reduce_template:
-            rendered = _render_prompt_template(
-                reduce_template,
-                {
-                    "period_start": period_start,
-                    "period_end": period_end,
-                    "incident_start": _ctx_value(self.prompt_context, "incident_start", period_start),
-                    "incident_end": _ctx_value(self.prompt_context, "incident_end", period_end),
-                    "incident_description": _ctx_value(self.prompt_context, "incident_description", ""),
-                    "alerts_list": _ctx_value(self.prompt_context, "alerts_list", ""),
-                    "metrics_context": _ctx_value(self.prompt_context, "metrics_context", ""),
-                    "source_name": _ctx_value(self.prompt_context, "source_name", ", ".join(sources or [])),
-                    "sql_query": _ctx_value(self.prompt_context, "sql_query", ""),
-                    "data_type": _ctx_value(self.prompt_context, "data_type", ""),
-                    "reduce_round": reduce_round,
-                    "source_names": ", ".join(sources or []),
-                    "sources_line": sources_line,
-                    "batch_count": len(summaries),
-                    "extra_prompt_context": extra_prompt_context,
-                    "anti_hallucination_rules": anti_rules,
-                    "summaries_text": rendered_summaries,
-                    "map_summaries": json.dumps(summaries, ensure_ascii=False),
-                    "map_summaries_text": rendered_summaries,
-                },
-            ).strip()
-            return _append_chain_requirement(rendered, "reduce")
-
-        lines = [
-            "Это REDUCE-этап расследования инцидента.",
-            "Если выше есть контекст инцидента/алертов — привяжи выводы к нему.",
-            *(([sources_line]) if sources_line else []),
-            "",
-            f"Источник: {_ctx_value(self.prompt_context, 'source_name', ', '.join(sources or []))}",
-            f"SQL: {_ctx_value(self.prompt_context, 'sql_query', '')}",
-            f"Период: [{period_start}, {period_end})",
-            f"Reduce round: {reduce_round}",
-            f"Количество map-саммари: {len(summaries)}",
-        ]
-        if extra_prompt_context:
-            lines += [
-                "",
-                "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ ДАННЫХ:",
-                extra_prompt_context,
-            ]
-        lines += [
-            "",
-            "ПРАВИЛА АНТИГАЛЛЮЦИНАЦИИ:",
-            anti_rules,
-            "",
-            "Объедини частичные summary в единый отчёт со строгими секциями:",
-            "1) ОБЗОР ИСТОЧНИКА",
-            "2) ХРОНОЛОГИЯ КЛЮЧЕВЫХ СОБЫТИЙ (только [РЕЛЕВАНТНО])",
-            "3) ЦЕПОЧКА СОБЫТИЙ ИСТОЧНИКА (ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК, несколько цепочек допустимы)",
-            "4) СВЯЗЬ МЕЖДУ ЦЕПОЧКАМИ: [СВЯЗАНЫ]/[ВОЗМОЖНО СВЯЗАНЫ]/[НЕЗАВИСИМЫ]",
-            "5) ОБЪЯСНЕНИЕ АЛЕРТОВ",
-            "6) ПЕРВОПРИЧИНЫ ПО ЦЕПОЧКАМ",
-            "7) ПРОБЕЛЫ В ДАННЫХ И РАЗРЫВЫ ЦЕПОЧЕК",
-            "8) ФОРМАТ ВЫВОДА ЦЕПОЧКИ: оформи красиво с узлами и стрелками.",
-            "",
-            "Частичные саммари:",
-            rendered_summaries,
-        ]
-        return _append_chain_requirement("\n".join(lines).strip(), "reduce")
+        user_text = incident_prompts.REDUCE_USER_PROMPT.format(
+            num_summaries=len(summaries),
+            summaries_json=json.dumps(summaries_payload, ensure_ascii=False),
+        )
+        return f"{system_text}\n\n{user_text}"
 
     def _build_freeform_prompt(
         self,
@@ -5003,6 +4702,7 @@ def regenerate_reduce_summary_from_map_summaries(
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
             ),
+            use_new_algorithm=True,
             use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),
             model_supports_tool_calling=bool(
                 getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
@@ -5095,6 +4795,7 @@ def summarize_logs(
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
             ),
+            use_new_algorithm=True,
             use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),
             model_supports_tool_calling=bool(
                 getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)

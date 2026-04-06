@@ -6021,13 +6021,8 @@ def _build_config(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
         0,
     )
-    use_new_algorithm = bool(
-        getattr(
-            settings,
-            "CONTROL_PLANE_UI_LOGS_SUMMARY_USE_NEW_ALGORITHM",
-            getattr(settings, "CONTROL_PLANE_LLM_USE_NEW_ALGORITHM", True),
-        )
-    )
+    # Legacy algorithm path is removed: always use the updated algorithm.
+    use_new_algorithm = True
     reduce_target_token_pct = max(
         min(int(getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50) or 50), 95),
         10,
@@ -7930,7 +7925,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
                 else:
                     state["estimated_batch_total"] = None
-                state["use_new_algorithm"] = bool(payload.get("use_new_algorithm", False))
+                state["use_new_algorithm"] = True
                 state["batch_plan"] = []
                 events.append("Map этап запущен")
             elif event == "page_fetched":

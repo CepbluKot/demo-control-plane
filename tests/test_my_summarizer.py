@@ -1,6 +1,7 @@
 import unittest
 import json
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import patch
 
 import pandas as pd
@@ -49,6 +50,71 @@ from settings import settings
 
 
 class TestMySummarizer(unittest.TestCase):
+    @staticmethod
+    def _structured_summary_dict(
+        batch_id: str,
+        *,
+        timestamp: str = "2026-03-18T00:00:00+00:00",
+        total_log_entries: int = 1,
+        include_timeline: bool = True,
+        is_empty: bool = False,
+    ) -> dict[str, Any]:
+        timeline = []
+        if include_timeline and not is_empty:
+            event_id = f"evt-{batch_id.replace(':', '-').replace('_', '-')}"
+            timeline = [
+                {
+                    "id": event_id,
+                    "timestamp": timestamp,
+                    "source": "svc-a",
+                    "description": f"Событие для {batch_id}",
+                    "severity": "high",
+                    "importance": 0.9,
+                    "evidence_type": "FACT",
+                    "evidence_quote": "timeout detected",
+                    "tags": ["timeout"],
+                }
+            ]
+        return {
+            "context": {
+                "batch_id": batch_id,
+                "time_range_start": timestamp,
+                "time_range_end": timestamp,
+                "total_log_entries": int(total_log_entries),
+                "source_query": [],
+                "source_services": ["svc-a"],
+            },
+            "timeline": timeline,
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {
+                "is_empty": bool(is_empty),
+                "noise_ratio": 0.1 if timeline else 1.0,
+                "notes": "",
+            },
+            "preliminary_recommendations": [],
+        }
+
+    @classmethod
+    def _structured_summary_json(cls, batch_id: str, **kwargs: Any) -> str:
+        return json.dumps(cls._structured_summary_dict(batch_id, **kwargs), ensure_ascii=False)
+
+    @staticmethod
+    def _extract_total_rows_from_map_prompt(prompt: str) -> int:
+        marker = "Всего строк логов:"
+        if marker not in prompt:
+            return 0
+        tail = prompt.split(marker, 1)[1].strip().splitlines()[0]
+        try:
+            return int(tail)
+        except Exception:
+            return 0
+
     def test_make_llm_call_raises_when_env_missing(self) -> None:
         with patch("my_summarizer.has_required_env", return_value=False):
             with self.assertRaises(RuntimeError):
@@ -245,17 +311,13 @@ class TestMySummarizer(unittest.TestCase):
             ]
 
         def _fake_llm(prompt: str) -> str:
-            if "Это REDUCE-этап" in prompt:
-                return "REDUCE_OK"
-            marker = "Строк в куске:"
-            if marker in prompt:
-                try:
-                    part = prompt.split(marker, 1)[1].strip().splitlines()[0]
-                    rows_count = int(part)
-                except Exception:
-                    rows_count = 0
+            if "Summary для объединения" in prompt:
+                return self._structured_summary_json("reduce-final", total_log_entries=8)
+            if "Логи для батча" in prompt:
+                rows_count = self._extract_total_rows_from_map_prompt(prompt)
                 if rows_count > 2:
                     calls["map_large"] += 1
+
                     class _Resp:
                         status_code = 400
 
@@ -264,7 +326,10 @@ class TestMySummarizer(unittest.TestCase):
                         response=_Resp(),
                     )
                 calls["map_small"] += 1
-                return f"MAP_OK_{rows_count}"
+                return self._structured_summary_json(
+                    f"map-small-{calls['map_small']}",
+                    total_log_entries=max(rows_count, 1),
+                )
             return "GENERIC_OK"
 
         summarizer = PeriodLogSummarizer(
@@ -284,7 +349,7 @@ class TestMySummarizer(unittest.TestCase):
             period_end="2026-03-25T11:00:00+00:00",
             columns=["timestamp", "message"],
         )
-        self.assertNotIn("400 Client Error", str(result.summary))
+        self.assertIn('"batch_id": "reduce-final"', str(result.summary))
         self.assertGreater(calls["map_large"], 0)
         self.assertGreater(calls["map_small"], 0)
         parsed_map = [json.loads(item) for item in result.map_summaries if str(item).strip().startswith("{")]
@@ -736,7 +801,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("query_1", prompt)
         self.assertIn("summary one", prompt)
 
-    def test_map_prompt_uses_custom_template(self) -> None:
+    def test_map_prompt_uses_builtin_template_even_if_legacy_template_set(self) -> None:
         config_overrides = {
             "CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE": (
                 "CUSTOM MAP | period={period_start}->{period_end} | "
@@ -760,16 +825,12 @@ class TestMySummarizer(unittest.TestCase):
                     }
                 ],
             )
-        self.assertIn("CUSTOM MAP", prompt)
-        self.assertIn("type=aggregated", prompt)
-        self.assertIn("ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ЛОКАЛЬНАЯ ЦЕПОЧКА СОБЫТИЙ БАТЧА", prompt)
-        self.assertIn(
-            "ОБЯЗАТЕЛЬНЫЙ ОТДЕЛЬНЫЙ БЛОК: ПРЕДПОЛОЖЕНИЯ О ПЕРВОПРИЧИНЕ ПО КАЖДОМУ ИНЦИДЕНТУ",
-            prompt,
-        )
-        self.assertIn("ИНЦИДЕНТ ИЗ UI (ДОСЛОВНО)", prompt)
+        self.assertNotIn("CUSTOM MAP", prompt)
+        self.assertIn("Формат ответа (строго)", prompt)
+        self.assertIn("Верни ТОЛЬКО один валидный JSON-объект.", prompt)
+        self.assertIn("Всего строк логов: 1", prompt)
 
-    def test_new_algorithm_map_prompt_requires_strict_json_output(self) -> None:
+    def test_map_prompt_requires_strict_json_output(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda prompt: prompt,
@@ -840,13 +901,17 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("final=structured summary", prompt)
 
     def test_regenerate_reduce_summary_from_map_summaries(self) -> None:
+        merged_json = self._structured_summary_json("reduce-merged", total_log_entries=2)
         out = regenerate_reduce_summary_from_map_summaries(
-            map_summaries=["batch-1 summary", "batch-2 summary"],
+            map_summaries=[
+                self._structured_summary_json("map-1", total_log_entries=1),
+                self._structured_summary_json("map-2", total_log_entries=1),
+            ],
             period_start="2026-03-18T00:00:00Z",
             period_end="2026-03-18T01:00:00Z",
-            llm_call=lambda _prompt: "MERGED SUMMARY",
+            llm_call=lambda _prompt: merged_json,
         )
-        self.assertIn("MERGED SUMMARY", out)
+        self.assertIn('"batch_id": "reduce-merged"', out)
 
     def test_regenerate_reduce_summary_does_not_truncate_when_limits_zero(self) -> None:
         config_overrides = {
@@ -854,15 +919,21 @@ class TestMySummarizer(unittest.TestCase):
             "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS": 0,
             "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS": 0,
         }
-        long_result = "MERGED " + ("X" * 10000)
+        long_text = "X" * 10000
+        long_payload = self._structured_summary_dict("map-long", total_log_entries=1)
+        long_payload["timeline"][0]["description"] = long_text
+        long_json = json.dumps(long_payload, ensure_ascii=False)
         with patch.multiple(settings, **config_overrides):
             out = regenerate_reduce_summary_from_map_summaries(
-                map_summaries=["batch-1 summary", "batch-2 summary"],
+                map_summaries=[long_json],
                 period_start="2026-03-18T00:00:00Z",
                 period_end="2026-03-18T01:00:00Z",
-                llm_call=lambda _prompt: long_result,
+                llm_call=lambda _prompt: self._structured_summary_json(
+                    "unused",
+                    total_log_entries=1,
+                ),
             )
-        self.assertEqual(out, long_result)
+        self.assertIn(long_text, out)
 
     def test_regenerate_reduce_summary_from_map_summaries_empty(self) -> None:
         out = regenerate_reduce_summary_from_map_summaries(
@@ -887,22 +958,27 @@ class TestMySummarizer(unittest.TestCase):
 
     def test_regenerate_reduce_summary_from_map_summaries_emits_progress(self) -> None:
         events = []
+        merged_json = self._structured_summary_json("reduce-merged", total_log_entries=2)
         out = regenerate_reduce_summary_from_map_summaries(
-            map_summaries=["batch-1 summary", "batch-2 summary"],
+            map_summaries=[
+                self._structured_summary_json("map-1", total_log_entries=1),
+                self._structured_summary_json("map-2", total_log_entries=1),
+            ],
             period_start="2026-03-18T00:00:00Z",
             period_end="2026-03-18T01:00:00Z",
-            llm_call=lambda _prompt: "MERGED SUMMARY",
+            llm_call=lambda _prompt: merged_json,
             on_progress=lambda event, payload: events.append((event, payload)),
         )
-        self.assertIn("MERGED SUMMARY", out)
+        self.assertIn('"batch_id": "reduce-merged"', out)
         event_names = [name for name, _ in events]
         self.assertIn("reduce_group_start", event_names)
 
-    def test_reduce_summaries_handles_400_by_switching_to_adaptive(self) -> None:
+    def test_reduce_summaries_handles_400_with_structured_split_merge(self) -> None:
         class _Resp:
             status_code = 400
 
         calls = {"n": 0}
+        merged_json = self._structured_summary_json("reduce-400-ok", total_log_entries=2)
 
         def _fake_llm(_prompt: str) -> str:
             calls["n"] += 1
@@ -911,19 +987,27 @@ class TestMySummarizer(unittest.TestCase):
                     "400 Client Error: Bad Request for url",
                     response=_Resp(),
                 )
-            return "MERGED_OK"
+            return merged_json
 
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=_fake_llm,
-            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+            config=SummarizerConfig(use_instructor=False),
         )
-        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["s1", "s2"],
-            period_start="2026-03-18T00:00:00+00:00",
-            period_end="2026-03-18T01:00:00+00:00",
-        )
-        self.assertEqual(final_summary, "MERGED_OK")
+        with patch.object(
+            summarizer,
+            "_compress_summary_on_overflow",
+            side_effect=lambda summary, **_: (summary, 0),
+        ):
+            final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                ],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
+        self.assertIn('"batch_id": "reduce-400-ok"', final_summary)
         self.assertGreaterEqual(llm_calls, 1)
         self.assertGreaterEqual(reduce_rounds, 1)
 
@@ -931,25 +1015,36 @@ class TestMySummarizer(unittest.TestCase):
         class _Resp:
             status_code = 400
 
+        merged_json = self._structured_summary_json("reduce-shrink-ok", total_log_entries=3)
+
         def _fake_llm(prompt: str) -> str:
-            # fail when trying to merge 3 summaries at once, succeed for smaller groups
-            if prompt.count("[SUMMARY ") >= 3:
+            # Fail when reducing 3 summaries in a single call, succeed for smaller groups.
+            if prompt.count('"batch_id"') >= 3 and "Summary для объединения" in prompt:
                 raise requests.exceptions.HTTPError(
                     "400 Client Error: Bad Request for url",
                     response=_Resp(),
                 )
-            return "OK_GROUP"
+            return merged_json
 
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=_fake_llm,
-            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+            config=SummarizerConfig(use_instructor=False, reduce_group_size=3),
         )
-        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["a", "b", "c"],
-            period_start="2026-03-18T00:00:00+00:00",
-            period_end="2026-03-18T01:00:00+00:00",
-        )
+        with patch.object(
+            summarizer,
+            "_compress_summary_on_overflow",
+            side_effect=lambda summary, **_: (summary, 0),
+        ):
+            final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                    self._structured_summary_json("map-c", total_log_entries=1),
+                ],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
         self.assertTrue(final_summary)
         self.assertGreaterEqual(llm_calls, 1)
         self.assertGreaterEqual(reduce_rounds, 1)
@@ -973,15 +1068,21 @@ class TestMySummarizer(unittest.TestCase):
             ]
 
         def _fake_llm(prompt: str) -> str:
-            if "Это REDUCE-этап" in prompt:
+            if "Summary для объединения" in prompt:
                 if calls["reduce_errors"] == 0:
                     calls["reduce_errors"] += 1
                     raise requests.exceptions.HTTPError(
                         "400 Client Error: Bad Request for url",
                         response=_Resp(),
                     )
-                return "REDUCE_OK_AFTER_400"
-            return "MAP_OK"
+                return self._structured_summary_json("reduce-ok-after-400", total_log_entries=4)
+            if "Логи для батча" in prompt:
+                rows_count = self._extract_total_rows_from_map_prompt(prompt)
+                return self._structured_summary_json(
+                    f"map-batch-{rows_count}",
+                    total_log_entries=max(rows_count, 1),
+                )
+            return "FREEFORM_OK"
 
         summarizer = PeriodLogSummarizer(
             db_fetch_page=_fake_fetch_page,
@@ -989,22 +1090,26 @@ class TestMySummarizer(unittest.TestCase):
             config=SummarizerConfig(
                 page_limit=1000,
                 llm_chunk_rows=2,
-                adaptive_reduce_on_overflow=True,
+                use_instructor=False,
                 keep_map_summaries_in_result=True,
             ),
             on_progress=lambda event, payload: progress_events.append((event, payload)),
         )
+        with patch.object(
+            summarizer,
+            "_compress_summary_on_overflow",
+            side_effect=lambda summary, **_: (summary, 0),
+        ):
+            result = summarizer.summarize_period(
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                columns=["timestamp", "message"],
+            )
 
-        result = summarizer.summarize_period(
-            period_start="2026-03-25T10:00:00+00:00",
-            period_end="2026-03-25T11:00:00+00:00",
-            columns=["timestamp", "message"],
-        )
-
-        self.assertEqual(result.summary, "REDUCE_OK_AFTER_400")
+        self.assertIn('"batch_id": "reduce-ok-after-400"', result.summary)
         self.assertGreaterEqual(result.reduce_rounds, 1)
         self.assertEqual(calls["reduce_errors"], 1)
-        self.assertIn("reduce_context_fallback", [name for name, _ in progress_events])
+        self.assertIn("reduce_group_start", [name for name, _ in progress_events])
 
     def test_reduce_summaries_single_summary_shortcut(self) -> None:
         calls = {"n": 0}
@@ -1034,36 +1139,41 @@ class TestMySummarizer(unittest.TestCase):
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=_fake_llm,
-            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+            config=SummarizerConfig(use_instructor=False),
         )
         with self.assertRaises(requests.exceptions.ConnectionError):
             summarizer._reduce_summaries(
-                chunk_summaries=["a", "b"],
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                ],
                 period_start="2026-03-18T00:00:00+00:00",
                 period_end="2026-03-18T01:00:00+00:00",
             )
 
-    def test_reduce_summaries_full_merge_empty_response_uses_default_text(self) -> None:
+    def test_reduce_summaries_raises_on_empty_reduce_payload(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "",
-            config=SummarizerConfig(adaptive_reduce_on_overflow=True),
+            config=SummarizerConfig(use_instructor=False),
         )
-        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["a", "b"],
-            period_start="2026-03-18T00:00:00+00:00",
-            period_end="2026-03-18T01:00:00+00:00",
-        )
-        self.assertEqual(final_summary, "Пустой ответ LLM на reduce-этапе.")
-        self.assertEqual(llm_calls, 1)
-        self.assertEqual(reduce_rounds, 1)
+        with self.assertRaises(RuntimeError):
+            summarizer._reduce_summaries(
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                ],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
 
-    def test_reduce_summaries_fixed_groups_when_adaptive_disabled(self) -> None:
+    def test_reduce_summaries_respects_fixed_group_size(self) -> None:
+        merged_json = self._structured_summary_json("reduce-fixed-groups", total_log_entries=3)
         calls = {"n": 0}
 
         def _fake_llm(_prompt: str) -> str:
             calls["n"] += 1
-            return f"R{calls['n']}"
+            return merged_json
 
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
@@ -1071,37 +1181,44 @@ class TestMySummarizer(unittest.TestCase):
             config=SummarizerConfig(
                 adaptive_reduce_on_overflow=False,
                 reduce_group_size=2,
+                use_instructor=False,
             ),
         )
         final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["a", "b", "c"],
+            chunk_summaries=[
+                self._structured_summary_json("map-a", total_log_entries=1),
+                self._structured_summary_json("map-b", total_log_entries=1),
+                self._structured_summary_json("map-c", total_log_entries=1),
+            ],
             period_start="2026-03-18T00:00:00+00:00",
             period_end="2026-03-18T01:00:00+00:00",
         )
-        self.assertEqual(final_summary, "R3")
-        self.assertEqual(llm_calls, 3)
+        self.assertIn('"batch_id": "reduce-fixed-groups"', final_summary)
+        self.assertEqual(llm_calls, 2)
         self.assertEqual(reduce_rounds, 2)
-        self.assertEqual(calls["n"], 3)
+        self.assertEqual(calls["n"], 2)
 
-    def test_reduce_summaries_fixed_groups_empty_response_uses_default(self) -> None:
+    def test_reduce_summaries_raises_on_empty_payload_with_group_size(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "",
             config=SummarizerConfig(
                 adaptive_reduce_on_overflow=False,
                 reduce_group_size=2,
+                use_instructor=False,
             ),
         )
-        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["a", "b"],
-            period_start="2026-03-18T00:00:00+00:00",
-            period_end="2026-03-18T01:00:00+00:00",
-        )
-        self.assertEqual(final_summary, "Пустой ответ LLM на reduce-этапе.")
-        self.assertEqual(llm_calls, 1)
-        self.assertEqual(reduce_rounds, 1)
+        with self.assertRaises(RuntimeError):
+            summarizer._reduce_summaries(
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                ],
+                period_start="2026-03-18T00:00:00+00:00",
+                period_end="2026-03-18T01:00:00+00:00",
+            )
 
-    def test_reduce_summaries_fixed_groups_raises_when_max_rounds_exceeded(self) -> None:
+    def test_reduce_summaries_raises_when_max_rounds_exceeded(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "X",
@@ -1109,35 +1226,45 @@ class TestMySummarizer(unittest.TestCase):
                 adaptive_reduce_on_overflow=False,
                 reduce_group_size=1,
                 max_reduce_rounds=1,
+                use_instructor=False,
             ),
         )
         with self.assertRaises(RuntimeError):
             summarizer._reduce_summaries(
-                chunk_summaries=["a", "b"],
+                chunk_summaries=[
+                    self._structured_summary_json("map-a", total_log_entries=1),
+                    self._structured_summary_json("map-b", total_log_entries=1),
+                ],
                 period_start="2026-03-18T00:00:00+00:00",
                 period_end="2026-03-18T01:00:00+00:00",
             )
 
     def test_reduce_summaries_budget_fallback_emits_event_and_completes(self) -> None:
         events = []
+        merged_json = self._structured_summary_json("reduce-budget-ok", total_log_entries=3)
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
-            llm_call=lambda _prompt: "SHOULD_NOT_BE_CALLED",
+            llm_call=lambda _prompt: merged_json,
             config=SummarizerConfig(
                 adaptive_reduce_on_overflow=True,
                 reduce_prompt_max_chars=1,
+                use_instructor=False,
             ),
             on_progress=lambda event, payload: events.append((event, payload)),
         )
         final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
-            chunk_summaries=["a", "b", "c"],
+            chunk_summaries=[
+                self._structured_summary_json("map-a", total_log_entries=1),
+                self._structured_summary_json("map-b", total_log_entries=1),
+                self._structured_summary_json("map-c", total_log_entries=1),
+            ],
             period_start="2026-03-18T00:00:00+00:00",
             period_end="2026-03-18T01:00:00+00:00",
         )
-        self.assertTrue(final_summary)
-        self.assertEqual(llm_calls, 0)
+        self.assertIn('"batch_id": "reduce-budget-ok"', final_summary)
+        self.assertGreaterEqual(llm_calls, 1)
         self.assertGreaterEqual(reduce_rounds, 1)
-        self.assertIn("reduce_context_fallback", [name for name, _ in events])
+        self.assertIn("reduce_group_start", [name for name, _ in events])
 
     def test_map_summary_returns_structured_json_with_required_sections(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -1574,6 +1701,49 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(fake_completions.calls, 2)
         mocked_sleep.assert_called()
 
+    def test_call_structured_with_instructor_stops_on_gateway_retry_cap(self) -> None:
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                raise RuntimeError(
+                    "<html><head><title>502 Bad Gateway</title></head>"
+                    "<body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>"
+                )
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=-1
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=1.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ):
+            with self.assertRaises(RuntimeError):
+                summarizer._call_structured_with_instructor(
+                    prompt="test",
+                    response_model=IncidentSummary,
+                    stage="reduce",
+                    gateway_retry_cap=2,
+                )
+
+        # 2 retries allowed after initial attempt => total 3 attempts.
+        self.assertEqual(fake_completions.calls, 3)
+
     def test_call_structured_with_instructor_doubles_timeout_on_read_timeout(self) -> None:
         payload = {
             "context": {
@@ -1693,6 +1863,8 @@ class TestMySummarizer(unittest.TestCase):
         self.assertTrue(mocked_instructor.called)
         self.assertEqual(calls, 1)
         self.assertEqual(reduced.context.batch_id, "reduce-r1-g1")
+        call_kwargs = mocked_instructor.call_args.kwargs
+        self.assertEqual(call_kwargs.get("gateway_retry_cap"), summarizer.config.reduce_gateway_retry_cap)
 
     def test_map_summary_invalid_json_is_converted_to_degraded_structured_payload(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -1792,7 +1964,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("map_schema_recovered", event_names)
         self.assertNotIn("map_schema_degraded", event_names)
 
-    def test_new_algorithm_reduce_uses_premerged_alert_refs(self) -> None:
+    def test_reduce_uses_premerged_alert_refs(self) -> None:
         def _mk_summary(
             batch_id: str,
             alert_status: str,
@@ -1884,7 +2056,7 @@ class TestMySummarizer(unittest.TestCase):
         parsed = json.loads(final_summary)
         self.assertEqual(parsed["alert_refs"][0]["status"], "EXPLAINED")
 
-    def test_new_algorithm_reduce_prompt_uses_json_objects_not_escaped_strings(self) -> None:
+    def test_reduce_prompt_uses_json_objects_not_escaped_strings(self) -> None:
         captured_prompt = {"text": ""}
 
         def _mk_summary(batch_id: str) -> str:
@@ -1943,7 +2115,7 @@ class TestMySummarizer(unittest.TestCase):
         # Old behavior encoded summaries as JSON strings with escaped quotes.
         self.assertNotIn('\\"context\\"', prompt_text)
 
-    def test_new_algorithm_reduce_splits_group_on_400(self) -> None:
+    def test_reduce_splits_group_on_400(self) -> None:
         def _mk_summary(batch_id: str) -> str:
             return json.dumps(
                 {
@@ -2019,7 +2191,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("timeline", parsed)
         self.assertFalse(bool(parsed.get("data_quality", {}).get("is_empty", True)))
 
-    def test_new_algorithm_map_respects_llm_chunk_rows_limit(self) -> None:
+    def test_map_respects_llm_chunk_rows_limit(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "ok",
@@ -2033,7 +2205,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(chunks[1], rows[2:4])
         self.assertEqual(chunks[2], rows[4:])
 
-    def test_new_algorithm_reduce_groups_use_fixed_group_size(self) -> None:
+    def test_reduce_groups_use_fixed_group_size(self) -> None:
         def _mk_summary_obj(batch_id: str):
             raw = json.dumps(
                 {
@@ -2091,7 +2263,7 @@ class TestMySummarizer(unittest.TestCase):
         groups = summarizer._group_structured_summaries_by_budget(summaries)
         self.assertEqual([len(g) for g in groups], [3, 3, 1])
 
-    def test_map_start_progress_has_no_legacy_split_fields(self) -> None:
+    def test_map_start_progress_has_expected_fields(self) -> None:
         progress_events = []
 
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
