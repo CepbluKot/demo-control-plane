@@ -524,6 +524,26 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
         self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
 
+    def test_generate_sectional_structured_summary_uses_fallback_on_empty_llm_response(self) -> None:
+        prompts: list[str] = []
+
+        def empty_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return ""
+
+        merged, sections = _generate_sectional_structured_summary(
+            llm_call=empty_llm,
+            base_summary="Structured reduce summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
+        self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
+
     def test_generate_sectional_structured_summary_compresses_only_prompt_context(self) -> None:
         prompts: list[str] = []
 
@@ -560,6 +580,26 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
 
         merged, sections = _generate_sectional_freeform_summary(
             llm_call=failing_llm,
+            final_summary="Structured summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+        )
+        self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
+        self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
+        self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
+
+    def test_generate_sectional_freeform_summary_uses_fallback_on_empty_llm_response(self) -> None:
+        prompts: list[str] = []
+
+        def empty_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return ""
+
+        merged, sections = _generate_sectional_freeform_summary(
+            llm_call=empty_llm,
             final_summary="Structured summary",
             user_goal="incident goal",
             period_start="2026-03-18T00:00:00Z",

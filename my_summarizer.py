@@ -1391,6 +1391,7 @@ def _make_llm_call(
     on_attempt: Optional[Callable[[int, int, float], None]] = None,
     on_result: Optional[Callable[[int, int, bool, float, Optional[str]], None]] = None,
     llm_timeout: float = 1200.0,
+    fail_open_return_empty: bool = False,
 ) -> LLMTextCaller:
     if not has_required_env():
         raise RuntimeError(
@@ -1457,6 +1458,11 @@ def _make_llm_call(
                         "LLM non-retryable error (stop retries): %s",
                         exc,
                     )
+                    if fail_open_return_empty:
+                        logger.warning(
+                            "LLM fail-open mode: returning empty response after non-retryable error."
+                        )
+                        return ""
                     raise
                 can_retry = (
                     is_read_timeout
@@ -1495,12 +1501,24 @@ def _make_llm_call(
                     if retry_delay > 0:
                         time.sleep(retry_delay)
                 else:
+                    if fail_open_return_empty:
+                        logger.warning(
+                            "LLM все %d попытки исчерпаны; fail-open mode -> returning empty response",
+                            configured_total_attempts,
+                        )
+                        return ""
                     logger.exception(
                         "LLM все %d попытки исчерпаны; поднимаем ошибку",
                         configured_total_attempts,
                     )
                     break
         if last_exc is not None:
+            if fail_open_return_empty:
+                logger.warning(
+                    "LLM fail-open mode: returning empty response after terminal exception: %s",
+                    last_exc,
+                )
+                return ""
             raise last_exc
         raise RuntimeError("LLM call failed without explicit exception")
 

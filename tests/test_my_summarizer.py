@@ -159,6 +159,28 @@ class TestMySummarizer(unittest.TestCase):
 
         self.assertEqual(retries, ["retry"])
 
+    def test_make_llm_call_fail_open_returns_empty_after_retry_exhaustion(self) -> None:
+        retries = []
+
+        def _raise_conn_error(*, message, system_prompt="", timeout=60.0):
+            _ = (message, system_prompt, timeout)
+            raise requests.exceptions.ConnectionError("network down")
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_raise_conn_error,
+        ):
+            llm_call = _make_llm_call(
+                max_retries=1,
+                retry_delay=0.0,
+                on_retry=lambda *_: retries.append("retry"),
+                fail_open_return_empty=True,
+            )
+            out = llm_call("test prompt")
+
+        self.assertEqual(out, "")
+        self.assertEqual(retries, ["retry"])
+
     def test_communicate_with_llm_retries_without_max_tokens_on_400(self) -> None:
         class _FakeResponse:
             def __init__(self, status_code: int, payload: dict):
@@ -271,6 +293,34 @@ class TestMySummarizer(unittest.TestCase):
             with self.assertRaises(requests.exceptions.HTTPError):
                 llm_call("test prompt")
 
+        self.assertEqual(retries, [])
+
+    def test_make_llm_call_fail_open_returns_empty_on_non_retryable_400(self) -> None:
+        class _Resp:
+            status_code = 400
+
+        retries = []
+
+        def _raise_bad_request(*, message, system_prompt="", timeout=60.0):
+            _ = (message, system_prompt, timeout)
+            raise requests.exceptions.HTTPError(
+                "400 Client Error: Bad Request",
+                response=_Resp(),
+            )
+
+        with patch("my_summarizer.has_required_env", return_value=True), patch(
+            "my_summarizer.communicate_with_llm",
+            side_effect=_raise_bad_request,
+        ):
+            llm_call = _make_llm_call(
+                max_retries=-1,
+                retry_delay=0.0,
+                on_retry=lambda *_: retries.append("retry"),
+                fail_open_return_empty=True,
+            )
+            out = llm_call("test prompt")
+
+        self.assertEqual(out, "")
         self.assertEqual(retries, [])
 
     def test_make_llm_call_doubles_timeout_on_read_timeout(self) -> None:

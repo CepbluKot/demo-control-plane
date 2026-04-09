@@ -4112,11 +4112,12 @@ def _generate_sectional_structured_summary(
                 section_text = _normalize_summary_text(llm_call(prompt))
             except Exception as section_exc:  # noqa: BLE001
                 if logger is not None:
-                    logger.exception(
-                        "FINAL_REPORT section failed | kind=structured | section=%s/%s | title=%s",
+                    logger.warning(
+                        "FINAL_REPORT section failed | kind=structured | section=%s/%s | title=%s | error=%s",
                         idx,
                         total,
                         title,
+                        section_exc,
                     )
                 section_text = ""
             if not section_text:
@@ -4203,11 +4204,12 @@ def _generate_sectional_freeform_summary(
                 section_text = _normalize_summary_text(llm_call(prompt))
             except Exception as section_exc:  # noqa: BLE001
                 if logger is not None:
-                    logger.exception(
-                        "FINAL_REPORT section failed | kind=freeform | section=%s/%s | title=%s",
+                    logger.warning(
+                        "FINAL_REPORT section failed | kind=freeform | section=%s/%s | title=%s | error=%s",
                         idx,
                         total,
                         title,
+                        section_exc,
                     )
                 section_text = ""
             if not section_text:
@@ -8747,6 +8749,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             on_attempt=_on_llm_attempt,
             on_result=_on_llm_result,
             llm_timeout=final_stage_timeout,
+            fail_open_return_empty=True,
         )
 
         def _final_stage_llm_call_with_context(prompt: str) -> str:
