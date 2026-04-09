@@ -25,6 +25,7 @@ from ui.pages.logs_summary_page import (
     _build_stage1_progress_snapshot,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
+    _compute_report_steps_total,
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
     _default_alert_time_values,
@@ -256,6 +257,32 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertTrue(snapshot["show"])
         self.assertAlmostEqual(float(snapshot["ratio"]), 0.25, places=6)
         self.assertIn("(5/20)", snapshot["label"])
+
+    def test_compute_report_steps_total_respects_enabled_stages(self) -> None:
+        all_on = _compute_report_steps_total(
+            section_count=len(FINAL_REPORT_SECTIONS),
+            include_structured=True,
+            include_freeform=True,
+            include_topic_sync=True,
+            include_instructor=True,
+        )
+        all_off = _compute_report_steps_total(
+            section_count=len(FINAL_REPORT_SECTIONS),
+            include_structured=False,
+            include_freeform=False,
+            include_topic_sync=False,
+            include_instructor=False,
+        )
+        freeform_only = _compute_report_steps_total(
+            section_count=len(FINAL_REPORT_SECTIONS),
+            include_structured=False,
+            include_freeform=True,
+            include_topic_sync=False,
+            include_instructor=False,
+        )
+        self.assertEqual(all_on, len(FINAL_REPORT_SECTIONS) * 2 + 6)
+        self.assertEqual(all_off, 1)
+        self.assertEqual(freeform_only, len(FINAL_REPORT_SECTIONS) + 2)
 
     def test_build_reduce_l1_progress_snapshot_waiting_in_reduce(self) -> None:
         snapshot = _build_reduce_l1_progress_snapshot(
@@ -712,6 +739,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIsNone(imported.get("result_html_path"))
         self.assertEqual(imported.get("final_summary"), "summary")
         self.assertTrue(imported.get("final_report_ready"))
+        self.assertTrue(imported.get("enable_final_structured"))
+        self.assertTrue(imported.get("enable_final_freeform"))
 
     def test_build_saved_params_from_import_request_prefills_form_fields(self) -> None:
         saved_params = _build_saved_params_from_import_request(
@@ -729,6 +758,10 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "llm_model_id": "model-x",
                 "use_instructor": False,
                 "model_supports_tool_calling": False,
+                "enable_final_structured": False,
+                "enable_final_freeform": False,
+                "enable_final_topics_sync": True,
+                "enable_final_instructor_report": False,
                 "enable_no_logs_hypothesis": True,
             },
             center_default="2026-03-01T00:00:00+03:00",
@@ -744,6 +777,10 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(saved_params["llm_model_id"], "model-x")
         self.assertFalse(saved_params["use_instructor"])
         self.assertFalse(saved_params["model_supports_tool_calling"])
+        self.assertFalse(saved_params["enable_final_structured"])
+        self.assertFalse(saved_params["enable_final_freeform"])
+        self.assertTrue(saved_params["enable_final_topics_sync"])
+        self.assertFalse(saved_params["enable_final_instructor_report"])
         self.assertTrue(saved_params["enable_no_logs_hypothesis"])
 
     def test_build_saved_params_from_import_request_legacy_sql_fields(self) -> None:
@@ -998,6 +1035,10 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "llm_batch_size": 321,
                 "use_instructor": False,
                 "model_supports_tool_calling": False,
+                "enable_final_structured": False,
+                "enable_final_freeform": True,
+                "enable_final_topics_sync": False,
+                "enable_final_instructor_report": False,
                 "map_workers": 4,
                 "max_retries": 7,
                 "llm_timeout": 111,
@@ -1017,6 +1058,10 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(mapped["logs_sum_llm_batch"], 321)
         self.assertFalse(mapped["logs_sum_use_instructor"])
         self.assertFalse(mapped["logs_sum_model_supports_tool_calling"])
+        self.assertFalse(mapped["logs_sum_enable_final_structured"])
+        self.assertTrue(mapped["logs_sum_enable_final_freeform"])
+        self.assertFalse(mapped["logs_sum_enable_final_topics_sync"])
+        self.assertFalse(mapped["logs_sum_enable_final_instructor_report"])
         self.assertFalse(mapped["logs_sum_parallel_map"])
         self.assertEqual(mapped["logs_sum_map_workers"], 1)
         self.assertTrue(mapped["logs_sum_demo_mode"])
@@ -1180,6 +1225,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT": 44,
             "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT": 33,
             "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD": 0.81,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE": 1,
+            "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS": 12345,
             "CONTROL_PLANE_LLM_USE_INSTRUCTOR": False,
             "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING": False,
         }
@@ -1190,6 +1237,8 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(cfg["reduce_target_token_pct"], 44)
         self.assertEqual(cfg["compression_target_pct"], 33)
         self.assertAlmostEqual(float(cfg["compression_importance_threshold"]), 0.81, places=6)
+        self.assertEqual(cfg["reduce_group_size"], 2)
+        self.assertEqual(cfg["reduce_input_max_chars"], 12345)
         self.assertFalse(cfg["use_instructor"])
         self.assertFalse(cfg["model_supports_tool_calling"])
         self.assertEqual(cfg["page_limit"], 1000)

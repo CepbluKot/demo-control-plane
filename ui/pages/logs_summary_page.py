@@ -87,6 +87,29 @@ def _default_llm_timeout_seconds() -> int:
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200) or 1200),
         10,
     )
+
+
+def _compute_report_steps_total(
+    *,
+    section_count: int,
+    include_structured: bool,
+    include_freeform: bool,
+    include_topic_sync: bool,
+    include_instructor: bool,
+) -> int:
+    total = 1  # final artifacts save
+    normalized_sections = max(int(section_count), 0)
+    if include_structured:
+        total += normalized_sections + 1
+    if include_freeform:
+        total += normalized_sections + 1
+    if include_topic_sync:
+        total += 1
+    if include_instructor:
+        total += 2
+    return max(total, 1)
+
+
 FINAL_REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
     (
         REPORT_CONTEXT_SECTION_TITLE,
@@ -2112,6 +2135,18 @@ def _form_values_from_saved_params(
                 getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
             )
         ),
+        "logs_sum_enable_final_structured": bool(
+            saved_params.get("enable_final_structured", True)
+        ),
+        "logs_sum_enable_final_freeform": bool(
+            saved_params.get("enable_final_freeform", True)
+        ),
+        "logs_sum_enable_final_topics_sync": bool(
+            saved_params.get("enable_final_topics_sync", True)
+        ),
+        "logs_sum_enable_final_instructor_report": bool(
+            saved_params.get("enable_final_instructor_report", True)
+        ),
         "logs_sum_period_mode": str(
             saved_params.get("period_mode", "Явный диапазон (start/end)")
         ),
@@ -2165,6 +2200,10 @@ def _checkpoint_payload_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
         "period_start",
         "period_end",
         "window_minutes",
+        "enable_final_structured",
+        "enable_final_freeform",
+        "enable_final_topics_sync",
+        "enable_final_instructor_report",
         "queries_count",
         "metrics_queries_count",
         "logs_processed",
@@ -2340,6 +2379,10 @@ def _state_from_imported_result(result_payload: Dict[str, Any]) -> Dict[str, Any
     state.setdefault("instructor_freeform_sections", [])
     state.setdefault("instructor_structured_summary", "")
     state.setdefault("instructor_freeform_summary", "")
+    state.setdefault("enable_final_structured", True)
+    state.setdefault("enable_final_freeform", True)
+    state.setdefault("enable_final_topics_sync", True)
+    state.setdefault("enable_final_instructor_report", True)
     state.setdefault("instructor_report_status", "imported")
     state.setdefault("instructor_report_error", "")
     state.setdefault("instructor_report_notes", "")
@@ -2428,6 +2471,12 @@ def _build_saved_params_from_import_request(
                 "model_supports_tool_calling",
                 getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
             )
+        ),
+        "enable_final_structured": bool(request.get("enable_final_structured", True)),
+        "enable_final_freeform": bool(request.get("enable_final_freeform", True)),
+        "enable_final_topics_sync": bool(request.get("enable_final_topics_sync", True)),
+        "enable_final_instructor_report": bool(
+            request.get("enable_final_instructor_report", True)
         ),
         "max_retries": _safe_int(request.get("max_retries"), -1),
         "llm_timeout": _safe_int(request.get("llm_timeout"), _default_llm_timeout_seconds()),
@@ -6021,6 +6070,14 @@ def _build_config(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
         0,
     )
+    reduce_group_size = max(
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2) or 2),
+        2,
+    )
+    reduce_input_max_chars = max(
+        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS", 40000) or 40000),
+        1000,
+    )
     # Legacy algorithm path is removed: always use the updated algorithm.
     use_new_algorithm = True
     reduce_target_token_pct = max(
@@ -6054,6 +6111,8 @@ def _build_config(
             keep_map_summaries_in_result=False,
             map_workers=max(map_workers, 1),
             use_new_algorithm=use_new_algorithm,
+            reduce_group_size=reduce_group_size,
+            reduce_input_max_chars=reduce_input_max_chars,
             reduce_target_token_pct=reduce_target_token_pct,
             compression_target_pct=compression_target_pct,
             compression_importance_threshold=compression_importance_threshold,
@@ -6188,6 +6247,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_model_supports_tool_calling": bool(
             getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)
         ),
+        "logs_sum_enable_final_structured": True,
+        "logs_sum_enable_final_freeform": True,
+        "logs_sum_enable_final_topics_sync": True,
+        "logs_sum_enable_final_instructor_report": True,
         "logs_sum_period_mode": "Явный диапазон (start/end)",
         "logs_sum_center_dt": center_default,
         "logs_sum_window_minutes": max(int(deps.loopback_minutes), 1),
@@ -6264,6 +6327,30 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             mapped.get(
                 "logs_sum_model_supports_tool_calling",
                 widget_defaults["logs_sum_model_supports_tool_calling"],
+            )
+        )
+        st.session_state["logs_sum_enable_final_structured"] = bool(
+            mapped.get(
+                "logs_sum_enable_final_structured",
+                widget_defaults["logs_sum_enable_final_structured"],
+            )
+        )
+        st.session_state["logs_sum_enable_final_freeform"] = bool(
+            mapped.get(
+                "logs_sum_enable_final_freeform",
+                widget_defaults["logs_sum_enable_final_freeform"],
+            )
+        )
+        st.session_state["logs_sum_enable_final_topics_sync"] = bool(
+            mapped.get(
+                "logs_sum_enable_final_topics_sync",
+                widget_defaults["logs_sum_enable_final_topics_sync"],
+            )
+        )
+        st.session_state["logs_sum_enable_final_instructor_report"] = bool(
+            mapped.get(
+                "logs_sum_enable_final_instructor_report",
+                widget_defaults["logs_sum_enable_final_instructor_report"],
             )
         )
         st.session_state["logs_sum_period_mode"] = mapped["logs_sum_period_mode"]
@@ -6741,6 +6828,38 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "Если выключено — Instructor работает в JSON-режиме."
             ),
         )
+        st.markdown("Этапы Финального Отчёта")
+        st.checkbox(
+            "Генерировать structured-отчёт по секциям",
+            key="logs_sum_enable_final_structured",
+            disabled=is_running,
+            help="Если выключено — structured-этап пропускается (останется reduce summary).",
+        )
+        st.checkbox(
+            "Генерировать freeform-отчёт по секциям",
+            key="logs_sum_enable_final_freeform",
+            disabled=is_running,
+            help="Если выключено — свободный narrative-этап пропускается.",
+        )
+        st.checkbox(
+            "Синхронизировать топики между отчётами",
+            key="logs_sum_enable_final_topics_sync",
+            disabled=is_running,
+            help="Добавляет недостающие разделы из списка 13 топиков в итоговые тексты.",
+        )
+        st.checkbox(
+            "Запускать дополнительный Instructor-отчёт (A/B)",
+            key="logs_sum_enable_final_instructor_report",
+            disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
+            help=(
+                "Тестовая вторая генерация после основного отчёта. "
+                "Требует включённый флаг Instructor."
+            ),
+        )
+        if not bool(st.session_state.get("logs_sum_enable_final_structured", True)) and not bool(
+            st.session_state.get("logs_sum_enable_final_freeform", True)
+        ):
+            st.caption("Оба финальных этапа выключены: сохраним только reduce summary + артефакты.")
         selected_model_for_budget = str(st.session_state.get("logs_sum_model_id") or "").strip()
         st.caption(
             f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
@@ -6836,6 +6955,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True),
         )
     )
+    enable_final_structured = bool(
+        st.session_state.get("logs_sum_enable_final_structured", True)
+    )
+    enable_final_freeform = bool(
+        st.session_state.get("logs_sum_enable_final_freeform", True)
+    )
+    enable_final_topics_sync = bool(
+        st.session_state.get("logs_sum_enable_final_topics_sync", True)
+    )
+    enable_final_instructor_report = bool(
+        st.session_state.get("logs_sum_enable_final_instructor_report", True)
+    )
     logs_timestamp_column = _normalize_timestamp_column_name(
         getattr(deps, "logs_timestamp_column", "timestamp")
     )
@@ -6919,6 +7050,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "llm_model_id": llm_model_id,
             "use_instructor": use_instructor,
             "model_supports_tool_calling": model_supports_tool_calling,
+            "enable_final_structured": enable_final_structured,
+            "enable_final_freeform": enable_final_freeform,
+            "enable_final_topics_sync": enable_final_topics_sync,
+            "enable_final_instructor_report": enable_final_instructor_report,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -6960,6 +7095,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "llm_model_id": llm_model_id,
             "use_instructor": use_instructor,
             "model_supports_tool_calling": model_supports_tool_calling,
+            "enable_final_structured": enable_final_structured,
+            "enable_final_freeform": enable_final_freeform,
+            "enable_final_topics_sync": enable_final_topics_sync,
+            "enable_final_instructor_report": enable_final_instructor_report,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -6994,6 +7133,18 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     model_supports_tool_calling = bool(
         active_params.get("model_supports_tool_calling", model_supports_tool_calling)
     )
+    enable_final_structured = bool(
+        active_params.get("enable_final_structured", enable_final_structured)
+    )
+    enable_final_freeform = bool(
+        active_params.get("enable_final_freeform", enable_final_freeform)
+    )
+    enable_final_topics_sync = bool(
+        active_params.get("enable_final_topics_sync", enable_final_topics_sync)
+    )
+    enable_final_instructor_report = bool(
+        active_params.get("enable_final_instructor_report", enable_final_instructor_report)
+    )
     logs_timestamp_column = _normalize_timestamp_column_name(
         active_params.get("logs_timestamp_column", logs_timestamp_column)
     )
@@ -7012,6 +7163,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     active_params["llm_model_id"] = llm_model_id
     active_params["use_instructor"] = use_instructor
     active_params["model_supports_tool_calling"] = model_supports_tool_calling
+    active_params["enable_final_structured"] = enable_final_structured
+    active_params["enable_final_freeform"] = enable_final_freeform
+    active_params["enable_final_topics_sync"] = enable_final_topics_sync
+    active_params["enable_final_instructor_report"] = enable_final_instructor_report
     active_params["llm_batch_size"] = llm_batch_size
     active_params["map_workers"] = 1
 
@@ -7245,6 +7400,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_model_id": llm_model_id,
         "use_instructor": use_instructor,
         "model_supports_tool_calling": model_supports_tool_calling,
+        "enable_final_structured": enable_final_structured,
+        "enable_final_freeform": enable_final_freeform,
+        "enable_final_topics_sync": enable_final_topics_sync,
+        "enable_final_instructor_report": enable_final_instructor_report,
         "map_workers": map_workers,
         "max_retries": max_retries,
         "llm_timeout": llm_timeout,
@@ -7382,6 +7541,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "instructor_report_notes",
                 "instructor_report_attempts",
                 "final_report_ready",
+                "enable_final_structured",
+                "enable_final_freeform",
+                "enable_final_topics_sync",
+                "enable_final_instructor_report",
                 "result_json_path",
                 "result_bundle_path",
                 "result_summary_path",
@@ -7479,6 +7642,10 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "llm_model_id": llm_model_id,
         "use_instructor": use_instructor,
         "model_supports_tool_calling": model_supports_tool_calling,
+        "enable_final_structured": enable_final_structured,
+        "enable_final_freeform": enable_final_freeform,
+        "enable_final_topics_sync": enable_final_topics_sync,
+        "enable_final_instructor_report": enable_final_instructor_report,
         "enable_no_logs_hypothesis": enable_no_logs_hypothesis,
         "live_events_path": str(live_events_path),
         "live_batches_path": str(live_batches_path),
@@ -9230,7 +9397,34 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state["final_summary_origin"] = "final_recovery_join"
                 state["final_summary"] = final_summary_for_report
 
-        report_steps_total = len(FINAL_REPORT_SECTIONS) * 2 + 4 + (2 if use_instructor else 0)
+        enable_structured_stage = bool(
+            active_params.get("enable_final_structured", state.get("enable_final_structured", True))
+        )
+        enable_freeform_stage = bool(
+            active_params.get("enable_final_freeform", state.get("enable_final_freeform", True))
+        )
+        enable_topic_sync_stage = bool(
+            active_params.get("enable_final_topics_sync", state.get("enable_final_topics_sync", True))
+        )
+        enable_instructor_report_stage = bool(
+            active_params.get(
+                "enable_final_instructor_report",
+                state.get("enable_final_instructor_report", True),
+            )
+        )
+        # Instructor report stage requires core Instructor mode to be enabled.
+        enable_instructor_report_stage = bool(enable_instructor_report_stage and use_instructor)
+        state["enable_final_structured"] = enable_structured_stage
+        state["enable_final_freeform"] = enable_freeform_stage
+        state["enable_final_topics_sync"] = enable_topic_sync_stage
+        state["enable_final_instructor_report"] = enable_instructor_report_stage
+        report_steps_total = _compute_report_steps_total(
+            section_count=len(FINAL_REPORT_SECTIONS),
+            include_structured=enable_structured_stage,
+            include_freeform=enable_freeform_stage,
+            include_topic_sync=enable_topic_sync_stage,
+            include_instructor=enable_instructor_report_stage,
+        )
         final_summary_for_instructor_input = final_summary_for_report
 
         def _set_report_progress(
@@ -9257,250 +9451,322 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
         if final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
             deps.logger.info(
-                "FINAL_REPORT pipeline start | final_summary_len=%s | report_steps_total=%s | use_instructor=%s",
+                "FINAL_REPORT pipeline start | final_summary_len=%s | report_steps_total=%s | structured=%s | freeform=%s | topic_sync=%s | instructor_stage=%s",
                 len(final_summary_for_report),
                 report_steps_total,
-                bool(use_instructor),
+                bool(enable_structured_stage),
+                bool(enable_freeform_stage),
+                bool(enable_topic_sync_stage),
+                bool(enable_instructor_report_stage),
             )
             state["report_progress_total"] = report_steps_total
             state["report_progress_current"] = 0
             state["report_progress_active"] = True
             _set_report_progress("Подготовка итогового отчёта", render_now=True)
-            try:
-                deps.logger.info("FINAL_REPORT structured stage start")
-                events = state.setdefault("events", [])
-                state["structured_sections"] = []
-                events.append("Готовим структурированный финальный отчет по секциям")
-                state["llm_phase_hint"] = "final_structured"
-                state["active_source_label"] = "final_structured"
-                _set_report_progress("Структурированный отчёт: старт", render_now=True)
-                _render_logs_summary_chat(analysis_placeholder, state, deps)
-
-                def _on_structured_section_start(
-                    section_idx: int,
-                    section_total: int,
-                    title: str,
-                ) -> None:
-                    state["active_step"] = (
-                        f"Структурированный отчёт: секция {section_idx}/{section_total} — {title}"
-                    )
-                    _set_report_progress(
-                        f"Структурированный отчёт: секция {section_idx}/{section_total}",
-                        render_now=False,
-                    )
-                    _push_live_event(
-                        f"LLM пишет structured секцию {section_idx}/{section_total}: {title}",
-                        render_now=True,
-                    )
-
-                def _on_structured_section_done(
-                    section_idx: int,
-                    section_total: int,
-                    title: str,
-                ) -> None:
-                    _set_report_progress(
-                        f"Структурированный отчёт: секция {section_idx}/{section_total} готова",
-                        step_inc=1,
-                        render_now=False,
-                    )
-                    _push_live_event(
-                        f"Structured секция готова {section_idx}/{section_total}: {title}",
-                        render_now=True,
-                    )
-
-                structured_summary, structured_sections = _generate_sectional_structured_summary(
-                    llm_call=final_stage_llm_call,
-                    base_summary=final_summary_for_report,
-                    user_goal=goal_text,
-                    period_start=period_start_iso,
-                    period_end=period_end_iso,
-                    stats=state.get("stats") or {},
-                    metrics_context=metrics_context_text,
-                    on_section_start=_on_structured_section_start,
-                    on_section_done=_on_structured_section_done,
-                    logger=deps.logger,
-                )
-                structured_summary = _normalize_summary_text(structured_summary)
-                if structured_summary:
-                    final_summary_for_report = structured_summary
-                    state["final_summary"] = structured_summary
-                    state["structured_sections"] = structured_sections
-                    events.append("Структурированный финальный отчет готов")
-                    deps.logger.info(
-                        "FINAL_REPORT structured stage done | sections=%s | summary_len=%s",
-                        len(structured_sections),
-                        len(structured_summary),
-                    )
-                else:
-                    events.append("Структурированный секционный отчет пустой, оставляем reduce summary")
-                    deps.logger.warning("FINAL_REPORT structured stage done but empty output")
-                _set_report_progress("Структурированный отчёт: этап завершён", step_inc=1, render_now=True)
-            except Exception as structured_exc:  # noqa: BLE001
-                deps.logger.exception("FINAL_REPORT structured stage failed")
-                state.setdefault("events", []).append(
-                    "Не удалось сгенерировать структурированный секционный отчет, оставляем reduce summary"
-                )
-                _set_report_progress(
-                    "Структурированный отчёт: ошибка, продолжаем дальше",
-                    step_inc=1,
-                    render_now=True,
+            def _finish_report_stage(
+                *,
+                stage_label: str,
+                stage_target_steps: int,
+                stage_done_steps: int,
+                message: str,
+            ) -> None:
+                if stage_target_steps <= 0:
+                    return
+                remaining = max(stage_target_steps - max(stage_done_steps, 0), 0)
+                _set_report_progress(message, step_inc=remaining, render_now=True)
+                deps.logger.info(
+                    "FINAL_REPORT %s progress finalized | target=%s | done=%s | added=%s",
+                    stage_label,
+                    stage_target_steps,
+                    stage_done_steps,
+                    remaining,
                 )
 
-            try:
-                deps.logger.info("FINAL_REPORT freeform stage start")
-                events = state.setdefault("events", [])
-                state["final_summary"] = final_summary_for_report
-                state["freeform_sections"] = []
-                events.append("Готовим расширенный финальный отчет в свободном формате")
-                state["llm_phase_hint"] = "final_freeform"
-                state["active_source_label"] = "final_freeform"
-                _set_report_progress("Свободный отчёт: старт", render_now=True)
-                _render_logs_summary_chat(analysis_placeholder, state, deps)
-                def _on_section_start(section_idx: int, section_total: int, title: str) -> None:
-                    state["active_step"] = (
-                        f"Финальный отчёт: секция {section_idx}/{section_total} — {title}"
-                    )
-                    _set_report_progress(
-                        f"Свободный отчёт: секция {section_idx}/{section_total}",
-                        render_now=False,
-                    )
-                    _push_live_event(
-                        f"LLM пишет секцию {section_idx}/{section_total}: {title}",
-                        render_now=True,
-                    )
-
-                def _on_section_done(section_idx: int, section_total: int, title: str) -> None:
-                    _set_report_progress(
-                        f"Свободный отчёт: секция {section_idx}/{section_total} готова",
-                        step_inc=1,
-                        render_now=False,
-                    )
-                    _push_live_event(
-                        f"Секция готова {section_idx}/{section_total}: {title}",
-                        render_now=True,
-                    )
-
-                freeform_summary, freeform_sections = _generate_sectional_freeform_summary(
-                    llm_call=final_stage_llm_call,
-                    final_summary=final_summary_for_report,
-                    user_goal=goal_text,
-                    period_start=period_start_iso,
-                    period_end=period_end_iso,
-                    stats=state.get("stats") or {},
-                    metrics_context=metrics_context_text,
-                    on_section_start=_on_section_start,
-                    on_section_done=_on_section_done,
-                    logger=deps.logger,
-                )
-                freeform_summary = _normalize_summary_text(freeform_summary)
-                if freeform_summary:
-                    state["freeform_final_summary"] = freeform_summary
-                    state["freeform_sections"] = freeform_sections
-                    events.append("Свободный финальный отчет готов")
-                    deps.logger.info(
-                        "FINAL_REPORT freeform stage done | sections=%s | summary_len=%s",
-                        len(freeform_sections),
-                        len(freeform_summary),
-                    )
-                else:
-                    events.append("Свободный финальный отчет пустой, используем основной")
-                    deps.logger.warning("FINAL_REPORT freeform stage done but empty output")
-                _set_report_progress("Свободный отчёт: этап завершён", step_inc=1, render_now=True)
-            except Exception as freeform_exc:  # noqa: BLE001
-                deps.logger.exception("FINAL_REPORT freeform stage failed | trying fallback")
-                state.setdefault("events", []).append(
-                    "Секционная генерация отчета не удалась, пробуем резервный один запрос"
-                )
+            structured_stage_target = len(FINAL_REPORT_SECTIONS) + 1 if enable_structured_stage else 0
+            structured_stage_done = 0
+            if enable_structured_stage:
                 try:
-                    map_summaries_for_final = _load_map_summaries_from_jsonl(
-                        str(map_summaries_jsonl_path)
-                    )
-                    map_summaries_text_for_final = "\n\n".join(
-                        f"[MAP SUMMARY #{idx + 1}]\n{text}"
-                        for idx, text in enumerate(map_summaries_for_final)
-                    )
-                    freeform_prompt = _build_freeform_summary_prompt(
-                        final_summary=final_summary_for_report,
-                        map_summaries_text=map_summaries_text_for_final,
+                    deps.logger.info("FINAL_REPORT structured stage start")
+                    events = state.setdefault("events", [])
+                    state["structured_sections"] = []
+                    events.append("Готовим структурированный финальный отчет по секциям")
+                    state["llm_phase_hint"] = "final_structured"
+                    state["active_source_label"] = "final_structured"
+                    _set_report_progress("Структурированный отчёт: старт", render_now=True)
+                    _render_logs_summary_chat(analysis_placeholder, state, deps)
+
+                    def _on_structured_section_start(
+                        section_idx: int,
+                        section_total: int,
+                        title: str,
+                    ) -> None:
+                        state["active_step"] = (
+                            f"Структурированный отчёт: секция {section_idx}/{section_total} — {title}"
+                        )
+                        _set_report_progress(
+                            f"Структурированный отчёт: секция {section_idx}/{section_total}",
+                            render_now=False,
+                        )
+                        _push_live_event(
+                            f"LLM пишет structured секцию {section_idx}/{section_total}: {title}",
+                            render_now=True,
+                        )
+
+                    def _on_structured_section_done(
+                        section_idx: int,
+                        section_total: int,
+                        title: str,
+                    ) -> None:
+                        nonlocal structured_stage_done
+                        structured_stage_done += 1
+                        _set_report_progress(
+                            f"Структурированный отчёт: секция {section_idx}/{section_total} готова",
+                            step_inc=1,
+                            render_now=False,
+                        )
+                        _push_live_event(
+                            f"Structured секция готова {section_idx}/{section_total}: {title}",
+                            render_now=True,
+                        )
+
+                    structured_summary, structured_sections = _generate_sectional_structured_summary(
+                        llm_call=final_stage_llm_call,
+                        base_summary=final_summary_for_report,
                         user_goal=goal_text,
                         period_start=period_start_iso,
                         period_end=period_end_iso,
                         stats=state.get("stats") or {},
                         metrics_context=metrics_context_text,
+                        on_section_start=_on_structured_section_start,
+                        on_section_done=_on_structured_section_done,
+                        logger=deps.logger,
                     )
-                    fallback_freeform = _normalize_summary_text(final_stage_llm_call(freeform_prompt))
-                    if fallback_freeform:
-                        state["freeform_final_summary"] = fallback_freeform
-                        state.setdefault("events", []).append(
-                            "Резервный freeform-отчет сгенерирован"
-                        )
+                    structured_summary = _normalize_summary_text(structured_summary)
+                    if structured_summary:
+                        final_summary_for_report = structured_summary
+                        state["final_summary"] = structured_summary
+                        state["structured_sections"] = structured_sections
+                        events.append("Структурированный финальный отчет готов")
                         deps.logger.info(
-                            "FINAL_REPORT freeform fallback done | summary_len=%s",
-                            len(fallback_freeform),
+                            "FINAL_REPORT structured stage done | sections=%s | summary_len=%s",
+                            len(structured_sections),
+                            len(structured_summary),
                         )
-                except Exception as fallback_exc:  # noqa: BLE001
-                    deps.logger.exception("FINAL_REPORT freeform fallback failed")
-                    state.setdefault("events", []).append(
-                        "Не удалось сгенерировать свободный финальный отчет"
+                    else:
+                        events.append("Структурированный секционный отчет пустой, оставляем reduce summary")
+                        deps.logger.warning("FINAL_REPORT structured stage done but empty output")
+                    _finish_report_stage(
+                        stage_label="structured",
+                        stage_target_steps=structured_stage_target,
+                        stage_done_steps=structured_stage_done,
+                        message="Структурированный отчёт: этап завершён",
                     )
-                _set_report_progress(
-                    "Свободный отчёт: ошибка, продолжаем сохранение артефактов",
-                    step_inc=1,
-                    render_now=True,
+                except Exception:  # noqa: BLE001
+                    deps.logger.exception("FINAL_REPORT structured stage failed")
+                    state.setdefault("events", []).append(
+                        "Не удалось сгенерировать структурированный секционный отчет, оставляем reduce summary"
+                    )
+                    _finish_report_stage(
+                        stage_label="structured",
+                        stage_target_steps=structured_stage_target,
+                        stage_done_steps=structured_stage_done,
+                        message="Структурированный отчёт: ошибка, продолжаем дальше",
+                    )
+            else:
+                state["structured_sections"] = []
+                state.setdefault("events", []).append(
+                    "Структурированный финальный отчёт отключён чекбоксом."
                 )
+                deps.logger.info("FINAL_REPORT structured stage skipped by checkbox")
+
+            freeform_stage_target = len(FINAL_REPORT_SECTIONS) + 1 if enable_freeform_stage else 0
+            freeform_stage_done = 0
+            if enable_freeform_stage:
+                try:
+                    deps.logger.info("FINAL_REPORT freeform stage start")
+                    events = state.setdefault("events", [])
+                    state["final_summary"] = final_summary_for_report
+                    state["freeform_sections"] = []
+                    events.append("Готовим расширенный финальный отчет в свободном формате")
+                    state["llm_phase_hint"] = "final_freeform"
+                    state["active_source_label"] = "final_freeform"
+                    _set_report_progress("Свободный отчёт: старт", render_now=True)
+                    _render_logs_summary_chat(analysis_placeholder, state, deps)
+
+                    def _on_section_start(section_idx: int, section_total: int, title: str) -> None:
+                        state["active_step"] = (
+                            f"Финальный отчёт: секция {section_idx}/{section_total} — {title}"
+                        )
+                        _set_report_progress(
+                            f"Свободный отчёт: секция {section_idx}/{section_total}",
+                            render_now=False,
+                        )
+                        _push_live_event(
+                            f"LLM пишет секцию {section_idx}/{section_total}: {title}",
+                            render_now=True,
+                        )
+
+                    def _on_section_done(section_idx: int, section_total: int, title: str) -> None:
+                        nonlocal freeform_stage_done
+                        freeform_stage_done += 1
+                        _set_report_progress(
+                            f"Свободный отчёт: секция {section_idx}/{section_total} готова",
+                            step_inc=1,
+                            render_now=False,
+                        )
+                        _push_live_event(
+                            f"Секция готова {section_idx}/{section_total}: {title}",
+                            render_now=True,
+                        )
+
+                    freeform_summary, freeform_sections = _generate_sectional_freeform_summary(
+                        llm_call=final_stage_llm_call,
+                        final_summary=final_summary_for_report,
+                        user_goal=goal_text,
+                        period_start=period_start_iso,
+                        period_end=period_end_iso,
+                        stats=state.get("stats") or {},
+                        metrics_context=metrics_context_text,
+                        on_section_start=_on_section_start,
+                        on_section_done=_on_section_done,
+                        logger=deps.logger,
+                    )
+                    freeform_summary = _normalize_summary_text(freeform_summary)
+                    if freeform_summary:
+                        state["freeform_final_summary"] = freeform_summary
+                        state["freeform_sections"] = freeform_sections
+                        events.append("Свободный финальный отчет готов")
+                        deps.logger.info(
+                            "FINAL_REPORT freeform stage done | sections=%s | summary_len=%s",
+                            len(freeform_sections),
+                            len(freeform_summary),
+                        )
+                    else:
+                        events.append("Свободный финальный отчет пустой, используем основной")
+                        deps.logger.warning("FINAL_REPORT freeform stage done but empty output")
+                    _finish_report_stage(
+                        stage_label="freeform",
+                        stage_target_steps=freeform_stage_target,
+                        stage_done_steps=freeform_stage_done,
+                        message="Свободный отчёт: этап завершён",
+                    )
+                except Exception:  # noqa: BLE001
+                    deps.logger.exception("FINAL_REPORT freeform stage failed | trying fallback")
+                    state.setdefault("events", []).append(
+                        "Секционная генерация отчета не удалась, пробуем резервный один запрос"
+                    )
+                    try:
+                        map_summaries_for_final = _load_map_summaries_from_jsonl(
+                            str(map_summaries_jsonl_path)
+                        )
+                        map_summaries_text_for_final = "\n\n".join(
+                            f"[MAP SUMMARY #{idx + 1}]\n{text}"
+                            for idx, text in enumerate(map_summaries_for_final)
+                        )
+                        freeform_prompt = _build_freeform_summary_prompt(
+                            final_summary=final_summary_for_report,
+                            map_summaries_text=map_summaries_text_for_final,
+                            user_goal=goal_text,
+                            period_start=period_start_iso,
+                            period_end=period_end_iso,
+                            stats=state.get("stats") or {},
+                            metrics_context=metrics_context_text,
+                        )
+                        fallback_freeform = _normalize_summary_text(final_stage_llm_call(freeform_prompt))
+                        if fallback_freeform:
+                            state["freeform_final_summary"] = fallback_freeform
+                            state.setdefault("events", []).append(
+                                "Резервный freeform-отчет сгенерирован"
+                            )
+                            deps.logger.info(
+                                "FINAL_REPORT freeform fallback done | summary_len=%s",
+                                len(fallback_freeform),
+                            )
+                    except Exception:  # noqa: BLE001
+                        deps.logger.exception("FINAL_REPORT freeform fallback failed")
+                        state.setdefault("events", []).append(
+                            "Не удалось сгенерировать свободный финальный отчет"
+                        )
+                    _finish_report_stage(
+                        stage_label="freeform",
+                        stage_target_steps=freeform_stage_target,
+                        stage_done_steps=freeform_stage_done,
+                        message="Свободный отчёт: ошибка, продолжаем сохранение артефактов",
+                    )
+            else:
+                state["freeform_sections"] = []
+                state["freeform_final_summary"] = ""
+                state.setdefault("events", []).append(
+                    "Свободный финальный отчёт отключён чекбоксом."
+                )
+                deps.logger.info("FINAL_REPORT freeform stage skipped by checkbox")
 
         topic_titles = [title for title, _ in FINAL_REPORT_SECTIONS]
-        preferred_structured_sections = (
-            state.get("structured_sections")
-            if isinstance(state.get("structured_sections"), list)
-            else (
-                state.get("freeform_sections")
-                if isinstance(state.get("freeform_sections"), list)
-                else None
-            )
-        )
-        preferred_freeform_sections = (
-            state.get("freeform_sections")
-            if isinstance(state.get("freeform_sections"), list)
-            else (
+        if enable_topic_sync_stage:
+            preferred_structured_sections = (
                 state.get("structured_sections")
                 if isinstance(state.get("structured_sections"), list)
-                else None
+                else (
+                    state.get("freeform_sections")
+                    if isinstance(state.get("freeform_sections"), list)
+                    else None
+                )
             )
-        )
-        synced_structured, missing_in_structured = _ensure_report_topics_present(
-            str(state.get("final_summary") or ""),
-            topic_titles=topic_titles,
-            preferred_sections=preferred_structured_sections,
-        )
-        if synced_structured:
-            state["final_summary"] = synced_structured
-        synced_freeform, missing_in_freeform = _ensure_report_topics_present(
-            str(state.get("freeform_final_summary") or ""),
-            topic_titles=topic_titles,
-            preferred_sections=preferred_freeform_sections,
-        )
-        if synced_freeform:
-            state["freeform_final_summary"] = synced_freeform
-        if missing_in_structured:
+            preferred_freeform_sections = (
+                state.get("freeform_sections")
+                if isinstance(state.get("freeform_sections"), list)
+                else (
+                    state.get("structured_sections")
+                    if isinstance(state.get("structured_sections"), list)
+                    else None
+                )
+            )
+            missing_in_structured: List[str] = []
+            missing_in_freeform: List[str] = []
+            if enable_structured_stage:
+                synced_structured, missing_in_structured = _ensure_report_topics_present(
+                    str(state.get("final_summary") or ""),
+                    topic_titles=topic_titles,
+                    preferred_sections=preferred_structured_sections,
+                )
+                if synced_structured:
+                    state["final_summary"] = synced_structured
+            if enable_freeform_stage:
+                synced_freeform, missing_in_freeform = _ensure_report_topics_present(
+                    str(state.get("freeform_final_summary") or ""),
+                    topic_titles=topic_titles,
+                    preferred_sections=preferred_freeform_sections,
+                )
+                if synced_freeform:
+                    state["freeform_final_summary"] = synced_freeform
+            if missing_in_structured:
+                state.setdefault("events", []).append(
+                    "Синхронизация топиков: добавили недостающие разделы в структурированный отчет"
+                )
+            if missing_in_freeform:
+                state.setdefault("events", []).append(
+                    "Синхронизация топиков: добавили недостающие разделы в свободный отчет"
+                )
+            deps.logger.info(
+                "FINAL_REPORT topics sync done | missing_structured=%s | missing_freeform=%s",
+                len(missing_in_structured),
+                len(missing_in_freeform),
+            )
+            if _safe_int(state.get("report_progress_total"), 0) > 0:
+                _set_report_progress("Синхронизация топиков завершена", step_inc=1, render_now=True)
+        else:
             state.setdefault("events", []).append(
-                "Синхронизация топиков: добавили недостающие разделы в структурированный отчет"
+                "Синхронизация топиков отключена чекбоксом."
             )
-        if missing_in_freeform:
-            state.setdefault("events", []).append(
-                "Синхронизация топиков: добавили недостающие разделы в свободный отчет"
-            )
-        deps.logger.info(
-            "FINAL_REPORT topics sync done | missing_structured=%s | missing_freeform=%s",
-            len(missing_in_structured),
-            len(missing_in_freeform),
-        )
-        if _safe_int(state.get("report_progress_total"), 0) > 0:
-            _set_report_progress("Синхронизация топиков завершена", step_inc=1, render_now=True)
+            deps.logger.info("FINAL_REPORT topic sync stage skipped by checkbox")
 
         # Additional experimental stage (does not replace default reports):
         # generate one more final report pair via Instructor for A/B testing.
-        if use_instructor and final_summary_for_report and final_summary_for_report != "Нет логов за указанный период.":
+        if (
+            enable_instructor_report_stage
+            and final_summary_for_report
+            and final_summary_for_report != "Нет логов за указанный период."
+        ):
             try:
                 deps.logger.info("FINAL_REPORT instructor stage start")
                 state["llm_phase_hint"] = "final_instructor_report"
@@ -9589,7 +9855,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     step_inc=1,
                     render_now=True,
                 )
-        elif not use_instructor:
+        elif not enable_instructor_report_stage:
             state["instructor_report_status"] = "disabled"
         else:
             state["instructor_report_status"] = "skipped_no_data"

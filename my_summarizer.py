@@ -124,7 +124,9 @@ class SummarizerConfig:
     auto_shrink_on_400: bool = True
     max_shrink_rounds: int = 6
     # New algorithm default: fixed-size reduce groups (algorithm (1).md).
-    reduce_group_size: int = 3
+    reduce_group_size: int = 2
+    # Max chars allowed for one structured summary at REDUCE input.
+    reduce_input_max_chars: int = 40000
     max_reduce_rounds: int = 12
     # 0 or negative => no truncation.
     max_cell_chars: int = 0
@@ -1307,7 +1309,13 @@ def _is_transient_gateway_exception(exc: Exception) -> bool:
         "502 bad gateway" in text
         or "503 service temporarily unavailable" in text
         or "504 gateway timeout" in text
+        or "504 gateway time-out" in text
+        or "gateway time-out" in text
+        or ("504" in text and "gateway" in text and "time-out" in text)
         or ("bad gateway" in text and "nginx" in text)
+        or ("service temporarily unavailable" in text and "nginx" in text)
+        or ("gateway timeout" in text and "nginx" in text)
+        or ("gateway time-out" in text and "nginx" in text)
     )
 
 
@@ -1625,9 +1633,20 @@ class PeriodLogSummarizer:
         configured_total_attempts = -1 if infinite_retries else (max(retries, 0) + 1)
         base_timeout = self._structured_call_timeout_base()
         current_timeout = base_timeout
+        stage_text = str(stage or "").strip().lower()
+        is_reduce_stage = stage_text.startswith("reduce")
+        reduce_timeout_cap = min(base_timeout * 2.0, 300.0) if is_reduce_stage else None
+        reduce_timeout_escalations = 0
         attempt_no = 0
         last_exc: Optional[Exception] = None
         gateway_error_count = 0
+        empty_payload_error_count = 0
+        cap_limit: Optional[int] = None
+        if gateway_retry_cap is not None:
+            try:
+                cap_limit = max(int(gateway_retry_cap), 0)
+            except Exception:
+                cap_limit = None
         while True:
             attempt_no += 1
             mode_label = "TOOLS" if self._instructor_tool_calling_enabled() else "JSON"
@@ -1690,6 +1709,7 @@ class PeriodLogSummarizer:
                     self._instructor_force_json_mode = True
                     continue
                 if _is_instructor_empty_choices_exception(exc):
+                    empty_payload_error_count += 1
                     logger.warning(
                         "Instructor returned malformed payload (choices=None) | "
                         "stage=%s | attempt=%s. Resetting instructor client cache and retrying.",
@@ -1705,6 +1725,16 @@ class PeriodLogSummarizer:
                             attempt_no,
                         )
                         self._instructor_force_json_mode = True
+                    if cap_limit is not None and cap_limit > 0 and empty_payload_error_count > cap_limit:
+                        logger.warning(
+                            "Instructor malformed payload retry cap reached | stage=%s | attempt=%s | "
+                            "malformed_payloads=%s/%s | action=propagate_for_fallback",
+                            stage,
+                            attempt_no,
+                            empty_payload_error_count,
+                            cap_limit,
+                        )
+                        break
                     can_retry_empty = infinite_retries or attempt_no <= max(retries, 0)
                     if not can_retry_empty:
                         break
@@ -1715,12 +1745,6 @@ class PeriodLogSummarizer:
                     gateway_error_count += 1
                     self._instructor_client_cache.clear()
                     retry_delay = min(60.0, 3.0 * float(2 ** min(max(attempt_no - 1, 0), 4)))
-                    cap_limit = None
-                    if gateway_retry_cap is not None:
-                        try:
-                            cap_limit = max(int(gateway_retry_cap), 0)
-                        except Exception:
-                            cap_limit = None
                     logger.warning(
                         "Instructor gateway error (502/503/504) | stage=%s | attempt=%s | "
                         "retry_in=%.1fs | action=retry | gateway_errors=%s%s",
@@ -1761,15 +1785,39 @@ class PeriodLogSummarizer:
                 if not can_retry:
                     break
                 if is_read_timeout:
-                    next_timeout = current_timeout * 2.0
-                    logger.warning(
-                        "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | strategy=x2",
-                        stage,
-                        attempt_no,
-                        current_timeout,
-                        next_timeout,
-                    )
-                    current_timeout = next_timeout
+                    if is_reduce_stage:
+                        next_timeout = min(current_timeout * 2.0, float(reduce_timeout_cap or current_timeout))
+                        if reduce_timeout_escalations >= 1 or next_timeout <= current_timeout:
+                            logger.warning(
+                                "Instructor ReadTimeout cap reached for REDUCE | stage=%s | attempt=%s | "
+                                "timeout=%.1fs | cap=%.1fs | action=propagate_for_split",
+                                stage,
+                                attempt_no,
+                                current_timeout,
+                                float(reduce_timeout_cap or current_timeout),
+                            )
+                            break
+                        logger.warning(
+                            "Instructor ReadTimeout (REDUCE) | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | "
+                            "strategy=x2_then_split | cap=%.1fs",
+                            stage,
+                            attempt_no,
+                            current_timeout,
+                            next_timeout,
+                            float(reduce_timeout_cap or next_timeout),
+                        )
+                        current_timeout = next_timeout
+                        reduce_timeout_escalations += 1
+                    else:
+                        next_timeout = current_timeout * 2.0
+                        logger.warning(
+                            "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | strategy=x2",
+                            stage,
+                            attempt_no,
+                            current_timeout,
+                            next_timeout,
+                        )
+                        current_timeout = next_timeout
                 retry_delay = 10.0
                 if retry_delay > 0:
                     time.sleep(retry_delay)
@@ -1904,8 +1952,216 @@ class PeriodLogSummarizer:
         if not summaries:
             return []
         # Updated algorithm: fixed-size grouping, no local token budgeting.
-        group_size = max(int(getattr(self.config, "reduce_group_size", 3) or 3), 1)
+        group_size = max(int(getattr(self.config, "reduce_group_size", 2) or 2), 2)
         return [summaries[i : i + group_size] for i in range(0, len(summaries), group_size)]
+
+    @staticmethod
+    def _one_line_text(text: Any, *, max_chars: int = 220) -> str:
+        value = " ".join(str(text or "").split()).strip()
+        if max_chars <= 0 or len(value) <= max_chars:
+            return value
+        return value[: max_chars - 3] + "..."
+
+    def _summary_chars(self, summary: IncidentSummary) -> int:
+        return len(self._incident_summary_to_json(summary))
+
+    def _prune_l2_plus_fields(self, summary: IncidentSummary) -> IncidentSummary:
+        payload = summary.model_dump(mode="json")
+        pinned_facts = payload.get("pinned_facts") if isinstance(payload.get("pinned_facts"), list) else []
+        gaps = payload.get("gaps") if isinstance(payload.get("gaps"), list) else []
+        dq = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else {}
+        base_notes = self._one_line_text(dq.get("notes", ""), max_chars=140)
+
+        if pinned_facts:
+            top_fact = ""
+            for item in pinned_facts:
+                if isinstance(item, dict) and str(item.get("fact") or "").strip():
+                    top_fact = self._one_line_text(item.get("fact"), max_chars=100)
+                    break
+            payload["pinned_facts"] = [
+                {
+                    "id": "pf-annotation",
+                    "fact": f"pinned_facts={len(pinned_facts)}; top={top_fact or 'n/a'}",
+                    "evidence_quote": "",
+                    "relevance": "reduce_l2_pruned",
+                    "importance": 0.9,
+                }
+            ]
+        else:
+            payload["pinned_facts"] = []
+
+        if gaps:
+            payload["gaps"] = [
+                {
+                    "id": "gap-annotation",
+                    "description": f"gaps={len(gaps)}; details compressed for L2+ reduce",
+                    "between_events": [],
+                    "missing_data": "Use source-level summaries/checkpoints for full gap details.",
+                }
+            ]
+        else:
+            payload["gaps"] = []
+
+        payload["data_quality"] = {
+            **dq,
+            "notes": self._one_line_text(
+                f"reduce_l2_pruned; pinned_facts={len(pinned_facts)}; gaps={len(gaps)}; notes={base_notes or 'n/a'}",
+                max_chars=220,
+            ),
+        }
+        return IncidentSummary.model_validate(payload)
+
+    def _aggressive_reduce_prune(self, summary: IncidentSummary) -> IncidentSummary:
+        timeline_all = list(summary.timeline or [])
+        keep_ids = set()
+        for hyp in summary.hypotheses:
+            keep_ids.update(str(eid) for eid in hyp.supporting_events)
+            keep_ids.update(str(eid) for eid in hyp.contradicting_events)
+        for conflict in summary.conflicts:
+            keep_ids.update(str(eid) for eid in conflict.side_a.supporting_events)
+            keep_ids.update(str(eid) for eid in conflict.side_b.supporting_events)
+
+        timeline_by_id: Dict[str, IncidentTimelineEvent] = {str(item.id): item for item in timeline_all}
+        timeline_selected: List[IncidentTimelineEvent] = [
+            timeline_by_id[eid] for eid in keep_ids if eid in timeline_by_id
+        ]
+        selected_ids = {str(item.id) for item in timeline_selected}
+        if len(timeline_selected) < 120:
+            for item in sorted(timeline_all, key=lambda row: float(row.importance), reverse=True):
+                item_id = str(item.id)
+                if item_id in selected_ids:
+                    continue
+                timeline_selected.append(item)
+                selected_ids.add(item_id)
+                if len(timeline_selected) >= 120:
+                    break
+        timeline_selected = sorted(
+            timeline_selected,
+            key=lambda item: str(item.timestamp),
+        )
+        valid_ids = {str(item.id) for item in timeline_selected}
+
+        hypotheses = []
+        for item in summary.hypotheses:
+            payload = item.model_dump(mode="json")
+            payload["supporting_events"] = [
+                eid for eid in payload.get("supporting_events", []) if str(eid) in valid_ids
+            ]
+            payload["contradicting_events"] = [
+                eid for eid in payload.get("contradicting_events", []) if str(eid) in valid_ids
+            ]
+            hypotheses.append(payload)
+
+        conflicts = []
+        for item in summary.conflicts:
+            payload = item.model_dump(mode="json")
+            side_a = payload.get("side_a") if isinstance(payload.get("side_a"), dict) else {}
+            side_b = payload.get("side_b") if isinstance(payload.get("side_b"), dict) else {}
+            side_a["supporting_events"] = [
+                eid for eid in side_a.get("supporting_events", []) if str(eid) in valid_ids
+            ]
+            side_b["supporting_events"] = [
+                eid for eid in side_b.get("supporting_events", []) if str(eid) in valid_ids
+            ]
+            payload["side_a"] = side_a
+            payload["side_b"] = side_b
+            conflicts.append(payload)
+
+        return IncidentSummary.model_validate(
+            {
+                "context": summary.context.model_dump(mode="json"),
+                "timeline": [item.model_dump(mode="json") for item in timeline_selected],
+                "causal_links": [],
+                "alert_refs": [],
+                "hypotheses": hypotheses,
+                "pinned_facts": [],
+                "gaps": [],
+                "impact": summary.impact.model_dump(mode="json"),
+                "conflicts": conflicts,
+                "data_quality": {
+                    "is_empty": len(timeline_selected) == 0,
+                    "noise_ratio": float(summary.data_quality.noise_ratio),
+                    "notes": self._one_line_text(
+                        "aggressive_reduce_prune applied (kept timeline+hypotheses+impact+conflicts)",
+                        max_chars=220,
+                    ),
+                },
+                "preliminary_recommendations": [],
+            }
+        )
+
+    def _prepare_summary_for_reduce_level(
+        self,
+        *,
+        summary: IncidentSummary,
+        reduce_round: int,
+        summary_index: int,
+        summary_total: int,
+    ) -> tuple[IncidentSummary, int]:
+        llm_calls = 0
+        if reduce_round < 2:
+            return summary, llm_calls
+
+        max_chars = max(int(getattr(self.config, "reduce_input_max_chars", 40000) or 40000), 5000)
+        current = self._prune_l2_plus_fields(summary)
+        chars_after_prune = self._summary_chars(current)
+        logger.info(
+            "REDUCE pre-merge prune | level=L%s | item=%s/%s | chars=%s | threshold=%s",
+            reduce_round,
+            summary_index,
+            summary_total,
+            chars_after_prune,
+            max_chars,
+        )
+        if chars_after_prune <= max_chars:
+            return current, llm_calls
+
+        compressed, c_calls = self._compress_summary_on_overflow(current)
+        llm_calls += c_calls
+        chars_after_compress = self._summary_chars(compressed)
+        logger.info(
+            "REDUCE pre-merge compress | level=L%s | item=%s/%s | chars=%s | threshold=%s | llm_calls=%s",
+            reduce_round,
+            summary_index,
+            summary_total,
+            chars_after_compress,
+            max_chars,
+            c_calls,
+        )
+        if chars_after_compress <= max_chars:
+            return compressed, llm_calls
+
+        aggressive = self._aggressive_reduce_prune(compressed)
+        chars_after_aggressive = self._summary_chars(aggressive)
+        logger.warning(
+            "REDUCE aggressive prune | level=L%s | item=%s/%s | chars=%s | threshold=%s",
+            reduce_round,
+            summary_index,
+            summary_total,
+            chars_after_aggressive,
+            max_chars,
+        )
+        if chars_after_aggressive > max_chars:
+            aggressive, c2_calls = self._compress_summary_on_overflow(aggressive)
+            llm_calls += c2_calls
+            chars_after_aggressive = self._summary_chars(aggressive)
+            logger.info(
+                "REDUCE aggressive compress | level=L%s | item=%s/%s | chars=%s | threshold=%s | llm_calls=%s",
+                reduce_round,
+                summary_index,
+                summary_total,
+                chars_after_aggressive,
+                max_chars,
+                c2_calls,
+            )
+
+        if chars_after_aggressive > max_chars:
+            raise RuntimeError(
+                "REDUCE input summary still too large after prune/compress | "
+                f"level=L{reduce_round} | item={summary_index}/{summary_total} | "
+                f"chars={chars_after_aggressive} | threshold={max_chars}"
+            )
+        return aggressive, llm_calls
 
     def _compress_structured_summary_if_needed(
         self,
@@ -3040,8 +3296,10 @@ class PeriodLogSummarizer:
         sources: Optional[List[str]] = None,
         depth: int = 0,
     ) -> tuple[IncidentSummary, int]:
+        level_label = f"L{reduce_round}"
         logger.info(
-            "REDUCE group start | round=%s | group=%s/%s | depth=%s | size=%s",
+            "REDUCE group start | level=%s | round=%s | group=%s/%s | depth=%s | size=%s",
+            level_label,
             reduce_round,
             group_index,
             group_total,
@@ -3050,7 +3308,8 @@ class PeriodLogSummarizer:
         )
         if len(summaries) == 1:
             logger.info(
-                "REDUCE group done (passthrough) | round=%s | group=%s/%s | depth=%s",
+                "REDUCE group done (passthrough) | level=%s | round=%s | group=%s/%s | depth=%s",
+                level_label,
                 reduce_round,
                 group_index,
                 group_total,
@@ -3058,41 +3317,12 @@ class PeriodLogSummarizer:
             )
             return summaries[0], 0
         if depth > 12:
-            # Safety net: deterministic fallback to guarantee convergence.
-            merged_alerts = self._deterministic_merge_alert_refs(summaries)
-            total_logs = sum(max(int(s.context.total_log_entries), 0) for s in summaries)
-            fallback = IncidentSummary(
-                context=IncidentContext(
-                    batch_id=f"reduce-fallback-r{reduce_round}-g{group_index}",
-                    time_range_start=period_start,
-                    time_range_end=period_end,
-                    total_log_entries=total_logs,
-                    source_query=[],
-                    source_services=[],
-                ),
-                timeline=[],
-                causal_links=[],
-                alert_refs=merged_alerts,
-                hypotheses=[],
-                pinned_facts=[],
-                gaps=[],
-                impact=IncidentImpact(),
-                conflicts=[],
-                data_quality=IncidentDataQuality(
-                    is_empty=True,
-                    noise_ratio=1.0,
-                    notes="Deterministic fallback merge (max recursion depth reached).",
-                ),
-                preliminary_recommendations=[],
+            payload_chars = sum(self._summary_chars(item) for item in summaries)
+            raise RuntimeError(
+                "REDUCE abort: max split depth reached | "
+                f"level={level_label} | round={reduce_round} | group={group_index}/{group_total} | "
+                f"depth={depth} | size={len(summaries)} | input_chars={payload_chars}"
             )
-            logger.warning(
-                "REDUCE group deterministic fallback | round=%s | group=%s/%s | depth=%s",
-                reduce_round,
-                group_index,
-                group_total,
-                depth,
-            )
-            return fallback, 0
 
         serialized_group = [self._incident_summary_to_json(item) for item in summaries]
         merged_alerts = self._deterministic_merge_alert_refs(summaries)
@@ -3108,18 +3338,25 @@ class PeriodLogSummarizer:
         calls = 0
         try:
             if self._instructor_enabled():
-                gateway_retry_cap = max(
+                l1_gateway_cap = max(
                     int(getattr(self.config, "reduce_gateway_retry_cap", 3) or 3),
                     0,
+                )
+                gateway_retry_cap = l1_gateway_cap if reduce_round <= 1 else 1
+                stage_label = (
+                    f"reduce_{level_label.lower()}"
+                    f"_g{group_index}of{group_total}"
+                    f"_d{depth}"
                 )
                 parsed, calls = self._call_structured_with_instructor(
                     prompt=prompt,
                     response_model=IncidentSummary,
-                    stage="reduce",
+                    stage=stage_label,
                     gateway_retry_cap=gateway_retry_cap,
                 )
                 logger.info(
-                    "REDUCE group done (instructor) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    "REDUCE group done (instructor) | level=%s | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    level_label,
                     reduce_round,
                     group_index,
                     group_total,
@@ -3138,7 +3375,8 @@ class PeriodLogSummarizer:
             )
             if parsed is not None:
                 logger.info(
-                    "REDUCE group done (legacy-parse) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    "REDUCE group done (legacy-parse) | level=%s | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    level_label,
                     reduce_round,
                     group_index,
                     group_total,
@@ -3168,7 +3406,8 @@ class PeriodLogSummarizer:
             )
             if parsed_retry is not None:
                 logger.info(
-                    "REDUCE group done (legacy-repair) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    "REDUCE group done (legacy-repair) | level=%s | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    level_label,
                     reduce_round,
                     group_index,
                     group_total,
@@ -3185,9 +3424,11 @@ class PeriodLogSummarizer:
                 or _is_400_bad_request_exception(exc)
                 or _is_read_timeout_exception(exc)
                 or _is_transient_gateway_exception(exc)
+                or _is_instructor_empty_choices_exception(exc)
             ) and len(summaries) > 1:
                 logger.warning(
-                    "REDUCE group split fallback | round=%s | group=%s/%s | depth=%s | size=%s | error=%s",
+                    "REDUCE group split fallback | level=%s | round=%s | group=%s/%s | depth=%s | size=%s | error=%s",
+                    level_label,
                     reduce_round,
                     group_index,
                     group_total,
@@ -3234,7 +3475,8 @@ class PeriodLogSummarizer:
                     depth=depth + 1,
                 )
                 logger.info(
-                    "REDUCE group done (split-merge) | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    "REDUCE group done (split-merge) | level=%s | round=%s | group=%s/%s | depth=%s | calls=%s",
+                    level_label,
                     reduce_round,
                     group_index,
                     group_total,
@@ -3297,9 +3539,24 @@ class PeriodLogSummarizer:
             if reduce_rounds > self.config.max_reduce_rounds:
                 raise RuntimeError("Exceeded max reduce rounds")
 
+            if reduce_rounds >= 2:
+                prepared_level: List[IncidentSummary] = []
+                for idx, item in enumerate(current, start=1):
+                    prepared_item, prep_calls = self._prepare_summary_for_reduce_level(
+                        summary=item,
+                        reduce_round=reduce_rounds,
+                        summary_index=idx,
+                        summary_total=len(current),
+                    )
+                    llm_calls += prep_calls
+                    prepared_level.append(prepared_item)
+                current = prepared_level
+
             groups = self._group_structured_summaries_by_budget(current)
+            level_label = f"L{reduce_rounds}"
             logger.info(
-                "REDUCE round start | round=%s | current_items=%s | groups=%s",
+                "REDUCE round start | level=%s | round=%s | current_items=%s | groups=%s",
+                level_label,
                 reduce_rounds,
                 len(current),
                 len(groups),
@@ -3307,6 +3564,9 @@ class PeriodLogSummarizer:
 
             next_level: List[IncidentSummary] = []
             for group_index, group in enumerate(groups):
+                input_chars = sum(self._summary_chars(item) for item in group)
+                input_events = sum(len(item.timeline) for item in group)
+                input_hypotheses = sum(len(item.hypotheses) for item in group)
                 self._emit_progress(
                     "reduce_group_start",
                     {
@@ -3314,6 +3574,9 @@ class PeriodLogSummarizer:
                         "group_index": group_index,
                         "group_total": len(groups),
                         "group_size": len(group),
+                        "input_chars": input_chars,
+                        "input_events": input_events,
+                        "input_hypotheses": input_hypotheses,
                     },
                 )
                 try:
@@ -3335,6 +3598,14 @@ class PeriodLogSummarizer:
                     raise
                 llm_calls += group_calls
                 next_level.append(merged)
+                output_chars = self._summary_chars(merged)
+                output_events = len(merged.timeline)
+                output_hypotheses = len(merged.hypotheses)
+                compression_pct = (
+                    ((float(input_chars) - float(output_chars)) / float(input_chars)) * 100.0
+                    if input_chars > 0
+                    else float("nan")
+                )
                 self._emit_progress(
                     "reduce_group_done",
                     {
@@ -3342,11 +3613,19 @@ class PeriodLogSummarizer:
                         "group_index": group_index,
                         "group_total": len(groups),
                         "group_size": len(group),
+                        "input_chars": input_chars,
+                        "input_events": input_events,
+                        "input_hypotheses": input_hypotheses,
+                        "output_chars": output_chars,
+                        "output_events": output_events,
+                        "output_hypotheses": output_hypotheses,
+                        "compression_pct": compression_pct,
                     },
                 )
             current = next_level
             logger.info(
-                "REDUCE round done | round=%s | produced_items=%s | llm_calls_total=%s",
+                "REDUCE round done | level=%s | round=%s | produced_items=%s | llm_calls_total=%s",
+                level_label,
                 reduce_rounds,
                 len(current),
                 llm_calls,
@@ -3392,10 +3671,11 @@ class PeriodLogSummarizer:
             if round_idx > self.config.max_reduce_rounds:
                 raise RuntimeError("Exceeded max reduce rounds")
             next_level: List[str] = []
-            groups_total = int(math.ceil(len(current) / max(self.config.reduce_group_size, 1)))
-            for i in range(0, len(current), self.config.reduce_group_size):
-                group = current[i : i + self.config.reduce_group_size]
-                group_index = int(i / max(self.config.reduce_group_size, 1))
+            reduce_group_size = max(int(getattr(self.config, "reduce_group_size", 2) or 2), 2)
+            groups_total = int(math.ceil(len(current) / reduce_group_size))
+            for i in range(0, len(current), reduce_group_size):
+                group = current[i : i + reduce_group_size]
+                group_index = int(i / reduce_group_size)
                 self._emit_progress(
                     "reduce_group_start",
                     {
@@ -4702,6 +4982,21 @@ def regenerate_reduce_summary_from_map_summaries(
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
             ),
+            reduce_group_size=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2) or 2),
+                2,
+            ),
+            reduce_input_max_chars=max(
+                int(
+                    getattr(
+                        settings,
+                        "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS",
+                        40000,
+                    )
+                    or 40000
+                ),
+                1000,
+            ),
             use_new_algorithm=True,
             use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),
             model_supports_tool_calling=bool(
@@ -4794,6 +5089,21 @@ def summarize_logs(
             ),
             reduce_prompt_max_chars=int(
                 getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)
+            ),
+            reduce_group_size=max(
+                int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2) or 2),
+                2,
+            ),
+            reduce_input_max_chars=max(
+                int(
+                    getattr(
+                        settings,
+                        "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS",
+                        40000,
+                    )
+                    or 40000
+                ),
+                1000,
             ),
             use_new_algorithm=True,
             use_instructor=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)),

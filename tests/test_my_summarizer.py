@@ -1218,26 +1218,27 @@ class TestMySummarizer(unittest.TestCase):
                 period_end="2026-03-18T01:00:00+00:00",
             )
 
-    def test_reduce_summaries_raises_when_max_rounds_exceeded(self) -> None:
+    def test_reduce_summaries_clamps_group_size_to_two(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
-            llm_call=lambda _prompt: "X",
+            llm_call=lambda _prompt: self._structured_summary_json("reduce-clamped", total_log_entries=2),
             config=SummarizerConfig(
                 adaptive_reduce_on_overflow=False,
                 reduce_group_size=1,
-                max_reduce_rounds=1,
                 use_instructor=False,
             ),
         )
-        with self.assertRaises(RuntimeError):
-            summarizer._reduce_summaries(
-                chunk_summaries=[
-                    self._structured_summary_json("map-a", total_log_entries=1),
-                    self._structured_summary_json("map-b", total_log_entries=1),
-                ],
-                period_start="2026-03-18T00:00:00+00:00",
-                period_end="2026-03-18T01:00:00+00:00",
-            )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=[
+                self._structured_summary_json("map-a", total_log_entries=1),
+                self._structured_summary_json("map-b", total_log_entries=1),
+            ],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertIn('"batch_id": "reduce-clamped"', final_summary)
+        self.assertEqual(llm_calls, 1)
+        self.assertEqual(reduce_rounds, 1)
 
     def test_reduce_summaries_budget_fallback_emits_event_and_completes(self) -> None:
         events = []
@@ -1265,6 +1266,34 @@ class TestMySummarizer(unittest.TestCase):
         self.assertGreaterEqual(llm_calls, 1)
         self.assertGreaterEqual(reduce_rounds, 1)
         self.assertIn("reduce_group_start", [name for name, _ in events])
+
+    def test_reduce_group_start_progress_contains_input_chars(self) -> None:
+        events = []
+        merged_json = self._structured_summary_json("reduce-input-chars", total_log_entries=3)
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: merged_json,
+            config=SummarizerConfig(
+                adaptive_reduce_on_overflow=False,
+                reduce_group_size=2,
+                use_instructor=False,
+            ),
+            on_progress=lambda event, payload: events.append((event, payload)),
+        )
+        summarizer._reduce_summaries(
+            chunk_summaries=[
+                self._structured_summary_json("map-a", total_log_entries=1),
+                self._structured_summary_json("map-b", total_log_entries=1),
+                self._structured_summary_json("map-c", total_log_entries=1),
+            ],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        starts = [payload for event, payload in events if event == "reduce_group_start"]
+        self.assertTrue(starts)
+        first = starts[0]
+        self.assertIn("input_chars", first)
+        self.assertGreater(int(first.get("input_chars", 0)), 0)
 
     def test_map_summary_returns_structured_json_with_required_sections(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
@@ -1635,6 +1664,12 @@ class TestMySummarizer(unittest.TestCase):
         )
         self.assertTrue(_is_transient_gateway_exception(err))
 
+    def test_is_transient_gateway_exception_detects_504_time_out_html(self) -> None:
+        err = RuntimeError(
+            "<html><body><center><h1>504 Gateway Time-out</h1></center><hr><center>nginx</center></body></html>"
+        )
+        self.assertTrue(_is_transient_gateway_exception(err))
+
     def test_call_structured_with_instructor_retries_on_gateway_error_then_succeeds(self) -> None:
         payload = {
             "context": {
@@ -1744,6 +1779,48 @@ class TestMySummarizer(unittest.TestCase):
         # 2 retries allowed after initial attempt => total 3 attempts.
         self.assertEqual(fake_completions.calls, 3)
 
+    def test_call_structured_with_instructor_stops_on_malformed_payload_retry_cap(self) -> None:
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                _ = kwargs
+                self.calls += 1
+                raise RuntimeError(
+                    "<failed_attempts><last_exception>'NoneType' object has no attribute 'choices'</last_exception>"
+                )
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=-1
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=1.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ):
+            with self.assertRaises(RuntimeError):
+                summarizer._call_structured_with_instructor(
+                    prompt="test",
+                    response_model=IncidentSummary,
+                    stage="reduce",
+                    gateway_retry_cap=2,
+                )
+
+        # 2 retries allowed after initial attempt => total 3 attempts.
+        self.assertEqual(fake_completions.calls, 3)
+
     def test_call_structured_with_instructor_doubles_timeout_on_read_timeout(self) -> None:
         payload = {
             "context": {
@@ -1809,6 +1886,47 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(fake_completions.calls, 2)
         self.assertEqual(fake_completions.timeouts, [3.0, 6.0])
 
+    def test_call_structured_with_instructor_reduce_timeout_cap_breaks_after_one_escalation(self) -> None:
+        class _FakeCompletions:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.timeouts: list[float] = []
+
+            def create(self, **kwargs):
+                self.calls += 1
+                self.timeouts.append(float(kwargs.get("timeout", 0.0)))
+                raise RuntimeError("Request timed out.")
+
+        fake_completions = _FakeCompletions()
+        fake_chat = type("FakeChat", (), {"completions": fake_completions})()
+        fake_client = type("FakeClient", (), {"chat": fake_chat})()
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda prompt: prompt,
+            config=SummarizerConfig(use_instructor=True),
+        )
+
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer, "_get_instructor_client", return_value=fake_client
+        ), patch.object(
+            summarizer, "_structured_call_retry_limit", return_value=-1
+        ), patch.object(
+            summarizer, "_structured_call_timeout_base", return_value=120.0
+        ), patch(
+            "my_summarizer.time.sleep", return_value=None
+        ):
+            with self.assertRaises(RuntimeError):
+                summarizer._call_structured_with_instructor(
+                    prompt="test",
+                    response_model=IncidentSummary,
+                    stage="reduce_l2_g1of1_d0",
+                )
+
+        # One escalation only: 120 -> 240, then propagate for split.
+        self.assertEqual(fake_completions.calls, 2)
+        self.assertEqual(fake_completions.timeouts, [120.0, 240.0])
+
     def test_reduce_structured_group_uses_instructor_when_enabled(self) -> None:
         summary_payload = {
             "context": {
@@ -1865,6 +1983,178 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(reduced.context.batch_id, "reduce-r1-g1")
         call_kwargs = mocked_instructor.call_args.kwargs
         self.assertEqual(call_kwargs.get("gateway_retry_cap"), summarizer.config.reduce_gateway_retry_cap)
+        self.assertEqual(call_kwargs.get("stage"), "reduce_l1_g1of1_d0")
+
+    def test_reduce_structured_group_l2_uses_gateway_cap_one(self) -> None:
+        summary_payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        inp = IncidentSummary.model_validate(summary_payload)
+        out = IncidentSummary.model_validate(
+            {
+                **summary_payload,
+                "context": {
+                    **summary_payload["context"],
+                    "batch_id": "reduce-r2-g1",
+                },
+            }
+        )
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "legacy-path-should-not-be-used",
+            config=SummarizerConfig(use_instructor=True, use_new_algorithm=True, reduce_gateway_retry_cap=5),
+        )
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            return_value=(out, 1),
+        ) as mocked_instructor:
+            reduced, calls = summarizer._reduce_structured_group(
+                summaries=[inp, inp],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                reduce_round=2,
+                group_index=1,
+                group_total=1,
+                sources=None,
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(reduced.context.batch_id, "reduce-r2-g1")
+        call_kwargs = mocked_instructor.call_args.kwargs
+        self.assertEqual(call_kwargs.get("gateway_retry_cap"), 1)
+        self.assertEqual(call_kwargs.get("stage"), "reduce_l2_g1of1_d0")
+
+    def test_reduce_structured_group_aborts_on_max_depth(self) -> None:
+        summary_payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        inp = IncidentSummary.model_validate(summary_payload)
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "legacy-path-should-not-be-used",
+            config=SummarizerConfig(use_instructor=False, use_new_algorithm=True),
+        )
+        with self.assertRaises(RuntimeError):
+            summarizer._reduce_structured_group(
+                summaries=[inp, inp],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                reduce_round=1,
+                group_index=1,
+                group_total=1,
+                sources=None,
+                depth=13,
+            )
+
+    def test_prepare_summary_for_reduce_level_prunes_l2_fields(self) -> None:
+        summary_payload = self._structured_summary_dict("map-prune")
+        summary_payload["pinned_facts"] = [
+            {
+                "id": "pf-1",
+                "fact": "Very long pinned fact text " + ("x" * 200),
+                "evidence_quote": "quote",
+                "relevance": "test",
+                "importance": 0.95,
+            }
+        ]
+        summary_payload["gaps"] = [
+            {
+                "id": "gap-1",
+                "description": "Gap description " + ("y" * 180),
+                "between_events": [],
+                "missing_data": "Need more logs",
+            }
+        ]
+        summary_payload["data_quality"]["notes"] = "n" * 250
+        summary = IncidentSummary.model_validate(summary_payload)
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "unused",
+            config=SummarizerConfig(reduce_input_max_chars=100_000),
+        )
+
+        prepared, calls = summarizer._prepare_summary_for_reduce_level(
+            summary=summary,
+            reduce_round=2,
+            summary_index=1,
+            summary_total=1,
+        )
+        self.assertEqual(calls, 0)
+        self.assertLessEqual(len(prepared.pinned_facts), 1)
+        if prepared.pinned_facts:
+            self.assertEqual(prepared.pinned_facts[0].id, "pf-annotation")
+        self.assertLessEqual(len(prepared.gaps), 1)
+        self.assertIn("reduce_l2_pruned", prepared.data_quality.notes)
+
+    def test_prepare_summary_for_reduce_level_raises_when_still_too_large(self) -> None:
+        summary_payload = self._structured_summary_dict("map-too-large")
+        summary_payload["timeline"] = [
+            {
+                "id": f"evt-{i}",
+                "timestamp": "2026-03-25T10:00:00+00:00",
+                "source": "svc-a",
+                "description": "event " + ("z" * 300),
+                "severity": "low",
+                "importance": 0.8,
+                "evidence_type": "HYPOTHESIS",
+                "tags": ["test"],
+            }
+            for i in range(40)
+        ]
+        summary = IncidentSummary.model_validate(summary_payload)
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "unused",
+            config=SummarizerConfig(reduce_input_max_chars=1000),
+        )
+
+        with patch.object(summarizer, "_prune_l2_plus_fields", return_value=summary), patch.object(
+            summarizer, "_compress_summary_on_overflow", return_value=(summary, 0)
+        ), patch.object(
+            summarizer, "_aggressive_reduce_prune", return_value=summary
+        ):
+            with self.assertRaises(RuntimeError):
+                summarizer._prepare_summary_for_reduce_level(
+                    summary=summary,
+                    reduce_round=2,
+                    summary_index=1,
+                    summary_total=1,
+                )
 
     def test_map_summary_invalid_json_is_converted_to_degraded_structured_payload(self) -> None:
         def _fake_fetch_page(*, columns, period_start, period_end, limit, offset):
