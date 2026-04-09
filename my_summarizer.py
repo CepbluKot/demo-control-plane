@@ -149,8 +149,8 @@ class SummarizerConfig:
     reduce_target_token_pct: int = 50
     compression_target_pct: int = 50
     compression_importance_threshold: float = 0.7
-    # For REDUCE structured calls: after this many transient gateway errors
-    # (502/503/504) inside one group-call, bubble exception up so group can split.
+    # For REDUCE structured calls: after this many transient server errors
+    # (500/502/503/504) inside one group-call, bubble exception up so group can split.
     reduce_gateway_retry_cap: int = 3
     use_instructor: bool = False
     # If False, instructor works in JSON mode (no tool/function calling).
@@ -1295,7 +1295,7 @@ def _is_non_retryable_llm_exception(exc: Exception) -> bool:
 
 
 def _is_transient_gateway_exception(exc: Exception) -> bool:
-    transient_statuses = {502, 503, 504}
+    transient_statuses = {500, 502, 503, 504}
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int) and status_code in transient_statuses:
         return True
@@ -1306,7 +1306,14 @@ def _is_transient_gateway_exception(exc: Exception) -> bool:
             return True
     text = str(exc or "").strip().lower()
     return (
-        "502 bad gateway" in text
+        "500 internal server error" in text
+        or ("error code: 500" in text and "internalservererror" in text)
+        or ("internal server error" in text and "hosted_vllmexception" in text)
+        or ("connection error" in text and "hosted_vllmexception" in text)
+        or ("connection error" in text and "internalservererror" in text)
+        or ("litellm.internalservererror" in text and "connection error" in text)
+        or ("error code: 500" in text and "connection error" in text)
+        or "502 bad gateway" in text
         or "503 service temporarily unavailable" in text
         or "504 gateway timeout" in text
         or "504 gateway time-out" in text
@@ -1746,7 +1753,7 @@ class PeriodLogSummarizer:
                     self._instructor_client_cache.clear()
                     retry_delay = min(60.0, 3.0 * float(2 ** min(max(attempt_no - 1, 0), 4)))
                     logger.warning(
-                        "Instructor gateway error (502/503/504) | stage=%s | attempt=%s | "
+                        "Instructor transient server error (500/502/503/504) | stage=%s | attempt=%s | "
                         "retry_in=%.1fs | action=retry | gateway_errors=%s%s",
                         stage,
                         attempt_no,

@@ -1670,6 +1670,13 @@ class TestMySummarizer(unittest.TestCase):
         )
         self.assertTrue(_is_transient_gateway_exception(err))
 
+    def test_is_transient_gateway_exception_detects_500_internal_server_error(self) -> None:
+        err = RuntimeError(
+            "Error code: 500 - {'error': {'message': 'litellm.InternalServerError: "
+            "InternalServerError: Hosted_vllmException - Connection error..'}}"
+        )
+        self.assertTrue(_is_transient_gateway_exception(err))
+
     def test_call_structured_with_instructor_retries_on_gateway_error_then_succeeds(self) -> None:
         payload = {
             "context": {
@@ -2041,6 +2048,72 @@ class TestMySummarizer(unittest.TestCase):
         call_kwargs = mocked_instructor.call_args.kwargs
         self.assertEqual(call_kwargs.get("gateway_retry_cap"), 1)
         self.assertEqual(call_kwargs.get("stage"), "reduce_l2_g1of1_d0")
+
+    def test_reduce_structured_group_splits_on_500_and_recovers(self) -> None:
+        summary_payload = {
+            "context": {
+                "batch_id": "map-000001",
+                "time_range_start": "2026-03-25T10:00:00+00:00",
+                "time_range_end": "2026-03-25T10:05:00+00:00",
+                "total_log_entries": 1,
+                "source_query": [],
+                "source_services": [],
+            },
+            "timeline": [],
+            "causal_links": [],
+            "alert_refs": [],
+            "hypotheses": [],
+            "pinned_facts": [],
+            "gaps": [],
+            "impact": {},
+            "conflicts": [],
+            "data_quality": {"is_empty": True, "noise_ratio": 1.0, "notes": ""},
+            "preliminary_recommendations": [],
+        }
+        inp = IncidentSummary.model_validate(summary_payload)
+        out = IncidentSummary.model_validate(
+            {
+                **summary_payload,
+                "context": {
+                    **summary_payload["context"],
+                    "batch_id": "reduce-r1-g1",
+                },
+            }
+        )
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "legacy-path-should-not-be-used",
+            config=SummarizerConfig(use_instructor=True, use_new_algorithm=True),
+        )
+        call_sequence = [
+            RuntimeError(
+                "Error code: 500 - {'error': {'message': 'litellm.InternalServerError: "
+                "InternalServerError: Hosted_vllmException - Connection error..'}}"
+            ),
+            (out, 1),
+        ]
+        with patch.object(summarizer, "_instructor_enabled", return_value=True), patch.object(
+            summarizer,
+            "_call_structured_with_instructor",
+            side_effect=call_sequence,
+        ) as mocked_instructor, patch.object(
+            summarizer,
+            "_compress_summary_on_overflow",
+            side_effect=lambda summary, **_: (summary, 0),
+        ):
+            reduced, calls = summarizer._reduce_structured_group(
+                summaries=[inp, inp],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+                reduce_round=1,
+                group_index=1,
+                group_total=1,
+                sources=None,
+            )
+
+        self.assertEqual(reduced.context.batch_id, "reduce-r1-g1")
+        self.assertEqual(calls, 1)
+        self.assertEqual(mocked_instructor.call_count, 2)
 
     def test_reduce_structured_group_aborts_on_max_depth(self) -> None:
         summary_payload = {
