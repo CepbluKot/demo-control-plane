@@ -1928,6 +1928,18 @@ class PeriodLogSummarizer:
                 return parsed
         return 1
 
+    @staticmethod
+    def _extract_batch_queries_from_rows(rows: Sequence[Dict[str, Any]]) -> List[str]:
+        queries: List[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("__cp_db_query")
+            text = str(raw or "").strip()
+            if text and text not in queries:
+                queries.append(text)
+        return queries
+
     def _build_degraded_incident_summary_from_raw(
         self,
         *,
@@ -2733,6 +2745,7 @@ class PeriodLogSummarizer:
         depth: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
         batch_period_start, batch_period_end = _extract_batch_period(rows_chunk)
+        batch_queries = self._extract_batch_queries_from_rows(rows_chunk)
         prompt = self._build_chunk_prompt(
             period_start=period_start,
             period_end=period_end,
@@ -2766,6 +2779,7 @@ class PeriodLogSummarizer:
                             "summary": chunk_summary,
                             "summary_structured": chunk_summary_structured,
                             "rows": list(rows_chunk),
+                            "batch_queries": list(batch_queries),
                             "batch_period_start": batch_period_start,
                             "batch_period_end": batch_period_end,
                         }
@@ -2827,6 +2841,7 @@ class PeriodLogSummarizer:
                                 "summary": chunk_summary,
                                 "summary_structured": chunk_summary_structured,
                                 "rows": list(rows_chunk),
+                                "batch_queries": list(batch_queries),
                                 "batch_period_start": batch_period_start,
                                 "batch_period_end": batch_period_end,
                             }
@@ -2917,6 +2932,7 @@ class PeriodLogSummarizer:
                         "summary": chunk_summary,
                         "summary_structured": chunk_summary_structured,
                         "rows": list(rows_chunk),
+                        "batch_queries": list(batch_queries),
                         "batch_period_start": batch_period_start,
                         "batch_period_end": batch_period_end,
                     }
@@ -2932,6 +2948,7 @@ class PeriodLogSummarizer:
                         "summary": chunk_summary,
                         "summary_structured": chunk_summary_structured,
                         "rows": list(rows_chunk),
+                        "batch_queries": list(batch_queries),
                         "batch_period_start": batch_period_start,
                         "batch_period_end": batch_period_end,
                     }
@@ -3141,6 +3158,7 @@ class PeriodLogSummarizer:
                                 "batch_index": next_batch_index,
                                 "batch_total": estimated_batch_total,
                                 "batch_logs_count": len(rows_chunk),
+                                "batch_queries": self._extract_batch_queries_from_rows(rows_chunk),
                                 "batch_period_start": batch_period_start,
                                 "batch_period_end": batch_period_end,
                                 "rows_processed": rows_mapped,
@@ -3181,6 +3199,11 @@ class PeriodLogSummarizer:
                                 item_rows = list(item.get("rows") or [])
                                 item_summary = str(item.get("summary") or "").strip()
                                 item_summary_structured = dict(item.get("summary_structured") or {})
+                                item_batch_queries = [
+                                    str(q).strip()
+                                    for q in (item.get("batch_queries") or [])
+                                    if str(q or "").strip()
+                                ]
                                 item_bp_start = item.get("batch_period_start")
                                 item_bp_end = item.get("batch_period_end")
                                 current_batch_index = map_batch_index
@@ -3192,6 +3215,7 @@ class PeriodLogSummarizer:
                                             "rows_count": len(item_rows),
                                             "summary": item_summary,
                                             "summary_structured": item_summary_structured,
+                                            "batch_queries": item_batch_queries,
                                             "batch_period_start": item_bp_start,
                                             "batch_period_end": item_bp_end,
                                         }
@@ -3206,6 +3230,7 @@ class PeriodLogSummarizer:
                                         "batch_summary_structured": item_summary_structured,
                                         "batch_logs_count": len(item_rows),
                                         "batch_logs": item_rows,
+                                        "batch_queries": item_batch_queries,
                                         "batch_period_start": item_bp_start,
                                         "batch_period_end": item_bp_end,
                                         "rows_processed": rows_mapped,
@@ -3265,6 +3290,7 @@ class PeriodLogSummarizer:
                     batch_period_end=bp_end,
                     allow_schema_retry=False,
                 )
+                item_batch_queries = self._extract_batch_queries_from_rows(rows_snap)
                 map_summaries.append(chunk_summary)
                 if self.config.keep_map_batches_in_memory:
                     map_batches.append({
@@ -3272,6 +3298,7 @@ class PeriodLogSummarizer:
                         "rows_count": nrows,
                         "summary": chunk_summary,
                         "summary_structured": chunk_summary_structured,
+                        "batch_queries": item_batch_queries,
                         "batch_period_start": bp_start,
                         "batch_period_end": bp_end,
                     })
@@ -3286,6 +3313,7 @@ class PeriodLogSummarizer:
                         "batch_summary_structured": chunk_summary_structured,
                         "batch_logs_count": nrows,
                         "batch_logs": rows_snap,
+                        "batch_queries": item_batch_queries,
                         "batch_period_start": bp_start,
                         "batch_period_end": bp_end,
                         "rows_processed": rows_mapped,

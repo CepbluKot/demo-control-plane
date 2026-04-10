@@ -29,6 +29,7 @@ from ui.pages.logs_summary_page import (
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
     _build_query_for_template,
+    _batch_queries_from_batch,
     _default_alert_time_values,
     _build_sectional_freeform_prompt,
     _build_sectional_structured_prompt,
@@ -1440,6 +1441,7 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                                 "batch_period_start": "2026-03-18T00:00:00+00:00",
                                 "batch_period_end": "2026-03-18T00:01:00+00:00",
                                 "batch_logs": [{"timestamp": "2026-03-18T00:00:00+00:00"}],
+                                "batch_queries": ["SELECT * FROM logs LIMIT 100 OFFSET 0"],
                             },
                             ensure_ascii=False,
                         )
@@ -1449,6 +1451,20 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             self.assertEqual(len(loaded), 15)
             self.assertEqual(int(loaded[0]["batch_index"]), 0)
             self.assertEqual(int(loaded[-1]["batch_index"]), 14)
+            self.assertEqual(
+                loaded[0].get("batch_queries"),
+                ["SELECT * FROM logs LIMIT 100 OFFSET 0"],
+            )
+
+    def test_batch_queries_from_batch_falls_back_to_batch_logs(self) -> None:
+        batch = {
+            "batch_logs": [
+                {"timestamp": "2026-03-18T00:00:00+00:00", "__cp_db_query": "SELECT 1"},
+                {"timestamp": "2026-03-18T00:00:01+00:00", "__cp_db_query": "SELECT 1"},
+                {"timestamp": "2026-03-18T00:00:02+00:00", "__cp_db_query": "SELECT 2"},
+            ]
+        }
+        self.assertEqual(_batch_queries_from_batch(batch), ["SELECT 1", "SELECT 2"])
 
     def test_build_causal_graph_dot(self) -> None:
         dot = _build_causal_graph_dot(

@@ -1051,7 +1051,13 @@ class _StreamingLogsMerger:
                     max_ts = sorted_df[self._timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         cursor.last_ts = max_ts.isoformat()
-                cursor.page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
+                page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
+                for row in page_records:
+                    row["__cp_db_query"] = query
+                    row["__cp_query_label"] = str(
+                        cursor.spec.get("label", f"query_{cursor.query_index + 1}")
+                    )
+                cursor.page_records = page_records
                 cursor.page_pos = 0
                 return True
 
@@ -2074,6 +2080,14 @@ def _load_recent_batches_from_jsonl(
                 batch_logs = payload.get("batch_logs", [])
                 if not isinstance(batch_logs, list):
                     batch_logs = []
+                batch_queries = payload.get("batch_queries", [])
+                if not isinstance(batch_queries, list):
+                    batch_queries = []
+                normalized_batch_queries: List[str] = []
+                for raw_query in batch_queries:
+                    query_text = str(raw_query or "").strip()
+                    if query_text and query_text not in normalized_batch_queries:
+                        normalized_batch_queries.append(query_text)
                 item = {
                     "batch_index": payload.get("batch_index"),
                     "batch_total": payload.get("batch_total"),
@@ -2082,6 +2096,7 @@ def _load_recent_batches_from_jsonl(
                     "batch_period_start": payload.get("batch_period_start"),
                     "batch_period_end": payload.get("batch_period_end"),
                     "batch_logs": batch_logs,
+                    "batch_queries": normalized_batch_queries,
                 }
                 if unlimited:
                     all_items.append(item)
@@ -3520,6 +3535,30 @@ def _summary_payload_from_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
     return _json_dict_from_text(batch.get("batch_summary"))
 
 
+def _batch_queries_from_batch(batch: Dict[str, Any]) -> List[str]:
+    queries: List[str] = []
+    raw_queries = batch.get("batch_queries")
+    if isinstance(raw_queries, list):
+        for raw_query in raw_queries:
+            query_text = str(raw_query or "").strip()
+            if query_text and query_text not in queries:
+                queries.append(query_text)
+
+    if queries:
+        return queries
+
+    batch_logs = batch.get("batch_logs")
+    if not isinstance(batch_logs, list):
+        return queries
+    for row in batch_logs:
+        if not isinstance(row, dict):
+            continue
+        query_text = str(row.get("__cp_db_query") or "").strip()
+        if query_text and query_text not in queries:
+            queries.append(query_text)
+    return queries
+
+
 def _get_report_sections_map(state: Dict[str, Any]) -> Dict[str, str]:
     sections_map: Dict[str, str] = {}
     raw_sections = state.get("structured_sections")
@@ -4728,8 +4767,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             "LLM вернула неструктурированный summary для этого батча. "
                             "Сырые логи батча доступны во вкладке `Логи Батча`."
                         )
-                    tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
-                        ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                    tab_events, tab_hyp, tab_alerts, tab_logs, tab_queries = st.tabs(
+                        ["События", "Гипотезы", "Алерты", "Логи Батча", "SQL Запросы"]
                     )
                     with tab_events:
                         if isinstance(timeline, list) and timeline:
@@ -4805,6 +4844,14 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             )
                         else:
                             st.info("Сырые логи батча не сохранены.")
+                    with tab_queries:
+                        queries = _batch_queries_from_batch(item)
+                        if queries:
+                            for query_idx, query_text in enumerate(queries, start=1):
+                                st.caption(f"Запрос #{query_idx}")
+                                st.code(query_text, language="sql")
+                        else:
+                            st.info("SQL-запрос для этого батча не сохранён.")
 
         with tab_more:
             subtab_metrics, subtab_conflicts, subtab_gaps, subtab_scale, subtab_limits, subtab_coverage, subtab_context = st.tabs(
@@ -5893,8 +5940,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                 "LLM вернула неструктурированный summary для этого батча. "
                                 "Сырые логи батча доступны во вкладке `Логи Батча`."
                             )
-                        tab_events, tab_hyp, tab_alerts, tab_logs = st.tabs(
-                            ["События", "Гипотезы", "Алерты", "Логи Батча"]
+                        tab_events, tab_hyp, tab_alerts, tab_logs, tab_queries = st.tabs(
+                            ["События", "Гипотезы", "Алерты", "Логи Батча", "SQL Запросы"]
                         )
                         with tab_events:
                             if isinstance(timeline, list) and timeline:
@@ -5972,6 +6019,14 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                 )
                             else:
                                 st.info("Сырые логи батча не сохранены.")
+                        with tab_queries:
+                            queries = _batch_queries_from_batch(item)
+                            if queries:
+                                for query_idx, query_text in enumerate(queries, start=1):
+                                    st.caption(f"Запрос #{query_idx}")
+                                    st.code(query_text, language="sql")
+                            else:
+                                st.info("SQL-запрос для этого батча не сохранён.")
 
             elif stage_label.startswith("Reduce L"):
                 st.markdown("#### Reduce")
@@ -8042,7 +8097,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         ) -> List[Dict[str, Any]]:
             if demo_mode:
                 rows = demo_logs[offset : offset + max(int(limit), 1)]
-                return [dict(row) for row in rows]
+                records = [dict(row) for row in rows]
+                for row in records:
+                    row["__cp_db_query"] = "-- demo mode --"
+                    row["__cp_query_label"] = "demo_query"
+                return records
 
             safe_limit = max(int(limit), 1)
             safe_offset = max(int(offset), 0)
@@ -8089,7 +8148,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         _single_query_last_ts[0] = max_ts.isoformat()
-                return [dict(row) for row in df.to_dict(orient="records")]
+                records = [dict(row) for row in df.to_dict(orient="records")]
+                for row in records:
+                    row["__cp_db_query"] = query
+                    row["__cp_query_label"] = str(spec.get("label", "query_1"))
+                return records
 
             # Multi-query mode:
             if streaming_logs_merger is None:
@@ -8297,6 +8360,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 full_logs = payload.get("batch_logs", [])
                 if not isinstance(full_logs, list):
                     full_logs = []
+                batch_queries = payload.get("batch_queries", [])
+                if not isinstance(batch_queries, list):
+                    batch_queries = []
+                normalized_batch_queries: List[str] = []
+                for raw_query in batch_queries:
+                    query_text = str(raw_query or "").strip()
+                    if query_text and query_text not in normalized_batch_queries:
+                        normalized_batch_queries.append(query_text)
+                if not normalized_batch_queries:
+                    for row in full_logs:
+                        if not isinstance(row, dict):
+                            continue
+                        query_text = str(row.get("__cp_db_query") or "").strip()
+                        if query_text and query_text not in normalized_batch_queries:
+                            normalized_batch_queries.append(query_text)
                 source_batch_offset = _safe_int(
                     state.get("source_batch_offset"),
                     _safe_int(state.get("resume_batch_offset"), 0),
@@ -8334,6 +8412,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_period_start": payload.get("batch_period_start"),
                         "batch_period_end": payload.get("batch_period_end"),
                         "batch_logs": full_logs,
+                        "batch_queries": normalized_batch_queries,
                     },
                 )
 
@@ -8379,6 +8458,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     "batch_period_start": payload.get("batch_period_start"),
                     "batch_period_end": payload.get("batch_period_end"),
                     "batch_logs": preview_logs,
+                    "batch_queries": normalized_batch_queries,
                 }
                 map_batches = state.setdefault("map_batches", [])
                 map_batches.append(batch_item)
@@ -8948,10 +9028,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     safe_offset = max(int(offset), 0)
                     if demo_mode:
                         source_rows = demo_logs_by_source.get(label, [])
-                        return [
+                        records = [
                             dict(row)
                             for row in source_rows[safe_offset : safe_offset + safe_limit]
                         ]
+                        for row in records:
+                            row["__cp_db_query"] = "-- demo mode --"
+                            row["__cp_query_label"] = label
+                        return records
 
                     query = _build_query_for_template(
                         template=_tmpl,
@@ -8987,7 +9071,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                         if not pd.isna(max_ts):
                             _last_ts[0] = max_ts.isoformat()
-                    return [dict(row) for row in df.to_dict(orient="records")]
+                    records = [dict(row) for row in df.to_dict(orient="records")]
+                    for row in records:
+                        row["__cp_db_query"] = query
+                        row["__cp_query_label"] = label
+                    return records
 
                 return _fetch
 

@@ -599,8 +599,16 @@ class TestMySummarizer(unittest.TestCase):
                 calls["count"] += 1
                 if calls["count"] == 1:
                     return [
-                        {"timestamp": "2026-03-25T10:00:00Z", "value": "ok"},
-                        {"timestamp": "2026-03-25T10:00:10Z", "value": "failed timeout"},
+                        {
+                            "timestamp": "2026-03-25T10:00:00Z",
+                            "value": "ok",
+                            "__cp_db_query": "SELECT * FROM logs LIMIT 100 OFFSET 0",
+                        },
+                        {
+                            "timestamp": "2026-03-25T10:00:10Z",
+                            "value": "failed timeout",
+                            "__cp_db_query": "SELECT * FROM logs LIMIT 100 OFFSET 0",
+                        },
                     ]
                 return []
 
@@ -650,8 +658,16 @@ class TestMySummarizer(unittest.TestCase):
                 calls["count"] += 1
                 if calls["count"] == 1:
                     return [
-                        {"timestamp": "2026-03-25T10:00:00Z", "value": "ok"},
-                        {"timestamp": "2026-03-25T10:00:10Z", "value": "failed timeout"},
+                        {
+                            "timestamp": "2026-03-25T10:00:00Z",
+                            "value": "ok",
+                            "__cp_db_query": "SELECT * FROM logs LIMIT 100 OFFSET 0",
+                        },
+                        {
+                            "timestamp": "2026-03-25T10:00:10Z",
+                            "value": "failed timeout",
+                            "__cp_db_query": "SELECT * FROM logs LIMIT 100 OFFSET 0",
+                        },
                     ]
                 return []
 
@@ -695,6 +711,10 @@ class TestMySummarizer(unittest.TestCase):
         self.assertIn("rows_processed", map_batch_payload)
         self.assertIn("batch_period_start", map_batch_payload)
         self.assertIn("batch_period_end", map_batch_payload)
+        self.assertEqual(
+            map_batch_payload.get("batch_queries"),
+            ["SELECT * FROM logs LIMIT 100 OFFSET 0"],
+        )
 
     def test_build_db_fetch_page_without_offset_placeholder_uses_auto_paging(self) -> None:
         config_overrides = {
@@ -907,6 +927,16 @@ class TestMySummarizer(unittest.TestCase):
         text = "a" * 5000
         out = PeriodLogSummarizer._truncate(text, 0)
         self.assertEqual(out, text)
+
+    def test_extract_batch_queries_from_rows_deduplicates_queries(self) -> None:
+        rows = [
+            {"timestamp": "2026-03-18T00:00:00Z", "__cp_db_query": "SELECT 1"},
+            {"timestamp": "2026-03-18T00:01:00Z", "__cp_db_query": "SELECT 1"},
+            {"timestamp": "2026-03-18T00:02:00Z", "__cp_db_query": "SELECT 2"},
+            {"timestamp": "2026-03-18T00:03:00Z"},
+        ]
+        queries = PeriodLogSummarizer._extract_batch_queries_from_rows(rows)
+        self.assertEqual(queries, ["SELECT 1", "SELECT 2"])
 
     def test_build_freeform_prompt_default_includes_map_summaries(self) -> None:
         summarizer = PeriodLogSummarizer(
