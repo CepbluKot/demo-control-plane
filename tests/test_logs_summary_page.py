@@ -291,6 +291,46 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("2026-03-18T00:10:00+00:00", query)
         self.assertNotIn("OFFSET", query.upper())
 
+    def test_build_query_for_template_prefer_keyset_plain_sql_no_offset(self) -> None:
+        query = _build_query_for_template(
+            template="SELECT timestamp, message FROM logs_table",
+            uses_template=False,
+            uses_paging_template=False,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=50,
+            offset=500,
+            last_ts="2026-03-18T00:15:00+00:00",
+            timestamp_column="timestamp",
+            prefer_keyset=True,
+        )
+        self.assertIn("LIMIT 50", query)
+        self.assertIn("ORDER BY timestamp ASC", query)
+        self.assertIn("2026-03-18T00:15:00+00:00", query)
+        self.assertNotIn("OFFSET", query.upper())
+
+    def test_build_query_for_template_prefer_keyset_with_last_ts_template_strips_offset(self) -> None:
+        query = _build_query_for_template(
+            template=(
+                "SELECT timestamp, message FROM logs "
+                "WHERE timestamp > parseDateTimeBestEffort('{last_ts}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp ASC LIMIT {limit} OFFSET {offset}"
+            ),
+            uses_template=True,
+            uses_paging_template=True,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=50,
+            offset=123,
+            last_ts="2026-03-18T00:15:00+00:00",
+            timestamp_column="timestamp",
+            prefer_keyset=True,
+        )
+        self.assertIn("LIMIT 50", query)
+        self.assertIn("2026-03-18T00:15:00+00:00", query)
+        self.assertNotIn("OFFSET", query.upper())
+
     def test_split_demo_logs_by_source_partitions_rows_without_loss(self) -> None:
         demo_logs = [
             {"timestamp": "2026-03-18T00:00:00Z", "message": "m1"},
