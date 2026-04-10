@@ -950,9 +950,17 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
                 "resume_stats_offset": {"rows_processed": 77},
                 "eta_seconds_left": 99,
                 "log_seconds_per_second": 12.5,
+                "batch_plan": [{"batch_id": 1, "status": "Готов"}],
+                "batch_split_count": 2,
+                "estimated_batch_total": 10,
+                "reduce_nodes": [{"round": 1, "group": 1, "status": "done"}],
+                "reduce_split_count": 3,
+                "verification": {"summary": "ok", "selected_logs": [], "corrections": []},
                 "final_summary_origin": "manual_rereduce",
                 "instructor_report_status": "done",
                 "instructor_structured_summary": "s2",
+                "llm_phase_hint": "reduce",
+                "active_source_label": "query_1",
                 "events": ["x"],
             }
         )
@@ -964,9 +972,17 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(payload["state"]["resume_stats_offset"]["rows_processed"], 77)
         self.assertEqual(payload["state"]["eta_seconds_left"], 99)
         self.assertEqual(payload["state"]["log_seconds_per_second"], 12.5)
+        self.assertEqual(payload["state"]["batch_plan"][0]["batch_id"], 1)
+        self.assertEqual(payload["state"]["batch_split_count"], 2)
+        self.assertEqual(payload["state"]["estimated_batch_total"], 10)
+        self.assertEqual(payload["state"]["reduce_nodes"][0]["round"], 1)
+        self.assertEqual(payload["state"]["reduce_split_count"], 3)
+        self.assertEqual(payload["state"]["verification"]["summary"], "ok")
         self.assertEqual(payload["state"]["final_summary_origin"], "manual_rereduce")
         self.assertEqual(payload["state"]["instructor_report_status"], "done")
         self.assertEqual(payload["state"]["instructor_structured_summary"], "s2")
+        self.assertEqual(payload["state"]["llm_phase_hint"], "reduce")
+        self.assertEqual(payload["state"]["active_source_label"], "query_1")
 
     def test_discover_resume_sessions_reads_run_params(self) -> None:
         with TemporaryDirectory() as tmp_dir:
