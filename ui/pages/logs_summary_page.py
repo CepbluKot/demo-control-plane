@@ -2010,6 +2010,21 @@ def _load_map_summaries_from_jsonl_for_source(path: str, source_name: str) -> Li
     return summaries
 
 
+def _build_map_summaries_prompt_text(map_summaries: Sequence[str]) -> str:
+    lines: List[str] = []
+    for idx, raw in enumerate(map_summaries, start=1):
+        text = _normalize_summary_text(raw)
+        if not text:
+            continue
+        lines.append(f"[MAP SUMMARY #{idx}]")
+        lines.append(text)
+    return "\n\n".join(lines).strip()
+
+
+def _load_map_summaries_prompt_text(path: str) -> str:
+    return _build_map_summaries_prompt_text(_load_map_summaries_from_jsonl(path))
+
+
 def _load_recent_batches_from_jsonl(
     path: str,
     *,
@@ -3936,6 +3951,7 @@ def _build_sectional_freeform_prompt(
     period_end: str,
     stats: Dict[str, Any],
     metrics_context: str,
+    map_summaries_text: str = "",
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
@@ -3969,6 +3985,7 @@ def _build_sectional_freeform_prompt(
                 "period_end": period_end,
                 "stats": json.dumps(_json_safe(stats), ensure_ascii=False, indent=2),
                 "metrics_context": metrics_block,
+                "map_summaries_text": map_summaries_text or "",
                 "previous_sections_text": previous_sections_text or "",
                 "section_index": section_index,
                 "section_total": section_total,
@@ -3996,6 +4013,8 @@ def _build_sectional_freeform_prompt(
         f"{previous_block}\n\n"
         "СТРУКТУРИРОВАННЫЙ АНАЛИЗ (опорный контекст):\n"
         f"{final_summary}\n"
+        "MAP SUMMARY ПО ВСЕМ БАТЧАМ (опорный контекст):\n"
+        f"{(map_summaries_text or 'Нет map-summary.')}\n"
         f"{custom_block}"
         f"{anti_block}\n"
         "Верни только текст текущей секции, без префиксов вроде 'Секция N'."
@@ -4015,6 +4034,7 @@ def _build_sectional_structured_prompt(
     period_end: str,
     stats: Dict[str, Any],
     metrics_context: str,
+    map_summaries_text: str = "",
 ) -> str:
     goal_block = user_goal.strip() or "Не указан"
     metrics_block = metrics_context.strip() or "Нет доп. метрик в контексте."
@@ -4046,6 +4066,8 @@ def _build_sectional_structured_prompt(
         f"{previous_block}\n\n"
         "БАЗОВЫЙ REDUCE SUMMARY (опорный контекст):\n"
         f"{base_summary}\n"
+        "MAP SUMMARY ПО ВСЕМ БАТЧАМ (опорный контекст):\n"
+        f"{(map_summaries_text or 'Нет map-summary.')}\n"
         f"{anti_block}\n"
         "Верни только текст текущей секции, без префиксов вроде 'Секция N'."
     )
@@ -4060,6 +4082,7 @@ def _generate_sectional_structured_summary(
     period_end: str,
     stats: Dict[str, Any],
     metrics_context: str,
+    map_summaries_text: str = "",
     on_section_start: Optional[Callable[[int, int, str], None]] = None,
     on_section_done: Optional[Callable[[int, int, str], None]] = None,
     logger: Optional[logging.Logger] = None,
@@ -4089,6 +4112,11 @@ def _generate_sectional_structured_summary(
             block_name=f"structured_base_summary_{idx}",
             logger=logger,
         )
+        map_summaries_for_prompt = _compress_context_for_llm_prompt(
+            map_summaries_text,
+            block_name=f"structured_map_summaries_{idx}",
+            logger=logger,
+        )
         section_text = _programmatic_section_text(
             section_title=title,
             user_goal=user_goal,
@@ -4107,6 +4135,7 @@ def _generate_sectional_structured_summary(
                 period_end=period_end,
                 stats=stats,
                 metrics_context=metrics_context,
+                map_summaries_text=map_summaries_for_prompt,
             )
             try:
                 section_text = _normalize_summary_text(llm_call(prompt))
@@ -4152,6 +4181,7 @@ def _generate_sectional_freeform_summary(
     period_end: str,
     stats: Dict[str, Any],
     metrics_context: str,
+    map_summaries_text: str = "",
     on_section_start: Optional[Callable[[int, int, str], None]] = None,
     on_section_done: Optional[Callable[[int, int, str], None]] = None,
     logger: Optional[logging.Logger] = None,
@@ -4181,6 +4211,11 @@ def _generate_sectional_freeform_summary(
             block_name=f"freeform_final_summary_{idx}",
             logger=logger,
         )
+        map_summaries_for_prompt = _compress_context_for_llm_prompt(
+            map_summaries_text,
+            block_name=f"freeform_map_summaries_{idx}",
+            logger=logger,
+        )
         section_text = _programmatic_section_text(
             section_title=title,
             user_goal=user_goal,
@@ -4199,6 +4234,7 @@ def _generate_sectional_freeform_summary(
                 period_end=period_end,
                 stats=stats,
                 metrics_context=metrics_context,
+                map_summaries_text=map_summaries_for_prompt,
             )
             try:
                 section_text = _normalize_summary_text(llm_call(prompt))
@@ -4905,6 +4941,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     if not base_summary:
                         st.warning("Нет итогового summary для пересборки отчёта.")
                     else:
+                        map_summaries_text_for_rebuild = _load_map_summaries_prompt_text(
+                            str(state.get("map_summaries_jsonl_path") or "")
+                        )
                         with st.spinner("Пересобираем structured/freeform отчёт из текущего summary..."):
                             rebuilt_structured, rebuilt_structured_sections = _generate_sectional_structured_summary(
                                 llm_call=llm_call,
@@ -4914,6 +4953,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 period_end=str(state.get("period_end") or ""),
                                 stats=state.get("stats") or {},
                                 metrics_context=str(state.get("metrics_context_text") or ""),
+                                map_summaries_text=map_summaries_text_for_rebuild,
                             )
                             rebuilt_freeform, rebuilt_freeform_sections = _generate_sectional_freeform_summary(
                                 llm_call=llm_call,
@@ -4923,6 +4963,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 period_end=str(state.get("period_end") or ""),
                                 stats=state.get("stats") or {},
                                 metrics_context=str(state.get("metrics_context_text") or ""),
+                                map_summaries_text=map_summaries_text_for_rebuild,
                             )
                         rebuilt_structured = _normalize_summary_text(rebuilt_structured) or base_summary
                         rebuilt_freeform = _normalize_summary_text(rebuilt_freeform)
@@ -5074,6 +5115,9 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 state.setdefault("events", []).append(
                                     "Пересборка structured: пишем структурированный отчет по секциям"
                                 )
+                                map_summaries_text_for_rebuild = _load_map_summaries_prompt_text(
+                                    str(state.get("map_summaries_jsonl_path") or "")
+                                )
                                 rebuilt_structured, rebuilt_structured_sections = _generate_sectional_structured_summary(
                                     llm_call=llm_call,
                                     base_summary=rebuilt_summary,
@@ -5082,6 +5126,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                     period_end=str(state.get("period_end") or ""),
                                     stats=state.get("stats") or {},
                                     metrics_context=str(state.get("metrics_context_text") or ""),
+                                    map_summaries_text=map_summaries_text_for_rebuild,
                                 )
                                 rebuilt_structured = _normalize_summary_text(rebuilt_structured)
                                 if rebuilt_structured:
@@ -5115,6 +5160,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                     period_end=str(state.get("period_end") or ""),
                                     stats=state.get("stats") or {},
                                     metrics_context=str(state.get("metrics_context_text") or ""),
+                                    map_summaries_text=map_summaries_text_for_rebuild,
                                 )
                                 rebuilt_freeform = _normalize_summary_text(rebuilt_freeform)
                                 if rebuilt_freeform:
@@ -9400,6 +9446,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     state["final_summary_origin"] = "final_recovery_join"
                 state["final_summary"] = final_summary_for_report
 
+        map_summaries_text_for_final = _load_map_summaries_prompt_text(str(map_summaries_jsonl_path))
+        if not map_summaries_text_for_final:
+            fallback_map_summaries = [
+                _normalize_summary_text(item.get("batch_summary"))
+                for item in (state.get("map_batches") or [])
+                if isinstance(item, dict)
+            ]
+            fallback_map_summaries = [item for item in fallback_map_summaries if item]
+            map_summaries_text_for_final = _build_map_summaries_prompt_text(fallback_map_summaries)
+
         enable_structured_stage = bool(
             active_params.get("enable_final_structured", state.get("enable_final_structured", True))
         )
@@ -9540,6 +9596,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         period_end=period_end_iso,
                         stats=state.get("stats") or {},
                         metrics_context=metrics_context_text,
+                        map_summaries_text=map_summaries_text_for_final,
                         on_section_start=_on_structured_section_start,
                         on_section_done=_on_structured_section_done,
                         logger=deps.logger,
@@ -9630,6 +9687,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         period_end=period_end_iso,
                         stats=state.get("stats") or {},
                         metrics_context=metrics_context_text,
+                        map_summaries_text=map_summaries_text_for_final,
                         on_section_start=_on_section_start,
                         on_section_done=_on_section_done,
                         logger=deps.logger,

@@ -1182,6 +1182,33 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(reduce_rounds, 0)
         self.assertEqual(calls["n"], 0)
 
+    def test_reduce_summaries_keeps_all_batches_including_empty(self) -> None:
+        captured_prompt: Dict[str, str] = {}
+
+        def _fake_llm(prompt: str) -> str:
+            captured_prompt["text"] = prompt
+            return self._structured_summary_json("reduce-all-batches", total_log_entries=2)
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=_fake_llm,
+            config=SummarizerConfig(use_instructor=False),
+        )
+        final_summary, llm_calls, reduce_rounds = summarizer._reduce_summaries(
+            chunk_summaries=[
+                self._structured_summary_json("map-empty", total_log_entries=1, is_empty=True),
+                self._structured_summary_json("map-nonempty", total_log_entries=1),
+            ],
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+        )
+        self.assertIn('"batch_id": "reduce-all-batches"', final_summary)
+        self.assertGreaterEqual(llm_calls, 1)
+        self.assertGreaterEqual(reduce_rounds, 1)
+        prompt_text = captured_prompt.get("text", "")
+        self.assertIn("map-empty", prompt_text)
+        self.assertIn("map-nonempty", prompt_text)
+
     def test_reduce_summaries_raises_on_non_overflow_error(self) -> None:
         def _fake_llm(_prompt: str) -> str:
             raise requests.exceptions.ConnectionError("network error")
@@ -2617,6 +2644,70 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(chunks[0], rows[:2])
         self.assertEqual(chunks[1], rows[2:4])
         self.assertEqual(chunks[2], rows[4:])
+
+    def test_map_split_uses_cnt_weight_for_grouped_rows(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "ok",
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=8),
+        )
+        rows = [
+            {"timestamp": "2026-03-25T10:00:00+00:00", "message": "g1", "cnt": 4},
+            {"timestamp": "2026-03-25T10:00:10+00:00", "message": "g2", "cnt": 4},
+            {"timestamp": "2026-03-25T10:00:20+00:00", "message": "g3", "cnt": 4},
+        ]
+        chunks = summarizer._split_rows_for_map(rows=rows, columns=["timestamp", "message", "cnt"])
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0], rows[:2])
+        self.assertEqual(chunks[1], rows[2:])
+
+    def test_reduce_structured_keeps_non_json_batch_as_degraded_input(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "ok",
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=8),
+        )
+        parsed_inputs: list[Any] = []
+
+        def _fake_reduce(*, summaries, **_kwargs):
+            parsed_inputs.extend(summaries)
+            return summaries[0], 0
+
+        with patch.object(summarizer, "_reduce_structured_group", side_effect=_fake_reduce):
+            summary_text, llm_calls, reduce_rounds = summarizer._reduce_summaries_structured(
+                chunk_summaries=[
+                    "plain non-json text",
+                    json.dumps(
+                        {
+                            "context": {
+                                "batch_id": "map-000002",
+                                "time_range_start": "2026-03-25T10:00:00+00:00",
+                                "time_range_end": "2026-03-25T10:05:00+00:00",
+                                "total_log_entries": 1,
+                                "source_query": [],
+                                "source_services": [],
+                            },
+                            "timeline": [],
+                            "causal_links": [],
+                            "alert_refs": [],
+                            "hypotheses": [],
+                            "pinned_facts": [],
+                            "gaps": [],
+                            "impact": {},
+                            "conflicts": [],
+                            "data_quality": {"is_empty": True, "noise_ratio": 1.0},
+                            "preliminary_recommendations": [],
+                        }
+                    ),
+                ],
+                period_start="2026-03-25T10:00:00+00:00",
+                period_end="2026-03-25T11:00:00+00:00",
+            )
+        self.assertEqual(llm_calls, 0)
+        self.assertEqual(reduce_rounds, 1)
+        self.assertTrue(summary_text)
+        self.assertEqual(len(parsed_inputs), 2)
+        self.assertIn("raw_summary", parsed_inputs[0].timeline[0].tags)
 
     def test_reduce_groups_use_fixed_group_size(self) -> None:
         def _mk_summary_obj(batch_id: str):

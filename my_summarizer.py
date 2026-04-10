@@ -1882,12 +1882,100 @@ class PeriodLogSummarizer:
         # Updated behavior: we still do not estimate tokens locally, but we MUST
         # honor explicit row cap per single MAP LLM call.
         max_rows_per_call = max(int(getattr(self.config, "llm_chunk_rows", 200) or 200), 1)
-        if len(rows) <= max_rows_per_call:
+        # For grouped SQL (e.g. rows with `cnt`), one DB row can represent many
+        # raw log lines. Use lightweight weighted splitting so LLM batching better
+        # matches real data volume.
+        def _row_weight(row: Dict[str, Any]) -> int:
+            for key in ("cnt", "log_count", "rows_count", "group_count"):
+                raw = row.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    parsed = int(float(str(raw).strip()))
+                except Exception:
+                    continue
+                if parsed > 0:
+                    return parsed
+            return 1
+
+        weighted_rows = [_row_weight(item) for item in rows]
+        effective_rows = sum(weighted_rows)
+        if len(rows) <= max_rows_per_call and effective_rows <= max_rows_per_call:
             return [rows]
-        return [
-            rows[i : i + max_rows_per_call]
-            for i in range(0, len(rows), max_rows_per_call)
-        ]
+
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_weight = 0
+        for row, weight in zip(rows, weighted_rows):
+            # If current chunk is not empty and adding this row would exceed the cap,
+            # flush current chunk first.
+            if current and (current_weight + weight) > max_rows_per_call:
+                chunks.append(current)
+                current = []
+                current_weight = 0
+            current.append(row)
+            current_weight += max(int(weight), 1)
+        if current:
+            chunks.append(current)
+
+        logger.info(
+            "MAP split rows | db_rows=%s | effective_rows=%s | max_rows_per_call=%s | chunks=%s",
+            len(rows),
+            effective_rows,
+            max_rows_per_call,
+            len(chunks),
+        )
+        return chunks
+
+    def _build_degraded_incident_summary_from_raw(
+        self,
+        *,
+        raw_text: str,
+        batch_id: str,
+        period_start: str,
+        period_end: str,
+    ) -> IncidentSummary:
+        raw_preview = self._one_line_text(raw_text, max_chars=600)
+        note = (
+            "REDUCE fallback: map summary non-structured, использован degraded-представитель. "
+            f"raw_preview={raw_preview}"
+        )
+        return IncidentSummary(
+            context=IncidentContext(
+                batch_id=batch_id,
+                time_range_start=period_start,
+                time_range_end=period_end,
+                total_log_entries=0,
+                source_query=[],
+                source_services=[],
+            ),
+            timeline=[
+                IncidentTimelineEvent(
+                    id=f"{batch_id}-raw",
+                    timestamp=period_start,
+                    source="unknown",
+                    description="Map summary невалиден как JSON; добавлен degraded fallback.",
+                    severity="low",
+                    importance=0.1,
+                    evidence_type="FACT",
+                    evidence_quote=raw_preview,
+                    tags=["degraded", "raw_summary"],
+                )
+            ],
+            causal_links=[],
+            alert_refs=[],
+            hypotheses=[],
+            pinned_facts=[],
+            gaps=[],
+            impact=IncidentImpact(),
+            conflicts=[],
+            data_quality=IncidentDataQuality(
+                is_empty=False,
+                noise_ratio=1.0,
+                notes=note,
+            ),
+            preliminary_recommendations=[],
+        )
 
     @staticmethod
     def _normalize_incident_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3525,21 +3613,29 @@ class PeriodLogSummarizer:
             return "Нет логов за указанный период.", 0, 0
         parsed_inputs: List[IncidentSummary] = []
         for idx, text in enumerate(chunk_summaries, start=1):
+            batch_id = f"map-{idx:06d}"
             parsed = self._parse_incident_summary_text(
                 str(text or ""),
-                fallback_batch_id=f"map-{idx:06d}",
+                fallback_batch_id=batch_id,
                 fallback_start=period_start,
                 fallback_end=period_end,
             )
             if parsed is None:
                 logger.warning(
-                    "REDUCE structured input skipped | item=%s/%s | reason=non_structured_map_summary",
+                    "REDUCE structured input degraded | item=%s/%s | reason=non_structured_map_summary",
                     idx,
                     len(chunk_summaries),
                 )
-                continue
-            if not self._summary_is_empty(parsed):
-                parsed_inputs.append(parsed)
+                parsed = self._build_degraded_incident_summary_from_raw(
+                    raw_text=str(text or ""),
+                    batch_id=batch_id,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+            # User-provided SQL defines what is relevant context.
+            # Do not drop "empty/noise" map summaries here: keep all parsed batches
+            # so every processed batch participates in downstream REDUCE/final report.
+            parsed_inputs.append(parsed)
 
         if not parsed_inputs:
             return (

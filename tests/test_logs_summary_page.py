@@ -504,6 +504,24 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("incident goal", prompts[0])
         self.assertIn("struct_body_1", prompts[1])
 
+    def test_build_sectional_structured_prompt_includes_map_summaries(self) -> None:
+        prompt = _build_sectional_structured_prompt(
+            section_index=1,
+            section_total=13,
+            section_title="1. Контекст",
+            section_requirement="Тест",
+            previous_sections_text="",
+            base_summary="base",
+            user_goal="goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+            map_summaries_text="[MAP SUMMARY #1]\nmap body",
+        )
+        self.assertIn("MAP SUMMARY ПО ВСЕМ БАТЧАМ", prompt)
+        self.assertIn("map body", prompt)
+
     def test_generate_sectional_structured_summary_continues_when_llm_errors(self) -> None:
         prompts: list[str] = []
 
@@ -590,6 +608,28 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(len(sections), len(FINAL_REPORT_SECTIONS))
         self.assertEqual(len(prompts), len(FINAL_REPORT_SECTIONS) - 2)
         self.assertIn("Данных недостаточно для уверенного вывода по этой секции.", merged)
+
+    def test_generate_sectional_freeform_summary_includes_map_summaries_context(self) -> None:
+        prompts: list[str] = []
+
+        def fake_llm(prompt: str) -> str:
+            prompts.append(prompt)
+            return "ok"
+
+        _generate_sectional_freeform_summary(
+            llm_call=fake_llm,
+            final_summary="Structured summary",
+            user_goal="incident goal",
+            period_start="2026-03-18T00:00:00Z",
+            period_end="2026-03-18T01:00:00Z",
+            stats={},
+            metrics_context="",
+            map_summaries_text="[MAP SUMMARY #1]\nmap body",
+        )
+        self.assertTrue(prompts)
+        joined = "\n".join(prompts)
+        self.assertIn("MAP SUMMARY ПО ВСЕМ БАТЧАМ", joined)
+        self.assertIn("map body", joined)
 
     def test_generate_sectional_freeform_summary_uses_fallback_on_empty_llm_response(self) -> None:
         prompts: list[str] = []
