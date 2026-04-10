@@ -2675,7 +2675,7 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(chunks[1], rows[2:4])
         self.assertEqual(chunks[2], rows[4:])
 
-    def test_map_split_uses_cnt_weight_for_grouped_rows(self) -> None:
+    def test_map_split_for_grouped_rows_is_by_row_count(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],
             llm_call=lambda _prompt: "ok",
@@ -2687,7 +2687,22 @@ class TestMySummarizer(unittest.TestCase):
             {"timestamp": "2026-03-25T10:00:20+00:00", "message": "g3", "cnt": 4},
         ]
         chunks = summarizer._split_rows_for_map(rows=rows, columns=["timestamp", "message", "cnt"])
-        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], rows)
+
+    def test_map_split_honors_row_limit_even_when_cnt_is_large(self) -> None:
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=lambda **_: [],
+            llm_call=lambda _prompt: "ok",
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=2),
+        )
+        rows = [
+            {"timestamp": "2026-03-25T10:00:00+00:00", "message": "g1", "cnt": 1000},
+            {"timestamp": "2026-03-25T10:00:10+00:00", "message": "g2", "cnt": 1000},
+            {"timestamp": "2026-03-25T10:00:20+00:00", "message": "g3", "cnt": 1000},
+        ]
+        chunks = summarizer._split_rows_for_map(rows=rows, columns=["timestamp", "message", "cnt"])
+        self.assertEqual([len(chunk) for chunk in chunks], [2, 1])
         self.assertEqual(chunks[0], rows[:2])
         self.assertEqual(chunks[1], rows[2:])
 

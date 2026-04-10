@@ -2,10 +2,13 @@ import unittest
 import zipfile
 import io
 import json
+import math
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from my_summarizer import PeriodLogSummarizer, SummarizerConfig
 from settings import settings
 from ui.pages.logs_summary_page import (
     FINAL_REPORT_SECTIONS,
@@ -16,6 +19,7 @@ from ui.pages.logs_summary_page import (
     _build_report_generation_progress_snapshot,
     _build_reduce_l1_progress_snapshot,
     _build_config,
+    _build_demo_logs_for_window,
     _extract_root_cause_hypotheses_block,
     _ensure_report_topics_present,
     _extract_request_result_from_bundle,
@@ -55,6 +59,7 @@ from ui.pages.logs_summary_page import (
     _normalize_summary_text,
     _render_alerts_context,
     _render_demo_query_text,
+    _select_demo_rows_by_time_cursor,
     _restore_map_batches_from_live_jsonl,
     _sort_df_by_timestamp,
     _state_from_imported_result,
@@ -165,6 +170,142 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertIn("LIMIT 100", query)
         self.assertNotIn("OFFSET", query.upper())
 
+    def test_select_demo_rows_by_time_cursor_pages_all_rows(self) -> None:
+        rows = [
+            {"timestamp": f"2026-03-18T00:{i:02d}:00+00:00", "message": f"m{i}"}
+            for i in range(6)
+        ]
+        page1, cursor1 = _select_demo_rows_by_time_cursor(
+            rows=rows,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T00:10:00+00:00",
+            limit=2,
+            last_ts=None,
+            timestamp_column="timestamp",
+        )
+        page2, cursor2 = _select_demo_rows_by_time_cursor(
+            rows=rows,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T00:10:00+00:00",
+            limit=2,
+            last_ts=cursor1,
+            timestamp_column="timestamp",
+        )
+        page3, _cursor3 = _select_demo_rows_by_time_cursor(
+            rows=rows,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T00:10:00+00:00",
+            limit=10,
+            last_ts=cursor2,
+            timestamp_column="timestamp",
+        )
+        self.assertEqual([row["message"] for row in page1], ["m0", "m1"])
+        self.assertEqual([row["message"] for row in page2], ["m2", "m3"])
+        self.assertEqual([row["message"] for row in page3], ["m4", "m5"])
+
+    def test_build_demo_logs_for_window_is_time_uniform_and_monotonic(self) -> None:
+        start = datetime.fromisoformat("2026-03-18T00:00:00+00:00")
+        end = datetime.fromisoformat("2026-03-18T02:00:00+00:00")
+        rows = _build_demo_logs_for_window(
+            period_start_dt=start,
+            period_end_dt=end,
+            total_logs=1000,
+        )
+        self.assertEqual(len(rows), 1000)
+        timestamps = [pd.to_datetime(row["timestamp"], utc=True) for row in rows]
+        self.assertTrue(all(timestamps[i] < timestamps[i + 1] for i in range(len(timestamps) - 1)))
+        self.assertGreaterEqual(timestamps[0], pd.Timestamp(start))
+        self.assertLess(timestamps[-1], pd.Timestamp(end))
+
+    def test_select_demo_rows_by_time_cursor_iterates_by_last_timestamp_until_end(self) -> None:
+        start_iso = "2026-03-18T00:00:00+00:00"
+        end_iso = "2026-03-18T03:00:00+00:00"
+        rows = _build_demo_logs_for_window(
+            period_start_dt=datetime.fromisoformat(start_iso),
+            period_end_dt=datetime.fromisoformat(end_iso),
+            total_logs=1000,
+        )
+        cursor: str | None = None
+        collected_messages: list[str] = []
+        pages = 0
+        while True:
+            page, next_cursor = _select_demo_rows_by_time_cursor(
+                rows=rows,
+                period_start_iso=start_iso,
+                period_end_iso=end_iso,
+                limit=100,
+                last_ts=cursor,
+                timestamp_column="timestamp",
+            )
+            if not page:
+                break
+            pages += 1
+            collected_messages.extend(str(item["message"]) for item in page)
+            self.assertEqual(next_cursor is not None, True)
+            cursor = next_cursor
+        self.assertEqual(pages, 10)
+        self.assertEqual(len(collected_messages), 1000)
+        self.assertEqual(len(set(collected_messages)), 1000)
+        self.assertEqual(collected_messages[0], "info synthetic log #1")
+        self.assertEqual(collected_messages[-1], "critical synthetic log #1000")
+
+    def test_demo_keyset_full_flow_processes_all_rows(self) -> None:
+        total_rows = 250
+        demo_rows = [
+            {
+                "timestamp": f"2026-03-18T00:{i // 60:02d}:{i % 60:02d}+00:00",
+                "message": f"log-{i}",
+            }
+            for i in range(total_rows)
+        ]
+        cursor = {"last_ts": None}
+        events: list[tuple[str, dict]] = []
+
+        def _db_fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = offset
+            rows, next_cursor = _select_demo_rows_by_time_cursor(
+                rows=demo_rows,
+                period_start_iso=period_start,
+                period_end_iso=period_end,
+                limit=limit,
+                last_ts=cursor["last_ts"],
+                timestamp_column="timestamp",
+            )
+            if next_cursor:
+                cursor["last_ts"] = next_cursor
+            return [{col: row.get(col) for col in columns} for row in rows]
+
+        summary_json = json.dumps(_demo_incident_summary_stub_payload(), ensure_ascii=False)
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_db_fetch_page,
+            llm_call=lambda _prompt: summary_json,
+            config=SummarizerConfig(
+                page_limit=50,
+                llm_chunk_rows=20,
+                use_new_algorithm=True,
+                keep_map_batches_in_memory=True,
+                keep_map_summaries_in_result=True,
+            ),
+            on_progress=lambda event, payload: events.append((event, dict(payload))),
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-18T00:00:00+00:00",
+            period_end="2026-03-18T01:00:00+00:00",
+            columns=["timestamp", "message"],
+            total_rows_estimate=total_rows,
+        )
+
+        self.assertEqual(result.rows_processed, total_rows)
+        self.assertEqual(result.pages_fetched, 5)
+        full_pages, tail_rows = divmod(total_rows, 50)
+        expected_batches = full_pages * int(math.ceil(50 / 20.0))
+        if tail_rows:
+            expected_batches += int(math.ceil(tail_rows / 20.0))
+        map_batch_events = [payload for name, payload in events if name == "map_batch"]
+        self.assertEqual(len(map_batch_events), expected_batches)
+        self.assertEqual(result.chunk_summaries, expected_batches)
+
     def test_extract_root_cause_hypotheses_block_from_section(self) -> None:
         text = (
             "1) ХРОНОЛОГИЯ\n"
@@ -231,6 +372,30 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertEqual(
             str(formatted.loc[0, "end_time"]),
             "2026-03-18 03:00:01.987654 MSK",
+        )
+
+    def test_format_table_timestamps_formats_time_start_time_end_and_period(self) -> None:
+        df = pd.DataFrame(
+            [
+                {
+                    "time_start": "2026-03-18T10:00:00+00:00",
+                    "time_end": "2026-03-18T10:05:00+00:00",
+                    "period": "2026-03-18T10:00:00+00:00 -> 2026-03-18T10:05:00+00:00",
+                }
+            ]
+        )
+        formatted = _format_table_timestamps(df)
+        self.assertEqual(
+            str(formatted.loc[0, "time_start"]),
+            "2026-03-18 13:00:00.000000 MSK",
+        )
+        self.assertEqual(
+            str(formatted.loc[0, "time_end"]),
+            "2026-03-18 13:05:00.000000 MSK",
+        )
+        self.assertEqual(
+            str(formatted.loc[0, "period"]),
+            "2026-03-18 13:00:00.000000 MSK -> 2026-03-18 13:05:00.000000 MSK",
         )
 
     def test_build_query_for_template_adds_stable_order_without_order_by(self) -> None:
@@ -332,6 +497,29 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         )
         self.assertIn("LIMIT 50", query)
         self.assertIn("2026-03-18T00:15:00+00:00", query)
+        self.assertNotIn("OFFSET", query.upper())
+
+    def test_build_query_for_template_prefer_keyset_adds_stable_outer_window(self) -> None:
+        query = _build_query_for_template(
+            template=(
+                "SELECT timestamp, message FROM logs "
+                "WHERE timestamp > parseDateTimeBestEffort('{last_ts}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
+            ),
+            uses_template=True,
+            uses_paging_template=True,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            offset=0,
+            last_ts="2026-03-18T00:20:00+00:00",
+            timestamp_column="timestamp",
+            prefer_keyset=True,
+        )
+        self.assertIn("AS cp_window", query)
+        self.assertIn("WHERE timestamp > parseDateTimeBestEffort('2026-03-18T00:20:00+00:00')", query)
+        self.assertIn("ORDER BY timestamp ASC", query)
         self.assertNotIn("OFFSET", query.upper())
 
     def test_split_demo_logs_by_source_partitions_rows_without_loss(self) -> None:
@@ -1396,7 +1584,15 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         self.assertFalse(mapped["logs_sum_parallel_map"])
         self.assertEqual(mapped["logs_sum_map_workers"], 1)
         self.assertTrue(mapped["logs_sum_demo_mode"])
+        self.assertEqual(mapped["logs_sum_demo_logs_count"], 2222)
         self.assertTrue(mapped["logs_sum_enable_no_logs_hypothesis"])
+
+    def test_form_values_from_saved_params_defaults_demo_logs_to_1000(self) -> None:
+        mapped = _form_values_from_saved_params(
+            saved_params={"logs_queries": ["SELECT 1"]},
+            default_query="SELECT fallback_query",
+        )
+        self.assertEqual(mapped["logs_sum_demo_logs_count"], 1000)
 
     def test_form_values_from_saved_params_uses_default_query_when_empty(self) -> None:
         mapped = _form_values_from_saved_params(

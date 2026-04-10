@@ -30,6 +30,7 @@ MAX_EVENT_LINES = 160
 # 0 means "no truncation" (keep all MAP batches in UI state).
 MAX_RENDERED_BATCHES = 0
 MAX_LOG_ROWS_PREVIEW = 80
+DEMO_LOGS_DEFAULT_COUNT = 1_000
 MAX_METRICS_ROWS_TOTAL = 50_000  # cap across all metric queries to avoid OOM
 MAX_LLM_TIMELINE_ROWS = 400
 LAST_STATE_SESSION_KEY = "logs_summary_last_result_state"
@@ -631,27 +632,46 @@ def _format_table_timestamps(df: pd.DataFrame) -> pd.DataFrame:
         "period_end",
         "start",
         "end",
+        "period",
+        "time_start",
+        "time_end",
+        "time_point",
     }
+
+    def _fmt_single(value: Any) -> str:
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return str(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(MSK)
+        else:
+            ts = ts.tz_convert(MSK)
+        return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+
     for col in out.columns:
         col_name = str(col).strip().lower()
         is_datetime_like = (
             col_name in timestamp_like
             or "timestamp" in col_name
             or "datetime" in col_name
+            or "date" in col_name
             or col_name.endswith("_time")
             or col_name.endswith("_at")
+            or col_name.endswith("_start")
+            or col_name.endswith("_end")
+            or col_name.endswith("_dt")
+            or col_name.endswith("_date")
+            or col_name.startswith("time_")
+            or col_name.startswith("date_")
         )
         if not is_datetime_like:
             continue
         def _fmt(value: Any) -> str:
-            ts = pd.to_datetime(value, errors="coerce")
-            if pd.isna(ts):
-                return str(value)
-            if ts.tzinfo is None:
-                ts = ts.tz_localize(MSK)
-            else:
-                ts = ts.tz_convert(MSK)
-            return ts.strftime("%Y-%m-%d %H:%M:%S.%f MSK")
+            text = str(value)
+            if "->" in text:
+                left, right = [part.strip() for part in text.split("->", 1)]
+                return f"{_fmt_single(left)} -> {_fmt_single(right)}"
+            return _fmt_single(value)
 
         out[col] = out[col].apply(_fmt).astype(str)
     return out
@@ -1914,21 +1934,20 @@ def _build_query_for_template(
     # Logs pipeline now prefers keyset pagination (timestamp cursor) so we can
     # avoid OFFSET-based paging entirely.
     if prefer_keyset:
-        effective_last_ts = last_ts if last_ts is not None else period_start_iso
         if uses_template:
+            # In keyset mode we do not trust template-level pagination semantics
+            # (`{last_ts}`, `LIMIT/OFFSET`, order direction). We freeze template
+            # rendering at the full window start, strip trailing paging, and apply
+            # a single consistent outer keyset window.
             rendered_query = _render_query_template(
                 query_template=template,
                 period_start_iso=period_start_iso,
                 period_end_iso=period_end_iso,
                 limit=limit,
                 offset=0,
-                last_ts=effective_last_ts,
+                last_ts=period_start_iso,
             )
-            # If template already supports keyset ({last_ts}), keep it mostly as-is,
-            # but strip any rendered OFFSET to enforce "no offset" policy.
-            if "{last_ts}" in str(template).lower():
-                return re.sub(r"(?is)\s+OFFSET\s+\d+\b", "", rendered_query).strip()
-            base_query = rendered_query
+            base_query = _strip_trailing_limit_offset(rendered_query)
         else:
             base_query = template
         return _build_window_query_for_plain_sql_keyset(
@@ -2070,12 +2089,16 @@ def _build_demo_logs_for_window(
     total_logs: int,
 ) -> List[Dict[str, Any]]:
     safe_total = max(int(total_logs), 1)
-    window_seconds = max(int((period_end_dt - period_start_dt).total_seconds()), safe_total + 1)
+    window_us = int((period_end_dt - period_start_dt).total_seconds() * 1_000_000)
+    # Keep strictly increasing demo timestamps so keyset pagination
+    # can always continue from `last_ts` without skipping/looping.
+    window_us = max(window_us, safe_total + 1)
     rows: List[Dict[str, Any]] = []
 
     for idx in range(safe_total):
-        sec_offset = int((idx + 1) * window_seconds / (safe_total + 1))
-        ts = period_start_dt + timedelta(seconds=sec_offset)
+        us_offset = int((idx + 1) * window_us / (safe_total + 1))
+        us_offset = min(us_offset, window_us - 1)
+        ts = period_start_dt + timedelta(microseconds=us_offset)
         phase = (idx + 1) / safe_total
         if phase < 0.35:
             level = "INFO"
@@ -2164,9 +2187,9 @@ def _select_demo_rows_by_time_cursor(
     if pd.isna(start_ts) or pd.isna(end_ts):
         return [], last_ts
 
-    indexed: List[tuple[pd.Timestamp, Dict[str, Any]]] = []
+    indexed: List[tuple[pd.Timestamp, int, Dict[str, Any]]] = []
     ts_col = _normalize_timestamp_column_name(timestamp_column)
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         ts_raw = row.get(ts_col)
@@ -2177,10 +2200,10 @@ def _select_demo_rows_by_time_cursor(
             continue
         if use_cursor and ts_val <= cursor_ts:
             continue
-        indexed.append((ts_val, row))
+        indexed.append((ts_val, row_idx, row))
 
-    indexed.sort(key=lambda item: item[0])
-    page = [dict(item[1]) for item in indexed[:safe_limit]]
+    indexed.sort(key=lambda item: (item[0], item[1]))
+    page = [dict(item[2]) for item in indexed[:safe_limit]]
     if not page:
         return [], last_ts
     new_cursor = indexed[min(len(indexed), safe_limit) - 1][0].isoformat()
@@ -2514,7 +2537,10 @@ def _form_values_from_saved_params(
             _default_llm_timeout_seconds(),
         ),
         "logs_sum_demo_mode": bool(saved_params.get("demo_mode", False)),
-        "logs_sum_demo_logs_count": _to_int(saved_params.get("demo_logs_count", 4000), 4000),
+        "logs_sum_demo_logs_count": _to_int(
+            saved_params.get("demo_logs_count", DEMO_LOGS_DEFAULT_COUNT),
+            DEMO_LOGS_DEFAULT_COUNT,
+        ),
         "logs_sum_enable_no_logs_hypothesis": bool(
             saved_params.get("enable_no_logs_hypothesis", False)
         ),
@@ -2835,7 +2861,7 @@ def _build_saved_params_from_import_request(
         "max_retries": _safe_int(request.get("max_retries"), -1),
         "llm_timeout": _safe_int(request.get("llm_timeout"), _default_llm_timeout_seconds()),
         "demo_mode": bool(request.get("demo_mode", False)),
-        "demo_logs_count": _safe_int(request.get("demo_logs_count"), 4000),
+        "demo_logs_count": _safe_int(request.get("demo_logs_count"), DEMO_LOGS_DEFAULT_COUNT),
         "enable_no_logs_hypothesis": bool(request.get("enable_no_logs_hypothesis", False)),
     }
 
@@ -4905,7 +4931,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     if col in filtered.columns
                 ]
                 st.dataframe(
-                    filtered[keep_cols] if keep_cols else filtered,
+                    _format_table_timestamps(filtered[keep_cols] if keep_cols else filtered),
                     use_container_width=True,
                     hide_index=True,
                     height=max(320, deps.logs_batch_table_height),
@@ -4941,7 +4967,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     links_df = pd.DataFrame(causal_links_rows)
                     keep_cols = [c for c in ["id", "cause_event_id", "effect_event_id", "mechanism", "confidence"] if c in links_df.columns]
                     st.dataframe(
-                        links_df[keep_cols] if keep_cols else links_df,
+                        _format_table_timestamps(links_df[keep_cols] if keep_cols else links_df),
                         use_container_width=True,
                         hide_index=True,
                         height=220,
@@ -4968,7 +4994,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             hist_df = pd.DataFrame(hist)
                             keep_cols = [c for c in ["batch_index", "status", "related_events", "explanation"] if c in hist_df.columns]
                             st.dataframe(
-                                hist_df[keep_cols] if keep_cols else hist_df,
+                                _format_table_timestamps(hist_df[keep_cols] if keep_cols else hist_df),
                                 use_container_width=True,
                                 hide_index=True,
                                 height=180,
@@ -5071,7 +5097,10 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     if "validation error" in notes or "raw llm" in notes:
                         status_icon = "⚠"
                         status_text = "degraded"
-                period = f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}"
+                period = (
+                    f"{_format_datetime_with_tz(item.get('batch_period_start'))} -> "
+                    f"{_format_datetime_with_tz(item.get('batch_period_end'))}"
+                )
                 summary_line = (
                     f"{status_icon} Батч {batch_idx}/{total or '?'} | {period} | "
                     f"событий: {len(timeline) if isinstance(timeline, list) else 0}"
@@ -5144,7 +5173,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                             alert_df = pd.DataFrame(alert_refs)
                             keep_cols = [c for c in ["alert_id", "status", "related_events", "explanation"] if c in alert_df.columns]
                             st.dataframe(
-                                alert_df[keep_cols] if keep_cols else alert_df,
+                                _format_table_timestamps(alert_df[keep_cols] if keep_cols else alert_df),
                                 use_container_width=True,
                                 hide_index=True,
                                 height=180,
@@ -5211,7 +5240,12 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                     st.info("Раздел метрик пока недоступен.")
             with subtab_conflicts:
                 if conflicts_rows:
-                    st.dataframe(pd.DataFrame(conflicts_rows), use_container_width=True, hide_index=True, height=240)
+                    st.dataframe(
+                        _format_table_timestamps(pd.DataFrame(conflicts_rows)),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=240,
+                    )
                 else:
                     body = _find_section_text(report_sections_map, "9.")
                     if body:
@@ -5220,7 +5254,12 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                         st.info("Конфликтующих интерпретаций не обнаружено.")
             with subtab_gaps:
                 if gaps_rows:
-                    st.dataframe(pd.DataFrame(gaps_rows), use_container_width=True, hide_index=True, height=240)
+                    st.dataframe(
+                        _format_table_timestamps(pd.DataFrame(gaps_rows)),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=240,
+                    )
                 else:
                     body = _find_section_text(report_sections_map, "10.")
                     if body:
@@ -6074,7 +6113,9 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         hist_df = pd.DataFrame(hist)
                         if not hist_df.empty:
                             st.dataframe(
-                                hist_df[["batch_index", "status", "related_events", "explanation"]],
+                                _format_table_timestamps(
+                                    hist_df[["batch_index", "status", "related_events", "explanation"]]
+                                ),
                                 use_container_width=True,
                                 hide_index=True,
                                 height=180,
@@ -6229,7 +6270,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         )
                 if batch_plan:
                     plan_df = pd.DataFrame(batch_plan)
-                    st.dataframe(plan_df, use_container_width=True, hide_index=True, height=260)
+                    st.dataframe(
+                        _format_table_timestamps(plan_df),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=260,
+                    )
                     split_count = _safe_int(state.get("batch_split_count"), 0)
                     if batch_total > 0:
                         st.caption(
@@ -6271,7 +6317,10 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                         if "validation error" in notes or "raw llm" in notes:
                             status_icon = "⚠"
                             status_text = "degraded"
-                    period = f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}"
+                    period = (
+                        f"{_format_datetime_with_tz(item.get('batch_period_start'))} -> "
+                        f"{_format_datetime_with_tz(item.get('batch_period_end'))}"
+                    )
                     summary_line = (
                         f"{status_icon} Батч {batch_idx}/{total or '?'} | {period} | "
                         f"событий: {len(timeline) if isinstance(timeline, list) else 0}"
@@ -6355,7 +6404,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                     c for c in ["alert_id", "status", "related_events", "explanation"] if c in alert_df.columns
                                 ]
                                 st.dataframe(
-                                    alert_df[keep_cols] if keep_cols else alert_df,
+                                    _format_table_timestamps(alert_df[keep_cols] if keep_cols else alert_df),
                                     use_container_width=True,
                                     hide_index=True,
                                     height=180,
@@ -6486,7 +6535,11 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             )
                     corrections = verification.get("corrections") or []
                     if corrections:
-                        st.dataframe(pd.DataFrame(corrections), use_container_width=True, hide_index=True)
+                        st.dataframe(
+                            _format_table_timestamps(pd.DataFrame(corrections)),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                     else:
                         st.success("Поправок не требуется.")
                 else:
@@ -6738,7 +6791,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_max_retries": int(deps.max_retries),
         "logs_sum_llm_timeout": max(int(deps.llm_timeout), 10),
         "logs_sum_demo_mode": bool(deps.test_mode),
-        "logs_sum_demo_logs_count": max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
+        "logs_sum_demo_logs_count": int(DEMO_LOGS_DEFAULT_COUNT),
         "logs_sum_llm_summary_height": max(int(deps.summary_text_height), 220),
         "logs_sum_llm_final_height": max(int(deps.final_text_height), 320),
     }
@@ -7457,7 +7510,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     demo_logs_count = int(
         st.session_state.get(
             "logs_sum_demo_logs_count",
-            max(int(deps.logs_tail_limit), deps.db_batch_size * 4, 4000),
+            DEMO_LOGS_DEFAULT_COUNT,
         )
     )
 
