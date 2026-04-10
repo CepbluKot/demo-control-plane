@@ -25,6 +25,9 @@ from ui.pages.logs_summary_page import (
     _build_stage1_progress_snapshot,
     _checkpoint_payload_from_state,
     _build_no_logs_hypothesis_prompt,
+    _demo_incident_summary_stub_payload,
+    _has_llm_credentials_configured,
+    _make_demo_llm_stub_call,
     _compute_report_steps_total,
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
@@ -49,6 +52,8 @@ from ui.pages.logs_summary_page import (
     _normalize_alert_items,
     _normalize_summary_text,
     _render_alerts_context,
+    _render_demo_query_text,
+    _restore_map_batches_from_live_jsonl,
     _state_from_imported_result,
     _summary_origin_label,
     _write_json_file,
@@ -62,6 +67,100 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
     def test_default_llm_timeout_seconds_is_20_minutes(self) -> None:
         with patch.object(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200):
             self.assertEqual(_default_llm_timeout_seconds(), 1200)
+
+    def test_has_llm_credentials_configured(self) -> None:
+        with patch.object(settings, "OPENAI_API_BASE_DB", "https://example.test/v1"), patch.object(
+            settings, "OPENAI_API_KEY_DB", "token"
+        ):
+            self.assertTrue(_has_llm_credentials_configured())
+        with patch.object(settings, "OPENAI_API_BASE_DB", ""), patch.object(
+            settings, "OPENAI_API_KEY_DB", ""
+        ):
+            self.assertFalse(_has_llm_credentials_configured())
+
+    def test_make_demo_llm_stub_call_returns_json_for_strict_json_prompt(self) -> None:
+        llm_stub = _make_demo_llm_stub_call()
+        out = llm_stub("Формат ответа (строго). Верни ТОЛЬКО один валидный JSON-объект.")
+        payload = json.loads(out)
+        self.assertEqual(payload.get("context", {}).get("batch_id"), "demo-batch")
+        self.assertIn("timeline", payload)
+
+    def test_make_demo_llm_stub_call_returns_text_for_regular_prompt(self) -> None:
+        llm_stub = _make_demo_llm_stub_call()
+        out = llm_stub("Напиши краткое резюме инцидента.")
+        self.assertIn("Демо-режим", out)
+
+    def test_demo_incident_summary_stub_payload_contains_required_keys(self) -> None:
+        payload = _demo_incident_summary_stub_payload()
+        for key in (
+            "context",
+            "timeline",
+            "causal_links",
+            "alert_refs",
+            "hypotheses",
+            "pinned_facts",
+            "gaps",
+            "impact",
+            "conflicts",
+            "data_quality",
+            "preliminary_recommendations",
+        ):
+            self.assertIn(key, payload)
+
+    def test_render_demo_query_text_uses_template_when_present(self) -> None:
+        query = _render_demo_query_text(
+            template=(
+                "SELECT timestamp, message FROM logs_demo_service "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp LIMIT {limit} OFFSET {offset}"
+            ),
+            uses_template=True,
+            uses_paging_template=True,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            last_ts=None,
+            timestamp_column="timestamp",
+        )
+        self.assertIn("LIMIT 100", query)
+        self.assertNotIn("OFFSET", query.upper())
+        self.assertIn("logs_demo_service", query)
+
+    def test_render_demo_query_text_falls_back_when_template_empty(self) -> None:
+        query = _render_demo_query_text(
+            template="",
+            uses_template=False,
+            uses_paging_template=False,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=50,
+            last_ts=None,
+            timestamp_column="timestamp",
+        )
+        self.assertIn("FROM logs_demo_service", query)
+        self.assertIn("LIMIT 50", query)
+        self.assertNotIn("OFFSET", query.upper())
+
+    def test_render_demo_query_text_uses_last_ts_as_moving_start_boundary(self) -> None:
+        query = _render_demo_query_text(
+            template=(
+                "SELECT timestamp, message FROM logs_demo_service "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp LIMIT {limit}"
+            ),
+            uses_template=True,
+            uses_paging_template=False,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            last_ts="2026-03-18T00:10:00+00:00",
+            timestamp_column="timestamp",
+        )
+        self.assertIn("2026-03-18T00:10:00+00:00", query)
+        self.assertIn("LIMIT 100", query)
+        self.assertNotIn("OFFSET", query.upper())
 
     def test_extract_root_cause_hypotheses_block_from_section(self) -> None:
         text = (
@@ -169,6 +268,28 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         )
         self.assertIn("ORDER BY timestamp DESC", query)
         self.assertNotIn("cp_ordered", query)
+
+    def test_build_query_for_template_prefer_keyset_avoids_offset(self) -> None:
+        query = _build_query_for_template(
+            template=(
+                "SELECT timestamp, message FROM logs "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
+            ),
+            uses_template=True,
+            uses_paging_template=True,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            offset=200,
+            last_ts="2026-03-18T00:10:00+00:00",
+            timestamp_column="timestamp",
+            prefer_keyset=True,
+        )
+        self.assertIn("LIMIT 100", query)
+        self.assertIn("2026-03-18T00:10:00+00:00", query)
+        self.assertNotIn("OFFSET", query.upper())
 
     def test_split_demo_logs_by_source_partitions_rows_without_loss(self) -> None:
         demo_logs = [
@@ -1465,6 +1586,41 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             ]
         }
         self.assertEqual(_batch_queries_from_batch(batch), ["SELECT 1", "SELECT 2"])
+
+    def test_restore_map_batches_from_live_jsonl_rehydrates_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batches.jsonl"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "event": "map_batch",
+                            "batch_index": 0,
+                            "batch_total": 2,
+                            "batch_summary": "{}",
+                            "batch_logs_count": 2,
+                            "batch_period_start": "2026-03-18T00:00:00+00:00",
+                            "batch_period_end": "2026-03-18T00:01:00+00:00",
+                            "batch_logs": [
+                                {"timestamp": "2026-03-18T00:00:00+00:00", "message": "a"},
+                                {"timestamp": "2026-03-18T00:00:10+00:00", "message": "b"},
+                            ],
+                            "batch_queries": ["SELECT * FROM logs LIMIT 100 OFFSET 0"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            state = {
+                "live_batches_path": str(path),
+                "map_batches": [],
+                "map_batches_done_total": 0,
+                "map_batches_total": 0,
+            }
+            _restore_map_batches_from_live_jsonl(state)
+            self.assertEqual(len(state.get("map_batches") or []), 1)
+            self.assertEqual(int(state.get("map_batches_done_total") or 0), 1)
+            self.assertEqual(int(state.get("map_batches_total") or 0), 1)
 
     def test_build_causal_graph_dot(self) -> None:
         dot = _build_causal_graph_dot(

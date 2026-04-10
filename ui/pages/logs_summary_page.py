@@ -82,6 +82,69 @@ MODEL_CONTEXT_PRESETS: Dict[str, int] = {
 }
 
 
+def _has_llm_credentials_configured() -> bool:
+    api_base = str(getattr(settings, "OPENAI_API_BASE_DB", "") or "").strip()
+    api_key = str(getattr(settings, "OPENAI_API_KEY_DB", "") or "").strip()
+    return bool(api_base and api_key)
+
+
+def _demo_incident_summary_stub_payload() -> Dict[str, Any]:
+    return {
+        "context": {
+            "batch_id": "demo-batch",
+            "time_range_start": "2026-01-01T00:00:00Z",
+            "time_range_end": "2026-01-01T00:01:00Z",
+            "total_log_entries": 0,
+            "source_query": ["demo_mode"],
+            "source_services": ["demo-service"],
+        },
+        "timeline": [],
+        "causal_links": [],
+        "alert_refs": [],
+        "hypotheses": [],
+        "pinned_facts": [],
+        "gaps": [],
+        "impact": {
+            "affected_services": [],
+            "affected_operations": [],
+            "error_counts": [],
+            "degradation_period_start": "",
+            "degradation_period_end": "",
+        },
+        "conflicts": [],
+        "data_quality": {
+            "is_empty": True,
+            "noise_ratio": 0.0,
+            "has_gaps": False,
+            "gap_periods": [],
+            "notes": "demo_mode_stub",
+        },
+        "preliminary_recommendations": [],
+    }
+
+
+def _make_demo_llm_stub_call() -> Callable[[str], str]:
+    json_payload = json.dumps(_demo_incident_summary_stub_payload(), ensure_ascii=False)
+
+    def _call(prompt: str) -> str:
+        text = str(prompt or "")
+        lowered = text.lower()
+        expects_json = (
+            "валидный json-объект" in lowered
+            or "format ответа (строго)" in lowered
+            or "формат ответа (строго)" in lowered
+            or "top-level keys" in lowered
+        )
+        if expects_json:
+            return json_payload
+        return (
+            "Демо-режим: внешняя LLM не настроена "
+            "(OPENAI_API_BASE_DB/OPENAI_API_KEY_DB), используется встроенный stub-ответ."
+        )
+
+    return _call
+
+
 def _default_llm_timeout_seconds() -> int:
     return max(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200) or 1200),
@@ -992,7 +1055,7 @@ class _StreamingLogsMerger:
             return False
 
         template = str(cursor.spec["template"])
-        uses_keyset = "{last_ts}" in template.lower()
+        uses_keyset = True
 
         # In rare cases page can contain only bad timestamps after normalization.
         # Continue fetching until we get at least one valid row or source is exhausted.
@@ -1007,6 +1070,7 @@ class _StreamingLogsMerger:
                 offset=cursor.next_offset,
                 last_ts=cursor.last_ts,  # None on first page → defaults to period_start
                 timestamp_column=self._timestamp_column,
+                prefer_keyset=True,
             )
             try:
                 df = self._query_logs_df(query)
@@ -1023,13 +1087,22 @@ class _StreamingLogsMerger:
                         f"Запрос #{cursor.query_index + 1} page(offset={cursor.next_offset}, "
                         f"limit={fetch_limit}) упал: {exc}"
                     )
-                self._logger.warning(
-                    "logs_summary_page.query_failed[stream:%s]: offset=%s limit=%s err=%s",
-                    cursor.query_index + 1,
-                    cursor.next_offset,
-                    fetch_limit,
-                    exc,
-                )
+                if uses_keyset:
+                    self._logger.warning(
+                        "logs_summary_page.query_failed[stream:%s]: last_ts=%s limit=%s err=%s",
+                        cursor.query_index + 1,
+                        cursor.last_ts,
+                        fetch_limit,
+                        exc,
+                    )
+                else:
+                    self._logger.warning(
+                        "logs_summary_page.query_failed[stream:%s]: offset=%s limit=%s err=%s",
+                        cursor.query_index + 1,
+                        cursor.next_offset,
+                        fetch_limit,
+                        exc,
+                    )
                 return False
 
             raw_rows = int(len(df))
@@ -1769,6 +1842,36 @@ def _build_window_query_for_plain_sql(
     )
 
 
+def _build_window_query_for_plain_sql_keyset(
+    *,
+    base_query: str,
+    period_start_iso: str,
+    period_end_iso: str,
+    limit: int,
+    last_ts: Optional[str],
+    timestamp_column: str = "timestamp",
+) -> str:
+    safe_limit = max(int(limit), 1)
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    base = _strip_trailing_limit_offset(_normalize_sql_query_text(base_query))
+    start_escaped = _escape_sql_literal(period_start_iso)
+    end_escaped = _escape_sql_literal(period_end_iso)
+    cursor_escaped = _escape_sql_literal(last_ts if last_ts is not None else period_start_iso)
+    start_operator = ">" if last_ts else ">="
+    return (
+        "SELECT * FROM ("
+        "SELECT * FROM ("
+        f"{base}"
+        ") AS cp_src "
+        f"WHERE {ts_col} >= parseDateTimeBestEffort('{start_escaped}') "
+        f"AND {ts_col} < parseDateTimeBestEffort('{end_escaped}')"
+        ") AS cp_window "
+        f"WHERE {ts_col} {start_operator} parseDateTimeBestEffort('{cursor_escaped}') "
+        f"ORDER BY {ts_col} ASC "
+        f"LIMIT {safe_limit}"
+    )
+
+
 def _build_query_for_template(
     *,
     template: str,
@@ -1780,7 +1883,37 @@ def _build_query_for_template(
     offset: int,
     last_ts: Optional[str] = None,
     timestamp_column: str = "timestamp",
+    prefer_keyset: bool = False,
 ) -> str:
+    # Logs pipeline now prefers keyset pagination (timestamp cursor) so we can
+    # avoid OFFSET-based paging entirely.
+    if prefer_keyset:
+        effective_last_ts = last_ts if last_ts is not None else period_start_iso
+        if uses_template:
+            rendered_query = _render_query_template(
+                query_template=template,
+                period_start_iso=period_start_iso,
+                period_end_iso=period_end_iso,
+                limit=limit,
+                offset=0,
+                last_ts=effective_last_ts,
+            )
+            # If template already supports keyset ({last_ts}), keep it mostly as-is,
+            # but strip any rendered OFFSET to enforce "no offset" policy.
+            if "{last_ts}" in str(template).lower():
+                return re.sub(r"(?is)\s+OFFSET\s+\d+\b", "", rendered_query).strip()
+            base_query = rendered_query
+        else:
+            base_query = template
+        return _build_window_query_for_plain_sql_keyset(
+            base_query=base_query,
+            period_start_iso=period_start_iso,
+            period_end_iso=period_end_iso,
+            limit=limit,
+            last_ts=last_ts,
+            timestamp_column=timestamp_column,
+        )
+
     if uses_template:
         rendered_query = _render_query_template(
             query_template=template,
@@ -1940,6 +2073,92 @@ def _build_demo_logs_for_window(
             }
         )
     return rows
+
+
+def _render_demo_query_text(
+    *,
+    template: str,
+    uses_template: bool,
+    uses_paging_template: bool,
+    period_start_iso: str,
+    period_end_iso: str,
+    limit: int,
+    last_ts: Optional[str],
+    timestamp_column: str,
+) -> str:
+    raw_template = str(template or "").strip()
+    safe_limit = max(int(limit), 1)
+    effective_start_iso = str(last_ts or period_start_iso)
+    if raw_template:
+        try:
+            rendered = _build_query_for_template(
+                template=raw_template,
+                uses_template=bool(uses_template),
+                uses_paging_template=bool(uses_paging_template),
+                period_start_iso=effective_start_iso,
+                period_end_iso=period_end_iso,
+                limit=safe_limit,
+                offset=0,
+                last_ts=effective_start_iso,
+                timestamp_column=timestamp_column,
+            )
+            rendered = re.sub(r"(?is)\s+OFFSET\s+\d+\b", "", rendered).strip()
+            return rendered
+        except Exception:
+            return raw_template
+
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    safe_start = _escape_sql_literal(effective_start_iso)
+    safe_end = _escape_sql_literal(period_end_iso)
+    start_operator = ">" if last_ts else ">="
+    return (
+        f"SELECT {ts_col}, level, message, service, pod, container, node, cluster "
+        "FROM logs_demo_service "
+        f"WHERE {ts_col} {start_operator} parseDateTimeBestEffort('{safe_start}') "
+        f"AND {ts_col} < parseDateTimeBestEffort('{safe_end}') "
+        f"ORDER BY {ts_col} ASC LIMIT {safe_limit}"
+    )
+
+
+def _select_demo_rows_by_time_cursor(
+    *,
+    rows: List[Dict[str, Any]],
+    period_start_iso: str,
+    period_end_iso: str,
+    limit: int,
+    last_ts: Optional[str],
+    timestamp_column: str,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    safe_limit = max(int(limit), 1)
+    start_ts = _to_msk_ts(period_start_iso)
+    end_ts = _to_msk_ts(period_end_iso)
+    cursor_ts = _to_msk_ts(last_ts) if str(last_ts or "").strip() else pd.NaT
+    use_cursor = not pd.isna(cursor_ts)
+
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return [], last_ts
+
+    indexed: List[tuple[pd.Timestamp, Dict[str, Any]]] = []
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ts_raw = row.get(ts_col)
+        ts_val = _to_msk_ts(ts_raw)
+        if pd.isna(ts_val):
+            continue
+        if ts_val < start_ts or ts_val >= end_ts:
+            continue
+        if use_cursor and ts_val <= cursor_ts:
+            continue
+        indexed.append((ts_val, row))
+
+    indexed.sort(key=lambda item: item[0])
+    page = [dict(item[1]) for item in indexed[:safe_limit]]
+    if not page:
+        return [], last_ts
+    new_cursor = indexed[min(len(indexed), safe_limit) - 1][0].isoformat()
+    return page, new_cursor
 
 
 def _split_demo_logs_by_source(
@@ -2107,6 +2326,56 @@ def _load_recent_batches_from_jsonl(
     if unlimited:
         return all_items
     return list(recent)
+
+
+def _restore_map_batches_from_live_jsonl(state: Dict[str, Any]) -> None:
+    live_path = str(state.get("live_batches_path") or "").strip()
+    if not live_path:
+        return
+    loaded = _load_recent_batches_from_jsonl(live_path, max_items=0)
+    if not loaded:
+        return
+
+    existing = state.get("map_batches")
+    if not isinstance(existing, list) or not existing:
+        state["map_batches"] = loaded
+    else:
+        merged: Dict[int, Dict[str, Any]] = {}
+        for item in existing:
+            if not isinstance(item, dict):
+                continue
+            idx = _safe_int(item.get("batch_index"), -1)
+            if idx < 0:
+                continue
+            merged[idx] = dict(item)
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            idx = _safe_int(item.get("batch_index"), -1)
+            if idx < 0:
+                continue
+            current = merged.get(idx, {})
+            candidate = dict(item)
+            # Prefer richer payload from JSONL if it has more logs / queries.
+            current_logs = current.get("batch_logs") if isinstance(current.get("batch_logs"), list) else []
+            candidate_logs = candidate.get("batch_logs") if isinstance(candidate.get("batch_logs"), list) else []
+            current_queries = current.get("batch_queries") if isinstance(current.get("batch_queries"), list) else []
+            candidate_queries = candidate.get("batch_queries") if isinstance(candidate.get("batch_queries"), list) else []
+            if len(candidate_logs) >= len(current_logs) and len(candidate_queries) >= len(current_queries):
+                current.update(candidate)
+            else:
+                for key, value in candidate.items():
+                    if key not in current or current.get(key) in (None, "", [], {}):
+                        current[key] = value
+            merged[idx] = current
+        state["map_batches"] = [merged[idx] for idx in sorted(merged.keys())]
+
+    map_batches = state.get("map_batches")
+    if isinstance(map_batches, list) and map_batches:
+        done = max((_safe_int(item.get("batch_index"), -1) for item in map_batches), default=-1) + 1
+        if done > 0:
+            state["map_batches_done_total"] = max(_safe_int(state.get("map_batches_done_total"), 0), done)
+            state["map_batches_total"] = max(_safe_int(state.get("map_batches_total"), 0), done)
 
 
 def _extract_last_batch_ts_from_run_dir(run_dir: Path) -> str:
@@ -4386,6 +4655,7 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
     status = str(state.get("status", ""))
     if status not in ("done", "error"):
         return
+    _restore_map_batches_from_live_jsonl(state)
 
     with container.container():
         st.markdown("2. Итоговый Отчет")
@@ -4726,6 +4996,8 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
             if not map_batches:
                 st.info("MAP-батчи пока недоступны.")
             for item in map_batches:
+                if not isinstance(item, dict):
+                    continue
                 batch_idx = _safe_int(item.get("batch_index"), 0) + 1
                 total = _safe_int(item.get("batch_total"), batch_total)
                 payload = _summary_payload_from_batch(item)
@@ -5695,6 +5967,7 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
         st.markdown("1. Pipeline")
         if not state:
             return
+        _restore_map_batches_from_live_jsonl(state)
 
         map_batches = state.get("map_batches")
         if not isinstance(map_batches, list):
@@ -5866,7 +6139,10 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if not batch_plan and map_batches:
                     # fallback plan from already processed map batches
                     for item in map_batches:
+                        if not isinstance(item, dict):
+                            continue
                         logs_count = _safe_int(item.get("batch_logs_count"), 0)
+                        batch_queries = _batch_queries_from_batch(item)
                         batch_plan.append(
                             {
                                 "batch_id": _safe_int(item.get("batch_index"), 0) + 1,
@@ -5874,6 +6150,12 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                 "rows": logs_count,
                                 "tokens": "disabled",
                                 "status": "Готов",
+                                "sql_queries_count": len(batch_queries),
+                                "sql_queries": (
+                                    "\n\n-- QUERY --\n\n".join(batch_queries)
+                                    if batch_queries
+                                    else ""
+                                ),
                             }
                         )
                 if batch_plan:
@@ -5899,6 +6181,8 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                 if not map_batches:
                     st.info("Map-батчи ещё не обработаны.")
                 for item in map_batches:
+                    if not isinstance(item, dict):
+                        continue
                     batch_idx = _safe_int(item.get("batch_index"), 0) + 1
                     total = _safe_int(item.get("batch_total"), batch_total)
                     payload = _summary_payload_from_batch(item)
@@ -6137,37 +6421,6 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     st.caption("Это текущий активный этап пайплайна.")
                 _render_stage_details(idx)
 
-        # Compact runtime metrics for observability.
-        stats = state.get("stats") or {}
-        with st.expander("Метрики Pipeline", expanded=False):
-            elapsed_human = str(stats.get("logs_processing_human") or "")
-            elapsed_seconds = _safe_float(stats.get("logs_processing_seconds"), 0.0)
-            llm_calls = _safe_int(stats.get("llm_calls"), 0)
-            reduce_rounds = _safe_int(stats.get("reduce_rounds"), 0)
-            retries_total = _safe_int(state.get("llm_calls_failed"), 0)
-            degraded_batches = 0
-            empty_batches = 0
-            for item in map_batches:
-                payload = _summary_payload_from_batch(item)
-                dq = payload.get("data_quality") if isinstance(payload, dict) else {}
-                notes = str((dq or {}).get("notes") or "").lower()
-                if "validation error" in notes or "raw llm map summary" in notes:
-                    degraded_batches += 1
-                if bool((dq or {}).get("is_empty", False)):
-                    empty_batches += 1
-            st.markdown(
-                "\n".join(
-                    [
-                        f"- Общее время: `{elapsed_human or _format_eta_seconds(elapsed_seconds)}`",
-                        f"- LLM-вызовов: `{llm_calls}`",
-                        f"- Retry: `{retries_total}`",
-                        f"- Reduce раундов: `{reduce_rounds}`",
-                        f"- Degraded батчей: `{degraded_batches}`",
-                        f"- Пустых батчей: `{empty_batches}`",
-                        f"- Split на reduce: `{_safe_int(state.get('reduce_split_count'), 0)}`",
-                    ]
-                )
-            )
         if state.get("error"):
             st.error(f"Ошибка выполнения: {state['error']}")
 
@@ -6273,9 +6526,9 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
 
     default_query = (deps.default_sql_query or "").strip() or (
         "SELECT timestamp, level, message FROM logs_demo_service "
-        "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+        "WHERE timestamp > parseDateTimeBestEffort('{last_ts}') "
         "AND timestamp < parseDateTimeBestEffort('{period_end}') "
-        "ORDER BY timestamp DESC LIMIT {limit} OFFSET {offset}"
+        "ORDER BY timestamp DESC LIMIT {limit}"
     )
 
     now_msk = datetime.now(MSK).replace(microsecond=0)
@@ -6648,15 +6901,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     height=max(int(deps.sql_textarea_height), 180),
                     placeholder=(
                         "SELECT timestamp, message FROM logs_table\n"
-                        "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
+                        "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
                         "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
                         "ORDER BY timestamp\n"
-                        "LIMIT {limit} OFFSET {offset}"
+                        "LIMIT {limit}"
                     ),
                     help=(
                         "Поддерживаются плейсхолдеры: "
-                        "{period_start}, {period_end}, {start}, {end}, {limit}, {offset}. "
-                        "Для keyset-пейджинга (без OFFSET) используйте {last_ts} вместо {offset}: "
+                        "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
+                        "Рекомендуемый формат без OFFSET: "
                         "WHERE timestamp > '{last_ts}' AND timestamp < '{period_end}' ORDER BY timestamp LIMIT {limit}"
                     ),
                     disabled=is_running,
@@ -7288,6 +7541,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     )
     demo_mode = bool(active_params.get("demo_mode", demo_mode))
     demo_logs_count = int(active_params.get("demo_logs_count", demo_logs_count))
+    llm_env_configured = _has_llm_credentials_configured()
+    demo_llm_stub_mode = bool(demo_mode and not llm_env_configured)
+    if demo_llm_stub_mode:
+        use_instructor = False
+        model_supports_tool_calling = False
+        enable_final_instructor_report = False
     resume_mode = str(active_params.get("resume_mode", "new")).strip().lower()
     resume_session_dir = str(active_params.get("resume_session_dir", "")).strip()
     resume_from_ts = str(active_params.get("resume_from_ts", "")).strip()
@@ -7490,6 +7749,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         initial_events.append(
             f"Старт: режим выборки логов по количеству (demo synthetic, rows={demo_logs_count})."
         )
+        if demo_llm_stub_mode:
+            initial_events.append(
+                "Демо-режим: OPENAI_API_BASE_DB / OPENAI_API_KEY_DB не заданы, "
+                "используется встроенный LLM-stub."
+            )
     elif logs_fetch_mode == "tail_n_logs":
         initial_events.append(
             f"Старт: режим выборки логов по количеству (tail_n_logs, limit={deps.logs_tail_limit})."
@@ -8095,21 +8359,46 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             limit: int,
             offset: int,
         ) -> List[Dict[str, Any]]:
-            if demo_mode:
-                rows = demo_logs[offset : offset + max(int(limit), 1)]
-                records = [dict(row) for row in rows]
-                for row in records:
-                    row["__cp_db_query"] = "-- demo mode --"
-                    row["__cp_query_label"] = "demo_query"
-                return records
-
             safe_limit = max(int(limit), 1)
             safe_offset = max(int(offset), 0)
+            if demo_mode:
+                spec = query_specs[0] if query_specs else {
+                    "template": "",
+                    "uses_template": False,
+                    "uses_paging_template": False,
+                    "label": "query_1",
+                }
+                cursor_before = _single_query_last_ts[0]
+                rows, next_cursor = _select_demo_rows_by_time_cursor(
+                    rows=demo_logs,
+                    period_start_iso=period_start,
+                    period_end_iso=period_end,
+                    limit=safe_limit,
+                    last_ts=cursor_before,
+                    timestamp_column=logs_timestamp_column,
+                )
+                if next_cursor:
+                    _single_query_last_ts[0] = next_cursor
+                demo_query = _render_demo_query_text(
+                    template=str(spec.get("template") or ""),
+                    uses_template=bool(spec.get("uses_template")),
+                    uses_paging_template=bool(spec.get("uses_paging_template")),
+                    period_start_iso=period_start,
+                    period_end_iso=period_end,
+                    limit=safe_limit,
+                    last_ts=cursor_before,
+                    timestamp_column=logs_timestamp_column,
+                )
+                records = [dict(row) for row in rows]
+                for row in records:
+                    row["__cp_db_query"] = demo_query
+                    row["__cp_query_label"] = str(spec.get("label", "query_1"))
+                return records
 
             if not multi_query_mode:
                 spec = query_specs[0]
                 template = str(spec["template"])
-                uses_keyset = "{last_ts}" in template.lower()
+                uses_keyset = True
                 query = _build_query_for_template(
                     template=template,
                     uses_template=bool(spec["uses_template"]),
@@ -8120,6 +8409,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     offset=safe_offset,
                     last_ts=_single_query_last_ts[0],  # None → period_start on first page
                     timestamp_column=logs_timestamp_column,
+                    prefer_keyset=True,
                 )
                 try:
                     df = deps.query_logs_df(query)
@@ -8133,12 +8423,20 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         _register_query_error(
                             f"Запрос #1 page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
                         )
-                    deps.logger.warning(
-                        "logs_summary_page.query_failed[single]: offset=%s limit=%s err=%s",
-                        safe_offset,
-                        safe_limit,
-                        exc,
-                    )
+                    if uses_keyset:
+                        deps.logger.warning(
+                            "logs_summary_page.query_failed[single]: last_ts=%s limit=%s err=%s",
+                            _single_query_last_ts[0],
+                            safe_limit,
+                            exc,
+                        )
+                    else:
+                        deps.logger.warning(
+                            "logs_summary_page.query_failed[single]: offset=%s limit=%s err=%s",
+                            safe_offset,
+                            safe_limit,
+                            exc,
+                        )
                     return []
                 if df.empty:
                     return []
@@ -8266,6 +8564,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         _safe_int(state.get("map_batches_total"), 0),
                         source_batch_offset + total_int,
                     )
+                batch_queries = payload.get("batch_queries", [])
+                if not isinstance(batch_queries, list):
+                    batch_queries = []
+                normalized_batch_queries: List[str] = []
+                for raw_query in batch_queries:
+                    query_text = str(raw_query or "").strip()
+                    if query_text and query_text not in normalized_batch_queries:
+                        normalized_batch_queries.append(query_text)
                 retries_label = "∞" if int(max_retries) < 0 else str(max_retries)
                 state["active_step"] = (
                     f"LLM анализирует MAP-batch {idx}/{total}"
@@ -8280,6 +8586,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "tokens": "disabled",
                         "status": "В Работе",
                         "reason": str(payload.get("split_reason") or ""),
+                        "sql_queries_count": len(normalized_batch_queries),
+                        "sql_queries": (
+                            "\n\n-- QUERY --\n\n".join(normalized_batch_queries)
+                            if normalized_batch_queries
+                            else ""
+                        ),
                     }
                     existing_idx = next(
                         (
@@ -8472,6 +8784,12 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "tokens": "disabled",
                         "status": "Готов",
                         "reason": str(payload.get("split_reason") or ""),
+                        "sql_queries_count": len(normalized_batch_queries),
+                        "sql_queries": (
+                            "\n\n-- QUERY --\n\n".join(normalized_batch_queries)
+                            if normalized_batch_queries
+                            else ""
+                        ),
                     }
                     existing_idx = next(
                         (
@@ -8802,13 +9120,19 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             except Exception:
                 pass
 
-        base_llm_call = deps.make_llm_call(
-            max_retries=max_retries,
-            on_retry=_on_retry,
-            on_attempt=_on_llm_attempt,
-            on_result=_on_llm_result,
-            llm_timeout=llm_timeout,
-        )
+        if demo_llm_stub_mode:
+            deps.logger.warning(
+                "Demo mode LLM fallback enabled: OPENAI_API_BASE_DB / OPENAI_API_KEY_DB are not configured."
+            )
+            base_llm_call = _make_demo_llm_stub_call()
+        else:
+            base_llm_call = deps.make_llm_call(
+                max_retries=max_retries,
+                on_retry=_on_retry,
+                on_attempt=_on_llm_attempt,
+                on_result=_on_llm_result,
+                llm_timeout=llm_timeout,
+            )
         llm_call_counter = {"value": 0}
 
         def _trace_llm_call(
@@ -8907,14 +9231,17 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             final_stage_timeout,
             final_stage_max_retries,
         )
-        final_stage_base_llm_call = deps.make_llm_call(
-            max_retries=final_stage_max_retries,
-            on_retry=_on_retry,
-            on_attempt=_on_llm_attempt,
-            on_result=_on_llm_result,
-            llm_timeout=final_stage_timeout,
-            fail_open_return_empty=True,
-        )
+        if demo_llm_stub_mode:
+            final_stage_base_llm_call = _make_demo_llm_stub_call()
+        else:
+            final_stage_base_llm_call = deps.make_llm_call(
+                max_retries=final_stage_max_retries,
+                on_retry=_on_retry,
+                on_attempt=_on_llm_attempt,
+                on_result=_on_llm_result,
+                llm_timeout=final_stage_timeout,
+                fail_open_return_empty=True,
+            )
 
         def _final_stage_llm_call_with_context(prompt: str) -> str:
             enriched_prompt = f"{context_prefix}\n\n{prompt}" if context_prefix else prompt
@@ -9012,7 +9339,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 """Create an independent paged-fetch closure for a single query spec."""
                 _last_ts: List[Optional[str]] = [None]
                 _tmpl = str(spec["template"])
-                _uses_keyset = "{last_ts}" in _tmpl.lower()
+                _uses_keyset = True
                 _uses_tpl = bool(spec["uses_template"])
                 _uses_paging_tpl = bool(spec["uses_paging_template"])
 
@@ -9028,12 +9355,29 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     safe_offset = max(int(offset), 0)
                     if demo_mode:
                         source_rows = demo_logs_by_source.get(label, [])
-                        records = [
-                            dict(row)
-                            for row in source_rows[safe_offset : safe_offset + safe_limit]
-                        ]
+                        cursor_before = _last_ts[0]
+                        records, next_cursor = _select_demo_rows_by_time_cursor(
+                            rows=source_rows,
+                            period_start_iso=period_start,
+                            period_end_iso=period_end,
+                            limit=safe_limit,
+                            last_ts=cursor_before,
+                            timestamp_column=logs_timestamp_column,
+                        )
+                        if next_cursor:
+                            _last_ts[0] = next_cursor
+                        demo_query = _render_demo_query_text(
+                            template=_tmpl,
+                            uses_template=_uses_tpl,
+                            uses_paging_template=_uses_paging_tpl,
+                            period_start_iso=period_start,
+                            period_end_iso=period_end,
+                            limit=safe_limit,
+                            last_ts=cursor_before,
+                            timestamp_column=logs_timestamp_column,
+                        )
                         for row in records:
-                            row["__cp_db_query"] = "-- demo mode --"
+                            row["__cp_db_query"] = demo_query
                             row["__cp_query_label"] = label
                         return records
 
@@ -9047,6 +9391,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         offset=safe_offset,
                         last_ts=_last_ts[0],
                         timestamp_column=logs_timestamp_column,
+                        prefer_keyset=True,
                     )
                     try:
                         df = deps.query_logs_df(query)
@@ -9059,10 +9404,22 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             _register_query_error(
                                 f"{label} page(offset={safe_offset}, limit={safe_limit}) упал: {exc}"
                             )
-                        deps.logger.warning(
-                            "logs_summary_page.per_source_fetch_failed[%s]: offset=%s limit=%s err=%s",
-                            label, safe_offset, safe_limit, exc,
-                        )
+                        if _uses_keyset:
+                            deps.logger.warning(
+                                "logs_summary_page.per_source_fetch_failed[%s]: last_ts=%s limit=%s err=%s",
+                                label,
+                                _last_ts[0],
+                                safe_limit,
+                                exc,
+                            )
+                        else:
+                            deps.logger.warning(
+                                "logs_summary_page.per_source_fetch_failed[%s]: offset=%s limit=%s err=%s",
+                                label,
+                                safe_offset,
+                                safe_limit,
+                                exc,
+                            )
                         return []
                     if df is None or df.empty:
                         return []
