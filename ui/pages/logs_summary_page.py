@@ -1025,7 +1025,7 @@ class _StreamingLogsMerger:
             _StreamingQueryCursor(query_index=idx, spec=spec)
             for idx, spec in enumerate(query_specs)
         ]
-        self._heap: List[tuple[int, int, int, Dict[str, Any]]] = []
+        self._heap: List[tuple[int, int, int, int, Dict[str, Any]]] = []
         self._started = False
         self._period_key: Optional[tuple[str, str]] = None
         self._global_emitted = 0
@@ -1057,9 +1057,10 @@ class _StreamingLogsMerger:
         template = str(cursor.spec["template"])
         uses_keyset = True
 
-        # In rare cases page can contain only bad timestamps after normalization.
-        # Continue fetching until we get at least one valid row or source is exhausted.
+        # In rare cases keyset cursor can stop progressing because timestamps are malformed.
+        # We still keep rows, but stop paging further to avoid infinite loops.
         for _ in range(20):
+            prev_last_ts = cursor.last_ts
             query = _build_query_for_template(
                 template=template,
                 uses_template=bool(cursor.spec["uses_template"]),
@@ -1120,16 +1121,39 @@ class _StreamingLogsMerger:
             sorted_df = _sort_df_by_timestamp(df, timestamp_column=self._timestamp_column)
             if not sorted_df.empty:
                 # Advance keyset cursor to last timestamp in the fetched page
+                max_ts = pd.NaT
                 if uses_keyset and self._timestamp_column in sorted_df.columns:
                     max_ts = sorted_df[self._timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         cursor.last_ts = max_ts.isoformat()
                 page_records = [dict(row) for row in sorted_df.to_dict(orient="records")]
+                valid_rows = int(raw_rows)
+                if self._timestamp_column in df.columns:
+                    valid_rows = int(df[self._timestamp_column].apply(_to_msk_ts).notna().sum())
+                if uses_keyset:
+                    prev_cursor_ts = _to_msk_ts(prev_last_ts) if prev_last_ts else pd.NaT
+                    progressed = not pd.isna(max_ts) and (pd.isna(prev_cursor_ts) or bool(max_ts > prev_cursor_ts))
+                    if not progressed:
+                        cursor.has_more = False
+                        self._logger.warning(
+                            "logs_summary_page.keyset_cursor_stalled[stream:%s]: last_ts=%s raw_rows=%s",
+                            cursor.query_index + 1,
+                            prev_last_ts,
+                            raw_rows,
+                        )
+                        self._register_query_error(
+                            f"Запрос #{cursor.query_index + 1} остановлен: курсор last_ts не продвинулся "
+                            f"(last_ts={prev_last_ts}, raw_rows={raw_rows})"
+                        )
                 for row in page_records:
                     row["__cp_db_query"] = query
                     row["__cp_query_label"] = str(
                         cursor.spec.get("label", f"query_{cursor.query_index + 1}")
                     )
+                    row["__cp_query_page_rows"] = raw_rows
+                    row["__cp_query_page_rows_raw"] = raw_rows
+                    row["__cp_query_page_rows_valid"] = valid_rows
+                    row["__cp_query_page_rows_dropped_ts"] = max(raw_rows - valid_rows, 0)
                 cursor.page_records = page_records
                 cursor.page_pos = 0
                 return True
@@ -1168,13 +1192,13 @@ class _StreamingLogsMerger:
 
             row = cursor.page_records[cursor.page_pos]
             cursor.page_pos += 1
-            ts = _to_msk_ts(row.get(self._timestamp_column))
-            if pd.isna(ts):
-                continue
             cursor.row_seq += 1
+            ts = _to_msk_ts(row.get(self._timestamp_column))
+            missing_ts = 1 if pd.isna(ts) else 0
+            sort_key = cursor.row_seq if missing_ts else int(ts.value)
             heapq.heappush(
                 self._heap,
-                (int(ts.value), cursor.query_index, cursor.row_seq, row),
+                (missing_ts, sort_key, cursor.query_index, cursor.row_seq, row),
             )
             return
 
@@ -1227,7 +1251,7 @@ class _StreamingLogsMerger:
                         fetch_limit=safe_limit,
                     )
             while self._global_emitted < safe_offset and self._heap:
-                _, cursor_idx, _, _ = heapq.heappop(self._heap)
+                _, _, cursor_idx, _, _ = heapq.heappop(self._heap)
                 self._global_emitted += 1
                 self._push_next_row(
                     self._cursors[cursor_idx],
@@ -1241,7 +1265,7 @@ class _StreamingLogsMerger:
         multi_source = len(self._cursors) > 1
         out: List[Dict[str, Any]] = []
         while len(out) < safe_limit and self._heap:
-            _, cursor_idx, _, row = heapq.heappop(self._heap)
+            _, _, cursor_idx, _, row = heapq.heappop(self._heap)
             row_out = dict(row)
             if multi_source:
                 row_out["_source"] = str(self._cursors[cursor_idx].spec.get("label", f"query_{cursor_idx + 1}"))
@@ -1607,7 +1631,9 @@ def _sort_df_by_timestamp(df: pd.DataFrame, *, timestamp_column: str = "timestam
         return df
     out = df.copy()
     out["__cp_ts"] = out[ts_col].apply(_to_msk_ts)
-    out = out.dropna(subset=["__cp_ts"]).sort_values("__cp_ts", kind="mergesort")
+    # Keep all rows (including unparsable timestamps) and push unparsable ones to the end.
+    # `mergesort` preserves relative order for equal keys / NaT blocks.
+    out = out.sort_values("__cp_ts", kind="mergesort", na_position="last")
     return out.drop(columns=["__cp_ts"]).reset_index(drop=True)
 
 
@@ -3828,6 +3854,34 @@ def _batch_queries_from_batch(batch: Dict[str, Any]) -> List[str]:
     return queries
 
 
+def _batch_query_page_rows_from_logs(batch_logs: Any) -> int:
+    if not isinstance(batch_logs, list):
+        return 0
+    page_rows = 0
+    for row in batch_logs:
+        if not isinstance(row, dict):
+            continue
+        raw_rows = _safe_int(row.get("__cp_query_page_rows_raw"), 0)
+        if raw_rows <= 0:
+            raw_rows = _safe_int(row.get("__cp_query_page_rows"), 0)
+        page_rows = max(page_rows, raw_rows)
+    return page_rows
+
+
+def _batch_valid_rows_from_logs(batch_logs: Any) -> int:
+    if not isinstance(batch_logs, list):
+        return 0
+    valid_rows = 0
+    for row in batch_logs:
+        if not isinstance(row, dict):
+            continue
+        valid = _safe_int(row.get("__cp_query_page_rows_valid"), 0)
+        if valid <= 0:
+            valid = _safe_int(row.get("__cp_query_page_rows"), 0)
+        valid_rows = max(valid_rows, valid)
+    return valid_rows
+
+
 def _get_report_sections_map(state: Dict[str, Any]) -> Dict[str, str]:
     sections_map: Dict[str, str] = {}
     raw_sections = state.get("structured_sections")
@@ -5108,6 +5162,18 @@ def _render_final_report(container, state: Dict[str, Any], deps: LogsSummaryPage
                                 )
                                 logs_df = logs_df[preferred_cols]
                             st.caption(f"Логов в батче: {len(logs_df.index)}")
+                            query_page_rows = _safe_int(item.get("query_page_rows"), 0)
+                            if query_page_rows <= 0:
+                                query_page_rows = _batch_query_page_rows_from_logs(batch_logs)
+                            valid_page_rows = _batch_valid_rows_from_logs(batch_logs)
+                            if valid_page_rows <= 0:
+                                valid_page_rows = int(len(logs_df.index))
+                            if query_page_rows > 0:
+                                st.caption(
+                                    "SQL вернул строк в странице: "
+                                    f"{query_page_rows}; валидных timestamp: {valid_page_rows}; "
+                                    f"в этот MAP-батч ушло {len(logs_df.index)}"
+                                )
                             st.dataframe(
                                 _format_table_timestamps(logs_df),
                                 use_container_width=True,
@@ -6143,11 +6209,14 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                             continue
                         logs_count = _safe_int(item.get("batch_logs_count"), 0)
                         batch_queries = _batch_queries_from_batch(item)
+                        batch_logs = item.get("batch_logs")
+                        query_page_rows = _batch_query_page_rows_from_logs(batch_logs)
                         batch_plan.append(
                             {
                                 "batch_id": _safe_int(item.get("batch_index"), 0) + 1,
                                 "period": f"{item.get('batch_period_start')} -> {item.get('batch_period_end')}",
                                 "rows": logs_count,
+                                "query_page_rows": query_page_rows if query_page_rows > 0 else "",
                                 "tokens": "disabled",
                                 "status": "Готов",
                                 "sql_queries_count": len(batch_queries),
@@ -6212,6 +6281,15 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                     duration_sec = _safe_float(item.get("processing_seconds"), float("nan"))
                     if not pd.isna(duration_sec) and duration_sec > 0:
                         summary_line += f" | {duration_sec:.1f}s"
+                    query_page_rows = _safe_int(item.get("query_page_rows"), 0)
+                    if query_page_rows <= 0:
+                        query_page_rows = _batch_query_page_rows_from_logs(item.get("batch_logs"))
+                    valid_page_rows = _batch_valid_rows_from_logs(item.get("batch_logs"))
+                    if query_page_rows > 0:
+                        if valid_page_rows > 0 and valid_page_rows != query_page_rows:
+                            summary_line += f" | SQL-страница: {query_page_rows} (валидных timestamp: {valid_page_rows})"
+                        else:
+                            summary_line += f" | SQL-страница: {query_page_rows}"
                     summary_line += f" | {status_text}"
                     with st.expander(summary_line, expanded=False):
                         has_structured_payload = isinstance(payload, dict) and bool(payload)
@@ -6295,6 +6373,18 @@ def _render_logs_summary_chat(container, state: Dict[str, Any], deps: LogsSummar
                                     )
                                     logs_df = logs_df[preferred_cols]
                                 st.caption(f"Логов в батче: {len(logs_df.index)}")
+                                query_page_rows = _safe_int(item.get("query_page_rows"), 0)
+                                if query_page_rows <= 0:
+                                    query_page_rows = _batch_query_page_rows_from_logs(batch_logs)
+                                valid_page_rows = _batch_valid_rows_from_logs(batch_logs)
+                                if valid_page_rows <= 0:
+                                    valid_page_rows = int(len(logs_df.index))
+                                if query_page_rows > 0:
+                                    st.caption(
+                                        "SQL вернул строк в странице: "
+                                        f"{query_page_rows}; валидных timestamp: {valid_page_rows}; "
+                                        f"в этот MAP-батч ушло {len(logs_df.index)}"
+                                    )
                                 st.dataframe(
                                     _format_table_timestamps(logs_df),
                                     use_container_width=True,
@@ -8412,15 +8502,21 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     timestamp_column=logs_timestamp_column,
                 )
                 records = [dict(row) for row in rows]
+                raw_rows = int(len(records))
                 for row in records:
                     row["__cp_db_query"] = demo_query
                     row["__cp_query_label"] = str(spec.get("label", "query_1"))
+                    row["__cp_query_page_rows"] = raw_rows
+                    row["__cp_query_page_rows_raw"] = raw_rows
+                    row["__cp_query_page_rows_valid"] = raw_rows
+                    row["__cp_query_page_rows_dropped_ts"] = 0
                 return records
 
             if not multi_query_mode:
                 spec = query_specs[0]
                 template = str(spec["template"])
                 uses_keyset = True
+                cursor_before = _single_query_last_ts[0]
                 query = _build_query_for_template(
                     template=template,
                     uses_template=bool(spec["uses_template"]),
@@ -8462,16 +8558,39 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     return []
                 if df.empty:
                     return []
+                raw_rows = int(len(df))
                 df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
                 # Advance keyset cursor so the next call fetches the next page
+                max_ts = pd.NaT
                 if uses_keyset and logs_timestamp_column in df.columns:
                     max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                     if not pd.isna(max_ts):
                         _single_query_last_ts[0] = max_ts.isoformat()
                 records = [dict(row) for row in df.to_dict(orient="records")]
+                valid_rows = int(raw_rows)
+                if logs_timestamp_column in df.columns:
+                    valid_rows = int(df[logs_timestamp_column].apply(_to_msk_ts).notna().sum())
+                if uses_keyset:
+                    prev_cursor_ts = _to_msk_ts(cursor_before) if cursor_before else pd.NaT
+                    progressed = not pd.isna(max_ts) and (pd.isna(prev_cursor_ts) or bool(max_ts > prev_cursor_ts))
+                    if not progressed:
+                        _register_query_error(
+                            f"Запрос #1 остановлен: курсор last_ts не продвинулся "
+                            f"(last_ts={cursor_before}, raw_rows={raw_rows})"
+                        )
+                        deps.logger.warning(
+                            "logs_summary_page.keyset_cursor_stalled[single]: last_ts=%s raw_rows=%s",
+                            cursor_before,
+                            raw_rows,
+                        )
+                        _single_query_last_ts[0] = period_end
                 for row in records:
                     row["__cp_db_query"] = query
                     row["__cp_query_label"] = str(spec.get("label", "query_1"))
+                    row["__cp_query_page_rows"] = raw_rows
+                    row["__cp_query_page_rows_raw"] = raw_rows
+                    row["__cp_query_page_rows_valid"] = valid_rows
+                    row["__cp_query_page_rows_dropped_ts"] = max(raw_rows - valid_rows, 0)
                 return records
 
             # Multi-query mode:
@@ -8605,6 +8724,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_id": idx,
                         "period": f"{payload.get('batch_period_start')} -> {payload.get('batch_period_end')}",
                         "rows": _safe_int(payload.get("batch_logs_count"), 0),
+                        "query_page_rows": "",
                         "tokens": "disabled",
                         "status": "В Работе",
                         "reason": str(payload.get("split_reason") or ""),
@@ -8783,12 +8903,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     )
 
                 preview_logs = full_logs
+                query_page_rows = _batch_query_page_rows_from_logs(preview_logs)
                 batch_item = {
                     "batch_index": global_batch_index_zero,
                     "batch_total": payload.get("batch_total"),
                     "batch_index_local": local_batch_index,
                     "batch_summary": payload.get("batch_summary"),
                     "batch_logs_count": payload.get("batch_logs_count"),
+                    "query_page_rows": query_page_rows,
                     "batch_period_start": payload.get("batch_period_start"),
                     "batch_period_end": payload.get("batch_period_end"),
                     "batch_logs": preview_logs,
@@ -8803,6 +8925,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         "batch_id": global_batch_index_one,
                         "period": f"{payload.get('batch_period_start')} -> {payload.get('batch_period_end')}",
                         "rows": _safe_int(payload.get("batch_logs_count"), len(full_logs)),
+                        "query_page_rows": query_page_rows if query_page_rows > 0 else "",
                         "tokens": "disabled",
                         "status": "Готов",
                         "reason": str(payload.get("split_reason") or ""),
@@ -9398,9 +9521,14 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             last_ts=cursor_before,
                             timestamp_column=logs_timestamp_column,
                         )
+                        raw_rows = int(len(records))
                         for row in records:
                             row["__cp_db_query"] = demo_query
                             row["__cp_query_label"] = label
+                            row["__cp_query_page_rows"] = raw_rows
+                            row["__cp_query_page_rows_raw"] = raw_rows
+                            row["__cp_query_page_rows_valid"] = raw_rows
+                            row["__cp_query_page_rows_dropped_ts"] = 0
                         return records
 
                     query = _build_query_for_template(
@@ -9415,6 +9543,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         timestamp_column=logs_timestamp_column,
                         prefer_keyset=True,
                     )
+                    cursor_before = _last_ts[0]
                     try:
                         df = deps.query_logs_df(query)
                     except Exception as exc:  # noqa: BLE001
@@ -9445,15 +9574,39 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         return []
                     if df is None or df.empty:
                         return []
+                    raw_rows = int(len(df))
                     df = _sort_df_by_timestamp(df, timestamp_column=logs_timestamp_column)
+                    max_ts = pd.NaT
                     if _uses_keyset and logs_timestamp_column in df.columns:
                         max_ts = df[logs_timestamp_column].apply(_to_msk_ts).max()
                         if not pd.isna(max_ts):
                             _last_ts[0] = max_ts.isoformat()
                     records = [dict(row) for row in df.to_dict(orient="records")]
+                    valid_rows = int(raw_rows)
+                    if logs_timestamp_column in df.columns:
+                        valid_rows = int(df[logs_timestamp_column].apply(_to_msk_ts).notna().sum())
+                    if _uses_keyset:
+                        prev_cursor_ts = _to_msk_ts(cursor_before) if cursor_before else pd.NaT
+                        progressed = not pd.isna(max_ts) and (pd.isna(prev_cursor_ts) or bool(max_ts > prev_cursor_ts))
+                        if not progressed:
+                            _register_query_error(
+                                f"{label} остановлен: курсор last_ts не продвинулся "
+                                f"(last_ts={cursor_before}, raw_rows={raw_rows})"
+                            )
+                            deps.logger.warning(
+                                "logs_summary_page.keyset_cursor_stalled[%s]: last_ts=%s raw_rows=%s",
+                                label,
+                                cursor_before,
+                                raw_rows,
+                            )
+                            _last_ts[0] = period_end
                     for row in records:
                         row["__cp_db_query"] = query
                         row["__cp_query_label"] = label
+                        row["__cp_query_page_rows"] = raw_rows
+                        row["__cp_query_page_rows_raw"] = raw_rows
+                        row["__cp_query_page_rows_valid"] = valid_rows
+                        row["__cp_query_page_rows_dropped_ts"] = max(raw_rows - valid_rows, 0)
                     return records
 
                 return _fetch

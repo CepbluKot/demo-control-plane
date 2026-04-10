@@ -32,6 +32,8 @@ from ui.pages.logs_summary_page import (
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
     _build_query_for_template,
+    _batch_valid_rows_from_logs,
+    _batch_query_page_rows_from_logs,
     _batch_queries_from_batch,
     _default_alert_time_values,
     _build_sectional_freeform_prompt,
@@ -54,6 +56,7 @@ from ui.pages.logs_summary_page import (
     _render_alerts_context,
     _render_demo_query_text,
     _restore_map_batches_from_live_jsonl,
+    _sort_df_by_timestamp,
     _state_from_imported_result,
     _summary_origin_label,
     _write_json_file,
@@ -354,6 +357,36 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         grouped = _split_demo_logs_by_source(demo_logs, ["query_1"])
         self.assertEqual(list(grouped.keys()), ["query_1"])
         self.assertEqual([row["message"] for row in grouped["query_1"]], ["m1", "m2"])
+
+    def test_batch_query_page_rows_from_logs_reads_max_marker(self) -> None:
+        rows = [
+            {"timestamp": "2026-03-18T00:00:00Z", "__cp_query_page_rows": 73},
+            {"timestamp": "2026-03-18T00:00:01Z", "__cp_query_page_rows": 56},
+            {"timestamp": "2026-03-18T00:00:02Z"},
+        ]
+        self.assertEqual(_batch_query_page_rows_from_logs(rows), 73)
+
+    def test_batch_query_page_rows_from_logs_handles_bad_input(self) -> None:
+        self.assertEqual(_batch_query_page_rows_from_logs(None), 0)
+        self.assertEqual(_batch_query_page_rows_from_logs([{"a": 1}, "bad"]), 0)
+
+    def test_batch_valid_rows_from_logs_prefers_valid_marker(self) -> None:
+        rows = [
+            {"timestamp": "2026-03-18T00:00:00Z", "__cp_query_page_rows_valid": 56},
+            {"timestamp": "2026-03-18T00:00:01Z", "__cp_query_page_rows_valid": 41},
+        ]
+        self.assertEqual(_batch_valid_rows_from_logs(rows), 56)
+
+    def test_sort_df_by_timestamp_keeps_unparsable_rows(self) -> None:
+        df = pd.DataFrame(
+            [
+                {"timestamp": "2026-03-18T00:00:01Z", "message": "ok"},
+                {"timestamp": "not-a-timestamp", "message": "bad"},
+            ]
+        )
+        out = _sort_df_by_timestamp(df, timestamp_column="timestamp")
+        self.assertEqual(len(out.index), 2)
+        self.assertIn("bad", out["message"].tolist())
 
     def test_summary_origin_label_maps_known_and_unknown_values(self) -> None:
         self.assertEqual(
