@@ -7084,14 +7084,16 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     height=140,
                     placeholder=(
                         "SELECT timestamp, value, service FROM metrics_table\n"
-                        "WHERE timestamp >= parseDateTimeBestEffort('{period_start}')\n"
+                        "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
                         "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
                         "ORDER BY timestamp\n"
-                        "LIMIT {limit} OFFSET {offset}"
+                        "LIMIT {limit}"
                     ),
                     help=(
                         "Ожидаются колонки timestamp и числовая value "
-                        "(service опционально)."
+                        "(service опционально). Поддерживаются плейсхолдеры "
+                        "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
+                        "Рекомендуемый формат без OFFSET."
                     ),
                     disabled=is_running,
                 )
@@ -8250,7 +8252,7 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                         )
                         break
                     service_label = f"metrics_query_{idx + 1}"
-                    metrics_offset = 0
+                    metrics_last_ts: Optional[str] = None
                     max_pages = 2_000
                     for _page_idx in range(max_pages):
                         remaining_cap = MAX_METRICS_ROWS_TOTAL - total_metrics_fetched
@@ -8268,20 +8270,22 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             period_start_iso=period_start_iso,
                             period_end_iso=period_end_iso,
                             limit=page_limit,
-                            offset=metrics_offset,
+                            offset=0,
+                            last_ts=metrics_last_ts,
                             timestamp_column="timestamp",
+                            prefer_keyset=True,
                         )
                         try:
                             chunk_df = deps.query_metrics_df(metrics_query)
                         except Exception as exc:  # noqa: BLE001
                             _register_query_error(
-                                f"Metrics query #{idx + 1} page(offset={metrics_offset}, "
+                                f"Metrics query #{idx + 1} page(last_ts={metrics_last_ts}, "
                                 f"limit={page_limit}) упал: {exc}"
                             )
                             deps.logger.warning(
-                                "logs_summary_page.metrics_query_failed[%s]: offset=%s limit=%s err=%s",
+                                "logs_summary_page.metrics_query_failed[%s]: last_ts=%s limit=%s err=%s",
                                 idx + 1,
-                                metrics_offset,
+                                metrics_last_ts,
                                 page_limit,
                                 exc,
                             )
@@ -8298,14 +8302,32 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                             metrics_frames.append(normalized_chunk)
 
                         page_rows = len(chunk_df)
-                        metrics_offset += page_rows
                         total_metrics_fetched += page_rows
+                        page_max_ts = pd.NaT
+                        if "timestamp" in chunk_df.columns:
+                            page_max_ts = chunk_df["timestamp"].apply(_to_msk_ts).max()
+                        if pd.isna(page_max_ts) and not normalized_chunk.empty and "timestamp" in normalized_chunk.columns:
+                            page_max_ts = normalized_chunk["timestamp"].apply(_to_msk_ts).max()
+                        if pd.isna(page_max_ts):
+                            _register_query_error(
+                                f"Metrics query #{idx + 1} остановлен: страница без валидной `timestamp` "
+                                f"(last_ts={metrics_last_ts}, limit={page_limit})"
+                            )
+                            break
+                        prev_cursor_ts = _to_msk_ts(metrics_last_ts) if metrics_last_ts else pd.NaT
+                        if not pd.isna(prev_cursor_ts) and page_max_ts <= prev_cursor_ts:
+                            _register_query_error(
+                                f"Metrics query #{idx + 1} остановлен: курсор `last_ts` не продвигается "
+                                f"({metrics_last_ts})"
+                            )
+                            break
+                        metrics_last_ts = page_max_ts.isoformat()
                         if page_rows < page_limit:
                             break
                     else:
                         _register_query_error(
                             f"Metrics query #{idx + 1} прерван после {max_pages} страниц "
-                            f"(возможен цикл из-за нестабильного SQL-пейджинга)"
+                            f"(возможен цикл keyset-пейджинга: курсор `last_ts` не сдвигается)"
                         )
 
             if metrics_frames:
