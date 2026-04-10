@@ -1879,36 +1879,20 @@ class PeriodLogSummarizer:
         if not rows:
             return []
         _ = columns  # reserved for future split rules by column content.
-        # Updated behavior: we still do not estimate tokens locally, but we MUST
-        # honor explicit row cap per single MAP LLM call.
+        # MAP splitting is strict by number of returned DB rows only.
+        # We intentionally do not downsize by synthetic "effective rows" weights,
+        # so users can reason about batching as "up to llm_chunk_rows rows".
         max_rows_per_call = max(int(getattr(self.config, "llm_chunk_rows", 200) or 200), 1)
-        # For grouped SQL (e.g. rows with `cnt`), one DB row can represent many
-        # raw log lines. Use lightweight weighted splitting so LLM batching better
-        # matches real data volume.
-        weighted_rows = [self._map_row_weight(item) for item in rows]
-        effective_rows = sum(weighted_rows)
-        if len(rows) <= max_rows_per_call and effective_rows <= max_rows_per_call:
+        if len(rows) <= max_rows_per_call:
             return [rows]
 
         chunks: List[List[Dict[str, Any]]] = []
-        current: List[Dict[str, Any]] = []
-        current_weight = 0
-        for row, weight in zip(rows, weighted_rows):
-            # If current chunk is not empty and adding this row would exceed the cap,
-            # flush current chunk first.
-            if current and (current_weight + weight) > max_rows_per_call:
-                chunks.append(current)
-                current = []
-                current_weight = 0
-            current.append(row)
-            current_weight += max(int(weight), 1)
-        if current:
-            chunks.append(current)
+        for start in range(0, len(rows), max_rows_per_call):
+            chunks.append(rows[start : start + max_rows_per_call])
 
         logger.info(
-            "MAP split rows | db_rows=%s | effective_rows=%s | max_rows_per_call=%s | chunks=%s",
+            "MAP split rows | db_rows=%s | max_rows_per_call=%s | chunks=%s",
             len(rows),
-            effective_rows,
             max_rows_per_call,
             len(chunks),
         )
