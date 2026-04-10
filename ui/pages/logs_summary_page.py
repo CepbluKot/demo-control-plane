@@ -1714,6 +1714,23 @@ def _wrap_with_limit_offset(*, query: str, limit: int, offset: int) -> str:
     )
 
 
+def _ensure_stable_order_for_offset_paging(
+    *,
+    query: str,
+    timestamp_column: str = "timestamp",
+) -> str:
+    base = _normalize_sql_query_text(query)
+    if re.search(r"(?is)\border\s+by\b", base):
+        return base
+    ts_col = _normalize_timestamp_column_name(timestamp_column)
+    return (
+        "SELECT * FROM ("
+        f"{base}"
+        ") AS cp_ordered "
+        f"ORDER BY {ts_col} ASC"
+    )
+
+
 def _build_window_query_for_plain_sql(
     *,
     base_query: str,
@@ -1770,8 +1787,12 @@ def _build_query_for_template(
         if uses_paging_template:
             return rendered_query
         rendered_without_limit = _strip_trailing_limit_offset(rendered_query)
-        return _wrap_with_limit_offset(
+        stable_ordered_query = _ensure_stable_order_for_offset_paging(
             query=rendered_without_limit,
+            timestamp_column=timestamp_column,
+        )
+        return _wrap_with_limit_offset(
+            query=stable_ordered_query,
             limit=limit,
             offset=offset,
         )

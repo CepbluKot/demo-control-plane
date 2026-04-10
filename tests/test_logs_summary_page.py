@@ -28,6 +28,7 @@ from ui.pages.logs_summary_page import (
     _compute_report_steps_total,
     _build_freeform_summary_prompt,
     _build_causal_graph_dot,
+    _build_query_for_template,
     _default_alert_time_values,
     _build_sectional_freeform_prompt,
     _build_sectional_structured_prompt,
@@ -128,6 +129,45 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
             str(formatted.loc[0, "end_time"]),
             "2026-03-18 03:00:01.987654 MSK",
         )
+
+    def test_build_query_for_template_adds_stable_order_without_order_by(self) -> None:
+        query = _build_query_for_template(
+            template=(
+                "SELECT timestamp, message FROM logs "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}')"
+            ),
+            uses_template=True,
+            uses_paging_template=False,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            offset=200,
+            last_ts=None,
+            timestamp_column="timestamp",
+        )
+        self.assertIn("ORDER BY timestamp ASC", query)
+        self.assertIn("LIMIT 100 OFFSET 200", query)
+
+    def test_build_query_for_template_keeps_existing_order_by(self) -> None:
+        query = _build_query_for_template(
+            template=(
+                "SELECT timestamp, message FROM logs "
+                "WHERE timestamp >= parseDateTimeBestEffort('{period_start}') "
+                "AND timestamp < parseDateTimeBestEffort('{period_end}') "
+                "ORDER BY timestamp DESC"
+            ),
+            uses_template=True,
+            uses_paging_template=False,
+            period_start_iso="2026-03-18T00:00:00+00:00",
+            period_end_iso="2026-03-18T01:00:00+00:00",
+            limit=100,
+            offset=0,
+            last_ts=None,
+            timestamp_column="timestamp",
+        )
+        self.assertIn("ORDER BY timestamp DESC", query)
+        self.assertNotIn("cp_ordered", query)
 
     def test_split_demo_logs_by_source_partitions_rows_without_loss(self) -> None:
         demo_logs = [
