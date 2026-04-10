@@ -2661,6 +2661,42 @@ class TestMySummarizer(unittest.TestCase):
         self.assertEqual(chunks[0], rows[:2])
         self.assertEqual(chunks[1], rows[2:])
 
+    def test_summarize_period_emits_aggregated_query_warning_event(self) -> None:
+        events: list[tuple[str, dict[str, Any]]] = []
+        calls = {"n": 0}
+
+        def _fetch_page(*, columns, period_start, period_end, limit, offset):
+            _ = (columns, period_start, period_end, limit, offset)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [
+                    {
+                        "timestamp": "2026-03-25T10:00:00+00:00",
+                        "message": "grouped row",
+                        "cnt": 900,
+                    }
+                ]
+            return []
+
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=_fetch_page,
+            llm_call=lambda _prompt: self._structured_summary_json("map-agg"),
+            config=SummarizerConfig(use_new_algorithm=True, llm_chunk_rows=200),
+            on_progress=lambda event, payload: events.append((event, dict(payload))),
+        )
+        result = summarizer.summarize_period(
+            period_start="2026-03-25T10:00:00+00:00",
+            period_end="2026-03-25T11:00:00+00:00",
+            columns=["timestamp", "message", "cnt"],
+            total_rows_estimate=900,
+        )
+        self.assertTrue(result.summary)
+        warning_payloads = [payload for name, payload in events if name == "map_query_aggregated"]
+        self.assertTrue(warning_payloads)
+        warning_payload = warning_payloads[0]
+        self.assertEqual(int(warning_payload.get("page_rows", 0)), 1)
+        self.assertEqual(int(warning_payload.get("effective_rows", 0)), 900)
+
     def test_reduce_structured_keeps_non_json_batch_as_degraded_input(self) -> None:
         summarizer = PeriodLogSummarizer(
             db_fetch_page=lambda **_: [],

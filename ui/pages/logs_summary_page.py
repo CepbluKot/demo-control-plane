@@ -8149,6 +8149,15 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 events.append(
                     f"Страница #{payload.get('page_index')}: {payload.get('page_rows')} строк"
                 )
+            elif event == "map_query_aggregated":
+                page_rows = _safe_int(payload.get("page_rows"), 0)
+                effective_rows = _safe_int(payload.get("effective_rows"), 0)
+                page_limit = _safe_int(payload.get("page_limit"), 0)
+                events.append(
+                    "⚠️ SQL возвращает агрегированные строки: "
+                    f"DB rows={page_rows}, effective_rows~{effective_rows}, page_limit={page_limit}. "
+                    "MAP-батчинг делится по строкам результата запроса, а не по сырым логам."
+                )
             elif event == "map_batch_start":
                 state["status"] = "map"
                 state["llm_phase_hint"] = "map"

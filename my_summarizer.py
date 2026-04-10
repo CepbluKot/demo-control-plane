@@ -1885,20 +1885,7 @@ class PeriodLogSummarizer:
         # For grouped SQL (e.g. rows with `cnt`), one DB row can represent many
         # raw log lines. Use lightweight weighted splitting so LLM batching better
         # matches real data volume.
-        def _row_weight(row: Dict[str, Any]) -> int:
-            for key in ("cnt", "log_count", "rows_count", "group_count"):
-                raw = row.get(key)
-                if raw is None or raw == "":
-                    continue
-                try:
-                    parsed = int(float(str(raw).strip()))
-                except Exception:
-                    continue
-                if parsed > 0:
-                    return parsed
-            return 1
-
-        weighted_rows = [_row_weight(item) for item in rows]
+        weighted_rows = [self._map_row_weight(item) for item in rows]
         effective_rows = sum(weighted_rows)
         if len(rows) <= max_rows_per_call and effective_rows <= max_rows_per_call:
             return [rows]
@@ -1926,6 +1913,20 @@ class PeriodLogSummarizer:
             len(chunks),
         )
         return chunks
+
+    @staticmethod
+    def _map_row_weight(row: Dict[str, Any]) -> int:
+        for key in ("cnt", "log_count", "rows_count", "group_count"):
+            raw = row.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                parsed = int(float(str(raw).strip()))
+            except Exception:
+                continue
+            if parsed > 0:
+                return parsed
+        return 1
 
     def _build_degraded_incident_summary_from_raw(
         self,
@@ -3096,6 +3097,31 @@ class PeriodLogSummarizer:
                     rows_processed,
                     offset,
                 )
+                # If SQL is pre-aggregated (e.g. GROUP BY with cnt), DB can return
+                # very few rows while each row represents many raw logs.
+                # In that case the pipeline is not able to create many MAP batches
+                # from one aggregated row, so emit an explicit diagnostic event.
+                page_effective_rows = sum(self._map_row_weight(item) for item in page)
+                if (
+                    pages_fetched == 1
+                    and len(page) < self.config.page_limit
+                    and page_effective_rows > len(page)
+                ):
+                    logger.warning(
+                        "MAP source appears pre-aggregated | page_rows=%s | effective_rows=%s | page_limit=%s. "
+                        "Batching is based on returned DB rows; use non-aggregated pageable SQL for full coverage.",
+                        len(page),
+                        page_effective_rows,
+                        self.config.page_limit,
+                    )
+                    self._emit_progress(
+                        "map_query_aggregated",
+                        {
+                            "page_rows": len(page),
+                            "effective_rows": page_effective_rows,
+                            "page_limit": self.config.page_limit,
+                        },
+                    )
 
                 # Updated algorithm: one DB page is fetched as-is, then split only by
                 # explicit row cap (`llm_chunk_rows`) without local token estimation.
