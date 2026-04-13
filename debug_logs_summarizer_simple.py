@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import socket
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -32,6 +33,38 @@ ANOMALY_FILE = Path("artifacts/debug_logs_summarizer_simple/anomaly.json")
 OUTPUT_DIR = Path("artifacts/debug_logs_summarizer_simple")
 PERIOD_HOURS_BACK = 2
 DEBUG_LOGS = True
+
+
+def _preflight_or_raise() -> None:
+    problems: List[str] = []
+    api_base = str(getattr(settings, "OPENAI_API_BASE_DB", "") or "").strip()
+    api_key = str(getattr(settings, "OPENAI_API_KEY_DB", "") or "").strip()
+    query_template = str(getattr(settings, "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "") or "").strip()
+    ch_host = str(getattr(settings, "CONTROL_PLANE_LOGS_CLICKHOUSE_HOST", "") or "").strip()
+    ch_port = int(getattr(settings, "CONTROL_PLANE_LOGS_CLICKHOUSE_PORT", 8123) or 8123)
+
+    if not api_base:
+        problems.append("Не задан OPENAI_API_BASE_DB")
+    if not api_key:
+        problems.append("Не задан OPENAI_API_KEY_DB")
+    if not query_template:
+        problems.append("Не задан CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY")
+    if not ch_host:
+        problems.append("Не задан CONTROL_PLANE_LOGS_CLICKHOUSE_HOST")
+
+    if ch_host:
+        try:
+            with socket.create_connection((ch_host, ch_port), timeout=2.0):
+                pass
+        except Exception as exc:
+            problems.append(
+                f"ClickHouse недоступен по {ch_host}:{ch_port} ({type(exc).__name__}: {exc})"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "Preflight не пройден:\n- " + "\n- ".join(problems)
+        )
 
 
 def _runtime_args() -> SimpleNamespace:
@@ -100,6 +133,7 @@ def _runtime_args() -> SimpleNamespace:
 
 
 def main() -> int:
+    _preflight_or_raise()
     logger = _setup_logging(DEBUG_LOGS)
     args = _runtime_args()
 
