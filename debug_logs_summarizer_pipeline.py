@@ -61,6 +61,25 @@ def _load_json(path: Optional[str]) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def _normalize_anomaly_for_logs(
+    anomaly: Optional[Dict[str, Any]],
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = dict(anomaly or {})
+    service = str(normalized.get("service") or "").strip()
+    if service:
+        return normalized
+    fallback_service = str(getattr(settings, "CONTROL_PLANE_FORECAST_SERVICE", "") or "").strip()
+    normalized["service"] = fallback_service or "demo-service"
+    if logger is not None:
+        logger.info(
+            "anomaly.service is empty -> fallback to %s",
+            normalized["service"],
+        )
+    return normalized
+
+
 def _load_map_summaries(path: Optional[str]) -> List[str]:
     if not path:
         return []
@@ -196,6 +215,7 @@ def _run_map_reduce_stage(
     output_dir: Path,
     logger: logging.Logger,
 ) -> Dict[str, Any]:
+    anomaly = _normalize_anomaly_for_logs(anomaly, logger=logger)
     fetch_mode = _resolve_logs_fetch_mode()
     tail_limit = max(int(getattr(settings, "CONTROL_PLANE_LOGS_TAIL_LIMIT", 1000) or 1000), 1)
     fetch_errors: List[str] = []
@@ -457,7 +477,7 @@ def main() -> int:
     if period_end_iso <= period_start_iso:
         raise ValueError("period_end must be greater than period_start")
 
-    anomaly = _load_json(args.anomaly_file)
+    anomaly = _normalize_anomaly_for_logs(_load_json(args.anomaly_file), logger=logger)
     user_goal = str(anomaly.get("description") or anomaly.get("name") or "")
     stats: Dict[str, Any] = {}
     map_summaries: List[str] = []
@@ -550,4 +570,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -109,6 +109,10 @@ def main() -> int:
     end_iso = now.isoformat()
 
     anomaly: Dict[str, Any] = _load_json(str(ANOMALY_FILE)) if ANOMALY_FILE.exists() else {}
+    if not str(anomaly.get("service") or "").strip():
+        fallback_service = str(getattr(settings, "CONTROL_PLANE_FORECAST_SERVICE", "") or "").strip()
+        anomaly["service"] = fallback_service or "demo-service"
+        logger.info("anomaly.service is empty -> fallback to %s", anomaly["service"])
     user_goal = str(anomaly.get("description") or anomaly.get("name") or "")
 
     logger.info(
@@ -174,4 +178,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
