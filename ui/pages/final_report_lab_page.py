@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 import os
 import random
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -313,6 +314,73 @@ def _build_map_summaries_text(chunks: Sequence[str]) -> str:
     return "\n\n".join(lines)
 
 
+def _extract_section_label_from_prompt(prompt_text: str) -> str:
+    match = re.search(r"СЕКЦИЯ\s+(\d+/\d+):\s*(.+)", str(prompt_text or ""))
+    if not match:
+        return ""
+    return f"{match.group(1)} — {match.group(2).strip()}"
+
+
+def _extract_between_markers(
+    text: str,
+    start_marker: str,
+    end_markers: Sequence[str],
+) -> str:
+    source = str(text or "")
+    start_pos = source.find(start_marker)
+    if start_pos < 0:
+        return ""
+    body_start = start_pos + len(start_marker)
+    tail = source[body_start:]
+    end_pos = len(tail)
+    for marker in end_markers:
+        pos = tail.find(marker)
+        if pos >= 0 and pos < end_pos:
+            end_pos = pos
+    return tail[:end_pos].strip()
+
+
+def _extract_merge_context_from_prompt(prompt_text: str, kind: str) -> Dict[str, str]:
+    prompt = str(prompt_text or "")
+    if kind == "structured":
+        previous_marker = "УЖЕ НАПИСАННЫЕ СЕКЦИИ СТРУКТУРИРОВАННОГО ОТЧЁТА:\n"
+        base_marker = "БАЗОВЫЙ REDUCE SUMMARY (опорный контекст):\n"
+        map_marker = "MAP SUMMARY ПО ВСЕМ БАТЧАМ (опорный контекст):\n"
+    else:
+        previous_marker = "УЖЕ НАПИСАННЫЕ СЕКЦИИ:\n"
+        base_marker = "СТРУКТУРИРОВАННЫЙ АНАЛИЗ (опорный контекст):\n"
+        map_marker = "MAP SUMMARY ПО ВСЕМ БАТЧАМ (опорный контекст):\n"
+
+    previous_text = _extract_between_markers(
+        prompt,
+        previous_marker,
+        [base_marker, map_marker, "Верни только текст текущей секции"],
+    )
+    base_text = _extract_between_markers(
+        prompt,
+        base_marker,
+        [map_marker, "Верни только текст текущей секции"],
+    )
+    map_text = _extract_between_markers(
+        prompt,
+        map_marker,
+        ["Верни только текст текущей секции"],
+    )
+    section_label = _extract_section_label_from_prompt(prompt)
+    recipe = (
+        "merge("
+        "already_written_sections + base_structured_summary + map_batches_summary"
+        ") -> current_section"
+    )
+    return {
+        "section_label": section_label,
+        "merge_recipe": recipe,
+        "previous_sections_text": previous_text,
+        "base_summary_text": base_text,
+        "map_summaries_text": map_text,
+    }
+
+
 def _run_sectional_generation(
     *,
     kind: str,
@@ -330,20 +398,30 @@ def _run_sectional_generation(
     section_table: List[Dict[str, Any]] = []
     llm_calls_table: List[Dict[str, Any]] = []
     started_by_idx: Dict[int, float] = {}
+    current_section_idx = 0
+    current_section_title = ""
     progress_bar = st.progress(0.0, text=f"{kind}: 0/{total}")
     status_placeholder = st.empty()
 
     def _tracked_llm_call(prompt: str) -> str:
         started = time.monotonic()
         prompt_text = str(prompt or "")
+        merge_ctx = _extract_merge_context_from_prompt(prompt_text, kind)
         row: Dict[str, Any] = {
             "call": len(llm_calls_table) + 1,
+            "section_index": current_section_idx,
+            "section_title": current_section_title,
             "prompt_chars": len(prompt_text),
             "status": "ok",
             "response_chars": 0,
             "elapsed_sec": 0.0,
             "error": "",
             "prompt_text": prompt_text,
+            "merge_recipe": str(merge_ctx.get("merge_recipe") or ""),
+            "merge_section_label": str(merge_ctx.get("section_label") or ""),
+            "merge_previous_sections_text": str(merge_ctx.get("previous_sections_text") or ""),
+            "merge_base_summary_text": str(merge_ctx.get("base_summary_text") or ""),
+            "merge_map_summaries_text": str(merge_ctx.get("map_summaries_text") or ""),
         }
         try:
             response = _normalize_summary_text(llm_call(prompt_text))
@@ -359,6 +437,9 @@ def _run_sectional_generation(
             raise
 
     def _on_start(section_idx: int, section_total: int, title: str) -> None:
+        nonlocal current_section_idx, current_section_title
+        current_section_idx = int(section_idx)
+        current_section_title = str(title or "")
         started_by_idx[section_idx] = time.monotonic()
         progress_bar.progress(
             max((section_idx - 1) / max(section_total, 1), 0.0),
@@ -707,13 +788,15 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
             state["frl_max_tokens"] = int(max_tokens)
 
     st.markdown("### 4) Запуск")
-    run_cols = st.columns(3)
+    run_cols = st.columns(4)
     with run_cols[0]:
         run_structured = st.checkbox("Structured", value=True)
     with run_cols[1]:
         run_freeform = st.checkbox("Freeform", value=True)
     with run_cols[2]:
         show_prompts = st.checkbox("Показывать промпты", value=False)
+    with run_cols[3]:
+        show_merge_inputs = st.checkbox("Показывать merge-входы", value=True)
 
     if st.button("Запустить секционную генерацию", type="primary", use_container_width=True):
         if not run_structured and not run_freeform:
@@ -797,6 +880,7 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 [
                     {
                         "call": row.get("call"),
+                        "section": row.get("merge_section_label") or row.get("section_title") or "",
                         "status": row.get("status"),
                         "prompt_chars": row.get("prompt_chars"),
                         "response_chars": row.get("response_chars"),
@@ -808,6 +892,37 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+            if show_merge_inputs:
+                st.markdown("##### Что С Чем Мержим (Полный Текст)")
+                for call in result.get("llm_calls") or []:
+                    call_id = int(call.get("call", 0))
+                    section_label = str(call.get("merge_section_label") or call.get("section_title") or "")
+                    with st.expander(
+                        f"{kind} merge #{call_id} | {section_label or 'без секции'}",
+                        expanded=False,
+                    ):
+                        st.code(str(call.get("merge_recipe") or ""), language="text")
+                        st.markdown("`already_written_sections`")
+                        st.text_area(
+                            f"{kind}_merge_prev_{call_id}",
+                            value=str(call.get("merge_previous_sections_text") or ""),
+                            height=220,
+                            label_visibility="collapsed",
+                        )
+                        st.markdown("`base_structured_summary`")
+                        st.text_area(
+                            f"{kind}_merge_base_{call_id}",
+                            value=str(call.get("merge_base_summary_text") or ""),
+                            height=220,
+                            label_visibility="collapsed",
+                        )
+                        st.markdown("`map_batches_summary`")
+                        st.text_area(
+                            f"{kind}_merge_map_{call_id}",
+                            value=str(call.get("merge_map_summaries_text") or ""),
+                            height=220,
+                            label_visibility="collapsed",
+                        )
             merged_text = str(result.get("merged_text") or "")
             st.text_area(
                 f"{kind.capitalize()} merged report",
