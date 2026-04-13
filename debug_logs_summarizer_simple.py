@@ -242,8 +242,11 @@ def _preflight_or_raise(selected_query: str) -> None:
 
 
 def main() -> int:
-    logger = _setup_logging(DEBUG_LOGS)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logger = _setup_logging(
+        DEBUG_LOGS,
+        log_file=OUTPUT_DIR / "debug_logs_summarizer_simple.log",
+    )
 
     params = RUN_CONFIG
     args = _runtime_args(params)

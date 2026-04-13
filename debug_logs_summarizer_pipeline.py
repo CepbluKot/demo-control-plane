@@ -84,14 +84,23 @@ def _parse_dt(raw: str) -> datetime:
     return parsed.to_pydatetime()
 
 
-def _setup_logging(debug: bool) -> logging.Logger:
+def _setup_logging(debug: bool, log_file: Optional[Path] = None) -> logging.Logger:
     level = logging.DEBUG if debug else logging.INFO
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if log_file is not None:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d | %(message)s",
+        handlers=handlers,
+        force=True,
     )
     logger = logging.getLogger("debug_logs_summarizer_pipeline")
     logger.setLevel(level)
+    if log_file is not None:
+        logger.info("debug logger file: %s", Path(log_file).resolve())
     return logger
 
 
@@ -468,9 +477,9 @@ def _run_final_sections_stage(
 
 def main() -> int:
     args = RUN_CONFIG
-    logger = _setup_logging(bool(args.debug))
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger = _setup_logging(bool(args.debug), log_file=output_dir / "debug_logs_summarizer_pipeline.log")
 
     now = datetime.now(MSK).replace(microsecond=0)
     raw_period_start = str(args.period_start or "").strip() or (now - timedelta(hours=2)).isoformat()
