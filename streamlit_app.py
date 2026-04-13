@@ -12,8 +12,10 @@ import streamlit as st
 from my_summarizer import PeriodLogSummarizer, SummarizerConfig, _make_llm_call, _query_logs_df
 from ui.pages import (
     ControlPlanePageDeps,
+    FinalReportLabPageDeps,
     LogsSummaryPageDeps,
     render_control_plane_page,
+    render_final_report_lab_page,
     render_logs_summary_page,
 )
 
@@ -1026,6 +1028,13 @@ def _render_control_plane_page() -> None:
     render_control_plane_page(deps)
 
 
+def _render_final_report_lab_page() -> None:
+    deps = FinalReportLabPageDeps(
+        logger=logger,
+    )
+    render_final_report_lab_page(deps)
+
+
 def main() -> None:
     st.set_page_config(page_title="Control Plane", layout="wide")
     _ensure_runtime()
@@ -1034,13 +1043,16 @@ def main() -> None:
     with st.sidebar:
         page = st.radio(
             "Страницы",
-            ["Control Plane", "Logs Summarizer"],
+            ["Control Plane", "Logs Summarizer", "Final Report Lab"],
             index=0,
             key="cp_page_selector",
         )
 
     if page == "Logs Summarizer":
         _render_logs_summary_page()
+        return
+    if page == "Final Report Lab":
+        _render_final_report_lab_page()
         return
 
     _render_control_plane_page()
