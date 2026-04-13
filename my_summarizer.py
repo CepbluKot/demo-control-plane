@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+import itertools
 import json
 import logging
 import math
@@ -98,6 +100,16 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
 _EARLIEST_PERIOD_START = "1970-01-01T00:00:00+00:00"
 TModel = TypeVar("TModel", bound=BaseModel)
+_HTTP_TRACE_CONTEXT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "llm_http_trace_id",
+    default=None,
+)
+_HTTP_TRACE_COUNTER = itertools.count(1)
+
+
+def _new_request_trace_id(prefix: str = "req") -> str:
+    seq = next(_HTTP_TRACE_COUNTER)
+    return f"{prefix}-{int(time.time() * 1000)}-{seq:06d}"
 class DBPageFetcher(Protocol):
     def __call__(
         self,
@@ -716,7 +728,7 @@ def _response_body_text(response: Any) -> str:
         return f"<response body unavailable: {exc}>"
 
 
-def _raise_for_status_with_body(response: Any) -> None:
+def _raise_for_status_with_body(response: Any, *, request_id: Optional[str] = None) -> None:
     try:
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
@@ -724,7 +736,8 @@ def _raise_for_status_with_body(response: Any) -> None:
         url = getattr(response, "url", None)
         body_text = _response_body_text(response)
         logger.error(
-            "LLM HTTP error status=%s url=%s response_body=%s",
+            "LLM HTTP error | request_id=%s | status=%s | url=%s | response_body=%s",
+            str(request_id or "<n/a>"),
             status,
             url or "<unknown>",
             body_text,
@@ -805,12 +818,51 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
         1,
     )
 
+    trace_parent = str(_HTTP_TRACE_CONTEXT.get() or "").strip()
+    request_group_id = trace_parent or _new_request_trace_id("llm")
+    logger.info(
+        "LLM HTTP call group start | request_group_id=%s | model=%s | timeout=%.1fs | continue_on_length=%s | continue_round_limit=%s",
+        request_group_id,
+        str(settings.LLM_MODEL_ID),
+        float(timeout),
+        bool(continue_on_length),
+        int(continue_round_limit),
+    )
+
     dialog_messages: List[Dict[str, str]] = list(messages)
     collected_parts: List[str] = []
     for round_idx in range(1, continue_round_limit + 1):
         payload = dict(base_payload)
         payload["messages"] = list(dialog_messages)
-        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        request_id = f"{request_group_id}-r{round_idx}"
+        request_started = time.monotonic()
+        logger.info(
+            "LLM HTTP request start | request_id=%s | round=%s/%s | timeout=%.1fs | has_max_tokens=%s",
+            request_id,
+            round_idx,
+            continue_round_limit,
+            float(timeout),
+            bool("max_tokens" in payload),
+        )
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        except Exception as exc:
+            elapsed = max(time.monotonic() - request_started, 0.0)
+            logger.warning(
+                "LLM HTTP request exception | request_id=%s | elapsed=%.2fs | error=%s",
+                request_id,
+                elapsed,
+                exc,
+            )
+            raise
+        elapsed = max(time.monotonic() - request_started, 0.0)
+        logger.info(
+            "LLM HTTP request done | request_id=%s | status=%s | elapsed=%.2fs",
+            request_id,
+            getattr(response, "status_code", "<unknown>"),
+            elapsed,
+        )
+        active_request_id = request_id
         if (
             response.status_code == 400
             and "max_tokens" in payload
@@ -819,22 +871,51 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
             # Some OpenAI-compatible gateways reject max_tokens or specific values.
             # Retry once without explicit max_tokens before surfacing the error.
             logger.warning(
-                "LLM gateway returned 400 with max_tokens=%s; retrying the same call without max_tokens.",
+                "LLM gateway returned 400 with max_tokens=%s; retrying without max_tokens | request_id=%s",
                 configured_max_tokens,
+                request_id,
             )
             logger.warning(
-                "LLM 400 response body (with max_tokens): %s",
+                "LLM 400 response body (with max_tokens) | request_id=%s | body=%s",
+                request_id,
                 _response_body_text(response),
             )
             payload_without_max = dict(payload)
             payload_without_max.pop("max_tokens", None)
-            response = requests.post(
-                url,
-                json=payload_without_max,
-                headers=headers,
-                timeout=timeout,
+            retry_request_id = f"{request_group_id}-r{round_idx}-nomax"
+            retry_started = time.monotonic()
+            logger.info(
+                "LLM HTTP request start | request_id=%s | round=%s/%s | timeout=%.1fs | has_max_tokens=false",
+                retry_request_id,
+                round_idx,
+                continue_round_limit,
+                float(timeout),
             )
-        _raise_for_status_with_body(response)
+            try:
+                response = requests.post(
+                    url,
+                    json=payload_without_max,
+                    headers=headers,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                retry_elapsed = max(time.monotonic() - retry_started, 0.0)
+                logger.warning(
+                    "LLM HTTP request exception | request_id=%s | elapsed=%.2fs | error=%s",
+                    retry_request_id,
+                    retry_elapsed,
+                    exc,
+                )
+                raise
+            retry_elapsed = max(time.monotonic() - retry_started, 0.0)
+            logger.info(
+                "LLM HTTP request done | request_id=%s | status=%s | elapsed=%.2fs",
+                retry_request_id,
+                getattr(response, "status_code", "<unknown>"),
+                retry_elapsed,
+            )
+            active_request_id = retry_request_id
+        _raise_for_status_with_body(response, request_id=active_request_id)
         data = response.json()
         chunk_text, finish_reason = _parse_chat_completion_response(data)
         collected_parts.append(str(chunk_text or ""))
@@ -844,17 +925,18 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
             break
         if round_idx >= continue_round_limit:
             logger.warning(
-                "LLM output still marked as truncated after %s continuation rounds; "
-                "returning accumulated text as-is.",
+                "LLM output still marked as truncated after %s continuation rounds; returning accumulated text | request_group_id=%s",
                 continue_round_limit,
+                request_group_id,
             )
             break
 
         logger.warning(
-            "LLM finish_reason=%s: requesting continuation chunk %s/%s",
+            "LLM finish_reason=%s: requesting continuation chunk %s/%s | request_group_id=%s",
             finish_reason,
             round_idx + 1,
             continue_round_limit,
+            request_group_id,
         )
         dialog_messages.append({"role": "assistant", "content": str(chunk_text or "")})
         dialog_messages.append(
@@ -867,7 +949,14 @@ def communicate_with_llm(message: str, system_prompt: str = "", timeout: float =
             }
         )
 
-    return "".join(collected_parts).strip()
+    output = "".join(collected_parts).strip()
+    logger.info(
+        "LLM HTTP call group done | request_group_id=%s | rounds=%s | output_len=%s",
+        request_group_id,
+        len(collected_parts),
+        len(output),
+    )
+    return output
 
 
 def _normalize_period(
@@ -1409,8 +1498,24 @@ def _make_llm_call(
         base_timeout = max(float(llm_timeout), 1.0)
         current_timeout = base_timeout
         attempt_no = 0
+        llm_call_id = _new_request_trace_id("llmcall")
+        logger.info(
+            "LLM logical call start | call_id=%s | max_attempts=%s | timeout=%.1fs",
+            llm_call_id,
+            "∞" if configured_total_attempts < 0 else configured_total_attempts,
+            base_timeout,
+        )
         while True:
             attempt_no += 1
+            attempt_trace_id = f"{llm_call_id}-a{attempt_no}"
+            logger.info(
+                "LLM logical attempt start | call_id=%s | attempt_id=%s | attempt=%s/%s | timeout=%.1fs",
+                llm_call_id,
+                attempt_trace_id,
+                attempt_no,
+                "∞" if effective_total_attempts < 0 else effective_total_attempts,
+                current_timeout,
+            )
             if on_attempt is not None:
                 try:
                     on_attempt(attempt_no, effective_total_attempts, current_timeout)
@@ -1418,12 +1523,22 @@ def _make_llm_call(
                     pass
             started = time.monotonic()
             try:
-                response = communicate_with_llm(
-                    message=prompt,
-                    system_prompt=_system_prompt,
-                    timeout=current_timeout,
-                )
+                trace_token = _HTTP_TRACE_CONTEXT.set(attempt_trace_id)
+                try:
+                    response = communicate_with_llm(
+                        message=prompt,
+                        system_prompt=_system_prompt,
+                        timeout=current_timeout,
+                    )
+                finally:
+                    _HTTP_TRACE_CONTEXT.reset(trace_token)
                 elapsed = max(time.monotonic() - started, 0.0)
+                logger.info(
+                    "LLM logical attempt done | call_id=%s | attempt_id=%s | elapsed=%.2fs",
+                    llm_call_id,
+                    attempt_trace_id,
+                    elapsed,
+                )
                 if on_result is not None:
                     try:
                         on_result(attempt_no, effective_total_attempts, True, elapsed, None)
@@ -1433,6 +1548,13 @@ def _make_llm_call(
             except Exception as exc:
                 last_exc = exc
                 elapsed = max(time.monotonic() - started, 0.0)
+                logger.warning(
+                    "LLM logical attempt failed | call_id=%s | attempt_id=%s | elapsed=%.2fs | error=%s",
+                    llm_call_id,
+                    attempt_trace_id,
+                    elapsed,
+                    exc,
+                )
                 is_read_timeout = _is_read_timeout_exception(exc)
                 is_non_retryable = _is_non_retryable_llm_exception(exc)
                 if is_read_timeout:
@@ -1455,12 +1577,15 @@ def _make_llm_call(
                         pass
                 if is_non_retryable:
                     logger.error(
-                        "LLM non-retryable error (stop retries): %s",
+                        "LLM non-retryable error (stop retries) | call_id=%s | attempt_id=%s | error=%s",
+                        llm_call_id,
+                        attempt_trace_id,
                         exc,
                     )
                     if fail_open_return_empty:
                         logger.warning(
-                            "LLM fail-open mode: returning empty response after non-retryable error."
+                            "LLM fail-open mode | call_id=%s | returning empty response after non-retryable error",
+                            llm_call_id,
                         )
                         return ""
                     raise
@@ -1473,7 +1598,9 @@ def _make_llm_call(
                     if is_read_timeout:
                         next_timeout = current_timeout * 2.0
                         logger.warning(
-                            "LLM ReadTimeout on attempt %d; next timeout %.1fs (prev %.1fs, strategy=x2)",
+                            "LLM ReadTimeout | call_id=%s | attempt_id=%s | attempt=%d | next timeout %.1fs (prev %.1fs, strategy=x2)",
+                            llm_call_id,
+                            attempt_trace_id,
                             attempt_no,
                             next_timeout,
                             current_timeout,
@@ -1481,13 +1608,15 @@ def _make_llm_call(
                         current_timeout = next_timeout
                     elif infinite_retries:
                         logger.warning(
-                            "LLM retry %d/∞ after error: %s",
+                            "LLM retry | call_id=%s | next_attempt=%d/∞ | error=%s",
+                            llm_call_id,
                             attempt_no + 1,
                             exc,
                         )
                     else:
                         logger.warning(
-                            "LLM retry %d/%d after error: %s",
+                            "LLM retry | call_id=%s | next_attempt=%d/%d | error=%s",
+                            llm_call_id,
                             attempt_no + 1,
                             configured_total_attempts,
                             exc,
@@ -1503,12 +1632,14 @@ def _make_llm_call(
                 else:
                     if fail_open_return_empty:
                         logger.warning(
-                            "LLM все %d попытки исчерпаны; fail-open mode -> returning empty response",
+                            "LLM attempts exhausted | call_id=%s | total_attempts=%d | fail-open mode -> returning empty response",
+                            llm_call_id,
                             configured_total_attempts,
                         )
                         return ""
                     logger.exception(
-                        "LLM все %d попытки исчерпаны; поднимаем ошибку",
+                        "LLM attempts exhausted | call_id=%s | total_attempts=%d | raising error",
+                        llm_call_id,
                         configured_total_attempts,
                     )
                     break
@@ -1674,9 +1805,11 @@ class PeriodLogSummarizer:
                 cap_limit = None
         while True:
             attempt_no += 1
+            attempt_request_id = _new_request_trace_id("instr")
             mode_label = "TOOLS" if self._instructor_tool_calling_enabled() else "JSON"
             logger.info(
-                "Instructor structured call start | stage=%s | model=%s | mode=%s | attempt=%s/%s | timeout=%.1fs",
+                "Instructor structured call start | request_id=%s | stage=%s | model=%s | mode=%s | attempt=%s/%s | timeout=%.1fs",
+                attempt_request_id,
                 stage,
                 str(settings.LLM_MODEL_ID),
                 mode_label,
@@ -1700,7 +1833,8 @@ class PeriodLogSummarizer:
                 )
                 elapsed = max(time.monotonic() - started, 0.0)
                 logger.info(
-                    "Instructor structured call done | stage=%s | attempt=%s | elapsed=%.2fs",
+                    "Instructor structured call done | request_id=%s | stage=%s | attempt=%s | elapsed=%.2fs",
+                    attempt_request_id,
                     stage,
                     attempt_no,
                     elapsed,
@@ -1710,7 +1844,8 @@ class PeriodLogSummarizer:
                 last_exc = exc
                 elapsed = max(time.monotonic() - started, 0.0)
                 logger.warning(
-                    "Instructor structured call failed | stage=%s | attempt=%s | elapsed=%.2fs | error=%s",
+                    "Instructor structured call failed | request_id=%s | stage=%s | attempt=%s | elapsed=%.2fs | error=%s",
+                    attempt_request_id,
                     stage,
                     attempt_no,
                     elapsed,
@@ -1737,7 +1872,8 @@ class PeriodLogSummarizer:
                     empty_payload_error_count += 1
                     logger.warning(
                         "Instructor returned malformed payload (choices=None) | "
-                        "stage=%s | attempt=%s. Resetting instructor client cache and retrying.",
+                        "request_id=%s | stage=%s | attempt=%s. Resetting instructor client cache and retrying.",
+                        attempt_request_id,
                         stage,
                         attempt_no,
                     )
@@ -1745,7 +1881,8 @@ class PeriodLogSummarizer:
                     if self._instructor_tool_calling_enabled() and attempt_no >= 3:
                         logger.warning(
                             "Instructor malformed payload repeats in TOOLS mode | "
-                            "stage=%s | attempt=%s. Switching to JSON mode.",
+                            "request_id=%s | stage=%s | attempt=%s. Switching to JSON mode.",
+                            attempt_request_id,
                             stage,
                             attempt_no,
                         )
@@ -1772,9 +1909,10 @@ class PeriodLogSummarizer:
                     retry_delay = min(60.0, 3.0 * float(2 ** min(max(attempt_no - 1, 0), 4)))
                     logger.warning(
                         "Instructor transient server error (500/502/503/504) | stage=%s | attempt=%s | "
-                        "retry_in=%.1fs | action=retry | gateway_errors=%s%s",
+                        "request_id=%s | retry_in=%.1fs | action=retry | gateway_errors=%s%s",
                         stage,
                         attempt_no,
+                        attempt_request_id,
                         retry_delay,
                         gateway_error_count,
                         (
@@ -1791,9 +1929,10 @@ class PeriodLogSummarizer:
                     if not can_retry_gateway:
                         logger.warning(
                             "Instructor gateway retry cap reached | stage=%s | attempt=%s | "
-                            "gateway_errors=%s%s | action=propagate_for_fallback",
+                            "request_id=%s | gateway_errors=%s%s | action=propagate_for_fallback",
                             stage,
                             attempt_no,
+                            attempt_request_id,
                             gateway_error_count,
                             (
                                 f"/{cap_limit}" if cap_limit is not None and cap_limit > 0 else ""
@@ -1815,20 +1954,22 @@ class PeriodLogSummarizer:
                         if reduce_timeout_escalations >= 1 or next_timeout <= current_timeout:
                             logger.warning(
                                 "Instructor ReadTimeout cap reached for REDUCE | stage=%s | attempt=%s | "
-                                "timeout=%.1fs | cap=%.1fs | action=propagate_for_split",
+                                "request_id=%s | timeout=%.1fs | cap=%.1fs | action=propagate_for_split",
                                 stage,
                                 attempt_no,
+                                attempt_request_id,
                                 current_timeout,
                                 float(reduce_timeout_cap or current_timeout),
                             )
                             break
                         logger.warning(
                             "Instructor ReadTimeout (REDUCE) | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | "
-                            "strategy=x2_then_split | cap=%.1fs",
+                            "request_id=%s | strategy=x2_then_split | cap=%.1fs",
                             stage,
                             attempt_no,
                             current_timeout,
                             next_timeout,
+                            attempt_request_id,
                             float(reduce_timeout_cap or next_timeout),
                         )
                         current_timeout = next_timeout
@@ -1836,9 +1977,10 @@ class PeriodLogSummarizer:
                     else:
                         next_timeout = current_timeout * 2.0
                         logger.warning(
-                            "Instructor ReadTimeout | stage=%s | attempt=%s | timeout %.1fs -> %.1fs | strategy=x2",
+                            "Instructor ReadTimeout | stage=%s | attempt=%s | request_id=%s | timeout %.1fs -> %.1fs | strategy=x2",
                             stage,
                             attempt_no,
+                            attempt_request_id,
                             current_timeout,
                             next_timeout,
                         )

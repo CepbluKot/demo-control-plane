@@ -1790,6 +1790,31 @@ class TestLogsSummaryPageHelpers(unittest.TestCase):
         # Even if env min is larger, lower bound must not exceed the user cap.
         self.assertEqual(cfg["min_llm_chunk_rows"], 120)
 
+    def test_build_config_accepts_runtime_reduce_overrides(self) -> None:
+        deps = type(
+            "_Deps",
+            (),
+            {
+                "summarizer_config_cls": staticmethod(lambda **kwargs: kwargs),
+            },
+        )()
+        cfg = _build_config(
+            deps,
+            db_batch_size=1000,
+            llm_batch_size=200,
+            map_workers=1,
+            reduce_group_size_override=3,
+            reduce_input_max_chars_override=55000,
+            reduce_target_token_pct_override=35,
+            compression_target_pct_override=30,
+            compression_importance_threshold_override=0.85,
+        )
+        self.assertEqual(cfg["reduce_group_size"], 3)
+        self.assertEqual(cfg["reduce_input_max_chars"], 55000)
+        self.assertEqual(cfg["reduce_target_token_pct"], 35)
+        self.assertEqual(cfg["compression_target_pct"], 30)
+        self.assertAlmostEqual(float(cfg["compression_importance_threshold"]), 0.85, places=6)
+
     def test_collect_timeline_events_from_map_batches(self) -> None:
         state = {
             "map_batches": [

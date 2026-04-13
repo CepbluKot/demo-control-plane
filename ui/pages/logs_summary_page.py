@@ -6576,6 +6576,11 @@ def _build_config(
     *,
     use_instructor: Optional[bool] = None,
     model_supports_tool_calling: Optional[bool] = None,
+    reduce_group_size_override: Optional[int] = None,
+    reduce_input_max_chars_override: Optional[int] = None,
+    reduce_target_token_pct_override: Optional[int] = None,
+    compression_target_pct_override: Optional[int] = None,
+    compression_importance_threshold_override: Optional[float] = None,
 ) -> Any:
     max_cell_chars = int(
         getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)
@@ -6598,27 +6603,38 @@ def _build_config(
         int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6) or 6),
         0,
     )
-    reduce_group_size = max(
-        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2) or 2),
-        2,
+    reduce_group_size_raw = (
+        reduce_group_size_override
+        if reduce_group_size_override is not None
+        else getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2)
     )
-    reduce_input_max_chars = max(
-        int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS", 40000) or 40000),
-        1000,
+    reduce_group_size = max(int(reduce_group_size_raw or 2), 2)
+    reduce_input_max_chars_raw = (
+        reduce_input_max_chars_override
+        if reduce_input_max_chars_override is not None
+        else getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS", 40000)
     )
+    reduce_input_max_chars = max(int(reduce_input_max_chars_raw or 40000), 1000)
     # Legacy algorithm path is removed: always use the updated algorithm.
     use_new_algorithm = True
-    reduce_target_token_pct = max(
-        min(int(getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50) or 50), 95),
-        10,
+    reduce_target_token_pct_raw = (
+        reduce_target_token_pct_override
+        if reduce_target_token_pct_override is not None
+        else getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50)
     )
-    compression_target_pct = max(
-        min(int(getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT", 50) or 50), 95),
-        10,
+    reduce_target_token_pct = max(min(int(reduce_target_token_pct_raw or 50), 95), 10)
+    compression_target_pct_raw = (
+        compression_target_pct_override
+        if compression_target_pct_override is not None
+        else getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT", 50)
     )
-    compression_importance_threshold = float(
-        getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7) or 0.7
+    compression_target_pct = max(min(int(compression_target_pct_raw or 50), 95), 10)
+    compression_importance_threshold_raw = (
+        compression_importance_threshold_override
+        if compression_importance_threshold_override is not None
+        else getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7)
     )
+    compression_importance_threshold = float(compression_importance_threshold_raw or 0.7)
     if use_instructor is None:
         use_instructor = bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True))
     if model_supports_tool_calling is None:
@@ -6779,6 +6795,25 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
         "logs_sum_enable_final_freeform": True,
         "logs_sum_enable_final_topics_sync": True,
         "logs_sum_enable_final_instructor_report": True,
+        "logs_sum_reduce_group_size": max(
+            int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2) or 2),
+            2,
+        ),
+        "logs_sum_reduce_input_max_chars": max(
+            int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS", 40000) or 40000),
+            1000,
+        ),
+        "logs_sum_reduce_target_token_pct": max(
+            min(int(getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50) or 50), 95),
+            10,
+        ),
+        "logs_sum_compression_target_pct": max(
+            min(int(getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT", 50) or 50), 95),
+            10,
+        ),
+        "logs_sum_compression_importance_threshold": float(
+            getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7) or 0.7
+        ),
         "logs_sum_period_mode": "Явный диапазон (start/end)",
         "logs_sum_center_dt": center_default,
         "logs_sum_window_minutes": max(int(deps.loopback_minutes), 1),
@@ -6880,6 +6915,60 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 "logs_sum_enable_final_instructor_report",
                 widget_defaults["logs_sum_enable_final_instructor_report"],
             )
+        )
+        st.session_state["logs_sum_reduce_group_size"] = max(
+            int(
+                saved_params.get(
+                    "reduce_group_size",
+                    widget_defaults["logs_sum_reduce_group_size"],
+                )
+            ),
+            2,
+        )
+        st.session_state["logs_sum_reduce_input_max_chars"] = max(
+            int(
+                saved_params.get(
+                    "reduce_input_max_chars",
+                    widget_defaults["logs_sum_reduce_input_max_chars"],
+                )
+            ),
+            1000,
+        )
+        st.session_state["logs_sum_reduce_target_token_pct"] = max(
+            min(
+                int(
+                    saved_params.get(
+                        "reduce_target_token_pct",
+                        widget_defaults["logs_sum_reduce_target_token_pct"],
+                    )
+                ),
+                95,
+            ),
+            10,
+        )
+        st.session_state["logs_sum_compression_target_pct"] = max(
+            min(
+                int(
+                    saved_params.get(
+                        "compression_target_pct",
+                        widget_defaults["logs_sum_compression_target_pct"],
+                    )
+                ),
+                95,
+            ),
+            10,
+        )
+        st.session_state["logs_sum_compression_importance_threshold"] = min(
+            max(
+                float(
+                    saved_params.get(
+                        "compression_importance_threshold",
+                        widget_defaults["logs_sum_compression_importance_threshold"],
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
         )
         st.session_state["logs_sum_period_mode"] = mapped["logs_sum_period_mode"]
         st.session_state["logs_sum_window_minutes"] = max(int(mapped["logs_sum_window_minutes"]), 1)
@@ -7020,442 +7109,534 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                     st.error(f"Не удалось импортировать файл отчёта: {exc}")
 
         st.markdown("---")
-        st.markdown("SQL Запросы Логов")
-        if st.button(
-            "+ Добавить запрос логов",
-            key="logs_sum_add_log_query",
-            use_container_width=True,
-            disabled=is_running,
-        ):
-            st.session_state[logs_queries_state_key].append(_new_query_item(""))
-            st.rerun()
-
-        remove_log_query_id: Optional[str] = None
-        for idx, item in enumerate(st.session_state[logs_queries_state_key], start=1):
-            item_id = str(item.get("id"))
-            query_key = f"logs_sum_log_query_text_{item_id}"
-            if query_key not in st.session_state:
-                st.session_state[query_key] = str(item.get("text", ""))
-            col_query, col_remove = st.columns([10, 2])
-            with col_query:
-                st.text_area(
-                    f"SQL логов #{idx}",
-                    key=query_key,
-                    height=max(int(deps.sql_textarea_height), 180),
-                    placeholder=(
-                        "SELECT timestamp, message FROM logs_table\n"
-                        "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
-                        "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
-                        "ORDER BY timestamp\n"
-                        "LIMIT {limit}"
-                    ),
-                    help=(
-                        "Поддерживаются плейсхолдеры: "
-                        "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
-                        "Рекомендуемый формат без OFFSET: "
-                        "WHERE timestamp > '{last_ts}' AND timestamp < '{period_end}' ORDER BY timestamp LIMIT {limit}"
-                    ),
-                    disabled=is_running,
-                )
-            with col_remove:
-                can_remove = len(st.session_state[logs_queries_state_key]) > 1
-                if st.button(
-                    "Убрать",
-                    key=f"logs_sum_remove_log_query_{item_id}",
-                    disabled=is_running or not can_remove,
-                    help="Удалить этот SQL-блок",
-                    use_container_width=True,
-                ):
-                    remove_log_query_id = item_id
-            item["text"] = str(st.session_state.get(query_key, ""))
-
-        if remove_log_query_id:
-            st.session_state[logs_queries_state_key] = [
-                item for item in st.session_state[logs_queries_state_key]
-                if str(item.get("id")) != remove_log_query_id
-            ]
-            st.rerun()
-
-        st.markdown("Алерты/Инциденты")
-        alert_time_defaults = _default_alert_time_values(
-            center_dt_text=str(st.session_state.get("logs_sum_center_dt", "")),
-            start_dt_text=str(st.session_state.get("logs_sum_start_dt", "")),
-            end_dt_text=str(st.session_state.get("logs_sum_end_dt", "")),
-            center_default=center_default,
-            start_default=start_default,
-            end_default=end_default,
+        st.markdown("### Конфигурация Пайплайна По Вкладкам")
+        st.caption(
+            "Настрой шаги отдельно: источники -> получение логов -> MAP -> REDUCE/финал -> запуск."
         )
-        if st.button(
-            "+ Добавить алерт",
-            key="logs_sum_add_alert",
-            use_container_width=True,
-            disabled=is_running,
-        ):
-            st.session_state[alerts_state_key].append(
-                _new_alert_item(
-                    time_point=alert_time_defaults["time_point"],
-                    time_start=alert_time_defaults["time_start"],
-                    time_end=alert_time_defaults["time_end"],
-                )
+        config_tabs = st.tabs(
+            [
+                "1. Источники",
+                "2. Получение Логов",
+                "3. MAP",
+                "4. REDUCE + Финал",
+                "5. Запуск",
+            ]
+        )
+
+        run_clicked = False
+
+        with config_tabs[0]:
+            st.markdown("#### SQL Запросы Логов")
+            if st.button(
+                "+ Добавить запрос логов",
+                key="logs_sum_add_log_query",
+                use_container_width=True,
+                disabled=is_running,
+            ):
+                st.session_state[logs_queries_state_key].append(_new_query_item(""))
+                st.rerun()
+
+            remove_log_query_id: Optional[str] = None
+            for idx, item in enumerate(st.session_state[logs_queries_state_key], start=1):
+                item_id = str(item.get("id"))
+                query_key = f"logs_sum_log_query_text_{item_id}"
+                if query_key not in st.session_state:
+                    st.session_state[query_key] = str(item.get("text", ""))
+                col_query, col_remove = st.columns([10, 2])
+                with col_query:
+                    st.text_area(
+                        f"SQL логов #{idx}",
+                        key=query_key,
+                        height=max(int(deps.sql_textarea_height), 180),
+                        placeholder=(
+                            "SELECT timestamp, message FROM logs_table\n"
+                            "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
+                            "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
+                            "ORDER BY timestamp\n"
+                            "LIMIT {limit}"
+                        ),
+                        help=(
+                            "Поддерживаются плейсхолдеры: "
+                            "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
+                            "Рекомендуемый формат без OFFSET: "
+                            "WHERE timestamp > '{last_ts}' AND timestamp < '{period_end}' ORDER BY timestamp LIMIT {limit}"
+                        ),
+                        disabled=is_running,
+                    )
+                with col_remove:
+                    can_remove = len(st.session_state[logs_queries_state_key]) > 1
+                    if st.button(
+                        "Убрать",
+                        key=f"logs_sum_remove_log_query_{item_id}",
+                        disabled=is_running or not can_remove,
+                        help="Удалить этот SQL-блок",
+                        use_container_width=True,
+                    ):
+                        remove_log_query_id = item_id
+                item["text"] = str(st.session_state.get(query_key, ""))
+
+            if remove_log_query_id:
+                st.session_state[logs_queries_state_key] = [
+                    item
+                    for item in st.session_state[logs_queries_state_key]
+                    if str(item.get("id")) != remove_log_query_id
+                ]
+                st.rerun()
+
+            st.markdown("#### Алерты/Инциденты")
+            alert_time_defaults = _default_alert_time_values(
+                center_dt_text=str(st.session_state.get("logs_sum_center_dt", "")),
+                start_dt_text=str(st.session_state.get("logs_sum_start_dt", "")),
+                end_dt_text=str(st.session_state.get("logs_sum_end_dt", "")),
+                center_default=center_default,
+                start_default=start_default,
+                end_default=end_default,
             )
-            st.rerun()
+            if st.button(
+                "+ Добавить алерт",
+                key="logs_sum_add_alert",
+                use_container_width=True,
+                disabled=is_running,
+            ):
+                st.session_state[alerts_state_key].append(
+                    _new_alert_item(
+                        time_point=alert_time_defaults["time_point"],
+                        time_start=alert_time_defaults["time_start"],
+                        time_end=alert_time_defaults["time_end"],
+                    )
+                )
+                st.rerun()
 
-        remove_alert_id: Optional[str] = None
-        for idx, item in enumerate(st.session_state[alerts_state_key], start=1):
-            item_id = str(item.get("id") or uuid4().hex)
-            item["id"] = item_id
-            title_key = f"logs_sum_alert_title_{item_id}"
-            details_key = f"logs_sum_alert_details_{item_id}"
-            mode_key = f"logs_sum_alert_time_mode_{item_id}"
-            point_key = f"logs_sum_alert_time_point_{item_id}"
-            start_key = f"logs_sum_alert_time_start_{item_id}"
-            end_key = f"logs_sum_alert_time_end_{item_id}"
-            if title_key not in st.session_state:
-                st.session_state[title_key] = str(item.get("title", ""))
-            if details_key not in st.session_state:
-                st.session_state[details_key] = str(item.get("details", ""))
-            if mode_key not in st.session_state:
-                st.session_state[mode_key] = (
-                    "Промежуток"
-                    if str(item.get("time_mode", "point")).strip().lower() == "range"
-                    else "Один момент"
-                )
-            if point_key not in st.session_state:
-                st.session_state[point_key] = (
-                    str(item.get("time_point", "")).strip() or alert_time_defaults["time_point"]
-                )
-            if start_key not in st.session_state:
-                st.session_state[start_key] = (
-                    str(item.get("time_start", "")).strip() or alert_time_defaults["time_start"]
-                )
-            if end_key not in st.session_state:
-                st.session_state[end_key] = (
-                    str(item.get("time_end", "")).strip() or alert_time_defaults["time_end"]
-                )
+            remove_alert_id: Optional[str] = None
+            for idx, item in enumerate(st.session_state[alerts_state_key], start=1):
+                item_id = str(item.get("id") or uuid4().hex)
+                item["id"] = item_id
+                title_key = f"logs_sum_alert_title_{item_id}"
+                details_key = f"logs_sum_alert_details_{item_id}"
+                mode_key = f"logs_sum_alert_time_mode_{item_id}"
+                point_key = f"logs_sum_alert_time_point_{item_id}"
+                start_key = f"logs_sum_alert_time_start_{item_id}"
+                end_key = f"logs_sum_alert_time_end_{item_id}"
+                if title_key not in st.session_state:
+                    st.session_state[title_key] = str(item.get("title", ""))
+                if details_key not in st.session_state:
+                    st.session_state[details_key] = str(item.get("details", ""))
+                if mode_key not in st.session_state:
+                    st.session_state[mode_key] = (
+                        "Промежуток"
+                        if str(item.get("time_mode", "point")).strip().lower() == "range"
+                        else "Один момент"
+                    )
+                if point_key not in st.session_state:
+                    st.session_state[point_key] = (
+                        str(item.get("time_point", "")).strip() or alert_time_defaults["time_point"]
+                    )
+                if start_key not in st.session_state:
+                    st.session_state[start_key] = (
+                        str(item.get("time_start", "")).strip() or alert_time_defaults["time_start"]
+                    )
+                if end_key not in st.session_state:
+                    st.session_state[end_key] = (
+                        str(item.get("time_end", "")).strip() or alert_time_defaults["time_end"]
+                    )
 
-            col_alert, col_remove = st.columns([10, 2])
-            with col_alert:
+                col_alert, col_remove = st.columns([10, 2])
+                with col_alert:
+                    st.text_input(
+                        f"Алерт #{idx} — Название",
+                        key=title_key,
+                        placeholder=f"Например: alert_{idx}",
+                        disabled=is_running,
+                    )
+                    selected_mode = st.radio(
+                        f"Алерт #{idx} — Время",
+                        options=("Один момент", "Промежуток"),
+                        key=mode_key,
+                        horizontal=True,
+                        disabled=is_running,
+                    )
+                    if selected_mode == "Промежуток":
+                        st.text_input(
+                            f"Алерт #{idx} — Начало (ISO)",
+                            key=start_key,
+                            placeholder="2026-03-18T18:42:00+03:00",
+                            disabled=is_running,
+                        )
+                        st.text_input(
+                            f"Алерт #{idx} — Конец (ISO)",
+                            key=end_key,
+                            placeholder="2026-03-18T19:10:00+03:00",
+                            disabled=is_running,
+                        )
+                    else:
+                        st.text_input(
+                            f"Алерт #{idx} — Время (ISO)",
+                            key=point_key,
+                            placeholder="2026-03-18T18:42:00+03:00",
+                            disabled=is_running,
+                        )
+                    st.text_area(
+                        f"Алерт #{idx} — Описание (опционально)",
+                        key=details_key,
+                        height=100,
+                        disabled=is_running,
+                    )
+                with col_remove:
+                    can_remove_alert = len(st.session_state[alerts_state_key]) > 1
+                    if st.button(
+                        "Убрать",
+                        key=f"logs_sum_remove_alert_{item_id}",
+                        disabled=is_running or not can_remove_alert,
+                        use_container_width=True,
+                        help="Удалить этот алерт",
+                    ):
+                        remove_alert_id = item_id
+
+                item["title"] = str(st.session_state.get(title_key, ""))
+                item["details"] = str(st.session_state.get(details_key, ""))
+                item["time_mode"] = (
+                    "range"
+                    if str(st.session_state.get(mode_key, "Один момент")) == "Промежуток"
+                    else "point"
+                )
+                item["time_point"] = str(st.session_state.get(point_key, ""))
+                item["time_start"] = str(st.session_state.get(start_key, ""))
+                item["time_end"] = str(st.session_state.get(end_key, ""))
+
+            if remove_alert_id:
+                st.session_state[alerts_state_key] = [
+                    item
+                    for item in st.session_state[alerts_state_key]
+                    if str(item.get("id")) != remove_alert_id
+                ]
+                st.rerun()
+
+            st.markdown("#### SQL Запросы Метрик (Опционально)")
+            if st.button(
+                "+ Добавить запрос метрик",
+                key="logs_sum_add_metrics_query",
+                use_container_width=True,
+                disabled=is_running,
+            ):
+                st.session_state[metrics_queries_state_key].append(_new_query_item(""))
+                st.rerun()
+
+            remove_metrics_query_id: Optional[str] = None
+            for idx, item in enumerate(st.session_state[metrics_queries_state_key], start=1):
+                item_id = str(item.get("id"))
+                query_key = f"logs_sum_metrics_query_text_{item_id}"
+                if query_key not in st.session_state:
+                    st.session_state[query_key] = str(item.get("text", ""))
+                col_query, col_remove = st.columns([10, 2])
+                with col_query:
+                    st.text_area(
+                        f"SQL метрик #{idx}",
+                        key=query_key,
+                        height=140,
+                        placeholder=(
+                            "SELECT timestamp, value, service FROM metrics_table\n"
+                            "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
+                            "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
+                            "ORDER BY timestamp\n"
+                            "LIMIT {limit}"
+                        ),
+                        help=(
+                            "Ожидаются колонки timestamp и числовая value "
+                            "(service опционально). Поддерживаются плейсхолдеры "
+                            "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
+                            "Рекомендуемый формат без OFFSET."
+                        ),
+                        disabled=is_running,
+                    )
+                with col_remove:
+                    if st.button(
+                        "Убрать",
+                        key=f"logs_sum_remove_metrics_query_{item_id}",
+                        disabled=is_running,
+                        help="Удалить этот SQL-блок",
+                        use_container_width=True,
+                    ):
+                        remove_metrics_query_id = item_id
+                item["text"] = str(st.session_state.get(query_key, ""))
+
+            if remove_metrics_query_id:
+                st.session_state[metrics_queries_state_key] = [
+                    item
+                    for item in st.session_state[metrics_queries_state_key]
+                    if str(item.get("id")) != remove_metrics_query_id
+                ]
+                st.rerun()
+
+        with config_tabs[1]:
+            st.markdown("#### Параметры Получения Логов")
+            period_mode_label = st.radio(
+                "Режим периода",
+                options=("Окно вокруг даты (±N минут)", "Явный диапазон (start/end)"),
+                horizontal=False,
+                key="logs_sum_period_mode",
+                disabled=is_running,
+            )
+            is_window_mode = period_mode_label.startswith("Окно вокруг")
+
+            if is_window_mode:
                 st.text_input(
-                    f"Алерт #{idx} — Название",
-                    key=title_key,
-                    placeholder=f"Например: alert_{idx}",
+                    "Целевая дата/время (ISO)",
+                    key="logs_sum_center_dt",
+                    placeholder="Например: 2026-03-27T14:30:00+03:00",
+                    help="Часовой пояс по умолчанию — MSK (`+03:00`). Можно явно указать `+03:00` или `Z`.",
                     disabled=is_running,
                 )
-                selected_mode = st.radio(
-                    f"Алерт #{idx} — Время",
-                    options=("Один момент", "Промежуток"),
-                    key=mode_key,
-                    horizontal=True,
+                st.number_input(
+                    "Окно анализа (+- N минут)",
+                    min_value=1,
+                    max_value=60 * 24 * 30,
+                    step=1,
+                    key="logs_sum_window_minutes",
                     disabled=is_running,
                 )
-                if selected_mode == "Промежуток":
-                    st.text_input(
-                        f"Алерт #{idx} — Начало (ISO)",
-                        key=start_key,
-                        placeholder="2026-03-18T18:42:00+03:00",
-                        disabled=is_running,
-                    )
-                    st.text_input(
-                        f"Алерт #{idx} — Конец (ISO)",
-                        key=end_key,
-                        placeholder="2026-03-18T19:10:00+03:00",
-                        disabled=is_running,
-                    )
-                else:
-                    st.text_input(
-                        f"Алерт #{idx} — Время (ISO)",
-                        key=point_key,
-                        placeholder="2026-03-18T18:42:00+03:00",
-                        disabled=is_running,
-                    )
-                st.text_area(
-                    f"Алерт #{idx} — Описание (опционально)",
-                    key=details_key,
-                    height=100,
+            else:
+                st.text_input(
+                    "Дата/время начала (ISO)",
+                    key="logs_sum_start_dt",
+                    placeholder="Например: 2026-03-27T10:00:00+03:00",
+                    help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
                     disabled=is_running,
                 )
-            with col_remove:
-                can_remove_alert = len(st.session_state[alerts_state_key]) > 1
-                if st.button(
-                    "Убрать",
-                    key=f"logs_sum_remove_alert_{item_id}",
-                    disabled=is_running or not can_remove_alert,
-                    use_container_width=True,
-                    help="Удалить этот алерт",
-                ):
-                    remove_alert_id = item_id
+                st.text_input(
+                    "Дата/время конца (ISO)",
+                    key="logs_sum_end_dt",
+                    placeholder="Например: 2026-03-27T12:00:00+03:00",
+                    help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
+                    disabled=is_running,
+                )
 
-            item["title"] = str(st.session_state.get(title_key, ""))
-            item["details"] = str(st.session_state.get(details_key, ""))
-            item["time_mode"] = (
-                "range"
-                if str(st.session_state.get(mode_key, "Один момент")) == "Промежуток"
-                else "point"
+            st.number_input(
+                "Размер DB batch (выгрузка из БД)",
+                min_value=10,
+                max_value=100_000,
+                step=100,
+                key="logs_sum_db_batch",
+                disabled=is_running,
             )
-            item["time_point"] = str(st.session_state.get(point_key, ""))
-            item["time_start"] = str(st.session_state.get(start_key, ""))
-            item["time_end"] = str(st.session_state.get(end_key, ""))
-
-        if remove_alert_id:
-            st.session_state[alerts_state_key] = [
-                item for item in st.session_state[alerts_state_key]
-                if str(item.get("id")) != remove_alert_id
-            ]
-            st.rerun()
-
-        st.markdown("SQL Запросы Метрик (Опционально)")
-        if st.button(
-            "+ Добавить запрос метрик",
-            key="logs_sum_add_metrics_query",
-            use_container_width=True,
-            disabled=is_running,
-        ):
-            st.session_state[metrics_queries_state_key].append(_new_query_item(""))
-            st.rerun()
-
-        remove_metrics_query_id: Optional[str] = None
-        for idx, item in enumerate(st.session_state[metrics_queries_state_key], start=1):
-            item_id = str(item.get("id"))
-            query_key = f"logs_sum_metrics_query_text_{item_id}"
-            if query_key not in st.session_state:
-                st.session_state[query_key] = str(item.get("text", ""))
-            col_query, col_remove = st.columns([10, 2])
-            with col_query:
-                st.text_area(
-                    f"SQL метрик #{idx}",
-                    key=query_key,
-                    height=140,
-                    placeholder=(
-                        "SELECT timestamp, value, service FROM metrics_table\n"
-                        "WHERE timestamp > parseDateTimeBestEffort('{last_ts}')\n"
-                        "  AND timestamp < parseDateTimeBestEffort('{period_end}')\n"
-                        "ORDER BY timestamp\n"
-                        "LIMIT {limit}"
-                    ),
-                    help=(
-                        "Ожидаются колонки timestamp и числовая value "
-                        "(service опционально). Поддерживаются плейсхолдеры "
-                        "{period_start}, {period_end}, {start}, {end}, {limit}, {last_ts}. "
-                        "Рекомендуемый формат без OFFSET."
-                    ),
-                    disabled=is_running,
-                )
-            with col_remove:
-                if st.button(
-                    "Убрать",
-                    key=f"logs_sum_remove_metrics_query_{item_id}",
-                    disabled=is_running,
-                    help="Удалить этот SQL-блок",
-                    use_container_width=True,
-                ):
-                    remove_metrics_query_id = item_id
-            item["text"] = str(st.session_state.get(query_key, ""))
-
-        if remove_metrics_query_id:
-            st.session_state[metrics_queries_state_key] = [
-                item for item in st.session_state[metrics_queries_state_key]
-                if str(item.get("id")) != remove_metrics_query_id
-            ]
-            st.rerun()
-
-        period_mode_label = st.radio(
-            "Режим периода",
-            options=("Окно вокруг даты (±N минут)", "Явный диапазон (start/end)"),
-            horizontal=False,
-            key="logs_sum_period_mode",
-            disabled=is_running,
-        )
-        is_window_mode = period_mode_label.startswith("Окно вокруг")
-
-        if is_window_mode:
-            st.text_input(
-                "Целевая дата/время (ISO)",
-                key="logs_sum_center_dt",
-                placeholder="Например: 2026-03-27T14:30:00+03:00",
-                help="Часовой пояс по умолчанию — MSK (`+03:00`). Можно явно указать `+03:00` или `Z`.",
+            st.toggle(
+                "Демо режим (без БД)",
+                key="logs_sum_demo_mode",
                 disabled=is_running,
             )
             st.number_input(
-                "Окно анализа (+- N минут)",
-                min_value=1,
-                max_value=60 * 24 * 30,
+                "Количество логов в демо режиме",
+                min_value=100,
+                max_value=50_000,
+                step=100,
+                key="logs_sum_demo_logs_count",
+                disabled=is_running or not bool(st.session_state.get("logs_sum_demo_mode", False)),
+            )
+
+        with config_tabs[2]:
+            st.markdown("#### Параметры MAP")
+            st.number_input(
+                "Лимит строк на 1 LLM MAP batch",
+                min_value=10,
+                max_value=100_000,
+                step=10,
+                key="logs_sum_llm_batch",
+                disabled=is_running,
+                help=(
+                    "Верхняя граница строк для одного MAP-вызова LLM. "
+                    "Пайплайн никогда не отправит больше этого значения. "
+                    "Если LLM вернёт overflow/400, размер батча будет автоматически уменьшаться."
+                ),
+            )
+            api_model_candidates, api_models_error = _fetch_llm_model_candidates()
+            model_candidates = list(api_model_candidates)
+            if not model_candidates:
+                model_candidates = list(MODEL_CONTEXT_PRESETS.keys())
+            current_model = str(st.session_state.get("logs_sum_model_id") or "").strip()
+            if current_model and current_model not in model_candidates:
+                model_candidates.insert(0, current_model)
+            elif not current_model:
+                fallback_model = str(getattr(settings, "LLM_MODEL_ID", "") or "").strip()
+                if fallback_model and fallback_model not in model_candidates:
+                    model_candidates.insert(0, fallback_model)
+            if not model_candidates:
+                model_candidates = [str(getattr(settings, "LLM_MODEL_ID", "") or "default-model")]
+            st.selectbox(
+                "Модель LLM",
+                options=model_candidates,
+                key="logs_sum_model_id",
+                disabled=is_running,
+                help="Модель используется только на стороне API; локальный подсчёт токенов отключён.",
+            )
+            st.checkbox(
+                "Использовать Instructor для строгой структуры",
+                key="logs_sum_use_instructor",
+                disabled=is_running,
+                help=(
+                    "Когда включено, MAP/REDUCE структурируются через Instructor + Pydantic "
+                    "(валидация схемы без ручного JSON-parse)."
+                ),
+            )
+            st.checkbox(
+                "Модель поддерживает tool-calling",
+                key="logs_sum_model_supports_tool_calling",
+                disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
+                help=(
+                    "Включи, если gateway корректно поддерживает tool/function calling. "
+                    "Если выключено — Instructor работает в JSON-режиме."
+                ),
+            )
+            selected_model_for_budget = str(st.session_state.get("logs_sum_model_id") or "").strip()
+            st.caption(
+                f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
+            )
+            if api_model_candidates:
+                st.caption(f"Список моделей загружен из LLM API (`{len(api_model_candidates)}` шт.).")
+            elif api_models_error:
+                st.caption(f"LLM API модели недоступны: {api_models_error} Используем fallback список.")
+            st.caption("MAP обрабатывается последовательно (workers = 1).")
+
+        with config_tabs[3]:
+            st.markdown("#### Параметры REDUCE И Финального Отчёта")
+            st.markdown("Этапы Финального Отчёта")
+            st.checkbox(
+                "Генерировать structured-отчёт по секциям",
+                key="logs_sum_enable_final_structured",
+                disabled=is_running,
+                help="Если выключено — structured-этап пропускается (останется reduce summary).",
+            )
+            st.checkbox(
+                "Генерировать freeform-отчёт по секциям",
+                key="logs_sum_enable_final_freeform",
+                disabled=is_running,
+                help="Если выключено — свободный narrative-этап пропускается.",
+            )
+            st.checkbox(
+                "Синхронизировать топики между отчётами",
+                key="logs_sum_enable_final_topics_sync",
+                disabled=is_running,
+                help="Добавляет недостающие разделы из списка 13 топиков в итоговые тексты.",
+            )
+            st.checkbox(
+                "Запускать дополнительный Instructor-отчёт (A/B)",
+                key="logs_sum_enable_final_instructor_report",
+                disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
+                help=(
+                    "Тестовая вторая генерация после основного отчёта. "
+                    "Требует включённый флаг Instructor."
+                ),
+            )
+            if not bool(st.session_state.get("logs_sum_enable_final_structured", True)) and not bool(
+                st.session_state.get("logs_sum_enable_final_freeform", True)
+            ):
+                st.caption("Оба финальных этапа выключены: сохраним только reduce summary + артефакты.")
+
+            st.markdown("Параметры REDUCE")
+            st.number_input(
+                "Размер группы REDUCE (сколько summary мержим за вызов)",
+                min_value=2,
+                max_value=10,
                 step=1,
-                key="logs_sum_window_minutes",
+                key="logs_sum_reduce_group_size",
                 disabled=is_running,
             )
-        else:
-            st.text_input(
-                "Дата/время начала (ISO)",
-                key="logs_sum_start_dt",
-                placeholder="Например: 2026-03-27T10:00:00+03:00",
-                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
+            st.number_input(
+                "Лимит символов на 1 вход REDUCE summary",
+                min_value=1000,
+                max_value=500_000,
+                step=1000,
+                key="logs_sum_reduce_input_max_chars",
                 disabled=is_running,
             )
-            st.text_input(
-                "Дата/время конца (ISO)",
-                key="logs_sum_end_dt",
-                placeholder="Например: 2026-03-27T12:00:00+03:00",
-                help="Формат: `YYYY-MM-DDTHH:MM:SS+03:00` (если без зоны — считаем как MSK).",
+            st.number_input(
+                "Целевой % токенов после REDUCE",
+                min_value=10,
+                max_value=95,
+                step=1,
+                key="logs_sum_reduce_target_token_pct",
                 disabled=is_running,
+            )
+            st.number_input(
+                "Целевой % токенов после компрессии",
+                min_value=10,
+                max_value=95,
+                step=1,
+                key="logs_sum_compression_target_pct",
+                disabled=is_running,
+            )
+            st.number_input(
+                "Порог важности для компрессии",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.05,
+                key="logs_sum_compression_importance_threshold",
+                disabled=is_running,
+                format="%.2f",
             )
 
-        st.number_input(
-            "Размер DB batch (выгрузка из БД)",
-            min_value=10,
-            max_value=100_000,
-            step=100,
-            key="logs_sum_db_batch",
-            disabled=is_running,
-        )
-        st.number_input(
-            "Лимит строк на 1 LLM MAP batch",
-            min_value=10,
-            max_value=100_000,
-            step=10,
-            key="logs_sum_llm_batch",
-            disabled=is_running,
-            help=(
-                "Верхняя граница строк для одного MAP-вызова LLM. "
-                "Пайплайн никогда не отправит больше этого значения. "
-                "Если LLM вернёт overflow/400, размер батча будет автоматически уменьшаться."
-            ),
-        )
-        api_model_candidates, api_models_error = _fetch_llm_model_candidates()
-        model_candidates = list(api_model_candidates)
-        if not model_candidates:
-            model_candidates = list(MODEL_CONTEXT_PRESETS.keys())
-        current_model = str(st.session_state.get("logs_sum_model_id") or "").strip()
-        if current_model and current_model not in model_candidates:
-            model_candidates.insert(0, current_model)
-        elif not current_model:
-            fallback_model = str(getattr(settings, "LLM_MODEL_ID", "") or "").strip()
-            if fallback_model and fallback_model not in model_candidates:
-                model_candidates.insert(0, fallback_model)
-        if not model_candidates:
-            model_candidates = [str(getattr(settings, "LLM_MODEL_ID", "") or "default-model")]
-        st.selectbox(
-            "Модель LLM",
-            options=model_candidates,
-            key="logs_sum_model_id",
-            disabled=is_running,
-            help="Модель используется только на стороне API; локальный подсчёт токенов отключён.",
-        )
-        st.checkbox(
-            "Использовать Instructor для строгой структуры",
-            key="logs_sum_use_instructor",
-            disabled=is_running,
-            help=(
-                "Когда включено, MAP/REDUCE структурируются через Instructor + Pydantic "
-                "(валидация схемы без ручного JSON-parse)."
-            ),
-        )
-        st.checkbox(
-            "Модель поддерживает tool-calling",
-            key="logs_sum_model_supports_tool_calling",
-            disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
-            help=(
-                "Включи, если gateway корректно поддерживает tool/function calling. "
-                "Если выключено — Instructor работает в JSON-режиме."
-            ),
-        )
-        st.markdown("Этапы Финального Отчёта")
-        st.checkbox(
-            "Генерировать structured-отчёт по секциям",
-            key="logs_sum_enable_final_structured",
-            disabled=is_running,
-            help="Если выключено — structured-этап пропускается (останется reduce summary).",
-        )
-        st.checkbox(
-            "Генерировать freeform-отчёт по секциям",
-            key="logs_sum_enable_final_freeform",
-            disabled=is_running,
-            help="Если выключено — свободный narrative-этап пропускается.",
-        )
-        st.checkbox(
-            "Синхронизировать топики между отчётами",
-            key="logs_sum_enable_final_topics_sync",
-            disabled=is_running,
-            help="Добавляет недостающие разделы из списка 13 топиков в итоговые тексты.",
-        )
-        st.checkbox(
-            "Запускать дополнительный Instructor-отчёт (A/B)",
-            key="logs_sum_enable_final_instructor_report",
-            disabled=is_running or not bool(st.session_state.get("logs_sum_use_instructor", True)),
-            help=(
-                "Тестовая вторая генерация после основного отчёта. "
-                "Требует включённый флаг Instructor."
-            ),
-        )
-        if not bool(st.session_state.get("logs_sum_enable_final_structured", True)) and not bool(
-            st.session_state.get("logs_sum_enable_final_freeform", True)
-        ):
-            st.caption("Оба финальных этапа выключены: сохраним только reduce summary + артефакты.")
-        selected_model_for_budget = str(st.session_state.get("logs_sum_model_id") or "").strip()
-        st.caption(
-            f"Локальная оценка токенов отключена (model: `{selected_model_for_budget or 'n/a'}`)"
-        )
-        if api_model_candidates:
-            st.caption(f"Список моделей загружен из LLM API (`{len(api_model_candidates)}` шт.).")
-        elif api_models_error:
-            st.caption(f"LLM API модели недоступны: {api_models_error} Используем fallback список.")
-        st.caption("MAP обрабатывается последовательно (workers = 1).")
-        st.number_input(
-            "Ретраи LLM (при ошибке)",
-            min_value=-1,
-            max_value=100,
-            step=1,
-            key="logs_sum_max_retries",
-            disabled=is_running,
-            help=(
-                "Сколько раз повторить вызов LLM при ошибке. "
-                "0 = без ретраев (сразу fallback). "
-                "-1 = бесконечные ретраи. "
-                "Пауза между попытками фиксированная: 10 секунд."
-            ),
-        )
-        st.number_input(
-            "Таймаут LLM (сек)",
-            min_value=10,
-            max_value=7200,
-            step=10,
-            key="logs_sum_llm_timeout",
-            disabled=is_running,
-            help=(
-                "Максимальное время ожидания одного LLM-ответа. "
-                "При зависании запрос упадёт по таймауту и уйдёт на retry. "
-                "Для ReadTimeout таймаут растёт экспоненциально (x2 на каждую ошибку), "
-                "повторы идут бесконечно."
-            ),
-        )
-        st.checkbox(
-            "Если логов нет — сделать осторожное предположение через LLM",
-            key="logs_sum_enable_no_logs_hypothesis",
-            disabled=is_running,
-            help=(
-                "Опционально: даже если в периоде нет логов, "
-                "LLM сформирует гипотезы и список проверок для SRE."
-            ),
-        )
-        st.toggle(
-            "Демо режим (без БД)",
-            key="logs_sum_demo_mode",
-            disabled=is_running,
-        )
-        st.number_input(
-            "Количество логов в демо режиме",
-            min_value=100,
-            max_value=50_000,
-            step=100,
-            key="logs_sum_demo_logs_count",
-            disabled=is_running or not bool(st.session_state.get("logs_sum_demo_mode", False)),
-        )
+            st.number_input(
+                "Ретраи LLM (при ошибке)",
+                min_value=-1,
+                max_value=100,
+                step=1,
+                key="logs_sum_max_retries",
+                disabled=is_running,
+                help=(
+                    "Сколько раз повторить вызов LLM при ошибке. "
+                    "0 = без ретраев (сразу fallback). "
+                    "-1 = бесконечные ретраи. "
+                    "Пауза между попытками фиксированная: 10 секунд."
+                ),
+            )
+            st.number_input(
+                "Таймаут LLM (сек)",
+                min_value=10,
+                max_value=7200,
+                step=10,
+                key="logs_sum_llm_timeout",
+                disabled=is_running,
+                help=(
+                    "Максимальное время ожидания одного LLM-ответа. "
+                    "При зависании запрос упадёт по таймауту и уйдёт на retry. "
+                    "Для ReadTimeout таймаут растёт экспоненциально (x2 на каждую ошибку), "
+                    "повторы идут бесконечно."
+                ),
+            )
+            st.checkbox(
+                "Если логов нет — сделать осторожное предположение через LLM",
+                key="logs_sum_enable_no_logs_hypothesis",
+                disabled=is_running,
+                help=(
+                    "Опционально: даже если в периоде нет логов, "
+                    "LLM сформирует гипотезы и список проверок для SRE."
+                ),
+            )
 
-        run_clicked = st.button(
-            "Запустить Суммаризацию Логов",
-            type="primary",
-            use_container_width=True,
-            disabled=is_running,
-        )
+        with config_tabs[4]:
+            st.markdown("#### Запуск")
+            st.caption("Сначала пройди вкладки 1-4, затем запускай пайплайн.")
+            st.code(
+                "\n".join(
+                    [
+                        f"queries_logs={len(st.session_state.get(logs_queries_state_key, []))}",
+                        f"queries_metrics={len(st.session_state.get(metrics_queries_state_key, []))}",
+                        f"alerts={len(st.session_state.get(alerts_state_key, []))}",
+                        f"db_batch={st.session_state.get('logs_sum_db_batch')}",
+                        f"llm_batch={st.session_state.get('logs_sum_llm_batch')}",
+                        f"model={st.session_state.get('logs_sum_model_id')}",
+                        f"instructor={bool(st.session_state.get('logs_sum_use_instructor', True))}",
+                        f"reduce_group_size={st.session_state.get('logs_sum_reduce_group_size')}",
+                        f"reduce_input_max_chars={st.session_state.get('logs_sum_reduce_input_max_chars')}",
+                    ]
+                ),
+                language="text",
+            )
+            run_clicked = st.button(
+                "Запустить Суммаризацию Логов",
+                type="primary",
+                use_container_width=True,
+                disabled=is_running,
+                key="logs_sum_run_pipeline_button",
+            )
 
     logs_queries = _extract_queries_from_items(st.session_state.get(logs_queries_state_key))
     metrics_queries = _extract_queries_from_items(st.session_state.get(metrics_queries_state_key))
@@ -7496,6 +7677,23 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     )
     enable_final_instructor_report = bool(
         st.session_state.get("logs_sum_enable_final_instructor_report", True)
+    )
+    reduce_group_size = max(int(st.session_state.get("logs_sum_reduce_group_size", 2)), 2)
+    reduce_input_max_chars = max(
+        int(st.session_state.get("logs_sum_reduce_input_max_chars", 40000)),
+        1000,
+    )
+    reduce_target_token_pct = max(
+        min(int(st.session_state.get("logs_sum_reduce_target_token_pct", 50)), 95),
+        10,
+    )
+    compression_target_pct = max(
+        min(int(st.session_state.get("logs_sum_compression_target_pct", 50)), 95),
+        10,
+    )
+    compression_importance_threshold = min(
+        max(float(st.session_state.get("logs_sum_compression_importance_threshold", 0.7)), 0.0),
+        1.0,
     )
     logs_timestamp_column = _normalize_timestamp_column_name(
         getattr(deps, "logs_timestamp_column", "timestamp")
@@ -7584,6 +7782,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "enable_final_freeform": enable_final_freeform,
             "enable_final_topics_sync": enable_final_topics_sync,
             "enable_final_instructor_report": enable_final_instructor_report,
+            "reduce_group_size": reduce_group_size,
+            "reduce_input_max_chars": reduce_input_max_chars,
+            "reduce_target_token_pct": reduce_target_token_pct,
+            "compression_target_pct": compression_target_pct,
+            "compression_importance_threshold": compression_importance_threshold,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -7629,6 +7832,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
             "enable_final_freeform": enable_final_freeform,
             "enable_final_topics_sync": enable_final_topics_sync,
             "enable_final_instructor_report": enable_final_instructor_report,
+            "reduce_group_size": reduce_group_size,
+            "reduce_input_max_chars": reduce_input_max_chars,
+            "reduce_target_token_pct": reduce_target_token_pct,
+            "compression_target_pct": compression_target_pct,
+            "compression_importance_threshold": compression_importance_threshold,
             "logs_timestamp_column": logs_timestamp_column,
             "map_workers": map_workers,
             "max_retries": max_retries,
@@ -7675,6 +7883,31 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     enable_final_instructor_report = bool(
         active_params.get("enable_final_instructor_report", enable_final_instructor_report)
     )
+    reduce_group_size = max(int(active_params.get("reduce_group_size", reduce_group_size)), 2)
+    reduce_input_max_chars = max(
+        int(active_params.get("reduce_input_max_chars", reduce_input_max_chars)),
+        1000,
+    )
+    reduce_target_token_pct = max(
+        min(int(active_params.get("reduce_target_token_pct", reduce_target_token_pct)), 95),
+        10,
+    )
+    compression_target_pct = max(
+        min(int(active_params.get("compression_target_pct", compression_target_pct)), 95),
+        10,
+    )
+    compression_importance_threshold = min(
+        max(
+            float(
+                active_params.get(
+                    "compression_importance_threshold",
+                    compression_importance_threshold,
+                )
+            ),
+            0.0,
+        ),
+        1.0,
+    )
     logs_timestamp_column = _normalize_timestamp_column_name(
         active_params.get("logs_timestamp_column", logs_timestamp_column)
     )
@@ -7703,6 +7936,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
     active_params["enable_final_freeform"] = enable_final_freeform
     active_params["enable_final_topics_sync"] = enable_final_topics_sync
     active_params["enable_final_instructor_report"] = enable_final_instructor_report
+    active_params["reduce_group_size"] = reduce_group_size
+    active_params["reduce_input_max_chars"] = reduce_input_max_chars
+    active_params["reduce_target_token_pct"] = reduce_target_token_pct
+    active_params["compression_target_pct"] = compression_target_pct
+    active_params["compression_importance_threshold"] = compression_importance_threshold
     active_params["llm_batch_size"] = llm_batch_size
     active_params["map_workers"] = 1
 
@@ -9472,6 +9710,11 @@ def render_logs_summary_page(deps: LogsSummaryPageDeps) -> None:
                 map_workers,
                 use_instructor=use_instructor,
                 model_supports_tool_calling=model_supports_tool_calling,
+                reduce_group_size_override=reduce_group_size,
+                reduce_input_max_chars_override=reduce_input_max_chars,
+                reduce_target_token_pct_override=reduce_target_token_pct,
+                compression_target_pct_override=compression_target_pct,
+                compression_importance_threshold_override=compression_importance_threshold,
             )
 
         def _maybe_generate_no_logs_hypothesis() -> None:
