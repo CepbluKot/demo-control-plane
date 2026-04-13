@@ -27,6 +27,13 @@ DEFAULT_GROQ_API_BASE = DEFAULT_LAB_API_BASE
 DEFAULT_GROQ_MODEL = DEFAULT_LAB_MODEL
 FINAL_REPORT_LAB_TOKENS_PER_MINUTE_LIMIT = 30_000
 CHARS_PER_TOKEN_ESTIMATE = 3
+# FAT preset for local stress-tests of final-stage merge/section generation.
+DEFAULT_SYNTH_CHUNK_COUNT = 24
+DEFAULT_SYNTH_EVENTS_PER_CHUNK = 240
+DEFAULT_SYNTH_DETAILS_PER_EVENT = 3
+DEFAULT_SYNTH_PARAGRAPHS_PER_CHUNK = 10
+DEFAULT_SYNTH_SEED = 20260413
+AUTO_SEED_PROFILE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -474,6 +481,8 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
         or str(os.getenv("OPENAI_API_KEY_DB", "") or "").strip(),
     )
     state.setdefault("frl_last_results", {})
+    state.setdefault("frl_auto_seeded", False)
+    state.setdefault("frl_auto_seed_profile_version", 0)
 
     # One-time migration to new default model for existing sessions
     # that still keep external providers defaults.
@@ -486,16 +495,51 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
     ):
         state["frl_api_base"] = DEFAULT_LAB_API_BASE
 
+    # Auto-seed fat dataset so we can immediately test only final problematic stages.
+    # Uses versioning to transparently refresh old/smaller presets in existing sessions.
+    current_seed_version = int(state.get("frl_auto_seed_profile_version") or 0)
+    needs_refresh = current_seed_version != AUTO_SEED_PROFILE_VERSION
+    if needs_refresh:
+        auto_chunks = _build_synthetic_report_chunks(
+            chunk_count=DEFAULT_SYNTH_CHUNK_COUNT,
+            events_per_chunk=DEFAULT_SYNTH_EVENTS_PER_CHUNK,
+            details_per_event=DEFAULT_SYNTH_DETAILS_PER_EVENT,
+            paragraphs_per_chunk=DEFAULT_SYNTH_PARAGRAPHS_PER_CHUNK,
+            seed=DEFAULT_SYNTH_SEED,
+        )
+        state["frl_chunks"] = auto_chunks
+        state["frl_base_summary"] = _merge_synthetic_chunks(auto_chunks)
+        state["frl_map_summaries_text"] = _build_map_summaries_text(auto_chunks)
+        state["frl_auto_seeded"] = True
+        state["frl_auto_seed_profile_version"] = AUTO_SEED_PROFILE_VERSION
+        deps.logger.info(
+            "FINAL_REPORT_LAB auto-seeded FAT payload | version=%s | chunks=%s | base_chars=%s | map_chars=%s",
+            AUTO_SEED_PROFILE_VERSION,
+            len(auto_chunks),
+            len(str(state.get("frl_base_summary") or "")),
+            len(str(state.get("frl_map_summaries_text") or "")),
+        )
+
     with st.expander("1) Генерация больших synthetic-summary", expanded=True):
+        st.caption(
+            "Здесь автоматически загружается FAT synthetic preset, "
+            "чтобы сразу тестировать финальные этапы (без логов/батчей из БД)."
+        )
         gen_cols = st.columns(5)
         with gen_cols[0]:
-            chunk_count = st.number_input("L1 summaries", min_value=2, max_value=64, value=12, step=1)
+            chunk_count = st.number_input(
+                "L1 summaries",
+                min_value=2,
+                max_value=64,
+                value=DEFAULT_SYNTH_CHUNK_COUNT,
+                step=1,
+            )
         with gen_cols[1]:
             events_per_chunk = st.number_input(
                 "Событий/summary",
                 min_value=10,
                 max_value=500,
-                value=120,
+                value=DEFAULT_SYNTH_EVENTS_PER_CHUNK,
                 step=10,
             )
         with gen_cols[2]:
@@ -503,7 +547,7 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 "Деталей/событие",
                 min_value=1,
                 max_value=8,
-                value=2,
+                value=DEFAULT_SYNTH_DETAILS_PER_EVENT,
                 step=1,
             )
         with gen_cols[3]:
@@ -511,7 +555,7 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 "Гипотез/summary",
                 min_value=1,
                 max_value=20,
-                value=6,
+                value=DEFAULT_SYNTH_PARAGRAPHS_PER_CHUNK,
                 step=1,
             )
         with gen_cols[4]:
@@ -519,7 +563,7 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 "Seed",
                 min_value=1,
                 max_value=2_147_483_647,
-                value=20260413,
+                value=DEFAULT_SYNTH_SEED,
                 step=1,
             )
 
