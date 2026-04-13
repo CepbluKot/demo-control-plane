@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import argparse
+from dataclasses import asdict
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
+from pydantic import Field
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from my_summarizer import (
     DEFAULT_SUMMARY_COLUMNS,
@@ -27,6 +29,46 @@ from ui.pages.logs_summary_page import (
 )
 
 MSK = timezone(timedelta(hours=3))
+
+
+@pydantic_dataclass
+class DebugRunConfig:
+    # ===== Основные параметры прогона =====
+    mode: str = "full"  # "full" | "reduce-only" | "final-only"
+    period_start: str = ""  # Пример: "2026-04-13T10:00:00+03:00"
+    period_end: str = ""  # Пример: "2026-04-13T12:00:00+03:00"
+    anomaly_file: str = ""  # Пример: "artifacts/debug_logs_summarizer_simple/anomaly.json"
+    map_summaries_file: str = ""  # Для режимов reduce-only/final-only
+    base_summary_file: str = ""  # Для режима final-only
+    output_dir: str = "artifacts/debug_logs_summarizer"
+    debug: bool = True
+
+    # ===== Runtime параметры пайплайна =====
+    db_batch: int = Field(default=1000, ge=1)
+    llm_batch: int = Field(default=200, ge=1)
+    min_llm_batch: int = Field(default=20, ge=1)
+    max_retries: int = 3
+    llm_timeout: float = Field(default=1200.0, gt=0.0)
+    final_max_retries: int = 3
+    final_llm_timeout: float = Field(default=1200.0, gt=0.0)
+    reduce_group_size: int = Field(default=2, ge=2)
+    reduce_input_max_chars: int = Field(default=40000, ge=1000)
+    reduce_target_token_pct: int = Field(default=50, ge=10, le=95)
+    compression_target_pct: int = Field(default=50, ge=10, le=95)
+    compression_importance_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    max_shrink_rounds: int = Field(default=6, ge=0)
+    max_cell_chars: int = Field(default=0, ge=0)
+    max_summary_chars: int = Field(default=0, ge=0)
+    reduce_prompt_max_chars: int = Field(default=0, ge=0)
+    auto_shrink_on_400: bool = True
+    use_instructor: bool = True
+    model_supports_tool_calling: bool = True
+    skip_structured: bool = False
+    skip_freeform: bool = False
+
+
+# Меняй значения прямо тут, без CLI.
+RUN_CONFIG = DebugRunConfig()
 
 
 def _parse_dt(raw: str) -> datetime:
@@ -130,7 +172,7 @@ def _save_text(path: Path, text: str) -> None:
     path.write_text(str(text or ""), encoding="utf-8")
 
 
-def _build_runtime_config(args: argparse.Namespace) -> SummarizerConfig:
+def _build_runtime_config(args: Any) -> SummarizerConfig:
     return SummarizerConfig(
         page_limit=int(args.db_batch),
         llm_chunk_rows=int(args.llm_batch),
@@ -208,7 +250,7 @@ def _build_llm_call(
 
 def _run_map_reduce_stage(
     *,
-    args: argparse.Namespace,
+    args: Any,
     period_start_iso: str,
     period_end_iso: str,
     anomaly: Dict[str, Any],
@@ -320,7 +362,7 @@ def _run_map_reduce_stage(
 
 def _run_reduce_only_stage(
     *,
-    args: argparse.Namespace,
+    args: Any,
     map_summaries: Sequence[str],
     period_start_iso: str,
     period_end_iso: str,
@@ -350,7 +392,7 @@ def _run_reduce_only_stage(
 
 def _run_final_sections_stage(
     *,
-    args: argparse.Namespace,
+    args: Any,
     base_summary: str,
     map_summaries: Sequence[str],
     user_goal: str,
@@ -403,89 +445,21 @@ def _run_final_sections_stage(
     return out
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    now = datetime.now(MSK).replace(microsecond=0)
-    p = argparse.ArgumentParser(
-        description="Standalone debugger for the real Logs Summarizer pipeline.",
-    )
-    p.add_argument("--mode", choices=["full", "reduce-only", "final-only"], default="full")
-    p.add_argument("--period-start", default=(now - timedelta(hours=2)).isoformat())
-    p.add_argument("--period-end", default=now.isoformat())
-    p.add_argument("--anomaly-file", default="", help="JSON file with incident/anomaly payload.")
-    p.add_argument("--map-summaries-file", default="", help="JSON/JSONL with MAP summaries.")
-    p.add_argument("--base-summary-file", default="", help="Text file with prebuilt reduce summary.")
-    p.add_argument("--output-dir", default="artifacts/debug_logs_summarizer")
-    p.add_argument("--db-batch", type=int, default=int(getattr(settings, "CONTROL_PLANE_LOGS_PAGE_LIMIT", 1000)))
-    p.add_argument(
-        "--llm-batch",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE", 200)),
-    )
-    p.add_argument(
-        "--min-llm-batch",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE", 20)),
-    )
-    p.add_argument("--max-retries", type=int, default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES", -1)))
-    p.add_argument(
-        "--llm-timeout",
-        type=float,
-        default=float(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200.0)),
-    )
-    p.add_argument("--final-max-retries", type=int, default=3)
-    p.add_argument(
-        "--final-llm-timeout",
-        type=float,
-        default=float(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT", 1200.0)),
-    )
-    p.add_argument(
-        "--reduce-group-size",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_GROUP_SIZE", 2)),
-    )
-    p.add_argument(
-        "--reduce-input-max-chars",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_INPUT_MAX_CHARS", 40000)),
-    )
-    p.add_argument(
-        "--reduce-target-token-pct",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_LLM_REDUCE_TARGET_TOKEN_PCT", 50)),
-    )
-    p.add_argument(
-        "--compression-target-pct",
-        type=int,
-        default=int(getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_TARGET_PCT", 50)),
-    )
-    p.add_argument(
-        "--compression-importance-threshold",
-        type=float,
-        default=float(getattr(settings, "CONTROL_PLANE_LLM_COMPRESSION_IMPORTANCE_THRESHOLD", 0.7)),
-    )
-    p.add_argument("--max-shrink-rounds", type=int, default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SHRINK_ROUNDS", 6)))
-    p.add_argument("--max-cell-chars", type=int, default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_CELL_CHARS", 0)))
-    p.add_argument("--max-summary-chars", type=int, default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_SUMMARY_CHARS", 0)))
-    p.add_argument("--reduce-prompt-max-chars", type=int, default=int(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_REDUCE_PROMPT_MAX_CHARS", 0)))
-    p.add_argument("--auto-shrink-on-400", action=argparse.BooleanOptionalAction, default=bool(getattr(settings, "CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400", True)))
-    p.add_argument("--use-instructor", action=argparse.BooleanOptionalAction, default=bool(getattr(settings, "CONTROL_PLANE_LLM_USE_INSTRUCTOR", True)))
-    p.add_argument("--model-supports-tool-calling", action=argparse.BooleanOptionalAction, default=bool(getattr(settings, "CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING", True)))
-    p.add_argument("--skip-structured", action="store_true")
-    p.add_argument("--skip-freeform", action="store_true")
-    p.add_argument("--debug", action="store_true")
-    return p
-
-
 def main() -> int:
-    args = build_arg_parser().parse_args()
+    args = RUN_CONFIG
     logger = _setup_logging(bool(args.debug))
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    period_start_iso = _parse_dt(args.period_start).isoformat()
-    period_end_iso = _parse_dt(args.period_end).isoformat()
+    now = datetime.now(MSK).replace(microsecond=0)
+    raw_period_start = str(args.period_start or "").strip() or (now - timedelta(hours=2)).isoformat()
+    raw_period_end = str(args.period_end or "").strip() or now.isoformat()
+    period_start_iso = _parse_dt(raw_period_start).isoformat()
+    period_end_iso = _parse_dt(raw_period_end).isoformat()
     if period_end_iso <= period_start_iso:
         raise ValueError("period_end must be greater than period_start")
+    if args.mode not in {"full", "reduce-only", "final-only"}:
+        raise ValueError("mode must be one of: full, reduce-only, final-only")
 
     anomaly = _normalize_anomaly_for_logs(_load_json(args.anomaly_file), logger=logger)
     user_goal = str(anomaly.get("description") or anomaly.get("name") or "")
@@ -516,7 +490,7 @@ def main() -> int:
     elif args.mode == "reduce-only":
         map_summaries = _load_map_summaries(args.map_summaries_file)
         if not map_summaries:
-            raise ValueError("reduce-only mode requires non-empty --map-summaries-file")
+            raise ValueError("reduce-only mode requires non-empty RUN_CONFIG.map_summaries_file")
         base_summary = _run_reduce_only_stage(
             args=args,
             map_summaries=map_summaries,
@@ -532,7 +506,7 @@ def main() -> int:
                 Path(args.base_summary_file).read_text(encoding="utf-8")
             )
         if not base_summary:
-            raise ValueError("final-only mode requires --base-summary-file")
+            raise ValueError("final-only mode requires RUN_CONFIG.base_summary_file")
 
     if not base_summary and map_summaries:
         logger.info("base summary is empty, rebuilding from MAP summaries before final stage")
@@ -566,6 +540,7 @@ def main() -> int:
             "base_summary_len": len(base_summary or ""),
             "structured_len": len(str(final_payload.get("structured_summary") or "")),
             "freeform_len": len(str(final_payload.get("freeform_summary") or "")),
+            "run_config": asdict(args),
         },
     )
     if final_payload.get("structured_summary"):
