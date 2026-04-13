@@ -214,12 +214,17 @@ def _run_map_reduce_stage(
     anomaly: Dict[str, Any],
     output_dir: Path,
     logger: logging.Logger,
+    query_template_override: Optional[str] = None,
+    metrics_context: str = "",
 ) -> Dict[str, Any]:
     anomaly = _normalize_anomaly_for_logs(anomaly, logger=logger)
     fetch_mode = _resolve_logs_fetch_mode()
     tail_limit = max(int(getattr(settings, "CONTROL_PLANE_LOGS_TAIL_LIMIT", 1000) or 1000), 1)
     fetch_errors: List[str] = []
     progress_events: List[Dict[str, Any]] = []
+    original_query_template = str(getattr(settings, "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "") or "")
+    if str(query_template_override or "").strip():
+        settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY = str(query_template_override or "").strip()
 
     def _on_progress(event: str, payload: Dict[str, Any]) -> None:
         row = {
@@ -234,59 +239,63 @@ def _run_map_reduce_stage(
         fetch_errors.append(str(msg))
         _on_progress("fetch_error", {"error": str(msg)})
 
-    total_rows_estimate = _estimate_total_logs(
-        anomaly=anomaly,
-        period_start=period_start_iso,
-        period_end=period_end_iso,
-        page_limit=int(args.db_batch),
-        fetch_mode=fetch_mode,
-        tail_limit=tail_limit,
-    )
-    logger.info(
-        "estimate | rows_total=%s | fetch_mode=%s | tail_limit=%s",
-        total_rows_estimate,
-        fetch_mode,
-        tail_limit,
-    )
+    try:
+        total_rows_estimate = _estimate_total_logs(
+            anomaly=anomaly,
+            period_start=period_start_iso,
+            period_end=period_end_iso,
+            page_limit=int(args.db_batch),
+            fetch_mode=fetch_mode,
+            tail_limit=tail_limit,
+        )
+        logger.info(
+            "estimate | rows_total=%s | fetch_mode=%s | tail_limit=%s",
+            total_rows_estimate,
+            fetch_mode,
+            tail_limit,
+        )
 
-    db_fetch_page = _build_db_fetch_page(
-        anomaly,
-        fetch_mode=fetch_mode,
-        tail_limit=tail_limit,
-        on_error=_on_fetch_error,
-    )
-    llm_call = _build_llm_call(
-        timeout=float(args.llm_timeout),
-        max_retries=int(args.max_retries),
-        fail_open_return_empty=False,
-        logger=logger,
-    )
-    summarizer = PeriodLogSummarizer(
-        db_fetch_page=db_fetch_page,
-        llm_call=llm_call,
-        config=_build_runtime_config(args),
-        on_progress=_on_progress,
-        prompt_context={
-            "incident_start": period_start_iso,
-            "incident_end": period_end_iso,
-            "incident_description": str(anomaly.get("description") or ""),
-            "alerts_list": json.dumps(anomaly, ensure_ascii=False),
-            "metrics_context": "",
-            "source_name": str(anomaly.get("service") or "unknown"),
-            "sql_query": str(getattr(settings, "CONTROL_PLANE_LOGS_SQL_QUERY_TEMPLATE", "") or ""),
-            "time_column": str(getattr(settings, "CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp")),
-            "data_type": "",
-            "llm_timeout": float(args.llm_timeout),
-            "llm_max_retries": int(args.max_retries),
-        },
-    )
+        db_fetch_page = _build_db_fetch_page(
+            anomaly,
+            fetch_mode=fetch_mode,
+            tail_limit=tail_limit,
+            on_error=_on_fetch_error,
+        )
+        llm_call = _build_llm_call(
+            timeout=float(args.llm_timeout),
+            max_retries=int(args.max_retries),
+            fail_open_return_empty=False,
+            logger=logger,
+        )
+        summarizer = PeriodLogSummarizer(
+            db_fetch_page=db_fetch_page,
+            llm_call=llm_call,
+            config=_build_runtime_config(args),
+            on_progress=_on_progress,
+            prompt_context={
+                "incident_start": period_start_iso,
+                "incident_end": period_end_iso,
+                "incident_description": str(anomaly.get("description") or ""),
+                "alerts_list": json.dumps(anomaly, ensure_ascii=False),
+                "metrics_context": str(metrics_context or ""),
+                "source_name": str(anomaly.get("service") or "unknown"),
+                "sql_query": str(getattr(settings, "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "") or ""),
+                "time_column": str(getattr(settings, "CONTROL_PLANE_LOGS_TIMESTAMP_COLUMN", "timestamp")),
+                "data_type": "",
+                "llm_timeout": float(args.llm_timeout),
+                "llm_max_retries": int(args.max_retries),
+            },
+        )
 
-    result = summarizer.summarize_period(
-        period_start=period_start_iso,
-        period_end=period_end_iso,
-        columns=list(DEFAULT_SUMMARY_COLUMNS),
-        total_rows_estimate=total_rows_estimate,
-    )
+        result = summarizer.summarize_period(
+            period_start=period_start_iso,
+            period_end=period_end_iso,
+            columns=list(DEFAULT_SUMMARY_COLUMNS),
+            total_rows_estimate=total_rows_estimate,
+        )
+    finally:
+        if str(query_template_override or "").strip():
+            settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY = original_query_template
 
     payload = {
         "summary": _normalize_summary_text(result.summary),
@@ -349,6 +358,7 @@ def _run_final_sections_stage(
     period_end_iso: str,
     stats: Dict[str, Any],
     logger: logging.Logger,
+    metrics_context: str = "",
 ) -> Dict[str, Any]:
     map_summaries_text = "\n\n".join(
         f"[MAP SUMMARY #{idx + 1}]\n{_normalize_summary_text(item)}"
@@ -370,7 +380,7 @@ def _run_final_sections_stage(
             period_start=period_start_iso,
             period_end=period_end_iso,
             stats=stats,
-            metrics_context="",
+            metrics_context=str(metrics_context or ""),
             map_summaries_text=map_summaries_text,
             logger=logger,
         )
@@ -384,7 +394,7 @@ def _run_final_sections_stage(
             period_start=period_start_iso,
             period_end=period_end_iso,
             stats=stats,
-            metrics_context="",
+            metrics_context=str(metrics_context or ""),
             map_summaries_text=map_summaries_text,
             logger=logger,
         )
