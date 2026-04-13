@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
+from pathlib import Path
 import random
 import re
 import time
@@ -81,6 +83,185 @@ class _TokenPerMinuteLimiter:
             time.sleep(sleep_for)
             waited += sleep_for
             now = None
+
+
+def _safe_filename(text: str, *, fallback: str = "item") -> str:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return fallback
+    slug = re.sub(r"[^a-z0-9а-яё_-]+", "_", raw, flags=re.IGNORECASE)
+    slug = slug.strip("_")
+    return slug or fallback
+
+
+def _write_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(text or ""), encoding="utf-8")
+
+
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_jsonl_file(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(dict(row), ensure_ascii=False)
+        for row in (rows or [])
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _build_file_link_rows(run_dir: Path, manifest: Dict[str, Any]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+
+    def _add(label: str, rel_path: str) -> None:
+        rows.append(
+            {
+                "label": label,
+                "path": str((run_dir / rel_path).resolve()),
+                "relative_path": rel_path,
+            }
+        )
+
+    _add("manifest", "manifest.json")
+    _add("inputs/base_summary", "inputs/base_summary.txt")
+    _add("inputs/map_summaries", "inputs/map_summaries.txt")
+    for kind in ("structured", "freeform"):
+        if kind in manifest.get("outputs", {}):
+            _add(f"{kind}/merged_report", f"outputs/{kind}/merged_report.md")
+            _add(f"{kind}/llm_calls_jsonl", f"outputs/{kind}/llm_calls.jsonl")
+    return rows
+
+
+def _persist_final_report_lab_artifacts(
+    *,
+    user_goal: str,
+    metrics_context: str,
+    period_start: str,
+    period_end: str,
+    chunks: Sequence[str],
+    base_summary: str,
+    map_summaries_text: str,
+    results: Dict[str, Any],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id = f"final_report_lab_{ts}_{int(time.time() * 1000) % 1000:03d}"
+    run_dir = Path(str(getattr(settings, "CONTROL_PLANE_ARTIFACTS_DIR", "artifacts"))).resolve() / "final_report_lab" / run_id
+
+    # Inputs and transformation seeds
+    _write_text_file(run_dir / "inputs" / "user_goal.txt", user_goal)
+    _write_text_file(run_dir / "inputs" / "metrics_context.txt", metrics_context)
+    _write_text_file(run_dir / "inputs" / "period_start.txt", period_start)
+    _write_text_file(run_dir / "inputs" / "period_end.txt", period_end)
+    _write_text_file(run_dir / "inputs" / "base_summary.txt", base_summary)
+    _write_text_file(run_dir / "inputs" / "map_summaries.txt", map_summaries_text)
+    chunks_dir = run_dir / "inputs" / "chunks"
+    for idx, chunk in enumerate(chunks, start=1):
+        _write_text_file(chunks_dir / f"chunk_{idx:04d}.txt", str(chunk or ""))
+
+    outputs_manifest: Dict[str, Any] = {}
+    for kind, result in results.items():
+        if not isinstance(result, dict):
+            continue
+        kind_dir = run_dir / "outputs" / str(kind)
+        sections_dir = kind_dir / "sections"
+        calls_dir = kind_dir / "llm_calls"
+        merged_text = str(result.get("merged_text") or "")
+        _write_text_file(kind_dir / "merged_report.md", merged_text)
+        section_rows: List[Dict[str, Any]] = []
+        for idx, section in enumerate(result.get("sections") or [], start=1):
+            title = str(section.get("title") or f"section_{idx}")
+            safe_title = _safe_filename(title, fallback=f"section_{idx}")
+            text = str(section.get("text") or "")
+            rel_path = f"outputs/{kind}/sections/{idx:02d}_{safe_title}.md"
+            _write_text_file(run_dir / rel_path, text)
+            section_rows.append(
+                {
+                    "index": idx,
+                    "title": title,
+                    "path": rel_path,
+                    "chars": len(text),
+                }
+            )
+
+        llm_rows: List[Dict[str, Any]] = []
+        for call in result.get("llm_calls") or []:
+            call_no = int(call.get("call", len(llm_rows) + 1))
+            call_prefix = f"call_{call_no:04d}"
+            prompt_path = f"outputs/{kind}/llm_calls/{call_prefix}_prompt.txt"
+            response_path = f"outputs/{kind}/llm_calls/{call_prefix}_response.txt"
+            merge_prev_path = f"outputs/{kind}/llm_calls/{call_prefix}_merge_previous.txt"
+            merge_base_path = f"outputs/{kind}/llm_calls/{call_prefix}_merge_base.txt"
+            merge_map_path = f"outputs/{kind}/llm_calls/{call_prefix}_merge_map.txt"
+            _write_text_file(run_dir / prompt_path, str(call.get("prompt_text") or ""))
+            _write_text_file(run_dir / response_path, str(call.get("response_text") or ""))
+            _write_text_file(run_dir / merge_prev_path, str(call.get("merge_previous_sections_text") or ""))
+            _write_text_file(run_dir / merge_base_path, str(call.get("merge_base_summary_text") or ""))
+            _write_text_file(run_dir / merge_map_path, str(call.get("merge_map_summaries_text") or ""))
+
+            llm_rows.append(
+                {
+                    "call": call_no,
+                    "section_index": int(call.get("section_index") or 0),
+                    "section_title": str(call.get("section_title") or ""),
+                    "merge_section_label": str(call.get("merge_section_label") or ""),
+                    "status": str(call.get("status") or ""),
+                    "error": str(call.get("error") or ""),
+                    "prompt_chars": int(call.get("prompt_chars") or 0),
+                    "response_chars": int(call.get("response_chars") or 0),
+                    "elapsed_sec": float(call.get("elapsed_sec") or 0.0),
+                    "prompt_path": prompt_path,
+                    "response_path": response_path,
+                    "merge_previous_path": merge_prev_path,
+                    "merge_base_path": merge_base_path,
+                    "merge_map_path": merge_map_path,
+                }
+            )
+
+        _write_jsonl_file(kind_dir / "llm_calls.jsonl", llm_rows)
+        _write_json_file(kind_dir / "sections_index.json", section_rows)
+        outputs_manifest[str(kind)] = {
+            "merged_report_path": f"outputs/{kind}/merged_report.md",
+            "sections_index_path": f"outputs/{kind}/sections_index.json",
+            "llm_calls_path": f"outputs/{kind}/llm_calls.jsonl",
+            "sections_count": len(section_rows),
+            "llm_calls_count": len(llm_rows),
+            "elapsed_sec": float(result.get("elapsed_sec") or 0.0),
+        }
+
+    manifest = {
+        "type": "final_report_lab_run",
+        "created_at_utc": datetime.now(tz=timezone.utc).isoformat(),
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "inputs": {
+            "chunks_count": len(chunks),
+            "base_summary_chars": len(str(base_summary or "")),
+            "map_summaries_chars": len(str(map_summaries_text or "")),
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+        "outputs": outputs_manifest,
+    }
+    _write_json_file(run_dir / "manifest.json", manifest)
+
+    link_rows = _build_file_link_rows(run_dir, manifest)
+    for row in link_rows:
+        logger.info("FINAL_REPORT_LAB artifact | label=%s | path=%s", row["label"], row["path"])
+    logger.info("FINAL_REPORT_LAB artifact manifest | path=%s", str((run_dir / "manifest.json").resolve()))
+
+    return {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "manifest_path": str((run_dir / "manifest.json").resolve()),
+        "files": link_rows,
+    }
 
 
 def _build_chat_completions_url(api_base: str) -> str:
@@ -414,6 +595,7 @@ def _run_sectional_generation(
             "prompt_chars": len(prompt_text),
             "status": "ok",
             "response_chars": 0,
+            "response_text": "",
             "elapsed_sec": 0.0,
             "error": "",
             "prompt_text": prompt_text,
@@ -426,6 +608,7 @@ def _run_sectional_generation(
         try:
             response = _normalize_summary_text(llm_call(prompt_text))
             row["response_chars"] = len(response)
+            row["response_text"] = response
             row["elapsed_sec"] = round(time.monotonic() - started, 3)
             llm_calls_table.append(row)
             return response
@@ -525,6 +708,85 @@ def _default_user_goal_text() -> str:
     )
 
 
+def _render_stage_result(
+    *,
+    kind: str,
+    result: Dict[str, Any],
+    show_merge_inputs: bool,
+    show_prompts: bool,
+) -> None:
+    st.dataframe(result.get("section_stats") or [], use_container_width=True, hide_index=True)
+    st.dataframe(
+        [
+            {
+                "call": row.get("call"),
+                "section": row.get("merge_section_label") or row.get("section_title") or "",
+                "status": row.get("status"),
+                "prompt_chars": row.get("prompt_chars"),
+                "response_chars": row.get("response_chars"),
+                "elapsed_sec": row.get("elapsed_sec"),
+                "error": row.get("error", ""),
+            }
+            for row in (result.get("llm_calls") or [])
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if show_merge_inputs:
+        st.markdown("##### Что С Чем Мержим (Полный Текст)")
+        for call in result.get("llm_calls") or []:
+            call_id = int(call.get("call", 0))
+            section_label = str(call.get("merge_section_label") or call.get("section_title") or "")
+            with st.expander(
+                f"{kind} merge #{call_id} | {section_label or 'без секции'}",
+                expanded=False,
+            ):
+                st.code(str(call.get("merge_recipe") or ""), language="text")
+                st.markdown("`already_written_sections`")
+                st.text_area(
+                    f"{kind}_merge_prev_{call_id}",
+                    value=str(call.get("merge_previous_sections_text") or ""),
+                    height=220,
+                    label_visibility="collapsed",
+                )
+                st.markdown("`base_structured_summary`")
+                st.text_area(
+                    f"{kind}_merge_base_{call_id}",
+                    value=str(call.get("merge_base_summary_text") or ""),
+                    height=220,
+                    label_visibility="collapsed",
+                )
+                st.markdown("`map_batches_summary`")
+                st.text_area(
+                    f"{kind}_merge_map_{call_id}",
+                    value=str(call.get("merge_map_summaries_text") or ""),
+                    height=220,
+                    label_visibility="collapsed",
+                )
+    merged_text = str(result.get("merged_text") or "")
+    st.text_area(
+        f"{kind.capitalize()} merged report",
+        value=merged_text,
+        height=320,
+    )
+    st.download_button(
+        label=f"Скачать {kind}.md",
+        data=merged_text.encode("utf-8"),
+        file_name=f"final_report_lab_{kind}.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    if show_prompts:
+        for call in result.get("llm_calls") or []:
+            call_id = int(call.get("call", 0))
+            with st.expander(f"{kind} prompt #{call_id} ({call.get('status')})", expanded=False):
+                st.text_area(
+                    f"{kind}_prompt_{call_id}",
+                    value=str(call.get("prompt_text") or ""),
+                    height=260,
+                )
+
+
 def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
     st.title("Final Report Lab")
     st.caption(
@@ -562,6 +824,7 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
         or str(os.getenv("OPENAI_API_KEY_DB", "") or "").strip(),
     )
     state.setdefault("frl_last_results", {})
+    state.setdefault("frl_last_artifacts", {})
     state.setdefault("frl_auto_seeded", False)
     state.setdefault("frl_auto_seed_profile_version", 0)
 
@@ -589,66 +852,193 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
             seed=DEFAULT_SYNTH_SEED,
         )
         state["frl_chunks"] = auto_chunks
-        state["frl_base_summary"] = _merge_synthetic_chunks(auto_chunks)
-        state["frl_map_summaries_text"] = _build_map_summaries_text(auto_chunks)
+        # Stage-2 transformation is manual, so only stage-1 output is pre-seeded.
+        state["frl_base_summary"] = ""
+        state["frl_map_summaries_text"] = ""
+        state["frl_last_results"] = {}
+        state["frl_last_artifacts"] = {}
         state["frl_auto_seeded"] = True
         state["frl_auto_seed_profile_version"] = AUTO_SEED_PROFILE_VERSION
         deps.logger.info(
-            "FINAL_REPORT_LAB auto-seeded FAT payload | version=%s | chunks=%s | base_chars=%s | map_chars=%s",
+            "FINAL_REPORT_LAB auto-seeded FAT stage-1 payload | version=%s | chunks=%s",
             AUTO_SEED_PROFILE_VERSION,
             len(auto_chunks),
-            len(str(state.get("frl_base_summary") or "")),
-            len(str(state.get("frl_map_summaries_text") or "")),
         )
 
-    with st.expander("1) Генерация больших synthetic-summary", expanded=True):
+    state.setdefault("frl_stage_events", [])
+
+    def _append_stage_event(stage: str, status: str, details: str = "") -> None:
+        events = list(state.get("frl_stage_events") or [])
+        event = {
+            "ts_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "stage": stage,
+            "status": status,
+            "details": details,
+        }
+        events.append(event)
+        state["frl_stage_events"] = events[-400:]
+        deps.logger.info(
+            "FINAL_REPORT_LAB stage_event | stage=%s | status=%s | details=%s",
+            stage,
+            status,
+            details,
+        )
+
+    def _render_llm_controls(prefix: str) -> tuple[str, str, str, float, int, float, int]:
         st.caption(
-            "Здесь автоматически загружается FAT synthetic preset, "
-            "чтобы сразу тестировать финальные этапы (без логов/батчей из БД)."
+            f"Ограничение страницы: до {FINAL_REPORT_LAB_TOKENS_PER_MINUTE_LIMIT:,} токенов/мин "
+            "(оценка ~1 токен на 3 символа; считаем prompt + max_tokens)."
         )
-        gen_cols = st.columns(5)
-        with gen_cols[0]:
-            chunk_count = st.number_input(
-                "L1 summaries",
-                min_value=2,
-                max_value=64,
-                value=DEFAULT_SYNTH_CHUNK_COUNT,
-                step=1,
+        llm_cols = st.columns(3)
+        with llm_cols[0]:
+            api_base_local = st.text_input(
+                "API base/url",
+                value=str(state.get("frl_api_base") or DEFAULT_LAB_API_BASE),
+                key=f"{prefix}_api_base",
+                help="OpenAI-compatible endpoint рабочего стенда (обычно .../chat/completions).",
             )
-        with gen_cols[1]:
-            events_per_chunk = st.number_input(
-                "Событий/summary",
-                min_value=10,
-                max_value=500,
-                value=DEFAULT_SYNTH_EVENTS_PER_CHUNK,
-                step=10,
+        with llm_cols[1]:
+            model_local = st.text_input(
+                "Model",
+                value=str(state.get("frl_model") or DEFAULT_LAB_MODEL),
+                key=f"{prefix}_model",
             )
-        with gen_cols[2]:
-            details_per_event = st.number_input(
-                "Деталей/событие",
+        with llm_cols[2]:
+            api_key_local = st.text_input(
+                "API key",
+                value=str(state.get("frl_api_key") or ""),
+                key=f"{prefix}_api_key",
+                type="password",
+                help="По умолчанию берётся из OPENAI_API_KEY_DB.",
+            )
+        cfg_cols = st.columns(4)
+        with cfg_cols[0]:
+            timeout_local = st.number_input(
+                "Timeout (sec)",
+                min_value=5.0,
+                max_value=1800.0,
+                value=float(state.get("frl_timeout", 120.0) or 120.0),
+                step=5.0,
+                key=f"{prefix}_timeout",
+            )
+        with cfg_cols[1]:
+            retries_local = st.number_input(
+                "Max retries",
                 min_value=1,
-                max_value=8,
-                value=DEFAULT_SYNTH_DETAILS_PER_EVENT,
+                max_value=10,
+                value=int(state.get("frl_retries", 3) or 3),
                 step=1,
+                key=f"{prefix}_retries",
             )
-        with gen_cols[3]:
-            paragraphs_per_chunk = st.number_input(
-                "Гипотез/summary",
-                min_value=1,
-                max_value=20,
-                value=DEFAULT_SYNTH_PARAGRAPHS_PER_CHUNK,
-                step=1,
+        with cfg_cols[2]:
+            temperature_local = st.number_input(
+                "Temperature",
+                min_value=0.0,
+                max_value=2.0,
+                value=float(state.get("frl_temperature", 0.2) or 0.2),
+                step=0.1,
+                key=f"{prefix}_temperature",
             )
-        with gen_cols[4]:
-            seed = st.number_input(
-                "Seed",
-                min_value=1,
-                max_value=2_147_483_647,
-                value=DEFAULT_SYNTH_SEED,
-                step=1,
+        with cfg_cols[3]:
+            max_tokens_local = st.number_input(
+                "Max tokens",
+                min_value=64,
+                max_value=65536,
+                value=int(state.get("frl_max_tokens", 4096) or 4096),
+                step=128,
+                key=f"{prefix}_max_tokens",
             )
 
-        if st.button("Сгенерировать большие отчёты", use_container_width=True):
+        state["frl_api_base"] = str(api_base_local or "")
+        state["frl_model"] = str(model_local or "")
+        state["frl_api_key"] = str(api_key_local or "")
+        state["frl_timeout"] = float(timeout_local)
+        state["frl_retries"] = int(retries_local)
+        state["frl_temperature"] = float(temperature_local)
+        state["frl_max_tokens"] = int(max_tokens_local)
+        return (
+            str(api_base_local or ""),
+            str(model_local or ""),
+            str(api_key_local or ""),
+            float(timeout_local),
+            int(retries_local),
+            float(temperature_local),
+            int(max_tokens_local),
+        )
+
+    last_results = state.get("frl_last_results") or {}
+    has_chunks = bool(state.get("frl_chunks"))
+    has_transform = bool(str(state.get("frl_base_summary") or "").strip()) and bool(
+        str(state.get("frl_map_summaries_text") or "").strip()
+    )
+    has_structured = isinstance(last_results.get("structured"), dict)
+    has_freeform = isinstance(last_results.get("freeform"), dict)
+    has_audit = bool((state.get("frl_last_artifacts") or {}).get("run_dir"))
+
+    st.markdown("### Стадии")
+    status_cols = st.columns(5)
+    status_cols[0].metric("1) Синтетика", "Готово" if has_chunks else "Ожидание")
+    status_cols[1].metric("2) Transform", "Готово" if has_transform else "Ожидание")
+    status_cols[2].metric("3) Structured", "Готово" if has_structured else "Ожидание")
+    status_cols[3].metric("4) Freeform", "Готово" if has_freeform else "Ожидание")
+    status_cols[4].metric("5) Audit", "Готово" if has_audit else "Ожидание")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        [
+            "1. Синтетика",
+            "2. Transform",
+            "3. Structured",
+            "4. Freeform",
+            "5. Audit",
+        ]
+    )
+
+    with tab1:
+        st.caption(
+            "Ручной запуск Stage-1: генерируем жирные synthetic chunks. "
+            "Ни БД, ни лог-фетч тут не используются."
+        )
+        chunk_count = st.number_input(
+            "L1 summaries",
+            min_value=2,
+            max_value=64,
+            value=DEFAULT_SYNTH_CHUNK_COUNT,
+            step=1,
+            key="frl_stage1_chunk_count",
+        )
+        events_per_chunk = st.number_input(
+            "Событий/summary",
+            min_value=10,
+            max_value=500,
+            value=DEFAULT_SYNTH_EVENTS_PER_CHUNK,
+            step=10,
+            key="frl_stage1_events_per_chunk",
+        )
+        details_per_event = st.number_input(
+            "Деталей/событие",
+            min_value=1,
+            max_value=8,
+            value=DEFAULT_SYNTH_DETAILS_PER_EVENT,
+            step=1,
+            key="frl_stage1_details_per_event",
+        )
+        paragraphs_per_chunk = st.number_input(
+            "Гипотез/summary",
+            min_value=1,
+            max_value=20,
+            value=DEFAULT_SYNTH_PARAGRAPHS_PER_CHUNK,
+            step=1,
+            key="frl_stage1_paragraphs_per_chunk",
+        )
+        seed = st.number_input(
+            "Seed",
+            min_value=1,
+            max_value=2_147_483_647,
+            value=DEFAULT_SYNTH_SEED,
+            step=1,
+            key="frl_stage1_seed",
+        )
+        if st.button("Запустить этап 1: Сгенерировать chunks", key="frl_stage1_run", use_container_width=True):
             chunks = _build_synthetic_report_chunks(
                 chunk_count=int(chunk_count),
                 events_per_chunk=int(events_per_chunk),
@@ -656,292 +1046,267 @@ def render_final_report_lab_page(deps: FinalReportLabPageDeps) -> None:
                 paragraphs_per_chunk=int(paragraphs_per_chunk),
                 seed=int(seed),
             )
-            base_summary = _merge_synthetic_chunks(chunks)
-            map_summaries_text = _build_map_summaries_text(chunks)
             state["frl_chunks"] = chunks
-            state["frl_base_summary"] = base_summary
-            state["frl_map_summaries_text"] = map_summaries_text
-            st.success(
-                "Данные сгенерированы: "
-                f"{len(chunks)} chunks, base_summary={len(base_summary)} chars, "
-                f"map_summaries={len(map_summaries_text)} chars."
-            )
+            state["frl_base_summary"] = ""
+            state["frl_map_summaries_text"] = ""
+            state["frl_last_results"] = {}
+            state["frl_last_artifacts"] = {}
+            _append_stage_event("stage1_synthetic", "done", f"chunks={len(chunks)}")
+            st.success(f"Stage-1 готов: chunks={len(chunks)}")
 
-        chunks_now = state.get("frl_chunks") or []
+        chunks_now = list(state.get("frl_chunks") or [])
         if chunks_now:
-            chunk_rows = [
-                {
-                    "chunk": idx + 1,
-                    "chars": len(str(text or "")),
-                    "lines": len(str(text or "").splitlines()),
-                }
-                for idx, text in enumerate(chunks_now)
-            ]
-            st.dataframe(chunk_rows, use_container_width=True, hide_index=True)
+            st.dataframe(
+                [
+                    {
+                        "chunk": idx + 1,
+                        "chars": len(str(text or "")),
+                        "lines": len(str(text or "").splitlines()),
+                    }
+                    for idx, text in enumerate(chunks_now)
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.text_area("Первый chunk (preview)", value=str(chunks_now[0] or ""), height=220)
+            st.text_area("Последний chunk (preview)", value=str(chunks_now[-1] or ""), height=220)
 
-    with st.expander("2) Входные данные для финальной секционной генерации", expanded=True):
+    with tab2:
+        st.caption("Ручной запуск Stage-2: преобразуем chunks -> base_summary + map_summaries_text.")
+        st.write(f"Chunks на входе: `{len(list(state.get('frl_chunks') or []))}`")
         state["frl_user_goal"] = st.text_area(
             "Контекст инцидента (UI)",
             value=str(state.get("frl_user_goal") or ""),
-            height=140,
+            height=130,
+            key="frl_stage2_user_goal",
         )
         state["frl_metrics_context"] = st.text_area(
             "Контекст метрик",
             value=str(state.get("frl_metrics_context") or ""),
-            height=110,
+            height=100,
+            key="frl_stage2_metrics",
         )
         period_cols = st.columns(2)
         with period_cols[0]:
             state["frl_period_start"] = st.text_input(
                 "Период start",
                 value=str(state.get("frl_period_start") or ""),
+                key="frl_stage2_period_start",
             )
         with period_cols[1]:
             state["frl_period_end"] = st.text_input(
                 "Период end",
                 value=str(state.get("frl_period_end") or ""),
-            )
-        text_cols = st.columns(2)
-        with text_cols[0]:
-            state["frl_base_summary"] = st.text_area(
-                "Base/Reduce summary (для merge)",
-                value=str(state.get("frl_base_summary") or ""),
-                height=260,
-            )
-        with text_cols[1]:
-            state["frl_map_summaries_text"] = st.text_area(
-                "MAP summaries text (контекст по батчам)",
-                value=str(state.get("frl_map_summaries_text") or ""),
-                height=260,
+                key="frl_stage2_period_end",
             )
 
-    with st.expander("3) LLM (рабочий стенд) — только для этой страницы", expanded=True):
-        st.caption(
-            f"Ограничение этой страницы: до {FINAL_REPORT_LAB_TOKENS_PER_MINUTE_LIMIT:,} токенов/мин "
-            "(оценка: ~1 токен на 3 символа; учитываем prompt + max_tokens)."
+        if st.button("Запустить этап 2: Собрать Transform", key="frl_stage2_run", use_container_width=True):
+            chunks_in = list(state.get("frl_chunks") or [])
+            if not chunks_in:
+                _append_stage_event("stage2_transform", "error", "no_chunks")
+                st.error("Нет chunks от Stage-1.")
+            else:
+                state["frl_base_summary"] = _merge_synthetic_chunks(chunks_in)
+                state["frl_map_summaries_text"] = _build_map_summaries_text(chunks_in)
+                state["frl_last_results"] = {}
+                state["frl_last_artifacts"] = {}
+                _append_stage_event(
+                    "stage2_transform",
+                    "done",
+                    f"base_chars={len(str(state.get('frl_base_summary') or ''))}, map_chars={len(str(state.get('frl_map_summaries_text') or ''))}",
+                )
+                st.success("Stage-2 готов: base/map собраны.")
+
+        st.write(
+            f"base_summary chars: `{len(str(state.get('frl_base_summary') or ''))}` | "
+            f"map_summaries chars: `{len(str(state.get('frl_map_summaries_text') or ''))}`"
         )
-        llm_cols = st.columns(3)
-        with llm_cols[0]:
-            api_base = st.text_input(
-                "API base/url",
-                value=str(state.get("frl_api_base") or DEFAULT_LAB_API_BASE),
-                help=(
-                    "OpenAI-compatible endpoint из рабочего стенда "
-                    "(обычно .../chat/completions)."
-                ),
-            )
-            state["frl_api_base"] = api_base
-        with llm_cols[1]:
-            model = st.text_input(
-                "Model",
-                value=str(state.get("frl_model") or DEFAULT_LAB_MODEL),
-            )
-            state["frl_model"] = model
-        with llm_cols[2]:
-            api_key = st.text_input(
-                "API key",
-                value=str(state.get("frl_api_key") or ""),
-                type="password",
-                help=(
-                    "По умолчанию берётся из OPENAI_API_KEY_DB. "
-                    "Не сохраняйте ключ в коде/репозитории."
-                ),
-            )
-            state["frl_api_key"] = api_key
-
-        llm_cfg_cols = st.columns(4)
-        with llm_cfg_cols[0]:
-            timeout_seconds = st.number_input(
-                "Timeout (sec)",
-                min_value=5.0,
-                max_value=1800.0,
-                value=float(state.get("frl_timeout", 120.0) or 120.0),
-                step=5.0,
-            )
-            state["frl_timeout"] = float(timeout_seconds)
-        with llm_cfg_cols[1]:
-            max_retries = st.number_input(
-                "Max retries",
-                min_value=1,
-                max_value=10,
-                value=int(state.get("frl_retries", 3) or 3),
-                step=1,
-            )
-            state["frl_retries"] = int(max_retries)
-        with llm_cfg_cols[2]:
-            temperature = st.number_input(
-                "Temperature",
-                min_value=0.0,
-                max_value=2.0,
-                value=float(state.get("frl_temperature", 0.2) or 0.2),
-                step=0.1,
-            )
-            state["frl_temperature"] = float(temperature)
-        with llm_cfg_cols[3]:
-            max_tokens = st.number_input(
-                "Max tokens",
-                min_value=64,
-                max_value=65536,
-                value=int(state.get("frl_max_tokens", 4096) or 4096),
-                step=128,
-            )
-            state["frl_max_tokens"] = int(max_tokens)
-
-    st.markdown("### 4) Запуск")
-    run_cols = st.columns(4)
-    with run_cols[0]:
-        run_structured = st.checkbox("Structured", value=True)
-    with run_cols[1]:
-        run_freeform = st.checkbox("Freeform", value=True)
-    with run_cols[2]:
-        show_prompts = st.checkbox("Показывать промпты", value=False)
-    with run_cols[3]:
-        show_merge_inputs = st.checkbox("Показывать merge-входы", value=True)
-
-    if st.button("Запустить секционную генерацию", type="primary", use_container_width=True):
-        if not run_structured and not run_freeform:
-            st.error("Выбери хотя бы один режим: Structured или Freeform.")
-            return
-        if not str(api_key or "").strip():
-            st.error("Нужен API key для LLM вызовов на этой странице.")
-            return
-        base_summary = str(state.get("frl_base_summary") or "").strip()
-        if not base_summary:
-            st.error("Base/Reduce summary пустой. Сначала сгенерируй synthetic-данные или вставь свой текст.")
-            return
-
-        llm_call = _make_groq_chat_call(
-            api_base=str(api_base or ""),
-            api_key=str(api_key or ""),
-            model=str(model or ""),
-            timeout_seconds=float(timeout_seconds),
-            max_retries=int(max_retries),
-            temperature=float(temperature),
-            max_tokens=int(max_tokens),
-            logger=deps.logger,
+        st.text_area(
+            "Base/Reduce summary",
+            value=str(state.get("frl_base_summary") or ""),
+            height=220,
+            key="frl_stage2_base_preview",
         )
-        stats = {
-            "synthetic_chunks": len(state.get("frl_chunks") or []),
-            "base_summary_chars": len(base_summary),
-            "map_summaries_chars": len(str(state.get("frl_map_summaries_text") or "")),
-            "final_sections_total": len(FINAL_REPORT_SECTIONS),
-        }
-        results: Dict[str, Any] = {}
-        if run_structured:
-            st.markdown("#### Structured run")
-            results["structured"] = _run_sectional_generation(
+        st.text_area(
+            "MAP summaries text",
+            value=str(state.get("frl_map_summaries_text") or ""),
+            height=220,
+            key="frl_stage2_map_preview",
+        )
+
+    with tab3:
+        st.caption("Ручной запуск Stage-3: секционная structured генерация.")
+        show_merge_inputs_struct = st.checkbox("Показывать merge-входы", value=True, key="frl_stage3_show_merge")
+        show_prompts_struct = st.checkbox("Показывать промпты", value=False, key="frl_stage3_show_prompts")
+        api_base, model, api_key, timeout_seconds, max_retries, temperature, max_tokens = _render_llm_controls(
+            "frl_stage3"
+        )
+        if st.button("Запустить этап 3: Structured", key="frl_stage3_run", use_container_width=True):
+            base_summary = str(state.get("frl_base_summary") or "").strip()
+            map_summaries_text = str(state.get("frl_map_summaries_text") or "")
+            if not base_summary or not map_summaries_text.strip():
+                _append_stage_event("stage3_structured", "error", "missing_transform")
+                st.error("Сначала выполни Stage-2 (нужны base_summary и map_summaries_text).")
+            elif not str(api_key or "").strip():
+                _append_stage_event("stage3_structured", "error", "missing_api_key")
+                st.error("Нужен API key.")
+            else:
+                llm_call = _make_groq_chat_call(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    max_retries=max_retries,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    logger=deps.logger,
+                )
+                stats = {
+                    "synthetic_chunks": len(state.get("frl_chunks") or []),
+                    "base_summary_chars": len(base_summary),
+                    "map_summaries_chars": len(map_summaries_text),
+                    "final_sections_total": len(FINAL_REPORT_SECTIONS),
+                }
+                results = dict(state.get("frl_last_results") or {})
+                results["structured"] = _run_sectional_generation(
+                    kind="structured",
+                    llm_call=llm_call,
+                    base_summary=base_summary,
+                    user_goal=str(state.get("frl_user_goal") or ""),
+                    period_start=str(state.get("frl_period_start") or ""),
+                    period_end=str(state.get("frl_period_end") or ""),
+                    stats=stats,
+                    metrics_context=str(state.get("frl_metrics_context") or ""),
+                    map_summaries_text=map_summaries_text,
+                    logger=deps.logger,
+                )
+                state["frl_last_results"] = results
+                state["frl_last_artifacts"] = {}
+                _append_stage_event(
+                    "stage3_structured",
+                    "done",
+                    f"elapsed_sec={results['structured'].get('elapsed_sec')}",
+                )
+                st.success("Stage-3 готов.")
+
+        structured_result = (state.get("frl_last_results") or {}).get("structured")
+        if isinstance(structured_result, dict):
+            _render_stage_result(
                 kind="structured",
-                llm_call=llm_call,
-                base_summary=base_summary,
-                user_goal=str(state.get("frl_user_goal") or ""),
-                period_start=str(state.get("frl_period_start") or ""),
-                period_end=str(state.get("frl_period_end") or ""),
-                stats=stats,
-                metrics_context=str(state.get("frl_metrics_context") or ""),
-                map_summaries_text=str(state.get("frl_map_summaries_text") or ""),
-                logger=deps.logger,
+                result=structured_result,
+                show_merge_inputs=bool(show_merge_inputs_struct),
+                show_prompts=bool(show_prompts_struct),
             )
-            st.success(
-                "Structured завершён: "
-                f"{results['structured']['elapsed_sec']} сек, "
-                f"итог={len(str(results['structured']['merged_text'] or ''))} chars."
-            )
-        if run_freeform:
-            st.markdown("#### Freeform run")
-            results["freeform"] = _run_sectional_generation(
-                kind="freeform",
-                llm_call=llm_call,
-                base_summary=base_summary,
-                user_goal=str(state.get("frl_user_goal") or ""),
-                period_start=str(state.get("frl_period_start") or ""),
-                period_end=str(state.get("frl_period_end") or ""),
-                stats=stats,
-                metrics_context=str(state.get("frl_metrics_context") or ""),
-                map_summaries_text=str(state.get("frl_map_summaries_text") or ""),
-                logger=deps.logger,
-            )
-            st.success(
-                "Freeform завершён: "
-                f"{results['freeform']['elapsed_sec']} сек, "
-                f"итог={len(str(results['freeform']['merged_text'] or ''))} chars."
-            )
-        state["frl_last_results"] = results
 
-    last_results = state.get("frl_last_results") or {}
-    if last_results:
-        st.markdown("### 5) Результаты")
-        for kind in ("structured", "freeform"):
-            result = last_results.get(kind)
-            if not isinstance(result, dict):
-                continue
-            st.markdown(f"#### {kind.capitalize()} output")
-            st.dataframe(result.get("section_stats") or [], use_container_width=True, hide_index=True)
-            st.dataframe(
-                [
-                    {
-                        "call": row.get("call"),
-                        "section": row.get("merge_section_label") or row.get("section_title") or "",
-                        "status": row.get("status"),
-                        "prompt_chars": row.get("prompt_chars"),
-                        "response_chars": row.get("response_chars"),
-                        "elapsed_sec": row.get("elapsed_sec"),
-                        "error": row.get("error", ""),
-                    }
-                    for row in (result.get("llm_calls") or [])
-                ],
-                use_container_width=True,
-                hide_index=True,
+    with tab4:
+        st.caption("Ручной запуск Stage-4: секционная freeform генерация.")
+        show_merge_inputs_free = st.checkbox("Показывать merge-входы", value=True, key="frl_stage4_show_merge")
+        show_prompts_free = st.checkbox("Показывать промпты", value=False, key="frl_stage4_show_prompts")
+        api_base, model, api_key, timeout_seconds, max_retries, temperature, max_tokens = _render_llm_controls(
+            "frl_stage4"
+        )
+        if st.button("Запустить этап 4: Freeform", key="frl_stage4_run", use_container_width=True):
+            base_summary = str(state.get("frl_base_summary") or "").strip()
+            map_summaries_text = str(state.get("frl_map_summaries_text") or "")
+            if not base_summary or not map_summaries_text.strip():
+                _append_stage_event("stage4_freeform", "error", "missing_transform")
+                st.error("Сначала выполни Stage-2 (нужны base_summary и map_summaries_text).")
+            elif not str(api_key or "").strip():
+                _append_stage_event("stage4_freeform", "error", "missing_api_key")
+                st.error("Нужен API key.")
+            else:
+                llm_call = _make_groq_chat_call(
+                    api_base=api_base,
+                    api_key=api_key,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    max_retries=max_retries,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    logger=deps.logger,
+                )
+                stats = {
+                    "synthetic_chunks": len(state.get("frl_chunks") or []),
+                    "base_summary_chars": len(base_summary),
+                    "map_summaries_chars": len(map_summaries_text),
+                    "final_sections_total": len(FINAL_REPORT_SECTIONS),
+                }
+                results = dict(state.get("frl_last_results") or {})
+                results["freeform"] = _run_sectional_generation(
+                    kind="freeform",
+                    llm_call=llm_call,
+                    base_summary=base_summary,
+                    user_goal=str(state.get("frl_user_goal") or ""),
+                    period_start=str(state.get("frl_period_start") or ""),
+                    period_end=str(state.get("frl_period_end") or ""),
+                    stats=stats,
+                    metrics_context=str(state.get("frl_metrics_context") or ""),
+                    map_summaries_text=map_summaries_text,
+                    logger=deps.logger,
+                )
+                state["frl_last_results"] = results
+                state["frl_last_artifacts"] = {}
+                _append_stage_event(
+                    "stage4_freeform",
+                    "done",
+                    f"elapsed_sec={results['freeform'].get('elapsed_sec')}",
+                )
+                st.success("Stage-4 готов.")
+
+        freeform_result = (state.get("frl_last_results") or {}).get("freeform")
+        if isinstance(freeform_result, dict):
+            _render_stage_result(
+                kind="freeform",
+                result=freeform_result,
+                show_merge_inputs=bool(show_merge_inputs_free),
+                show_prompts=bool(show_prompts_free),
             )
-            if show_merge_inputs:
-                st.markdown("##### Что С Чем Мержим (Полный Текст)")
-                for call in result.get("llm_calls") or []:
-                    call_id = int(call.get("call", 0))
-                    section_label = str(call.get("merge_section_label") or call.get("section_title") or "")
-                    with st.expander(
-                        f"{kind} merge #{call_id} | {section_label or 'без секции'}",
-                        expanded=False,
-                    ):
-                        st.code(str(call.get("merge_recipe") or ""), language="text")
-                        st.markdown("`already_written_sections`")
-                        st.text_area(
-                            f"{kind}_merge_prev_{call_id}",
-                            value=str(call.get("merge_previous_sections_text") or ""),
-                            height=220,
-                            label_visibility="collapsed",
-                        )
-                        st.markdown("`base_structured_summary`")
-                        st.text_area(
-                            f"{kind}_merge_base_{call_id}",
-                            value=str(call.get("merge_base_summary_text") or ""),
-                            height=220,
-                            label_visibility="collapsed",
-                        )
-                        st.markdown("`map_batches_summary`")
-                        st.text_area(
-                            f"{kind}_merge_map_{call_id}",
-                            value=str(call.get("merge_map_summaries_text") or ""),
-                            height=220,
-                            label_visibility="collapsed",
-                        )
-            merged_text = str(result.get("merged_text") or "")
-            st.text_area(
-                f"{kind.capitalize()} merged report",
-                value=merged_text,
-                height=320,
-            )
-            st.download_button(
-                label=f"Скачать {kind}.md",
-                data=merged_text.encode("utf-8"),
-                file_name=f"final_report_lab_{kind}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-            if show_prompts:
-                for call in result.get("llm_calls") or []:
-                    call_id = int(call.get("call", 0))
-                    with st.expander(f"{kind} prompt #{call_id} ({call.get('status')})", expanded=False):
-                        st.text_area(
-                            f"{kind}_prompt_{call_id}",
-                            value=str(call.get("prompt_text") or ""),
-                            height=260,
-                        )
+
+    with tab5:
+        st.caption(
+            "Ручной запуск Stage-5: сохраняем артефакты всех преобразований в файлы "
+            "и показываем пути (дублируются в логах)."
+        )
+        if st.button("Запустить этап 5: Сохранить Audit", key="frl_stage5_run", use_container_width=True):
+            results = dict(state.get("frl_last_results") or {})
+            if not results:
+                _append_stage_event("stage5_audit", "error", "no_results")
+                st.error("Нет результатов Stage-3/4 для сохранения.")
+            else:
+                artifacts_payload = _persist_final_report_lab_artifacts(
+                    user_goal=str(state.get("frl_user_goal") or ""),
+                    metrics_context=str(state.get("frl_metrics_context") or ""),
+                    period_start=str(state.get("frl_period_start") or ""),
+                    period_end=str(state.get("frl_period_end") or ""),
+                    chunks=list(state.get("frl_chunks") or []),
+                    base_summary=str(state.get("frl_base_summary") or ""),
+                    map_summaries_text=str(state.get("frl_map_summaries_text") or ""),
+                    results=results,
+                    logger=deps.logger,
+                )
+                state["frl_last_artifacts"] = artifacts_payload
+                _append_stage_event("stage5_audit", "done", str(artifacts_payload.get("run_dir") or ""))
+                st.success(f"Аудит сохранён: `{artifacts_payload.get('run_dir', '')}`")
+
+        last_artifacts = state.get("frl_last_artifacts") or {}
+        if isinstance(last_artifacts, dict) and last_artifacts.get("run_dir"):
+            st.write(f"Каталог запуска: `{last_artifacts.get('run_dir')}`")
+            file_rows = last_artifacts.get("files") or []
+            if file_rows:
+                st.dataframe(
+                    [
+                        {
+                            "label": str(row.get("label") or ""),
+                            "path": str(row.get("path") or ""),
+                            "relative_path": str(row.get("relative_path") or ""),
+                        }
+                        for row in file_rows
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        events_rows = list(state.get("frl_stage_events") or [])
+        if events_rows:
+            st.markdown("#### Журнал Этапов")
+            st.dataframe(events_rows, use_container_width=True, hide_index=True)

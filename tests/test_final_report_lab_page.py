@@ -1,4 +1,7 @@
 import unittest
+import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from ui.pages.final_report_lab_page import (
@@ -12,6 +15,7 @@ from ui.pages.final_report_lab_page import (
     _extract_openai_assistant_text,
     _make_groq_chat_call,
     _merge_synthetic_chunks,
+    _persist_final_report_lab_artifacts,
 )
 
 
@@ -117,6 +121,51 @@ class TestFinalReportLabHelpers(unittest.TestCase):
         self.assertEqual(captured["headers"].get("Authorization"), "Bearer secret")
         self.assertEqual(captured["json"].get("model"), "qwen/qwen3-32b")
         self.assertIn("messages", captured["json"])
+
+    def test_persist_final_report_lab_artifacts_writes_files(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            with patch("ui.pages.final_report_lab_page.settings.CONTROL_PLANE_ARTIFACTS_DIR", tmpdir):
+                payload = _persist_final_report_lab_artifacts(
+                    user_goal="goal",
+                    metrics_context="metrics",
+                    period_start="2026-03-18T00:00:00+03:00",
+                    period_end="2026-03-18T06:00:00+03:00",
+                    chunks=["chunk-1", "chunk-2"],
+                    base_summary="base-summary",
+                    map_summaries_text="map-summaries",
+                    results={
+                        "structured": {
+                            "merged_text": "merged-structured",
+                            "sections": [{"title": "1. Test", "text": "sec"}],
+                            "llm_calls": [
+                                {
+                                    "call": 1,
+                                    "section_index": 1,
+                                    "section_title": "1. Test",
+                                    "merge_section_label": "1/13 — 1. Test",
+                                    "status": "ok",
+                                    "error": "",
+                                    "prompt_chars": 10,
+                                    "response_chars": 20,
+                                    "elapsed_sec": 0.2,
+                                    "prompt_text": "prompt",
+                                    "response_text": "response",
+                                    "merge_previous_sections_text": "prev",
+                                    "merge_base_summary_text": "base",
+                                    "merge_map_summaries_text": "map",
+                                }
+                            ],
+                            "elapsed_sec": 1.0,
+                        }
+                    },
+                    logger=logging.getLogger("test.final_report_lab"),
+                )
+            run_dir = Path(str(payload["run_dir"]))
+            self.assertTrue((run_dir / "manifest.json").exists())
+            self.assertTrue((run_dir / "inputs" / "base_summary.txt").exists())
+            self.assertTrue((run_dir / "outputs" / "structured" / "merged_report.md").exists())
+            self.assertTrue((run_dir / "outputs" / "structured" / "llm_calls.jsonl").exists())
+            self.assertGreater(len(payload.get("files") or []), 0)
 
 
 if __name__ == "__main__":
