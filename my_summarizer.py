@@ -2839,10 +2839,18 @@ class PeriodLogSummarizer:
         return json_text, normalized.model_dump(mode="json")
 
     def _emit_progress(self, event: str, payload: Dict[str, Any]) -> None:
+        payload_meta = _payload_for_progress_log(payload)
+        log_meta: Dict[str, Any] = {"keys": sorted(payload_meta.keys())}
+        if "batch_logs_count" in payload_meta:
+            log_meta["batch_logs_count"] = payload_meta.get("batch_logs_count")
+        if "rows_processed" in payload_meta:
+            log_meta["rows_processed"] = payload_meta.get("rows_processed")
+        if "rows_total" in payload_meta:
+            log_meta["rows_total"] = payload_meta.get("rows_total")
         logger.info(
-            "summarizer.progress event=%s payload=%s",
+            "summarizer.progress event=%s meta=%s",
             event,
-            _payload_for_progress_log(payload),
+            log_meta,
         )
         if self.on_progress is None:
             return

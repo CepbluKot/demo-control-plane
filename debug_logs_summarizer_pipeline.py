@@ -5,6 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
@@ -172,6 +173,11 @@ def _save_text(path: Path, text: str) -> None:
     path.write_text(str(text or ""), encoding="utf-8")
 
 
+def _safe_event_slug(event: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(event or "").strip()).strip("_").lower()
+    return slug or "event"
+
+
 def _build_runtime_config(args: Any) -> SummarizerConfig:
     return SummarizerConfig(
         page_limit=int(args.db_batch),
@@ -264,18 +270,33 @@ def _run_map_reduce_stage(
     tail_limit = max(int(getattr(settings, "CONTROL_PLANE_LOGS_TAIL_LIMIT", 1000) or 1000), 1)
     fetch_errors: List[str] = []
     progress_events: List[Dict[str, Any]] = []
+    progress_payloads_dir = output_dir / "progress_payloads"
+    progress_payloads_dir.mkdir(parents=True, exist_ok=True)
+    progress_seq = 0
     original_query_template = str(getattr(settings, "CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY", "") or "")
     if str(query_template_override or "").strip():
         settings.CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY = str(query_template_override or "").strip()
 
+    def _persist_progress_payload(event: str, payload: Dict[str, Any]) -> str:
+        nonlocal progress_seq
+        progress_seq += 1
+        event_slug = _safe_event_slug(event)
+        payload_file = progress_payloads_dir / f"{progress_seq:04d}_{event_slug}.json"
+        _save_json(payload_file, payload)
+        try:
+            return str(payload_file.relative_to(output_dir))
+        except Exception:
+            return str(payload_file)
+
     def _on_progress(event: str, payload: Dict[str, Any]) -> None:
+        payload_file = _persist_progress_payload(event, payload)
         row = {
             "ts": datetime.now(MSK).isoformat(),
             "event": event,
-            "payload": payload,
+            "payload_file": payload_file,
         }
         progress_events.append(row)
-        logger.info("progress | event=%s | payload=%s", event, json.dumps(payload, ensure_ascii=False))
+        logger.info("progress | event=%s | payload_file=%s", event, payload_file)
 
     def _on_fetch_error(msg: str) -> None:
         fetch_errors.append(str(msg))
