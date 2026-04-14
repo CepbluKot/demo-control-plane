@@ -101,7 +101,7 @@ def build_summarizer(reduce_input_max_chars: int) -> PeriodLogSummarizer:
             reduce_input_max_chars=reduce_input_max_chars,
             reduce_group_size=2,
             use_instructor=True,
-            model_supports_tool_calling=True,
+            model_supports_tool_calling=False,
             compression_target_pct=50,
             compression_importance_threshold=0.7,
         ),
