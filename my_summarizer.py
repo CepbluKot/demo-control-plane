@@ -134,6 +134,8 @@ class SummarizerConfig:
     llm_chunk_rows: int = 200
     min_llm_chunk_rows: int = 20
     auto_shrink_on_400: bool = True
+    # Optionally shrink MAP chunk size on transient gateway errors (500/502/503/504).
+    auto_shrink_on_500: bool = True
     max_shrink_rounds: int = 6
     # New algorithm default: fixed-size reduce groups (algorithm (1).md).
     reduce_group_size: int = 2
@@ -164,6 +166,9 @@ class SummarizerConfig:
     # For REDUCE structured calls: after this many transient server errors
     # (500/502/503/504) inside one group-call, bubble exception up so group can split.
     reduce_gateway_retry_cap: int = 3
+    # For MAP structured calls: after this many transient server errors
+    # (500/502/503/504) inside one batch-call, bubble exception up so batch can shrink/split.
+    map_gateway_retry_cap: int = 3
     use_instructor: bool = False
     # If False, instructor works in JSON mode (no tool/function calling).
     # Needed for OpenAI-compatible gateways that do not support tool-calling parser.
@@ -2891,6 +2896,8 @@ class PeriodLogSummarizer:
         min_chunk = max(int(getattr(self.config, "min_llm_chunk_rows", 20) or 20), 1)
         max_shrink_rounds = max(int(getattr(self.config, "max_shrink_rounds", 6) or 6), 0)
         auto_shrink = bool(getattr(self.config, "auto_shrink_on_400", True))
+        auto_shrink_on_500 = bool(getattr(self.config, "auto_shrink_on_500", True))
+        map_gateway_retry_cap = max(int(getattr(self.config, "map_gateway_retry_cap", 3) or 3), 0)
         instructor_path_used = False
         try:
             if self._instructor_enabled() and not self._instructor_map_disabled_due_grammar:
@@ -2899,6 +2906,7 @@ class PeriodLogSummarizer:
                     prompt=prompt,
                     response_model=MapBatchSummaryModel,
                     stage="map",
+                    gateway_retry_cap=map_gateway_retry_cap,
                 )
                 chunk_summary, chunk_summary_structured = self._normalize_map_model_from_instructor(
                     model=structured_model,
@@ -2991,7 +2999,10 @@ class PeriodLogSummarizer:
                     exc = legacy_exc
             can_shrink_on_exc = (
                 auto_shrink
-                and _is_400_bad_request_exception(exc)
+                and (
+                    _is_400_bad_request_exception(exc)
+                    or (auto_shrink_on_500 and _is_transient_gateway_exception(exc))
+                )
                 and len(rows_chunk) > min_chunk
                 and depth < max_shrink_rounds
             )
@@ -3007,7 +3018,11 @@ class PeriodLogSummarizer:
                     "depth": depth,
                     "old_chunk_size": len(rows_chunk),
                     "new_chunk_size": next_size,
-                    "reason": "llm_400_bad_request_exception",
+                    "reason": (
+                        "llm_400_bad_request_exception"
+                        if _is_400_bad_request_exception(exc)
+                        else "llm_transient_gateway_exception"
+                    ),
                     "batch_period_start": batch_period_start,
                     "batch_period_end": batch_period_end,
                     "error": str(exc),

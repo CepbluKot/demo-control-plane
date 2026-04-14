@@ -62,6 +62,8 @@ class DebugRunConfig:
     max_summary_chars: int = Field(default=0, ge=0)
     reduce_prompt_max_chars: int = Field(default=0, ge=0)
     auto_shrink_on_400: bool = True
+    auto_shrink_on_500: bool = True
+    map_gateway_retry_cap: int = Field(default=3, ge=0)
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
     skip_structured: bool = False
@@ -99,6 +101,16 @@ def _setup_logging(debug: bool, log_file: Optional[Path] = None) -> logging.Logg
     )
     logger = logging.getLogger("debug_logs_summarizer_pipeline")
     logger.setLevel(level)
+    # Suppress very noisy transport/client debug logs to keep trace readable.
+    for noisy_logger_name in (
+        "httpcore",
+        "httpx",
+        "openai",
+        "openai._base_client",
+        "instructor",
+        "urllib3",
+    ):
+        logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)
     if log_file is not None:
         logger.info("debug logger file: %s", Path(log_file).resolve())
     return logger
@@ -193,6 +205,7 @@ def _build_runtime_config(args: Any) -> SummarizerConfig:
         llm_chunk_rows=int(args.llm_batch),
         min_llm_chunk_rows=max(int(args.min_llm_batch), 1),
         auto_shrink_on_400=bool(args.auto_shrink_on_400),
+        auto_shrink_on_500=bool(getattr(args, "auto_shrink_on_500", True)),
         max_shrink_rounds=max(int(args.max_shrink_rounds), 0),
         max_cell_chars=max(int(args.max_cell_chars), 0),
         max_summary_chars=max(int(args.max_summary_chars), 0),
@@ -209,6 +222,7 @@ def _build_runtime_config(args: Any) -> SummarizerConfig:
             max(float(args.compression_importance_threshold), 0.0),
             1.0,
         ),
+        map_gateway_retry_cap=max(int(getattr(args, "map_gateway_retry_cap", 3) or 3), 0),
         use_instructor=bool(args.use_instructor),
         model_supports_tool_calling=bool(args.model_supports_tool_calling),
     )
@@ -220,6 +234,8 @@ def _build_llm_call(
     max_retries: int,
     fail_open_return_empty: bool,
     logger: logging.Logger,
+    prompt_audit_dir: Optional[Path] = None,
+    call_label: str = "llm",
 ) -> Any:
     def _on_retry(attempt: int, total: int, exc: Exception) -> None:
         logger.warning(
@@ -253,7 +269,7 @@ def _build_llm_call(
             error_text or "",
         )
 
-    return _make_llm_call(
+    base_llm_call = _make_llm_call(
         max_retries=max_retries,
         on_retry=_on_retry,
         on_attempt=_on_attempt,
@@ -261,6 +277,49 @@ def _build_llm_call(
         llm_timeout=float(timeout),
         fail_open_return_empty=bool(fail_open_return_empty),
     )
+    call_counter = 0
+    audit_dir: Optional[Path] = None
+    if prompt_audit_dir is not None:
+        audit_dir = Path(prompt_audit_dir)
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("LLM prompt audit dir | label=%s | dir=%s", call_label, audit_dir)
+
+    def _wrapped(prompt: str) -> str:
+        nonlocal call_counter
+        call_counter += 1
+        call_id = f"{call_label}_{call_counter:04d}"
+        prompt_path: Optional[Path] = None
+        response_path: Optional[Path] = None
+        error_path: Optional[Path] = None
+        if audit_dir is not None:
+            prompt_path = audit_dir / f"{call_id}_prompt.txt"
+            _save_text(prompt_path, str(prompt or ""))
+            logger.info("LLM prompt saved | call_id=%s | file=%s", call_id, prompt_path)
+        try:
+            response = str(base_llm_call(prompt) or "")
+            if audit_dir is not None:
+                response_path = audit_dir / f"{call_id}_response.txt"
+                _save_text(response_path, response)
+                logger.info(
+                    "LLM response saved | call_id=%s | prompt_file=%s | response_file=%s",
+                    call_id,
+                    prompt_path,
+                    response_path,
+                )
+            return response
+        except Exception as exc:
+            if audit_dir is not None:
+                error_path = audit_dir / f"{call_id}_error.txt"
+                _save_text(error_path, str(exc))
+                logger.error(
+                    "LLM call failed | call_id=%s | prompt_file=%s | error_file=%s",
+                    call_id,
+                    prompt_path,
+                    error_path,
+                )
+            raise
+
+    return _wrapped
 
 
 def _run_map_reduce_stage(
@@ -306,6 +365,16 @@ def _run_map_reduce_stage(
         }
         progress_events.append(row)
         logger.info("progress | event=%s | payload_file=%s", event, payload_file)
+        if event == "map_batch_resize":
+            logger.warning(
+                "MAP batch resize | batch=%s | depth=%s | %s -> %s | reason=%s | payload_file=%s",
+                payload.get("batch_number"),
+                payload.get("depth"),
+                payload.get("old_chunk_size"),
+                payload.get("new_chunk_size"),
+                payload.get("reason"),
+                payload_file,
+            )
 
     def _on_fetch_error(msg: str) -> None:
         fetch_errors.append(str(msg))
@@ -338,6 +407,8 @@ def _run_map_reduce_stage(
             max_retries=int(args.max_retries),
             fail_open_return_empty=False,
             logger=logger,
+            prompt_audit_dir=output_dir / "prompt_audit" / "map_reduce",
+            call_label="map_reduce",
         )
         summarizer = PeriodLogSummarizer(
             db_fetch_page=db_fetch_page,
@@ -397,12 +468,19 @@ def _run_reduce_only_stage(
     period_start_iso: str,
     period_end_iso: str,
     logger: logging.Logger,
+    output_dir: Optional[Path] = None,
 ) -> str:
     llm_call = _build_llm_call(
         timeout=float(args.llm_timeout),
         max_retries=int(args.max_retries),
         fail_open_return_empty=False,
         logger=logger,
+        prompt_audit_dir=(
+            (Path(output_dir) / "prompt_audit" / "reduce_only")
+            if output_dir is not None
+            else None
+        ),
+        call_label="reduce_only",
     )
     summary = regenerate_reduce_summary_from_map_summaries(
         map_summaries=map_summaries,
@@ -431,6 +509,7 @@ def _run_final_sections_stage(
     stats: Dict[str, Any],
     logger: logging.Logger,
     metrics_context: str = "",
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     map_summaries_text = "\n\n".join(
         f"[MAP SUMMARY #{idx + 1}]\n{_normalize_summary_text(item)}"
@@ -442,6 +521,12 @@ def _run_final_sections_stage(
         max_retries=int(args.final_max_retries),
         fail_open_return_empty=True,
         logger=logger,
+        prompt_audit_dir=(
+            (Path(output_dir) / "prompt_audit" / "final_sections")
+            if output_dir is not None
+            else None
+        ),
+        call_label="final_sections",
     )
     out: Dict[str, Any] = {}
     if not bool(args.skip_structured):
@@ -527,6 +612,7 @@ def main() -> int:
             period_start_iso=period_start_iso,
             period_end_iso=period_end_iso,
             logger=logger,
+            output_dir=output_dir,
         )
         _save_text(output_dir / "summary_reduce.md", base_summary)
     else:
@@ -546,6 +632,7 @@ def main() -> int:
             period_start_iso=period_start_iso,
             period_end_iso=period_end_iso,
             logger=logger,
+            output_dir=output_dir,
         )
         _save_text(output_dir / "summary_reduce.md", base_summary)
 
@@ -558,6 +645,7 @@ def main() -> int:
         period_end_iso=period_end_iso,
         stats=stats,
         logger=logger,
+        output_dir=output_dir,
     )
 
     _save_json(
@@ -570,6 +658,7 @@ def main() -> int:
             "base_summary_len": len(base_summary or ""),
             "structured_len": len(str(final_payload.get("structured_summary") or "")),
             "freeform_len": len(str(final_payload.get("freeform_summary") or "")),
+            "prompt_audit_dir": str((output_dir / "prompt_audit").resolve()),
             "run_config": asdict(args),
         },
     )

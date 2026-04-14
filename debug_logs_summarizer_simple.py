@@ -77,6 +77,8 @@ class DebugSimpleRunConfig:
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
     auto_shrink_on_400: bool = True
+    auto_shrink_on_500: bool = True
+    map_gateway_retry_cap: int = Field(default=3, ge=0)
     max_shrink_rounds: int = Field(default=6, ge=0)
     max_cell_chars: int = Field(default=0, ge=0)
     max_summary_chars: int = Field(default=0, ge=0)
@@ -132,6 +134,8 @@ RUN_CONFIG = DebugSimpleRunConfig(
     use_instructor=True,
     model_supports_tool_calling=True,
     auto_shrink_on_400=True,
+    auto_shrink_on_500=True,
+    map_gateway_retry_cap=3,
     max_shrink_rounds=6,
     max_cell_chars=0,
     max_summary_chars=0,
@@ -180,6 +184,8 @@ def _runtime_args(params: DebugSimpleRunConfig) -> SimpleNamespace:
         llm_batch=max(int(params.llm_batch_size), 1),
         min_llm_batch=max(int(params.min_llm_batch), 1),
         auto_shrink_on_400=bool(params.auto_shrink_on_400),
+        auto_shrink_on_500=bool(params.auto_shrink_on_500),
+        map_gateway_retry_cap=max(int(params.map_gateway_retry_cap), 0),
         max_shrink_rounds=max(int(params.max_shrink_rounds), 0),
         max_cell_chars=max(int(params.max_cell_chars), 0),
         max_summary_chars=max(int(params.max_summary_chars), 0),
@@ -307,6 +313,7 @@ def main() -> int:
             period_start_iso=period_start_iso,
             period_end_iso=period_end_iso,
             logger=logger,
+            output_dir=OUTPUT_DIR,
         )
         _save_text(OUTPUT_DIR / "summary_reduce.md", base_summary)
 
@@ -320,6 +327,7 @@ def main() -> int:
         stats=stats,
         logger=logger,
         metrics_context=metrics_context,
+        output_dir=OUTPUT_DIR,
     )
 
     if final_payload.get("structured_summary"):
@@ -339,6 +347,7 @@ def main() -> int:
             "logs_queries_count": len(logs_queries),
             "metrics_queries_count": len(list(params.metrics_queries or [])),
             "llm_model_id": str(getattr(settings, "LLM_MODEL_ID", "") or ""),
+            "prompt_audit_dir": str((OUTPUT_DIR / "prompt_audit").resolve()),
             "run_config": asdict(params),
         },
     )
