@@ -61,6 +61,9 @@ class DebugSimpleRunConfig:
     alerts: List[Any] = field(default_factory=list)
     user_goal: str = ""
     service: str = "demo-service"
+    # Можно задать прямо тут, чтобы не зависеть от .env
+    api_base: str = ""
+    api_key: str = ""
 
     # Режим периода: RANGE или WINDOW.
     period_mode: PeriodMode = PeriodMode.RANGE
@@ -77,8 +80,6 @@ class DebugSimpleRunConfig:
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
     auto_shrink_on_400: bool = True
-    auto_shrink_on_500: bool = True
-    map_gateway_retry_cap: int = Field(default=3, ge=0)
     max_shrink_rounds: int = Field(default=6, ge=0)
     max_cell_chars: int = Field(default=0, ge=0)
     max_summary_chars: int = Field(default=0, ge=0)
@@ -122,6 +123,8 @@ RUN_CONFIG = DebugSimpleRunConfig(
     alerts=[],
     user_goal="",
     service="demo-service",
+    api_base="",  # Пример: "https://phoenix.scm-test.int.gazprombank.ru/api/v1"
+    api_key="",  # Пример: "sk-..."
     period_mode=PeriodMode.RANGE,  # PeriodMode.RANGE | PeriodMode.WINDOW
     window_minutes=120,  # используется только в режиме PeriodMode.WINDOW
     center_dt="2026-04-13T19:00:00+03:00",  # MSK
@@ -134,8 +137,6 @@ RUN_CONFIG = DebugSimpleRunConfig(
     use_instructor=True,
     model_supports_tool_calling=True,
     auto_shrink_on_400=True,
-    auto_shrink_on_500=True,
-    map_gateway_retry_cap=3,
     max_shrink_rounds=6,
     max_cell_chars=0,
     max_summary_chars=0,
@@ -184,8 +185,6 @@ def _runtime_args(params: DebugSimpleRunConfig) -> SimpleNamespace:
         llm_batch=max(int(params.llm_batch_size), 1),
         min_llm_batch=max(int(params.min_llm_batch), 1),
         auto_shrink_on_400=bool(params.auto_shrink_on_400),
-        auto_shrink_on_500=bool(params.auto_shrink_on_500),
-        map_gateway_retry_cap=max(int(params.map_gateway_retry_cap), 0),
         max_shrink_rounds=max(int(params.max_shrink_rounds), 0),
         max_cell_chars=max(int(params.max_cell_chars), 0),
         max_summary_chars=max(int(params.max_summary_chars), 0),
@@ -255,6 +254,10 @@ def main() -> int:
     )
 
     params = RUN_CONFIG
+    if str(params.api_base or "").strip():
+        settings.OPENAI_API_BASE_DB = str(params.api_base).strip()
+    if str(params.api_key or "").strip():
+        settings.OPENAI_API_KEY_DB = str(params.api_key).strip()
     args = _runtime_args(params)
     period_start_iso, period_end_iso = _resolve_period(params)
     logs_queries = [str(item or "").strip() for item in list(params.logs_queries or [])]
@@ -335,6 +338,9 @@ def main() -> int:
     if final_payload.get("freeform_summary"):
         _save_text(OUTPUT_DIR / "final_freeform.md", str(final_payload["freeform_summary"]))
     _save_json(OUTPUT_DIR / "final_sections.json", final_payload)
+    run_cfg_dump = asdict(params)
+    if run_cfg_dump.get("api_key"):
+        run_cfg_dump["api_key"] = "***"
     _save_json(
         OUTPUT_DIR / "run_meta.json",
         {
@@ -348,7 +354,7 @@ def main() -> int:
             "metrics_queries_count": len(list(params.metrics_queries or [])),
             "llm_model_id": str(getattr(settings, "LLM_MODEL_ID", "") or ""),
             "prompt_audit_dir": str((OUTPUT_DIR / "prompt_audit").resolve()),
-            "run_config": asdict(params),
+            "run_config": run_cfg_dump,
         },
     )
     logger.info("simple full run done | out=%s", OUTPUT_DIR.resolve())

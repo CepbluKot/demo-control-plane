@@ -43,6 +43,9 @@ class DebugRunConfig:
     base_summary_file: str = ""  # Для режима final-only
     output_dir: str = "artifacts/debug_logs_summarizer"
     debug: bool = True
+    # Можно задать прямо тут, чтобы не зависеть от .env
+    api_base: str = ""
+    api_key: str = ""
 
     # ===== Runtime параметры пайплайна =====
     db_batch: int = Field(default=1000, ge=1)
@@ -62,8 +65,6 @@ class DebugRunConfig:
     max_summary_chars: int = Field(default=0, ge=0)
     reduce_prompt_max_chars: int = Field(default=0, ge=0)
     auto_shrink_on_400: bool = True
-    auto_shrink_on_500: bool = True
-    map_gateway_retry_cap: int = Field(default=3, ge=0)
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
     skip_structured: bool = False
@@ -205,7 +206,6 @@ def _build_runtime_config(args: Any) -> SummarizerConfig:
         llm_chunk_rows=int(args.llm_batch),
         min_llm_chunk_rows=max(int(args.min_llm_batch), 1),
         auto_shrink_on_400=bool(args.auto_shrink_on_400),
-        auto_shrink_on_500=bool(getattr(args, "auto_shrink_on_500", True)),
         max_shrink_rounds=max(int(args.max_shrink_rounds), 0),
         max_cell_chars=max(int(args.max_cell_chars), 0),
         max_summary_chars=max(int(args.max_summary_chars), 0),
@@ -222,7 +222,6 @@ def _build_runtime_config(args: Any) -> SummarizerConfig:
             max(float(args.compression_importance_threshold), 0.0),
             1.0,
         ),
-        map_gateway_retry_cap=max(int(getattr(args, "map_gateway_retry_cap", 3) or 3), 0),
         use_instructor=bool(args.use_instructor),
         model_supports_tool_calling=bool(args.model_supports_tool_calling),
     )
@@ -562,6 +561,10 @@ def _run_final_sections_stage(
 
 def main() -> int:
     args = RUN_CONFIG
+    if str(args.api_base or "").strip():
+        settings.OPENAI_API_BASE_DB = str(args.api_base).strip()
+    if str(args.api_key or "").strip():
+        settings.OPENAI_API_KEY_DB = str(args.api_key).strip()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     logger = _setup_logging(bool(args.debug), log_file=output_dir / "debug_logs_summarizer_pipeline.log")
@@ -648,6 +651,9 @@ def main() -> int:
         output_dir=output_dir,
     )
 
+    run_cfg_dump = asdict(args)
+    if run_cfg_dump.get("api_key"):
+        run_cfg_dump["api_key"] = "***"
     _save_json(
         output_dir / "run_meta.json",
         {
@@ -659,7 +665,7 @@ def main() -> int:
             "structured_len": len(str(final_payload.get("structured_summary") or "")),
             "freeform_len": len(str(final_payload.get("freeform_summary") or "")),
             "prompt_audit_dir": str((output_dir / "prompt_audit").resolve()),
-            "run_config": asdict(args),
+            "run_config": run_cfg_dump,
         },
     )
     if final_payload.get("structured_summary"):
