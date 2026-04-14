@@ -115,7 +115,7 @@ FROM (
               AND NOT multiSearchAny(lower(log), [
                     'certificate_verify_failed',
                     'info',
-                    'object has no attribute \'upper\''
+                    'object has no attribute ''upper'''
                 ])
         )
     )
