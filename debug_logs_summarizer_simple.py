@@ -79,6 +79,8 @@ class DebugSimpleRunConfig:
     llm_model_id: str = "PNX.QWEN3 235b a22b instruct"
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
+    map_schema_repair_enabled: bool = False
+    map_schema_repair_attempts: int = Field(default=0, ge=0)
     auto_shrink_on_400: bool = True
     max_shrink_rounds: int = Field(default=6, ge=0)
     max_cell_chars: int = Field(default=0, ge=0)
@@ -136,6 +138,8 @@ RUN_CONFIG = DebugSimpleRunConfig(
     llm_model_id="PNX.QWEN3 235b a22b instruct",
     use_instructor=True,
     model_supports_tool_calling=True,
+    map_schema_repair_enabled=False,
+    map_schema_repair_attempts=0,
     auto_shrink_on_400=True,
     max_shrink_rounds=6,
     max_cell_chars=0,
@@ -199,6 +203,8 @@ def _runtime_args(params: DebugSimpleRunConfig) -> SimpleNamespace:
         ),
         use_instructor=bool(params.use_instructor),
         model_supports_tool_calling=bool(params.model_supports_tool_calling),
+        map_schema_repair_enabled=bool(params.map_schema_repair_enabled),
+        map_schema_repair_attempts=max(int(params.map_schema_repair_attempts), 0),
         llm_timeout=llm_timeout,
         max_retries=int(params.max_retries),
         final_max_retries=max(int(params.final_max_retries), 0),

@@ -67,6 +67,8 @@ class DebugRunConfig:
     auto_shrink_on_400: bool = True
     use_instructor: bool = True
     model_supports_tool_calling: bool = True
+    map_schema_repair_enabled: bool = False
+    map_schema_repair_attempts: int = Field(default=0, ge=0)
     skip_structured: bool = False
     skip_freeform: bool = False
 
@@ -224,6 +226,8 @@ def _build_runtime_config(args: Any) -> SummarizerConfig:
         ),
         use_instructor=bool(args.use_instructor),
         model_supports_tool_calling=bool(args.model_supports_tool_calling),
+        map_schema_repair_enabled=bool(getattr(args, "map_schema_repair_enabled", False)),
+        map_schema_repair_attempts=max(int(getattr(args, "map_schema_repair_attempts", 0) or 0), 0),
     )
 
 
@@ -509,11 +513,38 @@ def _run_final_sections_stage(
     logger: logging.Logger,
     metrics_context: str = "",
     output_dir: Optional[Path] = None,
+    # Максимум символов для всех MAP-саммари вместе. 0 = без лимита (осторожно!).
+    map_summaries_budget_chars: int = 40_000,
 ) -> Dict[str, Any]:
-    map_summaries_text = "\n\n".join(
-        f"[MAP SUMMARY #{idx + 1}]\n{_normalize_summary_text(item)}"
-        for idx, item in enumerate(map_summaries)
+    # Берём MAP-саммари в рамках char-бюджета чтобы не взрывать контекст LLM.
+    # Финальному отчёту достаточно base_summary; MAP нужны только как supporting detail.
+    clean_map: List[str] = [
+        _normalize_summary_text(item)
+        for item in map_summaries
         if _normalize_summary_text(item)
+    ]
+    if map_summaries_budget_chars > 0 and clean_map:
+        budget_left = map_summaries_budget_chars
+        capped_map: List[str] = []
+        for item in clean_map:
+            if budget_left <= 0:
+                break
+            capped_map.append(item[:budget_left])
+            budget_left -= len(item)
+        total_dropped = len(clean_map) - len(capped_map)
+        if total_dropped > 0:
+            logger.warning(
+                "final_sections: MAP саммари обрезаны по бюджету %s chars | "
+                "использовано %s/%s | dropped=%s",
+                map_summaries_budget_chars,
+                len(capped_map),
+                len(clean_map),
+                total_dropped,
+            )
+        clean_map = capped_map
+    map_summaries_text = "\n\n".join(
+        f"[MAP SUMMARY #{idx + 1}]\n{item}"
+        for idx, item in enumerate(clean_map)
     )
     llm_call = _build_llm_call(
         timeout=float(args.final_llm_timeout),

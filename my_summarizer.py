@@ -157,6 +157,11 @@ class SummarizerConfig:
     # New pipeline mode (algorithm (1).md): no local token estimation,
     # split only on real overflow/timeouts + cascading structured reduce.
     use_new_algorithm: bool = True
+    # MAP schema-repair mode for malformed JSON payloads from LLM.
+    # If disabled (default), we skip extra repair retries and immediately keep
+    # degraded programmatic fallback to avoid wasting time.
+    map_schema_repair_enabled: bool = False
+    map_schema_repair_attempts: int = 0
     # Reduce/compression target size in percents of input size.
     reduce_target_token_pct: int = 50
     compression_target_pct: int = 50
@@ -2351,10 +2356,42 @@ class PeriodLogSummarizer:
         summary_total: int,
     ) -> tuple[IncidentSummary, int]:
         llm_calls = 0
-        if reduce_round < 2:
-            return summary, llm_calls
-
         max_chars = max(int(getattr(self.config, "reduce_input_max_chars", 40000) or 40000), 5000)
+
+        if reduce_round < 2:
+            # L1: не трогаем структуру полей, просто проверяем размер и сжимаем если надо.
+            chars = self._summary_chars(summary)
+            logger.info(
+                "REDUCE pre-merge L1 size check | item=%s/%s | chars=%s | threshold=%s",
+                summary_index,
+                summary_total,
+                chars,
+                max_chars,
+            )
+            if chars <= max_chars:
+                return summary, llm_calls
+            compressed, c_calls = self._compress_summary_on_overflow(summary)
+            llm_calls += c_calls
+            chars_after = self._summary_chars(compressed)
+            logger.info(
+                "REDUCE pre-merge L1 compress | item=%s/%s | chars=%s -> %s | llm_calls=%s",
+                summary_index,
+                summary_total,
+                chars,
+                chars_after,
+                c_calls,
+            )
+            if chars_after > max_chars:
+                logger.warning(
+                    "REDUCE pre-merge L1 still large after compress | "
+                    "item=%s/%s | chars=%s | threshold=%s — продолжаем, reactive split поймает",
+                    summary_index,
+                    summary_total,
+                    chars_after,
+                    max_chars,
+                )
+            return compressed, llm_calls
+
         current = self._prune_l2_plus_fields(summary)
         chars_after_prune = self._summary_chars(current)
         logger.info(
@@ -2733,8 +2770,25 @@ class PeriodLogSummarizer:
                 _preview_text(raw_summary_text, max_chars=900),
             )
         llm_extra_calls = 0
-        max_schema_retries = 2
-        if parse_error and allow_schema_retry:
+        schema_repair_enabled = bool(getattr(self.config, "map_schema_repair_enabled", False))
+        max_schema_retries = max(
+            int(getattr(self.config, "map_schema_repair_attempts", 0) or 0),
+            0,
+        )
+        can_try_schema_repair = (
+            parse_error
+            and allow_schema_retry
+            and schema_repair_enabled
+            and max_schema_retries > 0
+        )
+        if parse_error and allow_schema_retry and not can_try_schema_repair:
+            logger.info(
+                "MAP batch %s: schema-repair retries skipped | enabled=%s | attempts=%s | action=use_degraded_payload",
+                batch_number,
+                schema_repair_enabled,
+                max_schema_retries,
+            )
+        if can_try_schema_repair:
             current_text = str(raw_summary_text or "")
             for attempt in range(1, max_schema_retries + 1):
                 self._emit_progress(
@@ -3848,18 +3902,19 @@ class PeriodLogSummarizer:
             if reduce_rounds > self.config.max_reduce_rounds:
                 raise RuntimeError("Exceeded max reduce rounds")
 
-            if reduce_rounds >= 2:
-                prepared_level: List[IncidentSummary] = []
-                for idx, item in enumerate(current, start=1):
-                    prepared_item, prep_calls = self._prepare_summary_for_reduce_level(
-                        summary=item,
-                        reduce_round=reduce_rounds,
-                        summary_index=idx,
-                        summary_total=len(current),
-                    )
-                    llm_calls += prep_calls
-                    prepared_level.append(prepared_item)
-                current = prepared_level
+            # На всех уровнях проверяем размер и сжимаем если надо.
+            # L1: только size-check + compress. L2+: ещё prune полей.
+            prepared_level: List[IncidentSummary] = []
+            for idx, item in enumerate(current, start=1):
+                prepared_item, prep_calls = self._prepare_summary_for_reduce_level(
+                    summary=item,
+                    reduce_round=reduce_rounds,
+                    summary_index=idx,
+                    summary_total=len(current),
+                )
+                llm_calls += prep_calls
+                prepared_level.append(prepared_item)
+            current = prepared_level
 
             groups = self._group_structured_summaries_by_budget(current)
             level_label = f"L{reduce_rounds}"
