@@ -1,0 +1,97 @@
+{
+  "time_range": [
+    "2024-01-15T14:05:00Z",
+    "2024-01-15T14:10:00Z"
+  ],
+  "narrative": "Деградация усилилась: появились upstream timeout на gateway и признаки stop-the-world GC. order-service начинает фиксировать таймауты при вызове payments. Падений pod еще нет, но сервисная цепочка уже нестабильна.",
+  "events": [
+    {
+      "id": "evt-001-001",
+      "timestamp": "2024-01-15T14:05:16Z",
+      "source": "api-gateway",
+      "description": "Upstream timeout to payments-service",
+      "severity": "high",
+      "tags": [
+        "timeout",
+        "gateway",
+        "upstream"
+      ]
+    },
+    {
+      "id": "evt-001-002",
+      "timestamp": "2024-01-15T14:06:40Z",
+      "source": "payments-service",
+      "description": "Full GC pause reached 1.8s",
+      "severity": "high",
+      "tags": [
+        "jvm",
+        "gc",
+        "latency"
+      ]
+    },
+    {
+      "id": "evt-001-003",
+      "timestamp": "2024-01-15T14:09:03Z",
+      "source": "order-service",
+      "description": "Payment RPC timeout rate jumped to 9%",
+      "severity": "medium",
+      "tags": [
+        "timeout",
+        "rpc",
+        "cascade"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-001-001",
+      "timestamp": "2024-01-15T14:05:15Z",
+      "source": "api-gateway",
+      "raw_line": "2024-01-15T14:05:15.771Z ERROR [gateway] upstream request failed: GET /payments/authorize -> 504 in 3001ms upstream=payments-service:8080",
+      "severity": "high",
+      "linked_event_id": "evt-001-001"
+    },
+    {
+      "id": "ev-001-002",
+      "timestamp": "2024-01-15T14:06:39Z",
+      "source": "payments-service",
+      "raw_line": "2024-01-15T14:06:39.462Z INFO  [payments] GC(1942) Pause Full (Allocation Failure) 1876.21ms old=1316M->1289M",
+      "severity": "high",
+      "linked_event_id": "evt-001-002"
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "hyp-001-001",
+      "title": "GC pauses are primary latency driver",
+      "description": "Длинные GC паузы совпадают по времени с upstream timeout на gateway. Это делает гипотезу о JVM давлении более правдоподобной, чем сетевой сбой. Однако без OOM/рестартов уверенность остается средней.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-001-001",
+        "evt-001-002"
+      ],
+      "contradicting_event_ids": []
+    },
+    {
+      "id": "hyp-001-002",
+      "title": "Secondary dependency slowdown in order path",
+      "description": "Таймауты в order-service могут быть каскадом от payments, но не исключено локальное насыщение thread pool в order-service. Прямых ошибок order runtime пока мало, поэтому гипотеза вспомогательная.",
+      "confidence": "low",
+      "supporting_event_ids": [
+        "evt-001-003"
+      ],
+      "contradicting_event_ids": []
+    }
+  ],
+  "anomalies": [
+    {
+      "description": "Синхронный рост gateway timeout и GC pause длительности",
+      "related_event_ids": [
+        "evt-001-001",
+        "evt-001-002"
+      ]
+    }
+  ],
+  "metrics_context": null,
+  "data_quality": null
+}

@@ -28,7 +28,7 @@ API_KEY    = "sk-placeholder"
 MODEL      = "PNX.QWEN3 235b a22b instruct"
 
 # Директория с файлами batch_000.json, batch_001.json, ...
-BATCHES_DIR = pathlib.Path("artifacts/test_batches")
+BATCHES_DIR = pathlib.Path("test_batches")
 
 MAX_CONTEXT_TOKENS      = 100_000
 MAX_GROUP_SIZE          = 3

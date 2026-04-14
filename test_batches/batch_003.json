@@ -1,0 +1,98 @@
+{
+  "time_range": [
+    "2024-01-15T14:15:00Z",
+    "2024-01-15T14:20:00Z"
+  ],
+  "narrative": "Система переходит в каскадный сбой: order-service открывает circuit breaker на вызовах payments. Рестарты payments становятся регулярными, а ретраи увеличивают нагрузку на gateway. Версия про memory-related отказ становится основной, но еще не окончательной.",
+  "events": [
+    {
+      "id": "evt-003-001",
+      "timestamp": "2024-01-15T14:15:11Z",
+      "source": "payments-service",
+      "description": "Container restarted unexpectedly",
+      "severity": "high",
+      "tags": [
+        "restart",
+        "crash",
+        "k8s"
+      ]
+    },
+    {
+      "id": "evt-003-002",
+      "timestamp": "2024-01-15T14:17:00Z",
+      "source": "order-service",
+      "description": "Circuit breaker opened for payments",
+      "severity": "high",
+      "tags": [
+        "circuit-breaker",
+        "cascade",
+        "dependency"
+      ]
+    },
+    {
+      "id": "evt-003-003",
+      "timestamp": "2024-01-15T14:19:26Z",
+      "source": "api-gateway",
+      "description": "Retry storm increased upstream attempts",
+      "severity": "medium",
+      "tags": [
+        "retry",
+        "gateway",
+        "load"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-003-001",
+      "timestamp": "2024-01-15T14:17:00Z",
+      "source": "order-service",
+      "raw_line": "2024-01-15T14:17:00.221Z WARN  [order] Resilience4j CircuitBreaker 'paymentsClient' changed state CLOSED -> OPEN failureRate=63.0",
+      "severity": "high",
+      "linked_event_id": "evt-003-002"
+    },
+    {
+      "id": "ev-003-002",
+      "timestamp": "2024-01-15T14:15:10Z",
+      "source": "payments-service",
+      "raw_line": "2024-01-15T14:15:10.933Z INFO  [payments] pod restart detected: previous container terminated unexpectedly exitCode=137",
+      "severity": "high",
+      "linked_event_id": "evt-003-001"
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "hyp-003-001",
+      "title": "Payments instability drives circuit breaker cascade",
+      "description": "Открытие circuit breaker в order-service совпадает с рестартами payments и всплеском retry на gateway. Это консистентно с каскадной деградацией через зависимость payments. Уверенность средняя, так как первичный триггер еще уточняется.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-003-001",
+        "evt-003-002",
+        "evt-003-003"
+      ],
+      "contradicting_event_ids": []
+    },
+    {
+      "id": "hyp-003-002",
+      "title": "OOM likely but not yet explicitly confirmed",
+      "description": "ExitCode=137 и memory pressure в предыдущем окне похожи на OOM-сценарий. Однако без прямого события OOMKilled мы оставляем пространство для альтернатив, например ручного SIGKILL или node-level eviction.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-003-001"
+      ],
+      "contradicting_event_ids": []
+    }
+  ],
+  "anomalies": [
+    {
+      "description": "Быстрое открытие circuit breaker после серии рестартов payments",
+      "related_event_ids": [
+        "evt-003-001",
+        "evt-003-002"
+      ]
+    }
+  ],
+  "metrics_context": null,
+  "data_quality": null
+}

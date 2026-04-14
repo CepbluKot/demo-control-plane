@@ -1,0 +1,107 @@
+{
+  "time_range": [
+    "2024-01-15T14:35:00Z",
+    "2024-01-15T14:40:00Z"
+  ],
+  "narrative": "После изменения memory limit появляются признаки стабилизации: новые pod переходят в Ready и ошибка на gateway снижается. order-service переводит circuit breaker в half-open и фиксирует успешные пробы. Инцидент еще не завершен полностью, но траектория восстановления уже устойчивая.",
+  "events": [
+    {
+      "id": "evt-007-001",
+      "timestamp": "2024-01-15T14:35:22Z",
+      "source": "payments-service",
+      "description": "New pods with 3Gi limit became Ready",
+      "severity": "high",
+      "tags": [
+        "recovery",
+        "k8s",
+        "memory"
+      ]
+    },
+    {
+      "id": "evt-007-002",
+      "timestamp": "2024-01-15T14:37:08Z",
+      "source": "api-gateway",
+      "description": "5xx ratio dropped to 4 percent",
+      "severity": "medium",
+      "tags": [
+        "gateway",
+        "recovery",
+        "5xx"
+      ]
+    },
+    {
+      "id": "evt-007-003",
+      "timestamp": "2024-01-15T14:39:41Z",
+      "source": "order-service",
+      "description": "Circuit breaker switched to HALF_OPEN",
+      "severity": "medium",
+      "tags": [
+        "circuit-breaker",
+        "recovery",
+        "dependency"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-007-001",
+      "timestamp": "2024-01-15T14:35:21Z",
+      "source": "kube-controller-manager",
+      "raw_line": "2024-01-15T14:35:21.669Z Normal  ScalingReplicaSet  deployment/payments-service scaled up replica set to 9",
+      "severity": "high",
+      "linked_event_id": "evt-007-001"
+    },
+    {
+      "id": "ev-007-002",
+      "timestamp": "2024-01-15T14:37:07Z",
+      "source": "api-gateway",
+      "raw_line": "2024-01-15T14:37:07.512Z INFO  [gateway] payments 5xx ratio normalized to 0.041 over 60s window",
+      "severity": "medium",
+      "linked_event_id": "evt-007-002"
+    },
+    {
+      "id": "ev-007-003",
+      "timestamp": "2024-01-15T14:39:41Z",
+      "source": "order-service",
+      "raw_line": "2024-01-15T14:39:41.104Z INFO  [order] CircuitBreaker 'paymentsClient' OPEN -> HALF_OPEN; probe success=5/5",
+      "severity": "medium",
+      "linked_event_id": "evt-007-003"
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "hyp-007-001",
+      "title": "OOM root cause fully confirmed by recovery response",
+      "description": "Снижение ошибок сразу после увеличения memory limit подтверждает, что OOM в payments был корневой причиной инцидента. Наблюдаемая динамика восстановления согласуется с устранением memory bottleneck. Уверенность высокая.",
+      "confidence": "high",
+      "supporting_event_ids": [
+        "evt-007-001",
+        "evt-007-002",
+        "evt-007-003"
+      ],
+      "contradicting_event_ids": []
+    },
+    {
+      "id": "hyp-007-002",
+      "title": "Residual latency from cache coldness may persist",
+      "description": "После стабилизации подов возможно временное ухудшение латентности из-за холодных кэшей и повторного прогрева соединений. Это ожидаемый post-restart эффект и не противоречит основной гипотезе.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-007-001",
+        "evt-007-003"
+      ],
+      "contradicting_event_ids": []
+    }
+  ],
+  "anomalies": [
+    {
+      "description": "Быстрый спад 5xx после memory patch без иных изменений",
+      "related_event_ids": [
+        "evt-007-001",
+        "evt-007-002"
+      ]
+    }
+  ],
+  "metrics_context": null,
+  "data_quality": null
+}

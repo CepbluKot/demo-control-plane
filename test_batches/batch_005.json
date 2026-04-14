@@ -1,0 +1,105 @@
+{
+  "time_range": [
+    "2024-01-15T14:25:00Z",
+    "2024-01-15T14:30:00Z"
+  ],
+  "narrative": "Перед пиком аварии появляется прямой признак OOMKilled в Kubernetes событиях. После перезапуска payments сервис стартует медленно, а order-service держит circuit breaker открытым. Картина становится почти однозначной, хотя remediation еще не выполнен.",
+  "events": [
+    {
+      "id": "evt-005-001",
+      "timestamp": "2024-01-15T14:25:18Z",
+      "source": "kubelet/node-a",
+      "description": "OOMKilled recorded for payments container",
+      "severity": "critical",
+      "tags": [
+        "oom",
+        "k8s",
+        "crash"
+      ]
+    },
+    {
+      "id": "evt-005-002",
+      "timestamp": "2024-01-15T14:27:41Z",
+      "source": "payments-service",
+      "description": "Cold start time reached 95 seconds",
+      "severity": "high",
+      "tags": [
+        "startup",
+        "recovery",
+        "latency"
+      ]
+    },
+    {
+      "id": "evt-005-003",
+      "timestamp": "2024-01-15T14:29:54Z",
+      "source": "order-service",
+      "description": "Circuit breaker stayed OPEN at 71 percent fail",
+      "severity": "critical",
+      "tags": [
+        "circuit-breaker",
+        "impact",
+        "cascade"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-005-001",
+      "timestamp": "2024-01-15T14:25:18Z",
+      "source": "kubelet",
+      "raw_line": "2024-01-15T14:25:18.041Z Warning  OOMKilling  kubelet  Memory cgroup out of memory: Kill process 2661 (java) score 987 or sacrifice child",
+      "severity": "critical",
+      "linked_event_id": "evt-005-001"
+    },
+    {
+      "id": "ev-005-002",
+      "timestamp": "2024-01-15T14:27:40Z",
+      "source": "payments-service",
+      "raw_line": "2024-01-15T14:27:40.918Z INFO  [payments] Application started in 95.224 seconds (JVM running for 97.102)",
+      "severity": "high",
+      "linked_event_id": "evt-005-002"
+    },
+    {
+      "id": "ev-005-003",
+      "timestamp": "2024-01-15T14:29:53Z",
+      "source": "order-service",
+      "raw_line": "2024-01-15T14:29:53.774Z ERROR [order] paymentsClient blocked by circuit breaker OPEN failureRate=71.4",
+      "severity": "critical",
+      "linked_event_id": "evt-005-003"
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "hyp-005-001",
+      "title": "OOM is the leading root-cause candidate",
+      "description": "Наличие OOMKilling события почти напрямую подтверждает память как первичный триггер отказа payments-service. Медленные cold start усиливают длительность деградации и поддерживают каскад через order-service. Уверенность уже высокая, но финальное подтверждение ожидаем в следующих окнах.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-005-001",
+        "evt-005-002",
+        "evt-005-003"
+      ],
+      "contradicting_event_ids": []
+    },
+    {
+      "id": "hyp-005-002",
+      "title": "Circuit breaker protects but prolongs partial outage",
+      "description": "Защитная логика order-service снижает лавину ошибок, но удерживает часть трафика в отказе даже при кратком восстановлении payments. Это объясняет, почему user impact сохраняется. Гипотеза сопутствующая.",
+      "confidence": "medium",
+      "supporting_event_ids": [
+        "evt-005-003"
+      ],
+      "contradicting_event_ids": []
+    }
+  ],
+  "anomalies": [
+    {
+      "description": "Прямое OOMKilling событие в момент максимального каскада",
+      "related_event_ids": [
+        "evt-005-001"
+      ]
+    }
+  ],
+  "metrics_context": "pod_memory_working_set у payments достиг 1.98Gi при limit 2Gi; restart_count +4 за 5 минут; gateway 5xx 21%; order circuit OPEN duration 270s.",
+  "data_quality": null
+}
