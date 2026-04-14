@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
+from pathlib import Path
 from typing import Any, Optional, Type, TypeVar
 
 from pydantic import BaseModel
@@ -115,6 +117,7 @@ class LLMClient:
         use_instructor: bool = True,
         model_supports_tool_calling: bool = False,
         timeout: float = 600.0,
+        audit_dir: Optional[Path] = None,
     ) -> None:
         self.api_base = api_base
         self.api_key = api_key
@@ -129,6 +132,11 @@ class LLMClient:
         self._instructor_cache: dict[str, Any] = {}
         # Если TOOLS даёт grammar error — переходим в JSON mode навсегда
         self._force_json_mode: bool = False
+
+        # Аудит: сохраняем каждый промпт и ответ в файлы
+        self._audit_dir: Optional[Path] = audit_dir
+        self._audit_counter: int = 0
+        self._audit_lock: threading.Lock = threading.Lock()
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -252,9 +260,18 @@ class LLMClient:
         temperature: float,
     ) -> TModel:
         """Один LLM-вызов с JSON-выводом."""
-        if self.use_instructor and instructor is not None and OpenAI is not None:
-            return self._call_via_instructor(system, user, response_model, temperature)
-        return self._call_json_direct(system, user, response_model, temperature)
+        n, prefix = self._audit_start("json")
+        error: Optional[str] = None
+        try:
+            if self.use_instructor and instructor is not None and OpenAI is not None:
+                result = self._call_via_instructor(system, user, response_model, temperature)
+            else:
+                result = self._call_json_direct(system, user, response_model, temperature)
+            self._audit_save(n, prefix, system, user, result.model_dump_json(indent=2), error=None)
+            return result
+        except Exception as exc:
+            self._audit_save(n, prefix, system, user, response=None, error=str(exc))
+            raise
 
     def _do_call_text(
         self,
@@ -265,21 +282,64 @@ class LLMClient:
         """Один LLM-вызов с plain text выводом."""
         if OpenAI is None:
             raise LLMUnavailableError("openai package not installed")
-        client = OpenAI(
-            base_url=_build_openai_base_url(self.api_base),
-            api_key=self.api_key,
-            max_retries=0,
-            timeout=self.timeout,
-        )
-        resp = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=temperature,
-        )
-        return resp.choices[0].message.content or ""
+        n, prefix = self._audit_start("text")
+        try:
+            client = OpenAI(
+                base_url=_build_openai_base_url(self.api_base),
+                api_key=self.api_key,
+                max_retries=0,
+                timeout=self.timeout,
+            )
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=temperature,
+            )
+            text = resp.choices[0].message.content or ""
+            self._audit_save(n, prefix, system, user, response=text, error=None)
+            return text
+        except Exception as exc:
+            self._audit_save(n, prefix, system, user, response=None, error=str(exc))
+            raise
+
+    # ── Аудит промптов / ответов ──────────────────────────────────────
+
+    def _audit_start(self, kind: str) -> tuple[int, Optional[Path]]:
+        """Резервирует номер вызова; возвращает (n, prefix | None)."""
+        if self._audit_dir is None:
+            return 0, None
+        with self._audit_lock:
+            self._audit_counter += 1
+            n = self._audit_counter
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+        prefix = self._audit_dir / f"call_{n:04d}_{kind}"
+        return n, prefix
+
+    def _audit_save(
+        self,
+        n: int,
+        prefix: Optional[Path],
+        system: str,
+        user: str,
+        response: Optional[str],
+        error: Optional[str],
+    ) -> None:
+        """Записывает промпт и ответ в файлы; логирует пути."""
+        if prefix is None:
+            return
+        (Path(f"{prefix}_system.txt")).write_text(system, encoding="utf-8")
+        (Path(f"{prefix}_user.txt")).write_text(user, encoding="utf-8")
+        if response is not None:
+            resp_path = Path(f"{prefix}_response.txt")
+            resp_path.write_text(response, encoding="utf-8")
+            logger.debug("LLM call_%04d → %s", n, resp_path)
+        if error is not None:
+            err_path = Path(f"{prefix}_error.txt")
+            err_path.write_text(error, encoding="utf-8")
+            logger.warning("LLM call_%04d ERROR → %s", n, err_path)
 
     def _call_via_instructor(
         self,

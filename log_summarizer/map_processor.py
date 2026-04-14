@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Optional
 
 from log_summarizer.chunker import Chunker
@@ -44,10 +46,12 @@ class MapProcessor:
         llm: LLMClient,
         chunker: Chunker,
         config: PipelineConfig,
+        run_dir: Optional[Path] = None,
     ) -> None:
         self.llm = llm
         self.chunker = chunker
         self.config = config
+        self._run_dir = run_dir
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -115,6 +119,7 @@ class MapProcessor:
                 temperature=self.config.temperature_map,
             )
             logger.debug("Chunk %d → %d events, %d evidence", chunk_id, len(result.events), len(result.evidence))
+            self._save_chunk_result(chunk_id, result)
             return result
         except ContextOverflowError:
             if len(chunk.rows) <= self.config.min_batch_lines:
@@ -205,6 +210,14 @@ class MapProcessor:
             metrics_context="; ".join(metrics_parts) if metrics_parts else None,
             data_quality="; ".join(quality_parts) if quality_parts else None,
         )
+
+    def _save_chunk_result(self, chunk_id: int, result: BatchAnalysis) -> None:
+        if self._run_dir is None:
+            return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        path = self._run_dir / f"chunk_{chunk_id:03d}.json"
+        path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        logger.info("MAP chunk %d saved → %s", chunk_id, path)
 
     @staticmethod
     def _empty_analysis(chunk: Chunk) -> BatchAnalysis:

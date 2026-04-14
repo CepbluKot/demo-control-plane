@@ -12,7 +12,8 @@
 from __future__ import annotations
 
 import json
-from typing import Union
+from pathlib import Path
+from typing import Optional, Union
 
 from log_summarizer.config import PipelineConfig
 from log_summarizer.llm_client import ContextOverflowError, LLMClient
@@ -41,9 +42,15 @@ class TreeReducer:
         config: Конфигурация пайплайна.
     """
 
-    def __init__(self, llm: LLMClient, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        config: PipelineConfig,
+        run_dir: Optional[Path] = None,
+    ) -> None:
         self.llm = llm
         self.config = config
+        self._run_dir = run_dir
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -82,13 +89,14 @@ class TreeReducer:
             groups = self._make_groups(items, group_size)
 
             next_items: list[_Item] = []
-            for group in groups:
+            for g_idx, group in enumerate(groups):
                 if len(group) == 1:
                     next_items.append(group[0])
                     continue
-                merged = await self._merge_group(group, round_num)
+                merged = await self._merge_group(group, round_num, g_idx)
                 merged = self._trim_events(merged)
                 merged = await self._maybe_compress(merged)
+                self._save_reduce_result(round_num, g_idx, merged)
                 next_items.append(merged)
 
             items = next_items
@@ -101,6 +109,7 @@ class TreeReducer:
                 items = [await self._merge_group(items, self.config.max_reduce_rounds + 1)]
 
         result = items[0]
+        self._save_reduce_result(0, 0, result, name="final_merged")  # перед evidence
 
         # Если результат — BatchAnalysis (edge case: один батч), конвертируем
         if isinstance(result, BatchAnalysis):
@@ -152,10 +161,27 @@ class TreeReducer:
 
     # ── Merge ─────────────────────────────────────────────────────────
 
+    def _save_reduce_result(
+        self,
+        round_num: int,
+        group_idx: int,
+        result: MergedAnalysis,
+        name: Optional[str] = None,
+    ) -> None:
+        if self._run_dir is None:
+            return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        fname = name or f"round_{round_num:02d}_group_{group_idx:02d}"
+        path = self._run_dir / f"{fname}.json"
+        # Сохраняем без evidence_bank (он большой и хранится отдельно)
+        path.write_text(result.to_json_str(), encoding="utf-8")
+        logger.info("REDUCE %s saved → %s", fname, path)
+
     async def _merge_group(
         self,
         group: list[_Item],
         round_num: int,
+        group_idx: int = 0,
     ) -> MergedAnalysis:
         """Отправляем группу в LLM, получаем MergedAnalysis.
 

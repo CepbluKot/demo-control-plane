@@ -73,6 +73,12 @@ class PipelineConfig:
     use_instructor: bool = True
     model_supports_tool_calling: bool = False  # False = JSON mode
 
+    # ── Наблюдаемость ────────────────────────────────────────────────
+    # Каждый прогон создаёт подпапку runs/{timestamp}/ с промптами,
+    # промежуточными результатами и финальным отчётом.
+    # Пустая строка = не сохранять артефакты.
+    runs_dir: str = "runs"
+
     def map_batch_tokens(self) -> int:
         """Бюджет токенов на один MAP-вызов (55% от контекста)."""
         return int(self.max_context_tokens * 0.55)

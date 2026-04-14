@@ -7,12 +7,22 @@
   4. MapProcessor.process_all → list[BatchAnalysis]  (параллельно)
   5. TreeReducer.reduce → MergedAnalysis
   6. ReportGenerator.generate → str (Markdown)
+
+Артефакты каждого прогона сохраняются в {runs_dir}/{timestamp}/:
+  llm/          — промпты и ответы LLM (call_NNNN_*.txt)
+  map/          — BatchAnalysis по каждому чанку
+  reduce/       — MergedAnalysis после каждого merge-шага
+  chunks_meta.json   — метаданные чанков (без сырых строк)
+  report.md          — финальный отчёт
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from log_summarizer.chunker import Chunker
@@ -23,7 +33,7 @@ from log_summarizer.map_processor import MapProcessor
 from log_summarizer.models import BatchAnalysis, Chunk, MetricRow
 from log_summarizer.report_generator import ReportGenerator
 from log_summarizer.tree_reducer import TreeReducer
-from log_summarizer.utils.logging import get_logger, setup_pipeline_logging
+from log_summarizer.utils.logging import get_logger
 
 logger = get_logger("orchestrator")
 
@@ -39,7 +49,9 @@ class PipelineOrchestrator:
     def __init__(self, clickhouse_client: Any, config: PipelineConfig) -> None:
         self.config = config
 
-        # Инициализируем компоненты
+        # Создаём папку для артефактов этого прогона
+        self._run_dir: Optional[Path] = self._make_run_dir(config.runs_dir)
+
         max_batch_tokens = int(config.max_context_tokens * 0.55)
         self._chunker = Chunker(
             max_batch_tokens=max_batch_tokens,
@@ -53,20 +65,26 @@ class PipelineOrchestrator:
             retry_backoff_base=config.retry_backoff_base,
             use_instructor=config.use_instructor,
             model_supports_tool_calling=config.model_supports_tool_calling,
+            audit_dir=self._run_dir / "llm" if self._run_dir else None,
         )
         self._data_loader = DataLoader(clickhouse_client, config)
-        self._map_processor = MapProcessor(self._llm, self._chunker, config)
-        self._tree_reducer = TreeReducer(self._llm, config)
-        self._report_generator = ReportGenerator(self._llm, config)
+        self._map_processor = MapProcessor(
+            self._llm, self._chunker, config,
+            run_dir=self._run_dir / "map" if self._run_dir else None,
+        )
+        self._tree_reducer = TreeReducer(
+            self._llm, config,
+            run_dir=self._run_dir / "reduce" if self._run_dir else None,
+        )
+        self._report_generator = ReportGenerator(
+            self._llm, config,
+            run_dir=self._run_dir,
+        )
 
     # ── Публичный API ─────────────────────────────────────────────────
 
     async def run(self) -> str:
-        """Запускает пайплайн и возвращает Markdown-отчёт.
-
-        Returns:
-            Финальный отчёт в формате Markdown.
-        """
+        """Запускает пайплайн и возвращает Markdown-отчёт."""
         t0 = time.monotonic()
         logger.info(
             "Pipeline starting: model=%s, incident=%s → %s",
@@ -74,6 +92,8 @@ class PipelineOrchestrator:
             self.config.incident_start,
             self.config.incident_end,
         )
+        if self._run_dir:
+            logger.info("Run artifacts → %s", self._run_dir.resolve())
 
         # ── 1. Загрузка данных ────────────────────────────────────────
         chunks, metrics = await asyncio.get_event_loop().run_in_executor(
@@ -89,13 +109,13 @@ class PipelineOrchestrator:
             len(chunks),
             len(metrics) if metrics else 0,
         )
+        self._save_chunks_meta(chunks)
 
         # ── 2. MAP-фаза ───────────────────────────────────────────────
         batch_results: list[BatchAnalysis] = await self._map_processor.process_all(
             chunks, metrics=metrics
         )
 
-        # Отфильтровываем пустые результаты (ошибки загрузки)
         batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
         if not batch_results:
             logger.warning("MAP phase produced no useful results")
@@ -115,24 +135,50 @@ class PipelineOrchestrator:
 
         elapsed = time.monotonic() - t0
         logger.info("Pipeline complete in %.1fs", elapsed)
+        if self._run_dir:
+            logger.info("All artifacts saved in %s", self._run_dir.resolve())
         return report
 
     def run_sync(self) -> str:
-        """Синхронная обёртка для использования без asyncio.run().
-
-        Создаёт новый event loop, запускает пайплайн, закрывает loop.
-        """
+        """Синхронная обёртка для использования без asyncio.run()."""
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(self.run())
         finally:
             loop.close()
 
-    # ── Загрузка данных (sync, запускается в executor) ────────────────
+    # ── Вспомогательные ───────────────────────────────────────────────
+
+    @staticmethod
+    def _make_run_dir(runs_dir: str) -> Optional[Path]:
+        """Создаёт папку runs/{timestamp}/ для артефактов прогона."""
+        if not runs_dir:
+            return None
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+        run_dir = Path(runs_dir) / ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def _save_chunks_meta(self, chunks: list[Chunk]) -> None:
+        """Сохраняет метаданные чанков (без сырых строк логов)."""
+        if self._run_dir is None:
+            return
+        meta = [
+            {
+                "index": i,
+                "rows": len(c.rows),
+                "token_estimate": c.token_estimate,
+                "time_from": c.time_range[0].isoformat(),
+                "time_to": c.time_range[1].isoformat(),
+            }
+            for i, c in enumerate(chunks)
+        ]
+        path = self._run_dir / "chunks_meta.json"
+        path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        logger.info("Chunks meta saved → %s  (%d chunks)", path, len(chunks))
 
     def _load_data(self) -> tuple[list[Chunk], Optional[list[MetricRow]]]:
         """Загрузка логов и метрик (синхронная, вызывается из executor)."""
-        # Загружаем все строки лога постранично и сразу чанкуем
         all_chunks: list[Chunk] = []
         total_rows = 0
 
@@ -150,10 +196,8 @@ class PipelineOrchestrator:
             len(all_chunks),
         )
 
-        # Метрики загружаем одним запросом
         metrics = self._data_loader.fetch_metrics(
             start=self.config.incident_start,
             end=self.config.incident_end,
         )
-
         return all_chunks, metrics

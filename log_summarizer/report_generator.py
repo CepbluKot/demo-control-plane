@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Optional
+
 from log_summarizer.config import PipelineConfig
 from log_summarizer.llm_client import ContextOverflowError, LLMClient
 from log_summarizer.models import MergedAnalysis, ReportBudget
@@ -43,9 +46,15 @@ class ReportGenerator:
         config: Конфигурация пайплайна.
     """
 
-    def __init__(self, llm: LLMClient, config: PipelineConfig) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        config: PipelineConfig,
+        run_dir: Optional[Path] = None,
+    ) -> None:
         self.llm = llm
         self.config = config
+        self._run_dir = run_dir
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -105,12 +114,15 @@ class ReportGenerator:
                 early_text=early_text,
             )
 
+        self._save_report_prompt(user, "report_full_prompt.txt")
         try:
-            return await self.llm.call_text(
+            report = await self.llm.call_text(
                 system=build_report_system_prompt(),
                 user=user,
                 temperature=self.config.temperature_report,
             )
+            self._save_report_md(report, "report.md")
+            return report
         except ContextOverflowError:
             logger.warning("ContextOverflow on full report — falling back to sectional mode")
             return await self._generate_sectional(
@@ -239,14 +251,32 @@ class ReportGenerator:
             if part.strip()
         )
 
+    def _save_report_prompt(self, prompt: str, filename: str) -> None:
+        if self._run_dir is None:
+            return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        path = self._run_dir / filename
+        path.write_text(prompt, encoding="utf-8")
+        logger.info("Report prompt saved → %s", path)
+
+    def _save_report_md(self, report: str, filename: str) -> None:
+        if self._run_dir is None:
+            return
+        path = self._run_dir / filename
+        path.write_text(report, encoding="utf-8")
+        logger.info("Report saved → %s", path)
+
     async def _call_section(self, section: str, user: str) -> str:
         """Один LLM-вызов для одной секции."""
+        self._save_report_prompt(user, f"report_{section}_prompt.txt")
         try:
-            return await self.llm.call_text(
+            result = await self.llm.call_text(
                 system=build_report_system_prompt(section=section),
                 user=user,
                 temperature=self.config.temperature_report,
             )
+            self._save_report_md(result, f"report_{section}.md")
+            return result
         except ContextOverflowError:
             logger.error(
                 "ContextOverflow even in sectional mode for section=%s — returning empty",
