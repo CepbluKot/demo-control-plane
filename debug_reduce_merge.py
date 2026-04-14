@@ -1,203 +1,162 @@
 """
-debug_reduce_merge.py — тест слияния двух больших батчей через _reduce_structured_group.
+debug_reduce_merge.py — тест REDUCE-фазы (TreeReducer) на синтетических данных.
 
-Сценарий: каждый батч влезает в контекст модели, но вместе — нет.
-Проверяем что split-fallback → compress → retry работает корректно.
+Не требует ClickHouse. Создаёт N синтетических BatchAnalysis-объектов
+(разные временные окна инцидента), прогоняет через TreeReducer,
+проверяет что дерево сжатия сходится и не теряет ключевые события.
 
 Запуск:
     python debug_reduce_merge.py
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import time
-from pathlib import Path
-from typing import Any, Dict, List
+import pathlib
+from datetime import datetime, timedelta, timezone
 
-# ═══════════════════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════════════════
+# ── CONFIG ────────────────────────────────────────────────────────────
+API_BASE   = "http://localhost:8000"
+API_KEY    = "sk-placeholder"
+MODEL      = "PNX.QWEN3 235b a22b instruct"
 
-LLM_API_BASE = "http://localhost:8000/v1"
-LLM_API_KEY  = "sk-placeholder"
-LLM_MODEL    = "PNX.QWEN3 235b a22b instruct"
+# Сколько синтетических батчей подать на вход (≥2, интереснее с 6-10)
+N_BATCHES = 8
 
-# Файлы с батчами — кладём рядом с этим скриптом
-BATCH_A = Path("batch_a.txt")
-BATCH_B = Path("batch_b.txt")
+MAX_CONTEXT_TOKENS      = 100_000
+MAX_GROUP_SIZE          = 3   # сколько item объединяем за раз
+MAX_EVENTS_PER_MERGE    = 30  # обрезка events после каждого merge
+COMPRESSION_TARGET_PCT  = 50  # сжимать если > 50% контекста
+# ─────────────────────────────────────────────────────────────────────
 
-OUTPUT_DIR = Path("artifacts/debug_reduce_merge")
-
-# Контекстное окно модели в символах (токены × 4).
-# Qwen3 235B, 100K ctx → 400_000
-CONTEXT_WINDOW_CHARS = 400_000
-
-# ═══════════════════════════════════════════════════════════════
-#  КОНЕЦ CONFIG
-# ═══════════════════════════════════════════════════════════════
-
-from settings import settings
-settings.OPENAI_API_BASE_DB = LLM_API_BASE
-settings.OPENAI_API_KEY_DB  = LLM_API_KEY
-settings.LLM_MODEL_ID       = LLM_MODEL
-
-from schemas import IncidentSummary
-from my_summarizer import PeriodLogSummarizer, SummarizerConfig, _make_llm_call
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+from log_summarizer.config import PipelineConfig
+from log_summarizer.llm_client import LLMClient
+from log_summarizer.models import (
+    Anomaly, BatchAnalysis, Event, Evidence, Hypothesis, Severity,
 )
-for noisy in ("httpcore", "httpx", "openai", "instructor", "urllib3"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
+from log_summarizer.tree_reducer import TreeReducer
+from log_summarizer.utils.logging import setup_pipeline_logging
+
+setup_pipeline_logging("INFO")
 log = logging.getLogger("debug_reduce_merge")
 
 
-def _fmt(n: int) -> str:
-    return f"{n:,}".replace(",", "_")
+def _dt(offset_min: int) -> datetime:
+    base = datetime(2024, 1, 15, 14, 0, 0, tzinfo=timezone.utc)
+    return base + timedelta(minutes=offset_min)
 
 
-def load_batch(path: Path) -> IncidentSummary:
-    log.info("Загружаю %s ...", path.resolve())
-    raw = path.read_text(encoding="utf-8")
-    data = json.loads(raw)
-    batch = IncidentSummary.model_validate(data)
-    log.info("  OK: %d events, %d hypotheses, %d causal_links",
-             len(batch.timeline), len(batch.hypotheses), len(batch.causal_links))
-    return batch
+def make_batch(idx: int) -> BatchAnalysis:
+    """Один синтетический батч — временное окно из ~5 минут инцидента."""
+    t0 = idx * 5   # каждый батч = 5 минут
+    t1 = t0 + 5
 
+    window_labels = [
+        ("pre-incident: normal traffic",      "INFO",     "api-gateway",    []),
+        ("GC pressure rising in payments",    "WARN",     "payments-svc",   ["oom", "gc"]),
+        ("OOM: payments-svc pod killed",      "CRITICAL", "kubelet",        ["oom", "crash"]),
+        ("downstream cascade: order-svc CB",  "HIGH",     "order-svc",      ["circuit-breaker"]),
+        ("second OOM: CrashLoopBackOff",      "HIGH",     "kubelet",        ["oom", "crash"]),
+        ("memory limit patched by oncall",    "MEDIUM",   "kubectl",        ["fix"]),
+        ("pod recovery: payments-svc up",     "MEDIUM",   "payments-svc",   ["recovery"]),
+        ("full recovery confirmed by prom",   "LOW",      "prometheus",     ["recovery"]),
+    ]
+    label, sev_str, source, tags = window_labels[idx % len(window_labels)]
+    sev = Severity(sev_str.lower()) if sev_str.lower() in Severity._value2member_map_ else Severity.MEDIUM
 
-def build_summarizer(reduce_input_max_chars: int) -> PeriodLogSummarizer:
-    def _on_retry(attempt: int, total: int, exc: Exception) -> None:
-        log.warning("LLM retry | attempt=%s | error=%s", attempt, exc)
-
-    def _on_attempt(attempt: int, total: int, timeout_seconds: float) -> None:
-        log.info("LLM attempt=%s | timeout=%.0fs", attempt, timeout_seconds)
-
-    def _on_result(attempt: int, total: int, success: bool, elapsed: float, err: Any) -> None:
-        log.info("LLM result | success=%s | elapsed=%.2fs | err=%s", success, elapsed, err or "")
-
-    llm_call = _make_llm_call(
-        max_retries=3,
-        on_retry=_on_retry,
-        on_attempt=_on_attempt,
-        on_result=_on_result,
-        llm_timeout=600.0,
-        fail_open_return_empty=False,
+    ev = Event(
+        id=f"evt-{idx:03d}-001",
+        timestamp=_dt(t0 + 2),
+        source=source,
+        description=label,
+        severity=sev,
+        tags=tags,
+    )
+    evidence = Evidence(
+        id=f"ev-{idx:03d}-001",
+        timestamp=_dt(t0 + 2),
+        source=source,
+        raw_line=f"{_dt(t0+2).isoformat()} {sev_str} {source}: {label}",
+        severity=sev,
+        linked_event_id=ev.id,
+    )
+    hyp = Hypothesis(
+        id=f"hyp-{idx:03d}-001",
+        title=f"Hypothesis from window {idx}",
+        description=f"Window {idx} suggests {label} as contributing factor",
+        confidence="medium",
+        supporting_event_ids=[ev.id],
+    )
+    return BatchAnalysis(
+        time_range=(_dt(t0), _dt(t1)),
+        narrative=f"Window {idx} ({_dt(t0).isoformat()} → {_dt(t1).isoformat()}): {label}.",
+        events=[ev],
+        evidence=[evidence],
+        hypotheses=[hyp],
+        anomalies=[Anomaly(description=f"anomaly in window {idx}", related_event_ids=[ev.id])],
     )
 
-    progress_events: List[Dict[str, Any]] = []
 
-    def on_progress(event: str, payload: Dict[str, Any]) -> None:
-        progress_events.append({"event": event, **payload})
-        log.info("progress | %s | %s", event,
-                 {k: v for k, v in payload.items() if k not in ("data",)})
-
-    return PeriodLogSummarizer(
-        db_fetch_page=lambda **_: [],
-        llm_call=llm_call,
-        config=SummarizerConfig(
-            reduce_input_max_chars=reduce_input_max_chars,
-            reduce_group_size=2,
-            use_instructor=True,
-            model_supports_tool_calling=False,
-            compression_target_pct=50,
-            compression_importance_threshold=0.7,
-        ),
-        on_progress=on_progress,
-        prompt_context={},
+async def main() -> None:
+    config = PipelineConfig(
+        model=MODEL,
+        api_base=API_BASE,
+        api_key=API_KEY,
+        incident_context="payments-service OOM cascade incident",
+        incident_start=_dt(0),
+        incident_end=_dt(N_BATCHES * 5),
+        max_context_tokens=MAX_CONTEXT_TOKENS,
+        max_group_size=MAX_GROUP_SIZE,
+        max_events_per_merge=MAX_EVENTS_PER_MERGE,
+        compression_target_pct=COMPRESSION_TARGET_PCT,
+        model_supports_tool_calling=False,
     )
 
-
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ── Загрузка и валидация батчей ───────────────────────────────
-    batch_a = load_batch(BATCH_A)
-    batch_b = load_batch(BATCH_B)
-
-    # Размерный анализ (без LLM)
-    _sizer = PeriodLogSummarizer(
-        db_fetch_page=lambda **_: [],
-        llm_call=lambda _: "",
-        config=SummarizerConfig(),
-        on_progress=lambda e, p: None,
-        prompt_context={},
+    batches = [make_batch(i) for i in range(N_BATCHES)]
+    log.info("Input batches: %d", len(batches))
+    log.info(
+        "Events total: %d | Evidence total: %d",
+        sum(len(b.events) for b in batches),
+        sum(len(b.evidence) for b in batches),
     )
-    size_a = _sizer._summary_chars(batch_a)
-    size_b = _sizer._summary_chars(batch_b)
-    size_combined = size_a + size_b
 
-    sep = "═" * 70
-    log.info(sep)
-    log.info("РАЗМЕРЫ БАТЧЕЙ")
-    log.info("  batch_a  : %s chars | %d events", _fmt(size_a), len(batch_a.timeline))
-    log.info("  batch_b  : %s chars | %d events", _fmt(size_b), len(batch_b.timeline))
-    log.info("  combined : %s chars", _fmt(size_combined))
-    log.info("  context  : %s chars", _fmt(CONTEXT_WINDOW_CHARS))
-    log.info("  batch_a alone : %s", "✓ fits" if size_a < CONTEXT_WINDOW_CHARS else "✗ too large")
-    log.info("  batch_b alone : %s", "✓ fits" if size_b < CONTEXT_WINDOW_CHARS else "✗ too large")
-    log.info("  combined      : %s", "✗ OVERFLOW (ожидаемо)" if size_combined > CONTEXT_WINDOW_CHARS else "✓ fits — увеличь батчи")
-    log.info(sep)
+    llm = LLMClient(
+        api_base=API_BASE,
+        api_key=API_KEY,
+        model=MODEL,
+        use_instructor=True,
+        model_supports_tool_calling=False,
+    )
+    reducer = TreeReducer(llm, config)
 
-    # ── Запуск слияния ────────────────────────────────────────────
-    # reduce_input_max_chars = размер большего батча (это лимит per-item перед L1)
-    reduce_input_max_chars = max(size_a, size_b)
+    result = await reducer.reduce(batches, early_summaries=[])
 
-    period_start = batch_a.context.time_range_start
-    period_end   = batch_b.context.time_range_end
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print("REDUCE RESULT")
+    print(sep)
+    print(f"  time_range   : {result.time_range[0].isoformat()} → {result.time_range[1].isoformat()}")
+    print(f"  events       : {len(result.events)}")
+    print(f"  evidence_bank: {len(result.evidence_bank)}")
+    print(f"  hypotheses   : {len(result.hypotheses)}")
+    print(f"  causal_chains: {len(result.causal_chains)}")
+    print(f"  anomalies    : {len(result.anomalies)}")
+    print(f"  gaps         : {len(result.gaps)}")
+    print(f"\n  narrative:\n    {result.narrative[:400]}")
+    print(f"\n  impact_summary:\n    {result.impact_summary[:200]}")
+    if result.hypotheses:
+        print(f"\n  top hypothesis: [{result.hypotheses[0].confidence}] {result.hypotheses[0].title}")
+    print(sep)
 
-    summarizer = build_summarizer(reduce_input_max_chars)
-
-    log.info("ЗАПУСКАЮ _reduce_structured_group([batch_a, batch_b])")
-    log.info("Ожидаемое поведение:")
-    log.info("  1. LLM вызов с обоими → context overflow (400 / error)")
-    log.info("  2. split: batch_a и batch_b обрабатываются по отдельности (passthrough, 1 item)")
-    log.info("  3. _compress_summary_on_overflow для каждого")
-    log.info("  4. retry merge сжатых → success (или ещё один split+compress)")
-    log.info(sep)
-
-    t0 = time.time()
-    try:
-        result, llm_calls = summarizer._reduce_structured_group(
-            summaries=[batch_a, batch_b],
-            period_start=period_start,
-            period_end=period_end,
-            reduce_round=1,
-            group_index=1,
-            group_total=1,
-            depth=0,
-        )
-        elapsed = time.time() - t0
-        size_result = summarizer._summary_chars(result)
-        compression = (1.0 - size_result / size_combined) * 100
-
-        log.info(sep)
-        log.info("РЕЗУЛЬТАТ: SUCCESS")
-        log.info("  LLM вызовов     : %d", llm_calls)
-        log.info("  Время           : %.1fs", elapsed)
-        log.info("  Входной размер  : %s chars", _fmt(size_combined))
-        log.info("  Выходной размер : %s chars", _fmt(size_result))
-        log.info("  Сжатие          : %.1f%%", compression)
-        log.info("  Timeline events : %d", len(result.timeline))
-        log.info("  Hypotheses      : %d", len(result.hypotheses))
-        log.info(sep)
-
-        out = OUTPUT_DIR / "merge_result.json"
-        out.write_text(
-            json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        log.info("Результат: %s", out.resolve())
-
-    except Exception as exc:
-        log.error(sep)
-        log.error("РЕЗУЛЬТАТ: ОШИБКА после %.1fs", time.time() - t0)
-        log.error("  %s: %s", type(exc).__name__, exc)
-        log.error(sep)
-        raise
+    pathlib.Path("artifacts").mkdir(exist_ok=True)
+    out_path = pathlib.Path("artifacts/debug_reduce_result.json")
+    out_path.write_text(
+        json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    log.info("Saved → %s", out_path.resolve())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
