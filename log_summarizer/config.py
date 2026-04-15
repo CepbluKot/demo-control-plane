@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from log_summarizer.models import Alert
+
 
 @dataclass
 class PipelineConfig:
@@ -23,10 +25,14 @@ class PipelineConfig:
     metrics_sql_template: Optional[str] = None
 
     # ── Контекст инцидента ────────────────────────────────────────────
-    # Тексты алертов + описание словами: "14:30 PagerDuty CRITICAL: payments error rate >50%..."
+    # Описание инцидента словами: что случилось, какие сервисы затронуты.
     incident_context: str = ""
     incident_start: Optional[datetime] = None
     incident_end: Optional[datetime] = None
+
+    # Алерты, сработавшие во время инцидента. Создаются через make_alerts().
+    # MAP-фаза проставляет статус по каждому алерту; REDUCE мержит программно.
+    alerts: list[Alert] = field(default_factory=list)
 
     # ── LLM ──────────────────────────────────────────────────────────
     model: str = "default-model"

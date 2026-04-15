@@ -1,108 +1,121 @@
 {
   "time_range": [
-    "2024-01-15T14:30:00Z",
-    "2024-01-15T14:35:00Z"
+    "2024-01-15T14:40:00+00:00",
+    "2024-01-15T15:00:00+00:00"
   ],
-  "narrative": "В этом окне фиксируется пик инцидента: повторные OOMKilled и максимальный процент отказов на gateway. oncall начинает ремедиацию и поднимает memory limit для payments-service. Причина инцидента подтверждается как memory exhaustion с высокой уверенностью.",
+  "narrative": "payments-svc entered CrashLoopBackOff after repeated OOM restarts. The on-call engineer applied a deployment patch to increase memory limit. After the patch, new pods became more stable and error pressure started to drop.",
   "events": [
     {
       "id": "evt-006-001",
-      "timestamp": "2024-01-15T14:30:07Z",
-      "source": "payments-service",
-      "description": "Repeated OOMKilled on hot shard pods",
-      "severity": "critical",
+      "timestamp": "2024-01-15T14:44:09+00:00",
+      "source": "kubelet",
+      "description": "payments pod entered CrashLoopBackOff after restarts",
+      "severity": "high",
+      "importance": 0.9,
       "tags": [
-        "oom",
-        "crash",
-        "critical"
+        "crashloop",
+        "kubernetes"
       ]
     },
     {
       "id": "evt-006-002",
-      "timestamp": "2024-01-15T14:31:45Z",
-      "source": "api-gateway",
-      "description": "Failure ratio peaked at 34 percent",
-      "severity": "critical",
+      "timestamp": "2024-01-15T14:52:27+00:00",
+      "source": "oncall/kubectl",
+      "description": "On-call patched memory limit from 2Gi to 4Gi",
+      "severity": "high",
+      "importance": 1.0,
       "tags": [
-        "gateway",
-        "5xx",
-        "peak-impact"
+        "remediation",
+        "memory-limit"
       ]
     },
     {
       "id": "evt-006-003",
-      "timestamp": "2024-01-15T14:34:10Z",
-      "source": "oncall-operator",
-      "description": "Patched payments memory limit from 2Gi to 3Gi",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:58:33+00:00",
+      "source": "payments-svc",
+      "description": "New pod started with improved heap headroom",
+      "severity": "medium",
+      "importance": 0.7,
       "tags": [
-        "recovery",
-        "configuration",
-        "memory"
+        "startup",
+        "recovery"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-006-001",
-      "timestamp": "2024-01-15T14:30:06Z",
+      "timestamp": "2024-01-15T14:44:08+00:00",
       "source": "kubelet",
-      "raw_line": "2024-01-15T14:30:06.777Z Warning  OOMKilling  kubelet  Kill process 2714 (java) in pod payments-service-7d9f8c9f4f-pk9lz",
-      "severity": "critical",
+      "raw_line": "2024-01-15T14:44:08.332Z Warning BackOff restarting failed container payments-svc",
+      "severity": "high",
       "linked_event_id": "evt-006-001"
     },
     {
       "id": "ev-006-002",
-      "timestamp": "2024-01-15T14:31:44Z",
-      "source": "api-gateway",
-      "raw_line": "2024-01-15T14:31:44.298Z ERROR [gateway] payments upstream failures=1821/5352 (0.340) over 60s",
-      "severity": "critical",
+      "timestamp": "2024-01-15T14:52:26+00:00",
+      "source": "oncall/kubectl",
+      "raw_line": "2024-01-15T14:52:26.881Z INFO kubectl patch deploy/payments-svc limits.memory=4Gi",
+      "severity": "high",
       "linked_event_id": "evt-006-002"
     },
     {
       "id": "ev-006-003",
-      "timestamp": "2024-01-15T14:34:10Z",
-      "source": "oncall",
-      "raw_line": "2024-01-15T14:34:10.112Z INFO  kubectl patch deploy/payments-service --type merge -p '{\"resources\":{\"limits\":{\"memory\":\"3Gi\"}}}'",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:58:32+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:58:32.500Z INFO Application started in 41.2s with Xmx3072m",
+      "severity": "medium",
       "linked_event_id": "evt-006-003"
     }
   ],
   "hypotheses": [
     {
       "id": "hyp-006-001",
-      "title": "OOM in payments is confirmed root cause",
-      "description": "Повторный OOMKilled, высокий crash rate и эффект каскада на gateway подтверждают memory exhaustion как корневую причину инцидента. Изменение memory limit напрямую таргетирует источник отказа. Уверенность высокая.",
+      "title": "Memory patch removes crashloop driver",
+      "description": "CrashLoopBackOff was a downstream effect of OOM and should stabilize after memory increase.",
       "confidence": "high",
       "supporting_event_ids": [
         "evt-006-001",
         "evt-006-002",
         "evt-006-003"
       ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-006-002",
-      "title": "Gateway retry policy amplifies peak errors",
-      "description": "Даже при root cause в памяти, retry-поведение gateway усиливает пиковую долю отказов в коротком окне. Это важно для пост-инцидентных улучшений, но не меняет первопричину.",
-      "confidence": "medium",
-      "supporting_event_ids": [
-        "evt-006-002"
-      ],
-      "contradicting_event_ids": [
-        "evt-006-003"
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001",
+        "alert-003"
       ]
     }
   ],
   "anomalies": [
     {
-      "description": "Пик отказов 34% совпал с серией OOMKilled",
+      "description": "Crashloop ended only after explicit memory patch.",
       "related_event_ids": [
         "evt-006-001",
         "evt-006-002"
       ]
     }
   ],
-  "metrics_context": null,
-  "data_quality": null
+  "metrics_context": "restart_count=7, crashloop active, then heap headroom +28% after patch",
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "explained",
+      "comment": "Historical root cause still valid"
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "partial",
+      "comment": "Error rate is dropping but still elevated"
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "explained",
+      "comment": "CrashLoopBackOff directly observed"
+    }
+  ],
+  "preliminary_recommendations": [
+    "Increase memory limit from 2Gi to 4Gi",
+    "Set JVM Xmx below container limit"
+  ]
 }

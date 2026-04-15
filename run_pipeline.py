@@ -156,9 +156,23 @@ INCIDENTS = [
         "context": """
             Airflow: массовые ошибки Pod creation failed (Forbidden) в kubernetes_executor.
             DAG-раны зависают в state=running, воркеры убиваются SIGTERM.
-            Алерт: AirflowKubernetesExecutorFailed, 02:08 UTC.
         """,
-        "start": datetime(2026, 3, 18, 2, 0, 0, tzinfo=timezone.utc),  # за 8 минут до алерта
+        # Алерты: name обязателен; fired_at, severity, description — опционально.
+        # ID присваиваются автоматически: alert-001, alert-002, ...
+        "alerts": [
+            {
+                "name": "AirflowKubernetesExecutorFailed",
+                "fired_at": datetime(2026, 3, 18, 2, 8, 0, tzinfo=timezone.utc),
+                "severity": "critical",
+                "description": "Pod creation failed (Forbidden) in kubernetes_executor",
+            },
+            {
+                "name": "AirflowDAGRunStuck",
+                "fired_at": datetime(2026, 3, 18, 2, 15, 0, tzinfo=timezone.utc),
+                "severity": "high",
+            },
+        ],
+        "start": datetime(2026, 3, 18, 2, 0, 0, tzinfo=timezone.utc),
         "end":   datetime(2026, 3, 18, 3, 0, 0, tzinfo=timezone.utc),
     },
     # Пример второго инцидента — раскомментируй и заполни:
@@ -205,6 +219,7 @@ LOG_LEVEL = "INFO"
 async def run_incident(ch, incident: dict) -> tuple[str, str | Exception]:
     """Запускает пайплайн для одного инцидента. Возвращает (name, report | error)."""
     from log_summarizer.config import PipelineConfig
+    from log_summarizer.models import make_alerts
     from log_summarizer.orchestrator import PipelineOrchestrator
 
     name = incident["name"]
@@ -217,6 +232,7 @@ async def run_incident(ch, incident: dict) -> tuple[str, str | Exception]:
         incident_context=incident["context"].strip(),
         incident_start=incident["start"],
         incident_end=incident["end"],
+        alerts=make_alerts(incident.get("alerts", [])),
         model=MODEL,
         api_base=API_BASE,
         api_key=API_KEY,

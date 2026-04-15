@@ -1,28 +1,29 @@
 {
   "time_range": [
-    "2024-01-15T14:05:00Z",
-    "2024-01-15T14:10:00Z"
+    "2024-01-15T14:05:00+00:00",
+    "2024-01-15T14:10:00+00:00"
   ],
-  "narrative": "Деградация усилилась: появились upstream timeout на gateway и признаки stop-the-world GC. order-service начинает фиксировать таймауты при вызове payments. Падений pod еще нет, но сервисная цепочка уже нестабильна.",
+  "narrative": "Degradation continued with more frequent timeouts from api-gateway to payments-svc. payments-svc logged longer full GC pauses and slower request completion. order-svc started to accumulate payment call retries but still stayed closed.",
   "events": [
     {
       "id": "evt-001-001",
-      "timestamp": "2024-01-15T14:05:16Z",
+      "timestamp": "2024-01-15T14:05:37+00:00",
       "source": "api-gateway",
-      "description": "Upstream timeout to payments-service",
-      "severity": "high",
+      "description": "Gateway saw first upstream timeout spikes to payments",
+      "severity": "medium",
+      "importance": 0.3,
       "tags": [
         "timeout",
-        "gateway",
-        "upstream"
+        "gateway"
       ]
     },
     {
       "id": "evt-001-002",
-      "timestamp": "2024-01-15T14:06:40Z",
-      "source": "payments-service",
-      "description": "Full GC pause reached 1.8s",
+      "timestamp": "2024-01-15T14:07:14+00:00",
+      "source": "payments-svc",
+      "description": "Full GC pauses reached 1.2s under sustained load",
       "severity": "high",
+      "importance": 0.4,
       "tags": [
         "jvm",
         "gc",
@@ -31,31 +32,31 @@
     },
     {
       "id": "evt-001-003",
-      "timestamp": "2024-01-15T14:09:03Z",
-      "source": "order-service",
-      "description": "Payment RPC timeout rate jumped to 9%",
-      "severity": "medium",
+      "timestamp": "2024-01-15T14:09:48+00:00",
+      "source": "order-svc",
+      "description": "Payment RPC retries increased to 3 attempts per call",
+      "severity": "low",
+      "importance": 0.2,
       "tags": [
-        "timeout",
-        "rpc",
-        "cascade"
+        "retry",
+        "order-svc"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-001-001",
-      "timestamp": "2024-01-15T14:05:15Z",
+      "timestamp": "2024-01-15T14:05:36+00:00",
       "source": "api-gateway",
-      "raw_line": "2024-01-15T14:05:15.771Z ERROR [gateway] upstream request failed: GET /payments/authorize -> 504 in 3001ms upstream=payments-service:8080",
-      "severity": "high",
+      "raw_line": "2024-01-15T14:05:36.991Z WARN upstream timeout service=payments-svc dur=3001ms",
+      "severity": "medium",
       "linked_event_id": "evt-001-001"
     },
     {
       "id": "ev-001-002",
-      "timestamp": "2024-01-15T14:06:39Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:06:39.462Z INFO  [payments] GC(1942) Pause Full (Allocation Failure) 1876.21ms old=1316M->1289M",
+      "timestamp": "2024-01-15T14:07:13+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:07:13.407Z INFO GC(1987) Pause Full 1210.5ms old=83%",
       "severity": "high",
       "linked_event_id": "evt-001-002"
     }
@@ -63,29 +64,21 @@
   "hypotheses": [
     {
       "id": "hyp-001-001",
-      "title": "GC pauses are primary latency driver",
-      "description": "Длинные GC паузы совпадают по времени с upstream timeout на gateway. Это делает гипотезу о JVM давлении более правдоподобной, чем сетевой сбой. Однако без OOM/рестартов уверенность остается средней.",
-      "confidence": "medium",
-      "supporting_event_ids": [
-        "evt-001-001",
-        "evt-001-002"
-      ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-001-002",
-      "title": "Secondary dependency slowdown in order path",
-      "description": "Таймауты в order-service могут быть каскадом от payments, но не исключено локальное насыщение thread pool в order-service. Прямых ошибок order runtime пока мало, поэтому гипотеза вспомогательная.",
+      "title": "Heap pressure is trending to failure",
+      "description": "Long GC pauses suggest memory saturation is approaching, but no confirmed OOM or kill event yet.",
       "confidence": "low",
       "supporting_event_ids": [
-        "evt-001-003"
+        "evt-001-002"
       ],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001"
+      ]
     }
   ],
   "anomalies": [
     {
-      "description": "Синхронный рост gateway timeout и GC pause длительности",
+      "description": "Timeout growth matches GC pause growth.",
       "related_event_ids": [
         "evt-001-001",
         "evt-001-002"
@@ -93,5 +86,23 @@
     }
   ],
   "metrics_context": null,
-  "data_quality": null
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }

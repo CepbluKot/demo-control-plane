@@ -1,97 +1,120 @@
 {
   "time_range": [
-    "2024-01-15T14:20:00Z",
-    "2024-01-15T14:25:00Z"
+    "2024-01-15T14:20:00+00:00",
+    "2024-01-15T14:30:00+00:00"
   ],
-  "narrative": "Инцидент достигает критической стадии: доля 5xx на gateway растет двузначно. payments pods флапают и не держат стабильный uptime. Очереди и ретраи усиливают пользовательский импакт по всей платежной цепочке.",
+  "narrative": "This window captured the transition from severe degradation to the first OOM symptoms. payments-svc hit memory limits and started unstable restarts near the end of the interval. api-gateway error ratio climbed sharply, confirming direct user-facing impact.",
   "events": [
     {
       "id": "evt-004-001",
-      "timestamp": "2024-01-15T14:20:09Z",
-      "source": "payments-service",
-      "description": "Replica flapping every 1-2 minutes",
+      "timestamp": "2024-01-15T14:22:14+00:00",
+      "source": "payments-svc",
+      "description": "Container memory hit limit with repeated allocation failures",
       "severity": "critical",
+      "importance": 0.9,
       "tags": [
-        "flapping",
-        "crash",
-        "stability"
+        "memory",
+        "jvm",
+        "oom"
       ]
     },
     {
       "id": "evt-004-002",
-      "timestamp": "2024-01-15T14:22:33Z",
+      "timestamp": "2024-01-15T14:24:58+00:00",
       "source": "api-gateway",
-      "description": "5xx ratio crossed 18 percent",
-      "severity": "critical",
+      "description": "Payment route error ratio climbed above 12 percent",
+      "severity": "high",
+      "importance": 0.8,
       "tags": [
-        "5xx",
+        "error-rate",
         "gateway",
-        "impact"
+        "5xx"
       ]
     },
     {
       "id": "evt-004-003",
-      "timestamp": "2024-01-15T14:24:50Z",
-      "source": "redis-cache",
-      "description": "Queue backlog rose to 28k items",
-      "severity": "medium",
+      "timestamp": "2024-01-15T14:29:46+00:00",
+      "source": "kubelet",
+      "description": "First OOM-kill precursor signal seen for payments pod",
+      "severity": "critical",
+      "importance": 1.0,
       "tags": [
-        "queue",
-        "backlog",
-        "cascade"
+        "oom",
+        "kubernetes",
+        "pod"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-004-001",
-      "timestamp": "2024-01-15T14:22:32Z",
-      "source": "api-gateway",
-      "raw_line": "2024-01-15T14:22:32.604Z ERROR [gateway] upstream cluster payments-service unhealthy=7/9 status_5xx_ratio=0.182",
+      "timestamp": "2024-01-15T14:22:13+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:22:13.771Z ERROR java.lang.OutOfMemoryError: Java heap space",
       "severity": "critical",
-      "linked_event_id": "evt-004-002"
+      "linked_event_id": "evt-004-001"
     },
     {
       "id": "ev-004-002",
-      "timestamp": "2024-01-15T14:20:08Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:20:08.187Z WARN  [payments] startup completed but pod restarted again after 96s uptime",
+      "timestamp": "2024-01-15T14:24:57+00:00",
+      "source": "api-gateway",
+      "raw_line": "2024-01-15T14:24:57.401Z ERROR payments status_5xx_ratio=0.124 window=60s",
+      "severity": "high",
+      "linked_event_id": "evt-004-002"
+    },
+    {
+      "id": "ev-004-003",
+      "timestamp": "2024-01-15T14:29:45+00:00",
+      "source": "kubelet",
+      "raw_line": "2024-01-15T14:29:45.993Z Warning OOMKilling pod/payments-svc-6f9f4f5c8d",
       "severity": "critical",
-      "linked_event_id": "evt-004-001"
+      "linked_event_id": "evt-004-003"
     }
   ],
   "hypotheses": [
     {
       "id": "hyp-004-001",
-      "title": "Primary fault remains inside payments runtime",
-      "description": "Поведение flapping и короткий uptime указывает на локальную нестабильность payments, а не на чисто внешнюю проблему сети. Высокий 5xx на gateway выглядит следствием этой деградации. Уверенность средняя.",
+      "title": "OOM root cause is now explicit",
+      "description": "OOM and error-rate signals align with a direct memory exhaustion failure path.",
       "confidence": "medium",
       "supporting_event_ids": [
         "evt-004-001",
-        "evt-004-002"
-      ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-004-002",
-      "title": "Backlog amplification worsens user impact",
-      "description": "Рост очереди в redis-cache, вероятно, усиливает время восстановления и latency хвостов. Это не первопричина, но важный фактор, который расширяет blast radius. Гипотеза сопутствующая.",
-      "confidence": "medium",
-      "supporting_event_ids": [
         "evt-004-003"
       ],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001",
+        "alert-002"
+      ]
     }
   ],
   "anomalies": [
     {
-      "description": "Критический 5xx на gateway при флапающем payments",
+      "description": "Error spike and OOM signal appeared in the same 10-minute slice.",
       "related_event_ids": [
-        "evt-004-001",
-        "evt-004-002"
+        "evt-004-002",
+        "evt-004-003"
       ]
     }
   ],
-  "metrics_context": null,
-  "data_quality": null
+  "metrics_context": "heap_used peaked at 97%, gateway_5xx_ratio reached 12.4%, restarts started",
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "explained",
+      "comment": "OOM-kill precursor and heap error seen"
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "explained",
+      "comment": "Gateway error ratio > 12%"
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }

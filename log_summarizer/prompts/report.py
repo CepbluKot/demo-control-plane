@@ -16,8 +16,13 @@ Structure:
 ## Executive Summary
 1-2 paragraphs: what happened, when, impact.
 
+## Alert Coverage
+For each alert in the alert_refs section: its ID, name, status (explained/partial/not_explained/not_seen),
+and a brief explanation. If no alerts provided, omit this section.
+
 ## Timeline
 Chronological bullet list of key events with timestamps and sources.
+Mark high-importance events (importance ≥ 0.8) with ⚠.
 
 ## Root Cause Analysis
 What caused the incident. Reference evidence and causal chains.
@@ -35,9 +40,11 @@ What else was going on that contributed or was unusual.
 
 ## Hypotheses
 List each hypothesis with confidence level and supporting/contradicting evidence.
+Include related alerts where applicable.
 
 ## Recommendations
 Concrete action items to prevent recurrence or reduce impact next time.
+Include preliminary_recommendations from the analysis if present.
 
 Rules:
 - Use exact timestamps from the data
@@ -53,11 +60,14 @@ You are a senior SRE writing part of a post-incident report.
 
 Write ONLY the following sections in Markdown:
 ## Executive Summary
+## Alert Coverage
 ## Timeline
 ## Root Cause Analysis
 ## Impact
 
 Use the analysis JSON provided. Be specific: timestamps, service names, causal chains.
+For Alert Coverage: list each alert with its status and brief explanation (omit section if no alerts).
+For Timeline: mark high-importance events (importance ≥ 0.8) with ⚠.
 Do not add other sections. No preamble.
 """
 
@@ -116,16 +126,18 @@ def format_report_user_prompt(
     incident_context: str,
     incident_start: str,
     incident_end: str,
+    alert_refs_text: str = "",
 ) -> str:
     """Форматирует user-промпт для финального отчёта (полного или секционного).
 
     Args:
-        analysis_json: Сериализованный MergedAnalysis (без evidence_bank).
+        analysis_json: Сериализованный MergedAnalysis (без evidence_bank/alert_refs).
         evidence_text: Конкатенация evidence_bank строк.
-        early_summaries_text: Ранние промежуточные саммари (до начала reduce).
+        early_summaries_text: Ранние промежуточные саммари.
         incident_context: Описание инцидента.
         incident_start: ISO8601 строка начала периода.
         incident_end: ISO8601 строка конца периода.
+        alert_refs_text: Статусы алертов (программный merge из MAP-фазы).
     """
     parts: list[str] = [
         f"## Incident context\n{incident_context}",
@@ -136,6 +148,13 @@ def format_report_user_prompt(
         analysis_json,
         "```",
     ]
+
+    if alert_refs_text.strip():
+        parts += [
+            "",
+            "## Alert coverage (status per alert)",
+            alert_refs_text,
+        ]
 
     if evidence_text.strip():
         parts += [

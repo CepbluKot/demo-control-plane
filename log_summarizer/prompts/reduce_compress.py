@@ -9,14 +9,17 @@ preserving all actionable signal. Output a single JSON object — no prose befor
 
 Compression rules:
 - narrative: shorten to ≤8 sentences; keep all key facts, timestamps, service names
-- events: shorten each description to ≤60 chars; keep all events (do not remove any)
+- events: shorten each description to ≤60 chars; keep all events (do not remove any);
+  preserve importance scores exactly
 - causal_chains: shorten each description to ≤80 chars; keep all chains
-- hypotheses: shorten descriptions to ≤120 chars; keep all hypotheses and their IDs
+- hypotheses: shorten descriptions to ≤120 chars; keep all hypotheses and their IDs;
+  preserve related_alert_ids exactly
 - anomalies: shorten each description to ≤80 chars; keep all anomalies
 - gaps: shorten descriptions to ≤60 chars; keep all gaps
 - impact_summary: shorten to ≤120 chars
-- Do NOT remove events, hypotheses, causal_chains, or anomalies — only compress text
-- Do NOT include evidence_bank — it is managed separately
+- preliminary_recommendations: shorten each to ≤60 chars; keep all
+- Do NOT remove events, hypotheses, causal_chains, anomalies, or recommendations
+- Do NOT include evidence_bank or alert_refs — they are managed separately
 
 === Output schema ===
 {{
@@ -29,6 +32,7 @@ Compression rules:
       "source": "<service>",
       "description": "<compressed ≤60 chars>",
       "severity": "critical|high|medium|low|info",
+      "importance": <0.0-1.0, preserve original value>,
       "tags": [...]
     }}
   ],
@@ -47,7 +51,8 @@ Compression rules:
       "description": "<compressed ≤120 chars>",
       "confidence": "low|medium|high",
       "supporting_event_ids": ["<evt-id>"],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": ["<alert-id>"]
     }}
   ],
   "anomalies": [
@@ -63,6 +68,9 @@ Compression rules:
       "description": "<compressed ≤60 chars>"
     }}
   ],
-  "impact_summary": "<compressed ≤120 chars>"
+  "impact_summary": "<compressed ≤120 chars>",
+  "preliminary_recommendations": [
+    "<compressed ≤60 chars>"
+  ]
 }}
 """

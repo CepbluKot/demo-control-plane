@@ -1,42 +1,42 @@
 {
   "time_range": [
-    "2024-01-15T14:00:00Z",
-    "2024-01-15T14:05:00Z"
+    "2024-01-15T14:00:00+00:00",
+    "2024-01-15T14:05:00+00:00"
   ],
-  "narrative": "В окне виден старт нагрузки Black Friday, но явной аварии еще нет. api-gateway фиксирует рост латентности до средне-высоких значений. В payments-service растет давление на JVM heap и ожидание в пуле соединений. Пока ситуация выглядит как предаварийная деградация без массовых падений.",
+  "narrative": "Traffic started to rise on payment routes, but hard failures were not visible yet. api-gateway logged mild latency growth to payments-svc during checkout calls. payments-svc showed early JVM pressure signals and slower DB pool acquisition.",
   "events": [
     {
       "id": "evt-000-001",
-      "timestamp": "2024-01-15T14:00:42Z",
+      "timestamp": "2024-01-15T14:01:10+00:00",
       "source": "api-gateway",
-      "description": "p95 latency rose from 120ms to 280ms",
+      "description": "p95 latency to payments rose from 140ms to 260ms",
       "severity": "medium",
+      "importance": 0.3,
       "tags": [
         "latency",
-        "gateway",
-        "degradation"
+        "gateway"
       ]
     },
     {
       "id": "evt-000-002",
-      "timestamp": "2024-01-15T14:02:10Z",
-      "source": "payments-service-7d9f8c9f4f-km2qv",
-      "description": "JVM old-gen climbed to 72 percent",
+      "timestamp": "2024-01-15T14:02:42+00:00",
+      "source": "payments-svc",
+      "description": "Old-gen usage crossed 70 percent with longer GC pauses",
       "severity": "low",
+      "importance": 0.2,
       "tags": [
         "jvm",
-        "memory",
-        "heap"
+        "gc"
       ]
     },
     {
       "id": "evt-000-003",
-      "timestamp": "2024-01-15T14:04:31Z",
-      "source": "payments-service",
-      "description": "Hikari wait time exceeded 400ms",
+      "timestamp": "2024-01-15T14:04:31+00:00",
+      "source": "payments-svc",
+      "description": "Hikari wait time exceeded 300ms on checkout requests",
       "severity": "medium",
+      "importance": 0.3,
       "tags": [
-        "connection",
         "db-pool",
         "timeout"
       ]
@@ -45,17 +45,17 @@
   "evidence": [
     {
       "id": "ev-000-001",
-      "timestamp": "2024-01-15T14:02:08Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:02:08.114Z WARN  [payments] [HikariPool-1 housekeeper] JVM memory pressure rising: OldGen=72%, Eden=91%, rss=1120Mi",
+      "timestamp": "2024-01-15T14:02:41+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:02:41.211Z WARN payments-svc GC pause=412ms oldGen=71%",
       "severity": "low",
       "linked_event_id": "evt-000-002"
     },
     {
       "id": "ev-000-002",
-      "timestamp": "2024-01-15T14:04:30Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:04:30.991Z WARN  [payments] [http-nio-8080-exec-44] HikariPool-1 - Connection is not available, request timed out after 402ms",
+      "timestamp": "2024-01-15T14:04:30+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:04:30.553Z WARN HikariPool-1 wait=327ms active=78 idle=2",
       "severity": "medium",
       "linked_event_id": "evt-000-003"
     }
@@ -63,34 +63,46 @@
   "hypotheses": [
     {
       "id": "hyp-000-001",
-      "title": "Traffic burst exceeds warm-up capacity",
-      "description": "Рост трафика может временно перегружать пул потоков и соединений. Поддерживается ростом latency и увеличением ожидания в Hikari. Пока нет прямых признаков падения контейнера, поэтому уверенность низкая.",
+      "title": "Load growth starts JVM pressure",
+      "description": "Traffic increase may be pushing heap and DB pool usage, but no hard crash signal exists yet.",
       "confidence": "low",
       "supporting_event_ids": [
         "evt-000-001",
-        "evt-000-003"
-      ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-000-002",
-      "title": "Early JVM memory pressure in payments",
-      "description": "Память в old-gen стабильно растет и может стать триггером для долгих GC пауз. Это объясняет часть задержек и косвенно влияние на upstream timeout. Нужны следующие окна, чтобы подтвердить переход в аварийный режим.",
-      "confidence": "low",
-      "supporting_event_ids": [
         "evt-000-002"
       ],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001",
+        "alert-002"
+      ]
     }
   ],
   "anomalies": [
     {
-      "description": "Необычно быстрый рост latency без внешнего сетевого инцидента",
+      "description": "Latency rose before any known infra incident.",
       "related_event_ids": [
         "evt-000-001"
       ]
     }
   ],
   "metrics_context": null,
-  "data_quality": null
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }

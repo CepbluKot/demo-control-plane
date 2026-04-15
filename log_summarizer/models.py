@@ -32,6 +32,71 @@ class Severity(str, Enum):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  Алерты — структурированный вход, ID назначается автоматически
+# ══════════════════════════════════════════════════════════════════════
+
+class Alert(BaseModel):
+    """Алерт, сработавший во время инцидента.
+
+    Создаётся через make_alerts() — ID присваивается автоматически.
+    Передаётся в промпт MAP-фазы, чтобы LLM мог проставить статус по каждому.
+    """
+
+    id: str                             # "alert-001", "alert-002", ... — авто
+    name: str                           # e.g. "AirflowKubernetesExecutorFailed"
+    fired_at: Optional[datetime] = None
+    severity: Severity = Severity.HIGH
+    description: Optional[str] = None  # текст алерта или краткое пояснение
+
+
+class AlertStatus(str, Enum):
+    """Статус объяснённости алерта в контексте батча / итогового анализа."""
+
+    EXPLAINED = "explained"         # причина найдена в логах этого батча
+    PARTIAL = "partial"             # частично объяснён, но не полностью
+    NOT_EXPLAINED = "not_explained" # алерт виден, но логи не объясняют
+    NOT_SEEN = "not_seen"           # в этом батче нет данных об алерте
+
+    @classmethod
+    def priority(cls, value: "AlertStatus") -> int:
+        """Приоритет для программного merge (меньше = лучше объяснён)."""
+        _order = [cls.EXPLAINED, cls.PARTIAL, cls.NOT_EXPLAINED, cls.NOT_SEEN]
+        try:
+            return _order.index(value)
+        except ValueError:
+            return len(_order)
+
+
+class AlertRef(BaseModel):
+    """Ссылка на алерт с оценкой его объяснённости в данном батче/анализе."""
+
+    alert_id: str                       # ссылка на Alert.id
+    status: AlertStatus
+    comment: Optional[str] = None       # краткое пояснение (≤80 символов)
+
+
+def make_alerts(raw: list[dict]) -> list[Alert]:
+    """Создаёт список Alert из сырых dict, авто-присваивая ID.
+
+    Пример входа:
+        [{"name": "AirflowKubernetesExecutorFailed",
+          "fired_at": datetime(...), "severity": "critical"}]
+
+    Присваивает: alert-001, alert-002, ...
+    """
+    result: list[Alert] = []
+    for i, item in enumerate(raw, 1):
+        result.append(Alert(
+            id=f"alert-{i:03d}",
+            name=item["name"],
+            fired_at=item.get("fired_at"),
+            severity=Severity(item.get("severity", "high")),
+            description=item.get("description"),
+        ))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  Входные структуры (загрузка из ClickHouse)
 # ══════════════════════════════════════════════════════════════════════
 
@@ -92,7 +157,8 @@ class Event(BaseModel):
     timestamp: datetime
     source: str
     description: str                     # краткое описание своими словами
-    severity: Severity
+    severity: Severity                   # объективная серьёзность события
+    importance: float = 0.5             # 0.0-1.0: релевантность для данного расследования
     tags: list[str] = Field(default_factory=list)  # oom/connection/timeout/...
 
 
@@ -105,6 +171,7 @@ class Hypothesis(BaseModel):
     confidence: str                      # "low" | "medium" | "high"
     supporting_event_ids: list[str]      # ссылки на Event.id
     contradicting_event_ids: list[str] = Field(default_factory=list)
+    related_alert_ids: list[str] = Field(default_factory=list)  # ссылки на Alert.id
 
 
 class Anomaly(BaseModel):
@@ -123,12 +190,19 @@ class BatchAnalysis(BaseModel):
     evidence: list[Evidence]             # дословные строки из логов
     hypotheses: list[Hypothesis]
     anomalies: list[Anomaly]
-    metrics_context: Optional[str] = None  # что показывали метрики
-    data_quality: Optional[str] = None    # "шумные логи" / "пустой батч" / ...
+    metrics_context: Optional[str] = None   # что показывали метрики
+    data_quality: Optional[str] = None     # "шумные логи" / "пустой батч" / ...
+    alert_refs: list[AlertRef] = Field(default_factory=list)            # статус по каждому алерту
+    preliminary_recommendations: list[str] = Field(default_factory=list)  # ранние рекомендации
 
     def to_json_str(self) -> str:
-        """Сериализация для оценки размера."""
-        return self.model_dump_json()
+        """Сериализация для REDUCE-промптов.
+
+        Исключает evidence (→ evidence_bank) и alert_refs (→ программный merge).
+        """
+        return self.model_copy(
+            update={"evidence": [], "alert_refs": []}
+        ).model_dump_json()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -163,13 +237,20 @@ class MergedAnalysis(BaseModel):
     anomalies: list[Anomaly]
     gaps: list[TimeGap]                  # дыры в данных
     impact_summary: str                  # какие сервисы, как долго, масштаб
+    preliminary_recommendations: list[str] = Field(default_factory=list)  # из MAP-фазы
 
-    # Прикрепляется в конце REDUCE — НЕ проходит через LLM-сжатие
+    # Прикрепляются в конце REDUCE — НЕ проходят через LLM
     evidence_bank: list[Evidence] = Field(default_factory=list)
+    alert_refs: list[AlertRef] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
-        """Сериализация БЕЗ evidence_bank — он живёт отдельно."""
-        return self.model_copy(update={"evidence_bank": []}).model_dump_json()
+        """Сериализация для REDUCE-промптов.
+
+        Исключает evidence_bank и alert_refs — они обрабатываются отдельно.
+        """
+        return self.model_copy(
+            update={"evidence_bank": [], "alert_refs": []}
+        ).model_dump_json()
 
     def to_json_str_with_evidence(self) -> str:
         """Полная сериализация включая evidence_bank."""

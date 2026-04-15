@@ -1,98 +1,108 @@
 {
   "time_range": [
-    "2024-01-15T14:15:00Z",
-    "2024-01-15T14:20:00Z"
+    "2024-01-15T14:15:00+00:00",
+    "2024-01-15T14:20:00+00:00"
   ],
-  "narrative": "Система переходит в каскадный сбой: order-service открывает circuit breaker на вызовах payments. Рестарты payments становятся регулярными, а ретраи увеличивают нагрузку на gateway. Версия про memory-related отказ становится основной, но еще не окончательной.",
+  "narrative": "Pre-failure degradation became severe, with repeated slowdowns in payments-svc. order-svc registered a high error trend but had not opened circuit breaker yet. Team visibility improved, yet still no explicit OOM kill in this interval.",
   "events": [
     {
       "id": "evt-003-001",
-      "timestamp": "2024-01-15T14:15:11Z",
-      "source": "payments-service",
-      "description": "Container restarted unexpectedly",
+      "timestamp": "2024-01-15T14:15:29+00:00",
+      "source": "payments-svc",
+      "description": "GC pause exceeded 2s with frequent allocation failures",
       "severity": "high",
+      "importance": 0.6,
       "tags": [
-        "restart",
-        "crash",
-        "k8s"
+        "gc",
+        "allocation",
+        "jvm"
       ]
     },
     {
       "id": "evt-003-002",
-      "timestamp": "2024-01-15T14:17:00Z",
-      "source": "order-service",
-      "description": "Circuit breaker opened for payments",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:17:02+00:00",
+      "source": "order-svc",
+      "description": "Payment dependency error rate crossed 18 percent",
+      "severity": "medium",
+      "importance": 0.4,
       "tags": [
-        "circuit-breaker",
-        "cascade",
-        "dependency"
+        "error-rate",
+        "order-svc"
       ]
     },
     {
       "id": "evt-003-003",
-      "timestamp": "2024-01-15T14:19:26Z",
+      "timestamp": "2024-01-15T14:19:41+00:00",
       "source": "api-gateway",
-      "description": "Retry storm increased upstream attempts",
+      "description": "Retry volume doubled for payment authorization route",
       "severity": "medium",
+      "importance": 0.3,
       "tags": [
         "retry",
-        "gateway",
-        "load"
+        "gateway"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-003-001",
-      "timestamp": "2024-01-15T14:17:00Z",
-      "source": "order-service",
-      "raw_line": "2024-01-15T14:17:00.221Z WARN  [order] Resilience4j CircuitBreaker 'paymentsClient' changed state CLOSED -> OPEN failureRate=63.0",
+      "timestamp": "2024-01-15T14:15:28+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:15:28.641Z WARN GC pause=2189ms reason=Allocation Failure",
       "severity": "high",
-      "linked_event_id": "evt-003-002"
+      "linked_event_id": "evt-003-001"
     },
     {
       "id": "ev-003-002",
-      "timestamp": "2024-01-15T14:15:10Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:15:10.933Z INFO  [payments] pod restart detected: previous container terminated unexpectedly exitCode=137",
-      "severity": "high",
-      "linked_event_id": "evt-003-001"
+      "timestamp": "2024-01-15T14:17:01+00:00",
+      "source": "order-svc",
+      "raw_line": "2024-01-15T14:17:01.210Z WARN payments errors=18.3% over 60s",
+      "severity": "medium",
+      "linked_event_id": "evt-003-002"
     }
   ],
   "hypotheses": [
     {
       "id": "hyp-003-001",
-      "title": "Payments instability drives circuit breaker cascade",
-      "description": "Открытие circuit breaker в order-service совпадает с рестартами payments и всплеском retry на gateway. Это консистентно с каскадной деградацией через зависимость payments. Уверенность средняя, так как первичный триггер еще уточняется.",
-      "confidence": "medium",
+      "title": "Service is near OOM threshold",
+      "description": "The pattern strongly suggests imminent OOM, but direct kubelet kill evidence is not yet in this batch.",
+      "confidence": "low",
       "supporting_event_ids": [
         "evt-003-001",
-        "evt-003-002",
-        "evt-003-003"
+        "evt-003-002"
       ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-003-002",
-      "title": "OOM likely but not yet explicitly confirmed",
-      "description": "ExitCode=137 и memory pressure в предыдущем окне похожи на OOM-сценарий. Однако без прямого события OOMKilled мы оставляем пространство для альтернатив, например ручного SIGKILL или node-level eviction.",
-      "confidence": "medium",
-      "supporting_event_ids": [
-        "evt-003-001"
-      ],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001"
+      ]
     }
   ],
   "anomalies": [
     {
-      "description": "Быстрое открытие circuit breaker после серии рестартов payments",
+      "description": "High retries persisted despite no deployment changes.",
       "related_event_ids": [
-        "evt-003-001",
-        "evt-003-002"
+        "evt-003-003"
       ]
     }
   ],
   "metrics_context": null,
-  "data_quality": null
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }

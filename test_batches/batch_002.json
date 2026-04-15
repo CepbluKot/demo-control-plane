@@ -1,108 +1,109 @@
 {
   "time_range": [
-    "2024-01-15T14:10:00Z",
-    "2024-01-15T14:15:00Z"
+    "2024-01-15T14:10:00+00:00",
+    "2024-01-15T14:15:00+00:00"
   ],
-  "narrative": "В этом окне наблюдается эскалация до пограничных значений памяти. kubelet сообщает о приближении к memory limit, а gateway видит всплеск 502. Сервис еще отвечает частично, но устойчивость быстро падает.",
+  "narrative": "The service moved closer to critical state as memory usage kept rising. api-gateway started logging both 502 and timeout responses for payment endpoints. No OOM kill event appeared in this window, but the trend remained negative.",
   "events": [
     {
       "id": "evt-002-001",
-      "timestamp": "2024-01-15T14:10:05Z",
-      "source": "payments-service",
-      "description": "Pod restart counter increased",
-      "severity": "medium",
+      "timestamp": "2024-01-15T14:10:51+00:00",
+      "source": "payments-svc",
+      "description": "Heap occupancy reached 89 percent during checkout bursts",
+      "severity": "high",
+      "importance": 0.5,
       "tags": [
-        "restart",
-        "k8s",
-        "stability"
+        "heap",
+        "jvm"
       ]
     },
     {
       "id": "evt-002-002",
-      "timestamp": "2024-01-15T14:11:47Z",
-      "source": "kubelet/node-a",
-      "description": "Container memory near hard limit",
+      "timestamp": "2024-01-15T14:12:19+00:00",
+      "source": "api-gateway",
+      "description": "Gateway returned mixed 502 and timeout from payments",
       "severity": "high",
+      "importance": 0.5,
       "tags": [
-        "memory",
-        "k8s",
-        "limit"
+        "5xx",
+        "timeout",
+        "gateway"
       ]
     },
     {
       "id": "evt-002-003",
-      "timestamp": "2024-01-15T14:14:22Z",
-      "source": "api-gateway",
-      "description": "502 burst reached 11 percent",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:14:07+00:00",
+      "source": "payments-svc",
+      "description": "DB pool saturation caused queue buildup in request threads",
+      "severity": "medium",
+      "importance": 0.3,
       "tags": [
-        "gateway",
-        "5xx",
-        "cascade"
+        "db-pool",
+        "queue"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-002-001",
-      "timestamp": "2024-01-15T14:11:46Z",
-      "source": "kubelet",
-      "raw_line": "2024-01-15T14:11:46.903Z Warning  MemoryPressure  kubelet  Node memory pressure detected for pod payments-service-7d9f8c9f4f-km2qv",
+      "timestamp": "2024-01-15T14:10:50+00:00",
+      "source": "payments-svc",
+      "raw_line": "2024-01-15T14:10:50.442Z WARN heap used=89% oldGen=86%",
       "severity": "high",
-      "linked_event_id": "evt-002-002"
+      "linked_event_id": "evt-002-001"
     },
     {
       "id": "ev-002-002",
-      "timestamp": "2024-01-15T14:14:21Z",
+      "timestamp": "2024-01-15T14:12:18+00:00",
       "source": "api-gateway",
-      "raw_line": "2024-01-15T14:14:21.088Z WARN  [gateway] upstream=payments-service status=502 count_60s=431 error_ratio=0.11",
+      "raw_line": "2024-01-15T14:12:18.073Z ERROR upstream=payments-svc status=502 timeout=1",
       "severity": "high",
-      "linked_event_id": "evt-002-003"
-    },
-    {
-      "id": "ev-002-003",
-      "timestamp": "2024-01-15T14:10:04Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:10:04.501Z INFO  [payments] Pod lifecycle event: restartCount changed 2 -> 3",
-      "severity": "medium",
-      "linked_event_id": "evt-002-001"
+      "linked_event_id": "evt-002-002"
     }
   ],
   "hypotheses": [
     {
       "id": "hyp-002-001",
-      "title": "Memory saturation is becoming dominant",
-      "description": "Комбинация memory pressure на узле, роста restartCount и 502 на gateway указывает на ресурсную деградацию payments-service. Вероятность memory-driven проблемы заметно выросла. Для корневой причины не хватает прямого OOMKilled события.",
-      "confidence": "medium",
-      "supporting_event_ids": [
-        "evt-002-001",
-        "evt-002-002",
-        "evt-002-003"
-      ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-002-002",
-      "title": "Gateway itself may amplify retries",
-      "description": "Часть нагрузки может усиливаться retry-политикой gateway и создавать вторичный шторм запросов. Эта гипотеза объясняет рост 502, но не объясняет memory pressure в pod. Поэтому она вторична.",
+      "title": "Memory saturation drives request failures",
+      "description": "Signals point to memory pressure as a likely root factor, but OOM evidence is still pending.",
       "confidence": "low",
       "supporting_event_ids": [
-        "evt-002-003"
-      ],
-      "contradicting_event_ids": [
+        "evt-002-001",
         "evt-002-002"
+      ],
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001",
+        "alert-002"
       ]
     }
   ],
   "anomalies": [
     {
-      "description": "Резкий скачок restartCount вместе с MemoryPressure",
+      "description": "502 appeared before any known pod restart signal.",
       "related_event_ids": [
-        "evt-002-001",
         "evt-002-002"
       ]
     }
   ],
-  "metrics_context": "payments-service RSS вырос с 1.1Gi до 1.46Gi за 4 минуты; JVM heap usage 92%; gateway 502 ratio 11%; CPU 78% без saturation по node load.",
-  "data_quality": null
+  "metrics_context": null,
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "not_seen",
+      "comment": null
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }

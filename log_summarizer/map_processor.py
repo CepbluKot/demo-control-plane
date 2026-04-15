@@ -19,7 +19,7 @@ from log_summarizer.models import (
     Chunk,
     MetricRow,
 )
-from log_summarizer.prompts.map_system import MAP_SYSTEM_TEMPLATE
+from log_summarizer.prompts.map_system import MAP_SYSTEM_TEMPLATE, format_alerts_section
 from log_summarizer.prompts.map_user import format_map_user_prompt
 from log_summarizer.utils.logging import get_logger
 from log_summarizer.utils.tokens import estimate_tokens
@@ -163,6 +163,7 @@ class MapProcessor:
             incident_context=self.config.incident_context or "No additional context provided.",
             incident_start=start,
             incident_end=end,
+            alerts_section=format_alerts_section(self.config.alerts),
         )
 
     def _save_chunk_result(self, chunk_id: int, result: BatchAnalysis) -> None:

@@ -81,11 +81,13 @@ class ReportGenerator:
         analysis_json = self._trim_analysis(merged, budget.analysis_tokens)
         evidence_text = self._trim_evidence(merged, budget.evidence_tokens)
         early_text = self._trim_early(early_summaries, budget.early_tokens)
+        alert_refs_text = self._format_alert_refs(merged)
 
         user = format_report_user_prompt(
             analysis_json=analysis_json,
             evidence_text=evidence_text,
             early_summaries_text=early_text,
+            alert_refs_text=alert_refs_text,
             incident_context=self.config.incident_context or "",
             incident_start=(
                 self.config.incident_start.isoformat()
@@ -112,6 +114,7 @@ class ReportGenerator:
                 analysis_json=analysis_json,
                 evidence_text=evidence_text,
                 early_text=early_text,
+                alert_refs_text=alert_refs_text,
             )
 
         self._save_report_prompt(user, "report_full_prompt.txt")
@@ -129,6 +132,7 @@ class ReportGenerator:
                 analysis_json=analysis_json,
                 evidence_text=evidence_text,
                 early_text=early_text,
+                alert_refs_text=alert_refs_text,
             )
 
     # ── Бюджетирование ────────────────────────────────────────────────
@@ -172,6 +176,22 @@ class ReportGenerator:
         return trim_to_budget(json_str, budget_tokens)
 
     @staticmethod
+    def _format_alert_refs(merged: MergedAnalysis) -> str:
+        """Форматирует статусы алертов для промпта.
+
+        Не обрезается по токенам — alert_refs компактны по определению.
+        """
+        if not merged.alert_refs:
+            return ""
+        lines = []
+        for ref in merged.alert_refs:
+            line = f"- {ref.alert_id}: **{ref.status.value}**"
+            if ref.comment:
+                line += f" — {ref.comment}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
     def _trim_evidence(merged: MergedAnalysis, budget_tokens: int) -> str:
         """Форматирует evidence_bank и обрезает целыми записями.
 
@@ -202,6 +222,7 @@ class ReportGenerator:
         analysis_json: str,
         evidence_text: str,
         early_text: str,
+        alert_refs_text: str = "",
     ) -> str:
         """Три отдельных LLM-вызова — один на секцию.
 
@@ -215,12 +236,13 @@ class ReportGenerator:
             + (self.config.incident_end.isoformat() if self.config.incident_end else "?")
         )
 
-        # Секция 1: executive summary + timeline + RCA + impact
+        # Секция 1: executive summary + alert coverage + timeline + RCA + impact
         user_analysis = (
             f"{base_ctx}\n\n"
             "## Analysis JSON\n```json\n"
             + analysis_json
             + "\n```"
+            + (f"\n\n## Alert coverage\n{alert_refs_text}" if alert_refs_text.strip() else "")
             + (f"\n\n## Early summaries\n{early_text}" if early_text.strip() else "")
         )
         # Секция 2: evidence

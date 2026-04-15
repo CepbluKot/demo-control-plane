@@ -18,6 +18,8 @@ from typing import Optional, Union
 from log_summarizer.config import PipelineConfig
 from log_summarizer.llm_client import ContextOverflowError, LLMClient
 from log_summarizer.models import (
+    AlertRef,
+    AlertStatus,
     BatchAnalysis,
     Evidence,
     MergedAnalysis,
@@ -72,8 +74,9 @@ class TreeReducer:
         if not batch_results:
             raise ValueError("Cannot reduce empty list of batch results")
 
-        # Collect all evidence upfront — never pass through LLM
+        # Collect evidence and alert_refs upfront — never pass through LLM
         evidence_bank = self._collect_evidence(batch_results)
+        alert_refs = self._merge_alert_refs(batch_results)
 
         items: list[_Item] = list(batch_results)
 
@@ -115,11 +118,14 @@ class TreeReducer:
         if isinstance(result, BatchAnalysis):
             result = self._batch_to_merged(result)
 
-        # Присоединяем evidence_bank — никогда не проходит через LLM
+        # Присоединяем evidence_bank и alert_refs — никогда не проходят через LLM
         evidence_bank = self._dedup_evidence(
             evidence_bank + list(result.evidence_bank)
         )
-        result = result.model_copy(update={"evidence_bank": evidence_bank})
+        result = result.model_copy(update={
+            "evidence_bank": evidence_bank,
+            "alert_refs": alert_refs,
+        })
 
         logger.info(
             "Reduce complete: %d events, %d evidence, %d hypotheses",
@@ -334,6 +340,24 @@ class TreeReducer:
         return all_evidence
 
     @staticmethod
+    def _merge_alert_refs(batch_results: list[BatchAnalysis]) -> list[AlertRef]:
+        """Программный merge alert_refs из всех MAP-батчей.
+
+        Для каждого alert_id берём лучший статус (EXPLAINED > PARTIAL >
+        NOT_EXPLAINED > NOT_SEEN) и комментарий от него же.
+        """
+        best: dict[str, AlertRef] = {}
+        for batch in batch_results:
+            for ref in batch.alert_refs:
+                existing = best.get(ref.alert_id)
+                if existing is None or (
+                    AlertStatus.priority(ref.status)
+                    < AlertStatus.priority(existing.status)
+                ):
+                    best[ref.alert_id] = ref
+        return list(best.values())
+
+    @staticmethod
     def _dedup_evidence(items: list[Evidence]) -> list[Evidence]:
         """Дедупликация Evidence по raw_line."""
         seen: set[str] = set()
@@ -398,7 +422,9 @@ class TreeReducer:
             anomalies=batch.anomalies,
             gaps=[],
             impact_summary=batch.metrics_context or "",
+            preliminary_recommendations=batch.preliminary_recommendations,
             evidence_bank=batch.evidence,
+            alert_refs=[],  # управляются отдельно
         )
 
     @staticmethod
@@ -439,6 +465,20 @@ class TreeReducer:
                 if item.impact_summary:
                     impacts.append(item.impact_summary)
 
+        # Уникальные рекомендации из всех батчей
+        all_recs: list[str] = []
+        seen_recs: set[str] = set()
+        for item in group:
+            recs = (
+                item.preliminary_recommendations
+                if isinstance(item, (BatchAnalysis, MergedAnalysis))
+                else []
+            )
+            for r in recs:
+                if r not in seen_recs:
+                    seen_recs.add(r)
+                    all_recs.append(r)
+
         return MergedAnalysis(
             time_range=(min(all_ts), max(all_ts)),
             narrative=" ".join(narratives),
@@ -448,4 +488,6 @@ class TreeReducer:
             anomalies=list(all_anomalies.values()),
             gaps=all_gaps,
             impact_summary="; ".join(impacts),
+            preliminary_recommendations=all_recs,
+            alert_refs=[],  # управляются отдельно
         )

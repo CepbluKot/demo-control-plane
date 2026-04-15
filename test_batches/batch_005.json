@@ -1,105 +1,121 @@
 {
   "time_range": [
-    "2024-01-15T14:25:00Z",
-    "2024-01-15T14:30:00Z"
+    "2024-01-15T14:30:00+00:00",
+    "2024-01-15T14:40:00+00:00"
   ],
-  "narrative": "Перед пиком аварии появляется прямой признак OOMKilled в Kubernetes событиях. После перезапуска payments сервис стартует медленно, а order-service держит circuit breaker открытым. Картина становится почти однозначной, хотя remediation еще не выполнен.",
+  "narrative": "The primary failure happened here: payments-svc was OOM-killed repeatedly. api-gateway propagated high 5xx and timeout rates to clients. order-svc opened circuit breaker to protect itself from continuous payment failures.",
   "events": [
     {
       "id": "evt-005-001",
-      "timestamp": "2024-01-15T14:25:18Z",
-      "source": "kubelet/node-a",
-      "description": "OOMKilled recorded for payments container",
+      "timestamp": "2024-01-15T14:30:08+00:00",
+      "source": "kubelet",
+      "description": "payments pod OOM-killed with exit code 137",
       "severity": "critical",
+      "importance": 1.0,
       "tags": [
         "oom",
-        "k8s",
-        "crash"
+        "kubernetes",
+        "exit137"
       ]
     },
     {
       "id": "evt-005-002",
-      "timestamp": "2024-01-15T14:27:41Z",
-      "source": "payments-service",
-      "description": "Cold start time reached 95 seconds",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:33:11+00:00",
+      "source": "api-gateway",
+      "description": "Gateway payment endpoint returned sustained 5xx and timeouts",
+      "severity": "critical",
+      "importance": 0.9,
       "tags": [
-        "startup",
-        "recovery",
-        "latency"
+        "gateway",
+        "5xx",
+        "timeout"
       ]
     },
     {
       "id": "evt-005-003",
-      "timestamp": "2024-01-15T14:29:54Z",
-      "source": "order-service",
-      "description": "Circuit breaker stayed OPEN at 71 percent fail",
-      "severity": "critical",
+      "timestamp": "2024-01-15T14:36:54+00:00",
+      "source": "order-svc",
+      "description": "Circuit breaker opened for payments dependency",
+      "severity": "high",
+      "importance": 0.9,
       "tags": [
-        "circuit-breaker",
-        "impact",
-        "cascade"
+        "order-svc",
+        "circuit-breaker"
       ]
     }
   ],
   "evidence": [
     {
       "id": "ev-005-001",
-      "timestamp": "2024-01-15T14:25:18Z",
+      "timestamp": "2024-01-15T14:30:07+00:00",
       "source": "kubelet",
-      "raw_line": "2024-01-15T14:25:18.041Z Warning  OOMKilling  kubelet  Memory cgroup out of memory: Kill process 2661 (java) score 987 or sacrifice child",
+      "raw_line": "2024-01-15T14:30:07.101Z Warning OOMKilling process=java pod=payments-svc",
       "severity": "critical",
       "linked_event_id": "evt-005-001"
     },
     {
       "id": "ev-005-002",
-      "timestamp": "2024-01-15T14:27:40Z",
-      "source": "payments-service",
-      "raw_line": "2024-01-15T14:27:40.918Z INFO  [payments] Application started in 95.224 seconds (JVM running for 97.102)",
-      "severity": "high",
+      "timestamp": "2024-01-15T14:33:10+00:00",
+      "source": "api-gateway",
+      "raw_line": "2024-01-15T14:33:10.664Z ERROR payments upstream failures=31% timeout=1",
+      "severity": "critical",
       "linked_event_id": "evt-005-002"
     },
     {
       "id": "ev-005-003",
-      "timestamp": "2024-01-15T14:29:53Z",
-      "source": "order-service",
-      "raw_line": "2024-01-15T14:29:53.774Z ERROR [order] paymentsClient blocked by circuit breaker OPEN failureRate=71.4",
-      "severity": "critical",
+      "timestamp": "2024-01-15T14:36:53+00:00",
+      "source": "order-svc",
+      "raw_line": "2024-01-15T14:36:53.219Z WARN CB paymentsClient CLOSED->OPEN failRate=66%",
+      "severity": "high",
       "linked_event_id": "evt-005-003"
     }
   ],
   "hypotheses": [
     {
       "id": "hyp-005-001",
-      "title": "OOM is the leading root-cause candidate",
-      "description": "Наличие OOMKilling события почти напрямую подтверждает память как первичный триггер отказа payments-service. Медленные cold start усиливают длительность деградации и поддерживают каскад через order-service. Уверенность уже высокая, но финальное подтверждение ожидаем в следующих окнах.",
-      "confidence": "medium",
+      "title": "OOM directly caused the outage cascade",
+      "description": "OOM kills in payments caused gateway failures and opened breaker in order-svc.",
+      "confidence": "high",
       "supporting_event_ids": [
         "evt-005-001",
         "evt-005-002",
         "evt-005-003"
       ],
-      "contradicting_event_ids": []
-    },
-    {
-      "id": "hyp-005-002",
-      "title": "Circuit breaker protects but prolongs partial outage",
-      "description": "Защитная логика order-service снижает лавину ошибок, но удерживает часть трафика в отказе даже при кратком восстановлении payments. Это объясняет, почему user impact сохраняется. Гипотеза сопутствующая.",
-      "confidence": "medium",
-      "supporting_event_ids": [
-        "evt-005-003"
-      ],
-      "contradicting_event_ids": []
+      "contradicting_event_ids": [],
+      "related_alert_ids": [
+        "alert-001",
+        "alert-002"
+      ]
     }
   ],
   "anomalies": [
     {
-      "description": "Прямое OOMKilling событие в момент максимального каскада",
+      "description": "Three critical failures chained within ten minutes.",
       "related_event_ids": [
-        "evt-005-001"
+        "evt-005-001",
+        "evt-005-002",
+        "evt-005-003"
       ]
     }
   ],
-  "metrics_context": "pod_memory_working_set у payments достиг 1.98Gi при limit 2Gi; restart_count +4 за 5 минут; gateway 5xx 21%; order circuit OPEN duration 270s.",
-  "data_quality": null
+  "metrics_context": null,
+  "data_quality": null,
+  "alert_refs": [
+    {
+      "alert_id": "alert-001",
+      "status": "explained",
+      "comment": "Direct OOM-kill event observed"
+    },
+    {
+      "alert_id": "alert-002",
+      "status": "explained",
+      "comment": "Error rate alert matches gateway failures"
+    },
+    {
+      "alert_id": "alert-003",
+      "status": "not_seen",
+      "comment": null
+    }
+  ],
+  "preliminary_recommendations": []
 }
