@@ -1,18 +1,20 @@
 """
 debug_map.py — тест MAP-фазы на синтетических логах.
 
-Не требует ClickHouse. Создаёт ~60 синтетических строк лога
-(OOM + рестарты + connection errors), прогоняет через MapProcessor,
-печатает BatchAnalysis.
+Не требует ClickHouse. Загружает строки логов из INPUT_ROWS_PATH
+(test_logs/log_rows.json), при отсутствии файла использует встроенные
+синтетические данные.
 
 Запуск:
     python debug_map.py
+    python debug_map.py  # загрузит test_logs/log_rows.json если есть
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import pathlib
 from datetime import datetime, timedelta, timezone
 
 # ── CONFIG ────────────────────────────────────────────────────────────
@@ -20,11 +22,14 @@ API_BASE   = "http://localhost:8000"
 API_KEY    = "sk-placeholder"
 MODEL      = "PNX.QWEN3 235b a22b instruct"
 
-INCIDENT_CONTEXT = "payments-service OOM, pod restarts after 14:30 UTC"
-INCIDENT_START   = "2024-01-15T14:00:00"
-INCIDENT_END     = "2024-01-15T15:00:00"
+INCIDENT_CONTEXT = "Airflow: массовые ошибки Pod creation failed (Forbidden) в kubernetes_executor. DAG-раны зависают, воркеры убиваются SIGTERM."
+INCIDENT_START   = "2026-03-18T02:00:00+00:00"
+INCIDENT_END     = "2026-03-18T03:00:00+00:00"
 
 MAX_CONTEXT_TOKENS = 100_000
+
+# Путь к JSON-файлу с логами. Если не найден — используются встроенные данные.
+INPUT_ROWS_PATH = pathlib.Path("test_logs/log_rows.json")
 # ─────────────────────────────────────────────────────────────────────
 
 from log_summarizer.chunker import Chunker
@@ -107,20 +112,34 @@ def make_synthetic_rows() -> list[LogRow]:
     return rows
 
 
+def load_rows_from_file(path: pathlib.Path) -> list[LogRow]:
+    """Загружает строки логов из JSON-файла."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return [LogRow.model_validate(item) for item in data]
+
+
 async def main() -> None:
+    if INPUT_ROWS_PATH.exists():
+        rows = load_rows_from_file(INPUT_ROWS_PATH)
+        log.info("Loaded %d rows from %s", len(rows), INPUT_ROWS_PATH)
+        start = min(r.timestamp for r in rows)
+        end   = max(r.timestamp for r in rows)
+    else:
+        rows = make_synthetic_rows()
+        log.warning("File %s not found — using built-in fixture", INPUT_ROWS_PATH)
+        start = datetime(2024, 1, 15, 14, 0, 0, tzinfo=timezone.utc)
+        end   = datetime(2024, 1, 15, 15, 0, 0, tzinfo=timezone.utc)
+
     config = PipelineConfig(
         model=MODEL,
         api_base=API_BASE,
         api_key=API_KEY,
         incident_context=INCIDENT_CONTEXT,
-        incident_start=datetime(2024, 1, 15, 14, 0, 0, tzinfo=timezone.utc),
-        incident_end=datetime(2024, 1, 15, 15, 0, 0, tzinfo=timezone.utc),
+        incident_start=start,
+        incident_end=end,
         max_context_tokens=MAX_CONTEXT_TOKENS,
         model_supports_tool_calling=False,
     )
-
-    rows = make_synthetic_rows()
-    log.info("Synthetic rows: %d", len(rows))
 
     chunker = Chunker(
         max_batch_tokens=int(MAX_CONTEXT_TOKENS * 0.55),

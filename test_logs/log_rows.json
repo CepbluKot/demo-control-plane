@@ -1,0 +1,562 @@
+[
+  {
+    "timestamp": "2026-03-18T02:00:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; next run in 5.0 seconds",
+    "raw_line": "2026-03-18T02:00:00+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; next run in 5.0 seconds"
+  },
+  {
+    "timestamp": "2026-03-18T02:00:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Processing DAG file /opt/airflow/dags/payments_etl.py",
+    "raw_line": "2026-03-18T02:00:30+00:00 INFO airflow-scheduler: Processing DAG file /opt/airflow/dags/payments_etl.py"
+  },
+  {
+    "timestamp": "2026-03-18T02:01:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: queued task payments_etl.extract run_id=scheduled__2026-03-18T02:00:00+00:00",
+    "raw_line": "2026-03-18T02:01:00+00:00 INFO airflow-scheduler: KubernetesExecutor: queued task payments_etl.extract run_id=scheduled__2026-03-18T02:00:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:01:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-abc12-xyz98",
+    "raw_line": "2026-03-18T02:01:30+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-abc12-xyz98"
+  },
+  {
+    "timestamp": "2026-03-18T02:02:00+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: payments_etl.extract succeeded in 24.3s",
+    "raw_line": "2026-03-18T02:02:00+00:00 INFO airflow-worker: TaskInstance: payments_etl.extract succeeded in 24.3s"
+  },
+  {
+    "timestamp": "2026-03-18T02:02:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: queued task fraud_rules.sync run_id=scheduled__2026-03-18T02:01:00+00:00",
+    "raw_line": "2026-03-18T02:02:30+00:00 INFO airflow-scheduler: KubernetesExecutor: queued task fraud_rules.sync run_id=scheduled__2026-03-18T02:01:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:03:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-qwe45-rty67",
+    "raw_line": "2026-03-18T02:03:00+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-qwe45-rty67"
+  },
+  {
+    "timestamp": "2026-03-18T02:03:30+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: fraud_rules.sync succeeded in 18.7s",
+    "raw_line": "2026-03-18T02:03:30+00:00 INFO airflow-worker: TaskInstance: fraud_rules.sync succeeded in 18.7s"
+  },
+  {
+    "timestamp": "2026-03-18T02:04:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun payments_etl scheduled__2026-03-18T02:00:00+00:00 state=running",
+    "raw_line": "2026-03-18T02:04:00+00:00 INFO airflow-scheduler: DagRun payments_etl scheduled__2026-03-18T02:00:00+00:00 state=running"
+  },
+  {
+    "timestamp": "2026-03-18T02:04:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DAG parsing stats: total=312 success=312 failed=0",
+    "raw_line": "2026-03-18T02:04:30+00:00 INFO airflow-scheduler: DAG parsing stats: total=312 success=312 failed=0"
+  },
+  {
+    "timestamp": "2026-03-18T02:05:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; next run in 5.0 seconds",
+    "raw_line": "2026-03-18T02:05:00+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; next run in 5.0 seconds"
+  },
+  {
+    "timestamp": "2026-03-18T02:05:30+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-zxc11-vbn22",
+    "raw_line": "2026-03-18T02:05:30+00:00 WARN airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-zxc11-vbn22"
+  },
+  {
+    "timestamp": "2026-03-18T02:06:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Kubernetes API response: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:06:00+00:00 ERROR airflow-scheduler: Kubernetes API response: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:06:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Processing DAG file /opt/airflow/dags/fraud_rules.py",
+    "raw_line": "2026-03-18T02:06:30+00:00 INFO airflow-scheduler: Processing DAG file /opt/airflow/dags/fraud_rules.py"
+  },
+  {
+    "timestamp": "2026-03-18T02:07:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-hjk33-lop44",
+    "raw_line": "2026-03-18T02:07:00+00:00 WARN airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-hjk33-lop44"
+  },
+  {
+    "timestamp": "2026-03-18T02:07:30+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: pod creation error for airflow-worker-hjk33-lop44: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:07:30+00:00 ERROR airflow-scheduler: KubernetesExecutor: pod creation error for airflow-worker-hjk33-lop44: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:08:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun fraud_rules scheduled__2026-03-18T02:05:00+00:00 state=running",
+    "raw_line": "2026-03-18T02:08:00+00:00 INFO airflow-scheduler: DagRun fraud_rules scheduled__2026-03-18T02:05:00+00:00 state=running"
+  },
+  {
+    "timestamp": "2026-03-18T02:08:30+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-mno55-pqr66",
+    "raw_line": "2026-03-18T02:08:30+00:00 WARN airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-mno55-pqr66"
+  },
+  {
+    "timestamp": "2026-03-18T02:09:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Kubernetes API response: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:09:00+00:00 ERROR airflow-scheduler: Kubernetes API response: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:09:30+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; DAG parsing loop completed",
+    "raw_line": "2026-03-18T02:09:30+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; DAG parsing loop completed"
+  },
+  {
+    "timestamp": "2026-03-18T02:10:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-stu77-vwx88: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:10:00+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-stu77-vwx88: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:10:40+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-def90-ghi12: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:10:40+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-def90-ghi12: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:11:20+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun payments_etl scheduled__2026-03-18T02:10:00+00:00 is still running; no worker assigned",
+    "raw_line": "2026-03-18T02:11:20+00:00 WARN airflow-scheduler: DagRun payments_etl scheduled__2026-03-18T02:10:00+00:00 is still running; no worker assigned"
+  },
+  {
+    "timestamp": "2026-03-18T02:12:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-worker",
+    "message": "Received SIGTERM. Terminating subprocesses for task payments_etl.transform",
+    "raw_line": "2026-03-18T02:12:00+00:00 ERROR airflow-worker: Received SIGTERM. Terminating subprocesses for task payments_etl.transform"
+  },
+  {
+    "timestamp": "2026-03-18T02:12:40+00:00",
+    "level": "ERROR",
+    "source": "airflow-worker",
+    "message": "Task exited with return code 143 (non-zero) for payments_etl.transform",
+    "raw_line": "2026-03-18T02:12:40+00:00 ERROR airflow-worker: Task exited with return code 143 (non-zero) for payments_etl.transform"
+  },
+  {
+    "timestamp": "2026-03-18T02:13:20+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Task instance failed: payments_etl.transform run_id=scheduled__2026-03-18T02:10:00+00:00",
+    "raw_line": "2026-03-18T02:13:20+00:00 ERROR airflow-scheduler: Task instance failed: payments_etl.transform run_id=scheduled__2026-03-18T02:10:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:14:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-jkl34-mno56: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:14:00+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-jkl34-mno56: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:14:40+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun fraud_rules scheduled__2026-03-18T02:11:00+00:00 remains running; queued tasks=27",
+    "raw_line": "2026-03-18T02:14:40+00:00 WARN airflow-scheduler: DagRun fraud_rules scheduled__2026-03-18T02:11:00+00:00 remains running; queued tasks=27"
+  },
+  {
+    "timestamp": "2026-03-18T02:15:20+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; processing callbacks",
+    "raw_line": "2026-03-18T02:15:20+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; processing callbacks"
+  },
+  {
+    "timestamp": "2026-03-18T02:16:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Task instance failed: fraud_rules.sync run_id=scheduled__2026-03-18T02:11:00+00:00",
+    "raw_line": "2026-03-18T02:16:00+00:00 ERROR airflow-scheduler: Task instance failed: fraud_rules.sync run_id=scheduled__2026-03-18T02:11:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:16:40+00:00",
+    "level": "ERROR",
+    "source": "airflow-worker",
+    "message": "Received SIGTERM. Terminating subprocesses for task fraud_rules.sync",
+    "raw_line": "2026-03-18T02:16:40+00:00 ERROR airflow-worker: Received SIGTERM. Terminating subprocesses for task fraud_rules.sync"
+  },
+  {
+    "timestamp": "2026-03-18T02:17:20+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-pqr78-stu90: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:17:20+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-pqr78-stu90: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:18:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun ml_scoring scheduled__2026-03-18T02:13:00+00:00 is still running; queued tasks=41",
+    "raw_line": "2026-03-18T02:18:00+00:00 WARN airflow-scheduler: DagRun ml_scoring scheduled__2026-03-18T02:13:00+00:00 is still running; queued tasks=41"
+  },
+  {
+    "timestamp": "2026-03-18T02:18:40+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Task instance failed: ml_scoring.score run_id=scheduled__2026-03-18T02:13:00+00:00",
+    "raw_line": "2026-03-18T02:18:40+00:00 ERROR airflow-scheduler: Task instance failed: ml_scoring.score run_id=scheduled__2026-03-18T02:13:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:19:20+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DAG parsing stats: total=312 success=312 failed=0",
+    "raw_line": "2026-03-18T02:19:20+00:00 INFO airflow-scheduler: DAG parsing stats: total=312 success=312 failed=0"
+  },
+  {
+    "timestamp": "2026-03-18T02:20:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "Executor queue full: queued_tasks=58 running_slots=0 free_slots=0",
+    "raw_line": "2026-03-18T02:20:00+00:00 WARN airflow-scheduler: Executor queue full: queued_tasks=58 running_slots=0 free_slots=0"
+  },
+  {
+    "timestamp": "2026-03-18T02:21:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-vwx11-yza22: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:21:00+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-vwx11-yza22: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:22:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Task instance failed: payments_etl.load run_id=scheduled__2026-03-18T02:20:00+00:00",
+    "raw_line": "2026-03-18T02:22:00+00:00 ERROR airflow-scheduler: Task instance failed: payments_etl.load run_id=scheduled__2026-03-18T02:20:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:23:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun backlog increasing; running=19 queued=63",
+    "raw_line": "2026-03-18T02:23:00+00:00 WARN airflow-scheduler: DagRun backlog increasing; running=19 queued=63"
+  },
+  {
+    "timestamp": "2026-03-18T02:24:00+00:00",
+    "level": "ERROR",
+    "source": "prometheus-alertmanager",
+    "message": "ALERT AirflowKubernetesExecutorFailed firing severity=critical",
+    "raw_line": "2026-03-18T02:24:00+00:00 ERROR prometheus-alertmanager: ALERT AirflowKubernetesExecutorFailed firing severity=critical"
+  },
+  {
+    "timestamp": "2026-03-18T02:25:00+00:00",
+    "level": "ERROR",
+    "source": "prometheus-alertmanager",
+    "message": "ALERT AirflowSchedulerHeartbeatMissed firing severity=high",
+    "raw_line": "2026-03-18T02:25:00+00:00 ERROR prometheus-alertmanager: ALERT AirflowSchedulerHeartbeatMissed firing severity=high"
+  },
+  {
+    "timestamp": "2026-03-18T02:26:00+00:00",
+    "level": "ERROR",
+    "source": "oncall-shell",
+    "message": "kubectl describe pod airflow-worker-vwx11-yza22 -> Error from server (Forbidden): pods \"airflow-worker-vwx11-yza22\" is forbidden",
+    "raw_line": "2026-03-18T02:26:00+00:00 ERROR oncall-shell: kubectl describe pod airflow-worker-vwx11-yza22 -> Error from server (Forbidden): pods \"airflow-worker-vwx11-yza22\" is forbidden"
+  },
+  {
+    "timestamp": "2026-03-18T02:27:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; heartbeat delay=7.2s",
+    "raw_line": "2026-03-18T02:27:00+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; heartbeat delay=7.2s"
+  },
+  {
+    "timestamp": "2026-03-18T02:28:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "Executor queue full: queued_tasks=71 running_slots=0 free_slots=0",
+    "raw_line": "2026-03-18T02:28:00+00:00 WARN airflow-scheduler: Executor queue full: queued_tasks=71 running_slots=0 free_slots=0"
+  },
+  {
+    "timestamp": "2026-03-18T02:29:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: failed to launch pod airflow-worker-bcd33-efg44: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\"",
+    "raw_line": "2026-03-18T02:29:00+00:00 ERROR airflow-scheduler: KubernetesExecutor: failed to launch pod airflow-worker-bcd33-efg44: pods is forbidden: User \"system:serviceaccount:airflow:airflow\" cannot create resource \"pods\" in API group \"\" in the namespace \"airflow\""
+  },
+  {
+    "timestamp": "2026-03-18T02:30:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-worker",
+    "message": "Received SIGTERM. Terminating subprocesses for task ml_scoring.score",
+    "raw_line": "2026-03-18T02:30:00+00:00 ERROR airflow-worker: Received SIGTERM. Terminating subprocesses for task ml_scoring.score"
+  },
+  {
+    "timestamp": "2026-03-18T02:31:00+00:00",
+    "level": "ERROR",
+    "source": "airflow-scheduler",
+    "message": "Task instance failed: ml_scoring.score run_id=scheduled__2026-03-18T02:24:00+00:00",
+    "raw_line": "2026-03-18T02:31:00+00:00 ERROR airflow-scheduler: Task instance failed: ml_scoring.score run_id=scheduled__2026-03-18T02:24:00+00:00"
+  },
+  {
+    "timestamp": "2026-03-18T02:32:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun payments_etl scheduled__2026-03-18T02:25:00+00:00 still running; no active workers",
+    "raw_line": "2026-03-18T02:32:00+00:00 WARN airflow-scheduler: DagRun payments_etl scheduled__2026-03-18T02:25:00+00:00 still running; no active workers"
+  },
+  {
+    "timestamp": "2026-03-18T02:33:00+00:00",
+    "level": "ERROR",
+    "source": "oncall-shell",
+    "message": "kubectl describe pod airflow-worker-bcd33-efg44 -> Error from server (Forbidden): pods \"airflow-worker-bcd33-efg44\" is forbidden",
+    "raw_line": "2026-03-18T02:33:00+00:00 ERROR oncall-shell: kubectl describe pod airflow-worker-bcd33-efg44 -> Error from server (Forbidden): pods \"airflow-worker-bcd33-efg44\" is forbidden"
+  },
+  {
+    "timestamp": "2026-03-18T02:34:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DAG parsing loop completed; next scan in 30 seconds",
+    "raw_line": "2026-03-18T02:34:00+00:00 INFO airflow-scheduler: DAG parsing loop completed; next scan in 30 seconds"
+  },
+  {
+    "timestamp": "2026-03-18T02:35:00+00:00",
+    "level": "WARN",
+    "source": "oncall-shell",
+    "message": "Investigating RBAC for serviceaccount airflow/airflow",
+    "raw_line": "2026-03-18T02:35:00+00:00 WARN oncall-shell: Investigating RBAC for serviceaccount airflow/airflow"
+  },
+  {
+    "timestamp": "2026-03-18T02:36:00+00:00",
+    "level": "ERROR",
+    "source": "oncall-shell",
+    "message": "kubectl auth can-i create pods --as system:serviceaccount:airflow:airflow -> no",
+    "raw_line": "2026-03-18T02:36:00+00:00 ERROR oncall-shell: kubectl auth can-i create pods --as system:serviceaccount:airflow:airflow -> no"
+  },
+  {
+    "timestamp": "2026-03-18T02:37:00+00:00",
+    "level": "INFO",
+    "source": "oncall-shell",
+    "message": "Applying RBAC fix: kubectl apply -f airflow-clusterrolebinding.yaml",
+    "raw_line": "2026-03-18T02:37:00+00:00 INFO oncall-shell: Applying RBAC fix: kubectl apply -f airflow-clusterrolebinding.yaml"
+  },
+  {
+    "timestamp": "2026-03-18T02:38:00+00:00",
+    "level": "INFO",
+    "source": "oncall-shell",
+    "message": "clusterrolebinding.rbac.authorization.k8s.io/airflow-worker-binding configured",
+    "raw_line": "2026-03-18T02:38:00+00:00 INFO oncall-shell: clusterrolebinding.rbac.authorization.k8s.io/airflow-worker-binding configured"
+  },
+  {
+    "timestamp": "2026-03-18T02:39:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-klm55-nop66",
+    "raw_line": "2026-03-18T02:39:00+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-klm55-nop66"
+  },
+  {
+    "timestamp": "2026-03-18T02:40:00+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: payments_etl.transform started on airflow-worker-klm55-nop66",
+    "raw_line": "2026-03-18T02:40:00+00:00 INFO airflow-worker: TaskInstance: payments_etl.transform started on airflow-worker-klm55-nop66"
+  },
+  {
+    "timestamp": "2026-03-18T02:41:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-qrs77-tuv88",
+    "raw_line": "2026-03-18T02:41:00+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-qrs77-tuv88"
+  },
+  {
+    "timestamp": "2026-03-18T02:42:00+00:00",
+    "level": "WARN",
+    "source": "airflow-scheduler",
+    "message": "DagRun backlog still high but new workers are launching",
+    "raw_line": "2026-03-18T02:42:00+00:00 WARN airflow-scheduler: DagRun backlog still high but new workers are launching"
+  },
+  {
+    "timestamp": "2026-03-18T02:43:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; heartbeat delay=3.1s",
+    "raw_line": "2026-03-18T02:43:00+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; heartbeat delay=3.1s"
+  },
+  {
+    "timestamp": "2026-03-18T02:44:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-wxy99-zab10",
+    "raw_line": "2026-03-18T02:44:00+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-wxy99-zab10"
+  },
+  {
+    "timestamp": "2026-03-18T02:45:00+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: fraud_rules.sync started on airflow-worker-qrs77-tuv88",
+    "raw_line": "2026-03-18T02:45:00+00:00 INFO airflow-worker: TaskInstance: fraud_rules.sync started on airflow-worker-qrs77-tuv88"
+  },
+  {
+    "timestamp": "2026-03-18T02:46:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Queued tasks are being dequeued after RBAC fix",
+    "raw_line": "2026-03-18T02:46:00+00:00 INFO airflow-scheduler: Queued tasks are being dequeued after RBAC fix"
+  },
+  {
+    "timestamp": "2026-03-18T02:47:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor: Successfully created pod airflow-worker-cde21-fgh32",
+    "raw_line": "2026-03-18T02:47:00+00:00 INFO airflow-scheduler: KubernetesExecutor: Successfully created pod airflow-worker-cde21-fgh32"
+  },
+  {
+    "timestamp": "2026-03-18T02:48:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun payments_etl scheduled__2026-03-18T02:40:00+00:00 picked by worker",
+    "raw_line": "2026-03-18T02:48:00+00:00 INFO airflow-scheduler: DagRun payments_etl scheduled__2026-03-18T02:40:00+00:00 picked by worker"
+  },
+  {
+    "timestamp": "2026-03-18T02:49:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DAG parsing stats: total=312 success=312 failed=0",
+    "raw_line": "2026-03-18T02:49:00+00:00 INFO airflow-scheduler: DAG parsing stats: total=312 success=312 failed=0"
+  },
+  {
+    "timestamp": "2026-03-18T02:50:00+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: payments_etl.transform succeeded in 31.4s",
+    "raw_line": "2026-03-18T02:50:00+00:00 INFO airflow-worker: TaskInstance: payments_etl.transform succeeded in 31.4s"
+  },
+  {
+    "timestamp": "2026-03-18T02:50:40+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: fraud_rules.sync succeeded in 22.8s",
+    "raw_line": "2026-03-18T02:50:40+00:00 INFO airflow-worker: TaskInstance: fraud_rules.sync succeeded in 22.8s"
+  },
+  {
+    "timestamp": "2026-03-18T02:51:20+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun payments_etl scheduled__2026-03-18T02:40:00+00:00 state=success",
+    "raw_line": "2026-03-18T02:51:20+00:00 INFO airflow-scheduler: DagRun payments_etl scheduled__2026-03-18T02:40:00+00:00 state=success"
+  },
+  {
+    "timestamp": "2026-03-18T02:52:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Backlog drain in progress: queued_tasks=29 running_workers=8",
+    "raw_line": "2026-03-18T02:52:00+00:00 INFO airflow-scheduler: Backlog drain in progress: queued_tasks=29 running_workers=8"
+  },
+  {
+    "timestamp": "2026-03-18T02:52:40+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat is alive; heartbeat delay=1.2s",
+    "raw_line": "2026-03-18T02:52:40+00:00 INFO airflow-scheduler: Scheduler heartbeat is alive; heartbeat delay=1.2s"
+  },
+  {
+    "timestamp": "2026-03-18T02:53:20+00:00",
+    "level": "INFO",
+    "source": "prometheus-alertmanager",
+    "message": "ALERT RESOLVED AirflowKubernetesExecutorFailed",
+    "raw_line": "2026-03-18T02:53:20+00:00 INFO prometheus-alertmanager: ALERT RESOLVED AirflowKubernetesExecutorFailed"
+  },
+  {
+    "timestamp": "2026-03-18T02:54:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun fraud_rules scheduled__2026-03-18T02:45:00+00:00 state=success",
+    "raw_line": "2026-03-18T02:54:00+00:00 INFO airflow-scheduler: DagRun fraud_rules scheduled__2026-03-18T02:45:00+00:00 state=success"
+  },
+  {
+    "timestamp": "2026-03-18T02:54:40+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "KubernetesExecutor launch latency returned to baseline",
+    "raw_line": "2026-03-18T02:54:40+00:00 INFO airflow-scheduler: KubernetesExecutor launch latency returned to baseline"
+  },
+  {
+    "timestamp": "2026-03-18T02:55:20+00:00",
+    "level": "INFO",
+    "source": "prometheus-alertmanager",
+    "message": "ALERT RESOLVED AirflowSchedulerHeartbeatMissed",
+    "raw_line": "2026-03-18T02:55:20+00:00 INFO prometheus-alertmanager: ALERT RESOLVED AirflowSchedulerHeartbeatMissed"
+  },
+  {
+    "timestamp": "2026-03-18T02:56:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "DagRun ml_scoring scheduled__2026-03-18T02:50:00+00:00 state=success",
+    "raw_line": "2026-03-18T02:56:00+00:00 INFO airflow-scheduler: DagRun ml_scoring scheduled__2026-03-18T02:50:00+00:00 state=success"
+  },
+  {
+    "timestamp": "2026-03-18T02:56:40+00:00",
+    "level": "INFO",
+    "source": "airflow-worker",
+    "message": "TaskInstance: ml_scoring.score succeeded in 27.6s",
+    "raw_line": "2026-03-18T02:56:40+00:00 INFO airflow-worker: TaskInstance: ml_scoring.score succeeded in 27.6s"
+  },
+  {
+    "timestamp": "2026-03-18T02:57:20+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Backlog drain in progress: queued_tasks=7 running_workers=5",
+    "raw_line": "2026-03-18T02:57:20+00:00 INFO airflow-scheduler: Backlog drain in progress: queued_tasks=7 running_workers=5"
+  },
+  {
+    "timestamp": "2026-03-18T02:58:00+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "No new Forbidden errors observed for pod creation",
+    "raw_line": "2026-03-18T02:58:00+00:00 INFO airflow-scheduler: No new Forbidden errors observed for pod creation"
+  },
+  {
+    "timestamp": "2026-03-18T02:58:40+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Scheduler heartbeat restored to normal cadence",
+    "raw_line": "2026-03-18T02:58:40+00:00 INFO airflow-scheduler: Scheduler heartbeat restored to normal cadence"
+  },
+  {
+    "timestamp": "2026-03-18T02:59:20+00:00",
+    "level": "INFO",
+    "source": "airflow-scheduler",
+    "message": "Incident window closed: DAG throughput returned to steady state",
+    "raw_line": "2026-03-18T02:59:20+00:00 INFO airflow-scheduler: Incident window closed: DAG throughput returned to steady state"
+  }
+]
