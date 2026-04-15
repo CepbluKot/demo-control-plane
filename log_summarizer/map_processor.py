@@ -172,7 +172,7 @@ class MapProcessor:
         self._run_dir.mkdir(parents=True, exist_ok=True)
         path = self._run_dir / f"chunk_{chunk_id:03d}.json"
         path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
-        logger.info("MAP chunk %d saved → %s", chunk_id, path)
+        logger.debug("MAP chunk %d saved → %s", chunk_id, path)
 
     @staticmethod
     def _empty_analysis(chunk: Chunk) -> BatchAnalysis:

@@ -30,7 +30,7 @@ from log_summarizer.config import PipelineConfig
 from log_summarizer.data_loader import DataLoader
 from log_summarizer.llm_client import LLMClient
 from log_summarizer.map_processor import MapProcessor
-from log_summarizer.models import BatchAnalysis, Chunk, MetricRow
+from log_summarizer.models import BatchAnalysis, Chunk, MergedAnalysis, MetricRow
 from log_summarizer.report_generator import ReportGenerator
 from log_summarizer.tree_reducer import TreeReducer
 from log_summarizer.utils.logging import get_logger
@@ -121,11 +121,15 @@ class PipelineOrchestrator:
             logger.warning("MAP phase produced no useful results")
             return "# Incident Analysis\n\nNo significant events found in the log data."
 
+        self._log_map_summary(batch_results)
+
         # ── 3. REDUCE-фаза ────────────────────────────────────────────
         merged = await self._tree_reducer.reduce(
             batch_results=batch_results,
             early_summaries=[],
         )
+
+        self._log_merged_summary(merged)
 
         # ── 4. Финальный отчёт ────────────────────────────────────────
         report = await self._report_generator.generate(
@@ -176,6 +180,77 @@ class PipelineOrchestrator:
         path = self._run_dir / "chunks_meta.json"
         path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         logger.info("Chunks meta saved → %s  (%d chunks)", path, len(chunks))
+
+    # ── Сводные логи ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_map_summary(batch_results: list[BatchAnalysis]) -> None:
+        """Сводная таблица MAP-результатов в лог."""
+        total_events = sum(len(b.events) for b in batch_results)
+        total_evidence = sum(len(b.evidence) for b in batch_results)
+        total_hyp = sum(len(b.hypotheses) for b in batch_results)
+
+        logger.info(
+            "MAP summary: %d batches | events=%d | evidence=%d | hypotheses=%d",
+            len(batch_results), total_events, total_evidence, total_hyp,
+        )
+        sep = "─" * 72
+        logger.info(sep)
+        logger.info(
+            "  %-5s  %-17s  %-6s  %-8s  %-3s  %-5s  %s",
+            "batch", "period", "events", "evidence", "hyp", "alert", "top severity",
+        )
+        logger.info(sep)
+        for i, b in enumerate(batch_results):
+            t0, t1 = b.time_range
+            sev: dict[str, int] = {}
+            for e in b.events:
+                sev[e.severity.value] = sev.get(e.severity.value, 0) + 1
+            sev_str = " ".join(f"{k}={v}" for k, v in sorted(sev.items()))
+            logger.info(
+                "  %03d    %s→%s  %-6d  %-8d  %-3d  %-5d  %s",
+                i,
+                t0.strftime("%H:%M:%S"), t1.strftime("%H:%M:%S"),
+                len(b.events), len(b.evidence), len(b.hypotheses), len(b.alert_refs),
+                sev_str or "—",
+            )
+        logger.info(sep)
+
+    @staticmethod
+    def _log_merged_summary(merged: MergedAnalysis) -> None:
+        """Сводка финального MergedAnalysis в лог."""
+        t0, t1 = merged.time_range
+        sev: dict[str, int] = {}
+        for e in merged.events:
+            sev[e.severity.value] = sev.get(e.severity.value, 0) + 1
+        conf: dict[str, int] = {}
+        for h in merged.hypotheses:
+            conf[h.confidence] = conf.get(h.confidence, 0) + 1
+
+        sep = "═" * 72
+        logger.info(sep)
+        logger.info("REDUCE result: %s → %s", t0.strftime("%H:%M:%S"), t1.strftime("%H:%M:%S"))
+        logger.info(
+            "  events=%d (%s) | causal=%d | hypotheses=%d (%s) | gaps=%d",
+            len(merged.events),
+            " ".join(f"{k}={v}" for k, v in sorted(sev.items())),
+            len(merged.causal_chains),
+            len(merged.hypotheses),
+            " ".join(f"{k}×{v}" for k, v in sorted(conf.items())),
+            len(merged.gaps),
+        )
+        logger.info(
+            "  evidence_bank=%d | alert_refs=%d | recommendations=%d",
+            len(merged.evidence_bank),
+            len(merged.alert_refs),
+            len(merged.preliminary_recommendations),
+        )
+        if merged.alert_refs:
+            for ref in merged.alert_refs:
+                logger.info("  alert %s → %s", ref.alert_id, ref.status.value)
+        narrative = (merged.narrative_ru or merged.narrative)[:120].replace("\n", " ")
+        logger.info("  narrative: %s…", narrative)
+        logger.info(sep)
 
     def _load_data(self) -> tuple[list[Chunk], Optional[list[MetricRow]]]:
         """Загрузка логов и метрик (синхронная, вызывается из executor)."""
