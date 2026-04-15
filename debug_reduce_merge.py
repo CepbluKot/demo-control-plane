@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import pathlib
@@ -47,6 +48,20 @@ log = logging.getLogger("debug_reduce_merge")
 
 SEP  = "═" * 72
 SEP2 = "─" * 72
+
+
+class _Tee:
+    """Пишет одновременно в несколько потоков (stdout + файл)."""
+    def __init__(self, *streams: io.IOBase) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> None:
+        for s in self._streams:
+            s.write(data)
+
+    def flush(self) -> None:
+        for s in self._streams:
+            s.flush()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -235,8 +250,6 @@ async def run(batches_dir: pathlib.Path) -> None:
         sum(len(b.hypotheses) for b in batches),
     )
 
-    print_input(batches)
-
     config = PipelineConfig(
         model=MODEL,
         api_base=API_BASE,
@@ -266,11 +279,17 @@ async def run(batches_dir: pathlib.Path) -> None:
     result = await reducer.reduce(batches, early_summaries=[])
     log.info("TreeReducer завершён")
 
-    # Показываем прогрессию по раундам из сохранённых файлов
-    print_rounds(reduce_dir)
-
-    # Показываем итог
-    print_final(result, run_dir)
+    # Весь вывод print() идёт одновременно в stdout и в файл
+    report_path = run_dir / "run_report.txt"
+    with report_path.open("w", encoding="utf-8") as report_file:
+        old_stdout = sys.stdout
+        sys.stdout = _Tee(old_stdout, report_file)  # type: ignore[assignment]
+        try:
+            print_input(batches)
+            print_rounds(reduce_dir)
+            print_final(result, run_dir)
+        finally:
+            sys.stdout = old_stdout
 
     # Сохраняем финальный результат
     final_path = run_dir / "final_result.json"
@@ -278,6 +297,7 @@ async def run(batches_dir: pathlib.Path) -> None:
         json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
+    log.info("Отчёт о прогоне     → %s", report_path)
     log.info("Финальный результат → %s", final_path)
     log.info("LLM промпты/ответы  → %s", llm_dir)
     log.info("Промежуточные merge → %s", reduce_dir)
