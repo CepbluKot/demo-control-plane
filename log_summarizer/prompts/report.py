@@ -9,49 +9,52 @@ from typing import Optional
 _REPORT_SYSTEM_FULL = """\
 You are a senior SRE writing a post-incident analysis report.
 
-Language: write in Russian. Keep technical terms in English as-is: service names,
-pod names, Kubernetes objects (Pod, Deployment, CrashLoopBackOff, etc.), error codes,
-metric names, CLI commands, OOM, SIGTERM, log levels, and all verbatim log lines.
-Everything else — section headers, descriptions, analysis, recommendations — in Russian.
+=== Language ===
+Write ENTIRELY in Russian. Do NOT write in English.
+Keep the following as-is (do not translate): service names, pod names, Kubernetes objects
+(Pod, Deployment, CrashLoopBackOff, etc.), error codes, metric names, CLI commands,
+OOM, SIGTERM, log levels, and verbatim log lines.
+Everything else — section headers, narrative, analysis, recommendations — in Russian.
 
+=== Task ===
 Write a clear, structured Markdown report. Be specific: use timestamps, service names,
-exact error messages from the evidence. Avoid vague phrases like "an issue occurred".
+exact error messages from the evidence. Avoid vague phrases.
 
-Structure:
-## Executive Summary
-1-2 paragraphs: what happened, when, impact.
+=== Structure ===
+## Краткое резюме
+1-2 абзаца: что произошло, когда, влияние.
 
-## Alert Coverage
-For each alert in the alert_refs section: its ID, name, status (explained/partial/not_explained/not_seen),
-and a brief explanation. If no alerts provided, omit this section.
+## Покрытие алертов
+Для каждого алерта из alert_refs: его ID, название, статус (explained/partial/not_explained/not_seen)
+и краткое объяснение. Если алертов нет — раздел пропустить.
 
-## Timeline
-Chronological bullet list of key events with timestamps and sources.
-Mark high-importance events (importance ≥ 0.8) with ⚠.
+## Хронология
+Хронологический список ключевых событий с временными метками и источниками.
+События с importance ≥ 0.8 отмечать символом ⚠.
 
-## Root Cause Analysis
-What caused the incident. Reference evidence and causal chains.
-Use sub-sections if multiple contributing factors.
+## Анализ первопричины
+Что вызвало инцидент. Ссылки на evidence и причинно-следственные цепочки.
+При нескольких факторах — подразделы.
 
-## Impact
-Which services were affected, for how long, estimated user/business impact.
+## Последствия
+Какие сервисы пострадали, как долго, оценка влияния на пользователей / бизнес.
 
-## Evidence
-Verbatim log lines supporting the root cause (from evidence_bank).
-Format: `[timestamp] [source] raw_line`
+## Доказательная база
+Дословные строки логов, подтверждающие первопричину (из evidence_bank).
+Формат: `[timestamp] [source] raw_line`
 
-## Contributing Factors & Anomalies
-What else was going on that contributed or was unusual.
+## Сопутствующие факторы и аномалии
+Что ещё происходило и повлияло на инцидент или выглядело необычно.
 
-## Hypotheses
-List each hypothesis with confidence level and supporting/contradicting evidence.
-Include related alerts where applicable.
+## Гипотезы
+Каждая гипотеза — с уровнем уверенности и подтверждающими/опровергающими фактами.
+Связанные алерты указывать там, где применимо.
 
-## Recommendations
-Concrete action items to prevent recurrence or reduce impact next time.
-Include preliminary_recommendations from the analysis if present.
+## Рекомендации
+Конкретные действия для предотвращения повторения или снижения последствий.
+Включить preliminary_recommendations из анализа, если они есть.
 
-Rules:
+=== Rules ===
 - Use exact timestamps from the data
 - Quote evidence verbatim in code blocks
 - Keep each section focused; no padding
@@ -61,32 +64,32 @@ Rules:
 # Секционные промпты — для split-режима когда полный промпт не влезает
 
 _LANG_NOTE = (
-    "Language: write in Russian. Keep technical terms in English as-is: service names, "
-    "pod names, Kubernetes objects, error codes, metric names, CLI commands, OOM, SIGTERM, "
-    "log levels, and all verbatim log lines.\n\n"
+    "Write ENTIRELY in Russian. Do NOT write in English. "
+    "Keep as-is: service names, pod names, Kubernetes objects, error codes, metric names, "
+    "CLI commands, OOM, SIGTERM, log levels, and verbatim log lines.\n\n"
 )
 
 _REPORT_SECTION_ANALYSIS = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
-Write ONLY the following sections in Markdown:
-## Executive Summary
-## Alert Coverage
-## Timeline
-## Root Cause Analysis
-## Impact
+Write ONLY the following sections in Markdown (use these exact Russian headers):
+## Краткое резюме
+## Покрытие алертов
+## Хронология
+## Анализ первопричины
+## Последствия
 
 Use the analysis JSON provided. Be specific: timestamps, service names, causal chains.
-For Alert Coverage: list each alert with its status and brief explanation (omit section if no alerts).
-For Timeline: mark high-importance events (importance ≥ 0.8) with ⚠.
+For Покрытие алертов: list each alert with its status and brief explanation (omit section if no alerts).
+For Хронология: mark high-importance events (importance ≥ 0.8) with ⚠.
 Do not add other sections. No preamble.
 """
 
 _REPORT_SECTION_EVIDENCE = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
-Write ONLY the following section in Markdown:
-## Evidence
+Write ONLY the following section in Markdown (use this exact Russian header):
+## Доказательная база
 
 List verbatim log lines from the evidence_bank that support the root cause.
 Format each line as:
@@ -98,12 +101,12 @@ Group by theme if there are many lines. No other sections. No preamble.
 _REPORT_SECTION_RECOMMENDATIONS = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
-Write ONLY the following sections in Markdown:
-## Contributing Factors & Anomalies
-## Hypotheses
-## Recommendations
+Write ONLY the following sections in Markdown (use these exact Russian headers):
+## Сопутствующие факторы и аномалии
+## Гипотезы
+## Рекомендации
 
-Use the analysis JSON provided. For Recommendations: concrete action items only,
+Use the analysis JSON provided. For Рекомендации: concrete action items only,
 no vague advice. Reference specific services/components by name.
 
 No other sections. No preamble.
