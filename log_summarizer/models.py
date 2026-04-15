@@ -156,7 +156,8 @@ class Event(BaseModel):
     id: str                              # e.g. "evt-007-001"
     timestamp: datetime
     source: str
-    description: str                     # краткое описание своими словами
+    description: str                     # краткое описание (English)
+    description_ru: Optional[str] = None # перевод description на русский (заполняется REDUCE)
     severity: Severity                   # объективная серьёзность события
     importance: float = 0.5             # 0.0-1.0: релевантность для данного расследования
     tags: list[str] = Field(default_factory=list)  # oom/connection/timeout/...
@@ -167,7 +168,9 @@ class Hypothesis(BaseModel):
 
     id: str
     title: str
+    title_ru: Optional[str] = None       # перевод title на русский (заполняется REDUCE)
     description: str
+    description_ru: Optional[str] = None # перевод description на русский (заполняется REDUCE)
     confidence: str                      # "low" | "medium" | "high"
     supporting_event_ids: list[str]      # ссылки на Event.id
     contradicting_event_ids: list[str] = Field(default_factory=list)
@@ -178,6 +181,7 @@ class Anomaly(BaseModel):
     """Что-то необычное, замеченное в логах."""
 
     description: str
+    description_ru: Optional[str] = None # перевод на русский (заполняется REDUCE)
     related_event_ids: list[str] = Field(default_factory=list)
 
 
@@ -214,7 +218,8 @@ class CausalLink(BaseModel):
 
     from_event_id: str
     to_event_id: str
-    description: str                     # "OOM в payments вызван ростом запросов из api-gateway"
+    description: str                     # "OOM in payments caused by request surge from api-gateway"
+    description_ru: Optional[str] = None # перевод на русский (заполняется REDUCE)
     confidence: str                      # "low" | "medium" | "high"
 
 
@@ -224,20 +229,24 @@ class TimeGap(BaseModel):
     start: datetime
     end: datetime
     description: str
+    description_ru: Optional[str] = None # перевод на русский (заполняется REDUCE)
 
 
 class MergedAnalysis(BaseModel):
     """Результат REDUCE-фазы: объединённый анализ."""
 
     time_range: tuple[datetime, datetime]
-    narrative: str                       # связный нарратив всего инцидента
+    narrative: str                       # связный нарратив (English)
+    narrative_ru: Optional[str] = None   # перевод narrative на русский (заполняется REDUCE)
     events: list[Event]                  # дедуплицированный timeline
     causal_chains: list[CausalLink]      # причинно-следственные цепочки
     hypotheses: list[Hypothesis]         # уточнённые гипотезы
     anomalies: list[Anomaly]
     gaps: list[TimeGap]                  # дыры в данных
-    impact_summary: str                  # какие сервисы, как долго, масштаб
-    preliminary_recommendations: list[str] = Field(default_factory=list)  # из MAP-фазы
+    impact_summary: str                  # какие сервисы, как долго, масштаб (English)
+    impact_summary_ru: Optional[str] = None  # перевод impact_summary на русский (заполняется REDUCE)
+    preliminary_recommendations: list[str] = Field(default_factory=list)          # из MAP-фазы (English)
+    preliminary_recommendations_ru: list[str] = Field(default_factory=list)       # перевод на русский
 
     # Прикрепляются в конце REDUCE — НЕ проходят через LLM
     evidence_bank: list[Evidence] = Field(default_factory=list)

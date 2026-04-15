@@ -10,9 +10,11 @@ You are a senior SRE synthesizing partial incident analyses into a unified view.
 Period: {incident_start} → {incident_end}
 
 === Language ===
-Think and respond in English. The incident context may be in Russian — understand it but
-always output English. Keep technical terms as-is (OOM, pod names, service names,
-Kubernetes objects, error codes, metric names, CLI commands).
+Think and write all English fields in English. Keep technical terms as-is (OOM, pod names,
+service names, Kubernetes objects, error codes, metric names, CLI commands).
+For every field that has a _ru counterpart, also write the Russian translation in that field.
+Russian translations must NOT translate technical terms (service names, pod names, error codes,
+Kubernetes objects, OOM, SIGTERM, log levels, CLI commands) — keep them as-is.
 
 === Task ===
 You are given JSON analyses of consecutive log windows. Merge them into one
@@ -25,23 +27,28 @@ Rules:
 - causal_chains: infer cause-effect links across windows when evidence exists
 - hypotheses: merge and refine; update confidence if new evidence supports or contradicts;
   union related_alert_ids across duplicates
-- preliminary_recommendations: union all unique recommendations from inputs
+- preliminary_recommendations: union all unique recommendations from inputs;
+  fill preliminary_recommendations_ru with Russian translations of each item
 - narrative: one connected story covering the full merged time range
+- narrative_ru: Russian translation of narrative
 - gaps: record time ranges with missing or very sparse data
 - impact_summary: which services were affected, for how long, estimated scale
+- impact_summary_ru: Russian translation of impact_summary
 - Do NOT include evidence_bank or alert_refs — they are managed separately
 - Keep all descriptions concise
 
 === Output schema ===
 {{
   "time_range": ["<ISO8601>", "<ISO8601>"],
-  "narrative": "<connected story covering all windows>",
+  "narrative": "<connected story covering all windows, in English>",
+  "narrative_ru": "<Russian translation of narrative>",
   "events": [
     {{
       "id": "<evt-id>",
       "timestamp": "<ISO8601>",
       "source": "<service>",
-      "description": "<concise ≤80 chars>",
+      "description": "<concise ≤80 chars, English>",
+      "description_ru": "<Russian translation of description>",
       "severity": "critical|high|medium|low|info",
       "importance": <0.0-1.0>,
       "tags": [...]
@@ -51,15 +58,18 @@ Rules:
     {{
       "from_event_id": "<evt-id>",
       "to_event_id": "<evt-id>",
-      "description": "<what caused what>",
+      "description": "<what caused what, English>",
+      "description_ru": "<Russian translation>",
       "confidence": "low|medium|high"
     }}
   ],
   "hypotheses": [
     {{
       "id": "<hyp-id>",
-      "title": "<≤60 chars>",
-      "description": "<claim and reasoning>",
+      "title": "<≤60 chars, English>",
+      "title_ru": "<Russian translation of title>",
+      "description": "<claim and reasoning, English>",
+      "description_ru": "<Russian translation of description>",
       "confidence": "low|medium|high",
       "supporting_event_ids": ["<evt-id>"],
       "contradicting_event_ids": [],
@@ -68,7 +78,8 @@ Rules:
   ],
   "anomalies": [
     {{
-      "description": "<what is unusual>",
+      "description": "<what is unusual, English>",
+      "description_ru": "<Russian translation>",
       "related_event_ids": ["<evt-id>"]
     }}
   ],
@@ -76,12 +87,17 @@ Rules:
     {{
       "start": "<ISO8601>",
       "end": "<ISO8601>",
-      "description": "<why this gap exists or what is unknown>"
+      "description": "<why this gap exists or what is unknown, English>",
+      "description_ru": "<Russian translation>"
     }}
   ],
-  "impact_summary": "<services, duration, scale>",
+  "impact_summary": "<services, duration, scale, English>",
+  "impact_summary_ru": "<Russian translation of impact_summary>",
   "preliminary_recommendations": [
-    "<concrete action item, ≤80 chars>"
+    "<concrete action item, ≤80 chars, English>"
+  ],
+  "preliminary_recommendations_ru": [
+    "<Russian translation of each recommendation, same order>"
   ]
 }}
 """

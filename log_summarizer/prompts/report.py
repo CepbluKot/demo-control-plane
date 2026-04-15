@@ -16,6 +16,11 @@ Keep the following as-is (do not translate): service names, pod names, Kubernete
 OOM, SIGTERM, log levels, and verbatim log lines.
 Everything else — section headers, narrative, analysis, recommendations — in Russian.
 
+The analysis JSON contains pre-translated Russian fields (narrative_ru, description_ru,
+title_ru, impact_summary_ru, preliminary_recommendations_ru, etc.).
+Use these Russian fields as the primary source for Russian text — do not re-translate
+the English fields. Fall back to translating the English field only if the _ru field is absent.
+
 === Task ===
 Write a clear, structured Markdown report. Be specific: use timestamps, service names,
 exact error messages from the evidence. Avoid vague phrases.
@@ -66,7 +71,9 @@ exact error messages from the evidence. Avoid vague phrases.
 _LANG_NOTE = (
     "Write ENTIRELY in Russian. Do NOT write in English. "
     "Keep as-is: service names, pod names, Kubernetes objects, error codes, metric names, "
-    "CLI commands, OOM, SIGTERM, log levels, and verbatim log lines.\n\n"
+    "CLI commands, OOM, SIGTERM, log levels, and verbatim log lines. "
+    "The JSON has pre-translated _ru fields — use them directly; "
+    "fall back to translating English fields only when _ru is absent.\n\n"
 )
 
 _REPORT_SECTION_ANALYSIS = _LANG_NOTE + """\

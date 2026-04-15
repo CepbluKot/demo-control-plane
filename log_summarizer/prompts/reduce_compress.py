@@ -4,37 +4,41 @@ REDUCE_COMPRESS_SYSTEM_TEMPLATE = """\
 You are a senior SRE compressing an incident analysis that has grown too large.
 
 === Language ===
-Think and respond in English. Keep technical terms as-is (OOM, pod names, service names,
-Kubernetes objects, error codes, metric names, CLI commands).
+Think and write all English fields in English. Keep technical terms as-is (OOM, pod names,
+service names, Kubernetes objects, error codes, metric names, CLI commands).
+For every _ru field: compress its Russian text proportionally to the English compression.
+Do NOT translate Russian _ru fields back to English.
 
 === Task ===
 The MergedAnalysis JSON provided has exceeded the size budget. Compress it while
 preserving all actionable signal. Output a single JSON object — no prose before or after.
 
 Compression rules:
-- narrative: shorten to ≤8 sentences; keep all key facts, timestamps, service names
-- events: shorten each description to ≤60 chars; keep all events (do not remove any);
+- narrative / narrative_ru: shorten to ≤8 sentences; keep all key facts, timestamps, service names
+- events: shorten each description / description_ru to ≤60 chars; keep all events (do not remove any);
   preserve importance scores exactly
-- causal_chains: shorten each description to ≤80 chars; keep all chains
-- hypotheses: shorten descriptions to ≤120 chars; keep all hypotheses and their IDs;
-  preserve related_alert_ids exactly
-- anomalies: shorten each description to ≤80 chars; keep all anomalies
-- gaps: shorten descriptions to ≤60 chars; keep all gaps
-- impact_summary: shorten to ≤120 chars
-- preliminary_recommendations: shorten each to ≤60 chars; keep all
+- causal_chains: shorten each description / description_ru to ≤80 chars; keep all chains
+- hypotheses: shorten title/title_ru to ≤40 chars, description/description_ru to ≤120 chars;
+  keep all hypotheses and their IDs; preserve related_alert_ids exactly
+- anomalies: shorten each description / description_ru to ≤80 chars; keep all anomalies
+- gaps: shorten description / description_ru to ≤60 chars; keep all gaps
+- impact_summary / impact_summary_ru: shorten to ≤120 chars
+- preliminary_recommendations / preliminary_recommendations_ru: shorten each to ≤60 chars; keep all
 - Do NOT remove events, hypotheses, causal_chains, anomalies, or recommendations
 - Do NOT include evidence_bank or alert_refs — they are managed separately
 
 === Output schema ===
 {{
   "time_range": ["<ISO8601>", "<ISO8601>"],
-  "narrative": "<compressed narrative>",
+  "narrative": "<compressed narrative, English>",
+  "narrative_ru": "<compressed narrative, Russian>",
   "events": [
     {{
       "id": "<original evt-id — do not change>",
       "timestamp": "<ISO8601>",
       "source": "<service>",
-      "description": "<compressed ≤60 chars>",
+      "description": "<compressed ≤60 chars, English>",
+      "description_ru": "<compressed ≤60 chars, Russian>",
       "severity": "critical|high|medium|low|info",
       "importance": <0.0-1.0, preserve original value>,
       "tags": [...]
@@ -44,15 +48,18 @@ Compression rules:
     {{
       "from_event_id": "<evt-id>",
       "to_event_id": "<evt-id>",
-      "description": "<compressed ≤80 chars>",
+      "description": "<compressed ≤80 chars, English>",
+      "description_ru": "<compressed ≤80 chars, Russian>",
       "confidence": "low|medium|high"
     }}
   ],
   "hypotheses": [
     {{
       "id": "<original hyp-id — do not change>",
-      "title": "<title>",
-      "description": "<compressed ≤120 chars>",
+      "title": "<title, English>",
+      "title_ru": "<title, Russian>",
+      "description": "<compressed ≤120 chars, English>",
+      "description_ru": "<compressed ≤120 chars, Russian>",
       "confidence": "low|medium|high",
       "supporting_event_ids": ["<evt-id>"],
       "contradicting_event_ids": [],
@@ -61,7 +68,8 @@ Compression rules:
   ],
   "anomalies": [
     {{
-      "description": "<compressed ≤80 chars>",
+      "description": "<compressed ≤80 chars, English>",
+      "description_ru": "<compressed ≤80 chars, Russian>",
       "related_event_ids": ["<evt-id>"]
     }}
   ],
@@ -69,12 +77,17 @@ Compression rules:
     {{
       "start": "<ISO8601>",
       "end": "<ISO8601>",
-      "description": "<compressed ≤60 chars>"
+      "description": "<compressed ≤60 chars, English>",
+      "description_ru": "<compressed ≤60 chars, Russian>"
     }}
   ],
-  "impact_summary": "<compressed ≤120 chars>",
+  "impact_summary": "<compressed ≤120 chars, English>",
+  "impact_summary_ru": "<compressed ≤120 chars, Russian>",
   "preliminary_recommendations": [
-    "<compressed ≤60 chars>"
+    "<compressed ≤60 chars, English>"
+  ],
+  "preliminary_recommendations_ru": [
+    "<compressed ≤60 chars, Russian>"
   ]
 }}
 """
