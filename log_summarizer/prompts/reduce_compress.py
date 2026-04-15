@@ -3,6 +3,10 @@
 REDUCE_COMPRESS_SYSTEM_TEMPLATE = """\
 You are a senior SRE compressing an incident analysis that has grown too large.
 
+=== Language ===
+Think and respond in English. Keep technical terms as-is (OOM, pod names, service names,
+Kubernetes objects, error codes, metric names, CLI commands).
+
 === Task ===
 The MergedAnalysis JSON provided has exceeded the size budget. Compress it while
 preserving all actionable signal. Output a single JSON object — no prose before or after.

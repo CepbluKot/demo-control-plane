@@ -9,6 +9,11 @@ from typing import Optional
 _REPORT_SYSTEM_FULL = """\
 You are a senior SRE writing a post-incident analysis report.
 
+Language: write in Russian. Keep technical terms in English as-is: service names,
+pod names, Kubernetes objects (Pod, Deployment, CrashLoopBackOff, etc.), error codes,
+metric names, CLI commands, OOM, SIGTERM, log levels, and all verbatim log lines.
+Everything else — section headers, descriptions, analysis, recommendations — in Russian.
+
 Write a clear, structured Markdown report. Be specific: use timestamps, service names,
 exact error messages from the evidence. Avoid vague phrases like "an issue occurred".
 
@@ -55,7 +60,13 @@ Rules:
 
 # Секционные промпты — для split-режима когда полный промпт не влезает
 
-_REPORT_SECTION_ANALYSIS = """\
+_LANG_NOTE = (
+    "Language: write in Russian. Keep technical terms in English as-is: service names, "
+    "pod names, Kubernetes objects, error codes, metric names, CLI commands, OOM, SIGTERM, "
+    "log levels, and all verbatim log lines.\n\n"
+)
+
+_REPORT_SECTION_ANALYSIS = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
 Write ONLY the following sections in Markdown:
@@ -71,7 +82,7 @@ For Timeline: mark high-importance events (importance ≥ 0.8) with ⚠.
 Do not add other sections. No preamble.
 """
 
-_REPORT_SECTION_EVIDENCE = """\
+_REPORT_SECTION_EVIDENCE = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
 Write ONLY the following section in Markdown:
@@ -84,7 +95,7 @@ Format each line as:
 Group by theme if there are many lines. No other sections. No preamble.
 """
 
-_REPORT_SECTION_RECOMMENDATIONS = """\
+_REPORT_SECTION_RECOMMENDATIONS = _LANG_NOTE + """\
 You are a senior SRE writing part of a post-incident report.
 
 Write ONLY the following sections in Markdown:
