@@ -205,14 +205,17 @@ class TreeReducer:
             )
             return result
         except ContextOverflowError:
+            if len(group) <= 2:
+                # Сжимаем по одному элементу и пробуем merge после каждого.
+                # Программный fallback только если даже после сжатия всех не влезло.
+                logger.warning(
+                    "ContextOverflow on pair — trying compression before programmatic fallback"
+                )
+                return await self._compress_and_merge(group)
             logger.warning(
                 "ContextOverflow in merge group of %d — splitting pair-wise",
                 len(group),
             )
-            if len(group) <= 2:
-                # Fallback: программный merge без LLM
-                return self._programmatic_merge(group)
-            # Рекурсивно сворачиваем попарно
             mid = len(group) // 2
             left = await self._merge_group(group[:mid], round_num)
             right = await self._merge_group(group[mid:], round_num)
@@ -284,6 +287,41 @@ class TreeReducer:
         except ContextOverflowError:
             logger.error("ContextOverflow during compression — returning uncompressed")
             return analysis
+
+    async def _compress_and_merge(self, group: list[_Item]) -> MergedAnalysis:
+        """Сжимаем элементы по одному и пробуем merge после каждого сжатия.
+
+        Алгоритм:
+          1. Конвертируем всё в MergedAnalysis (BatchAnalysis → via _batch_to_merged).
+          2. Сжимаем items[0], пробуем merge.
+          3. Если overflow — сжимаем items[1], пробуем ещё раз.
+          4. Если и после сжатия обоих overflow — программный fallback.
+        """
+        items: list[MergedAnalysis] = [
+            item if isinstance(item, MergedAnalysis) else self._batch_to_merged(item)
+            for item in group
+        ]
+
+        for i in range(len(items)):
+            items[i] = await self._compress(items[i])
+            try:
+                result: MergedAnalysis = await self.llm.call_json(
+                    system=self._build_merge_system(),
+                    user=self._build_merge_user(items),
+                    response_model=MergedAnalysis,
+                    temperature=self.config.temperature_reduce,
+                )
+                logger.debug("Merge succeeded after compressing %d/%d items", i + 1, len(items))
+                return result
+            except ContextOverflowError:
+                if i < len(items) - 1:
+                    logger.warning(
+                        "Still overflow after compressing item %d/%d — compressing next",
+                        i + 1, len(items),
+                    )
+
+        logger.error("ContextOverflow even after compressing all items — falling back to programmatic merge")
+        return self._programmatic_merge(items)
 
     # ── Evidence bank ─────────────────────────────────────────────────
 

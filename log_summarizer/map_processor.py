@@ -2,13 +2,12 @@
 
 Каждый чанк → один LLM-вызов → BatchAnalysis.
 При ContextOverflowError чанк делится пополам рекурсивно.
-Результаты двух половин сливаются программно (без LLM).
+Оба результата возвращаются отдельно — REDUCE-фаза свяжет их через LLM.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -16,12 +15,8 @@ from log_summarizer.chunker import Chunker
 from log_summarizer.config import PipelineConfig
 from log_summarizer.llm_client import ContextOverflowError, LLMClient
 from log_summarizer.models import (
-    Anomaly,
     BatchAnalysis,
     Chunk,
-    Evidence,
-    Event,
-    Hypothesis,
     MetricRow,
 )
 from log_summarizer.prompts.map_system import MAP_SYSTEM_TEMPLATE
@@ -62,23 +57,27 @@ class MapProcessor:
     ) -> list[BatchAnalysis]:
         """Параллельная обработка всех чанков с ограничением конкурентности.
 
+        При split чанка возвращаются два отдельных BatchAnalysis — их смержит
+        REDUCE-фаза через LLM, а не программно здесь.
+
         Args:
             chunks: Нарезанные батчи логов.
             metrics: Опциональные метрики за весь период.
 
         Returns:
-            BatchAnalysis для каждого чанка в том же порядке.
+            Плоский список BatchAnalysis (может быть больше len(chunks) при split).
         """
         semaphore = asyncio.Semaphore(self.config.map_concurrency)
 
-        async def _bounded(chunk: Chunk, idx: int) -> BatchAnalysis:
+        async def _bounded(chunk: Chunk, idx: int) -> list[BatchAnalysis]:
             async with semaphore:
                 return await self.process_chunk(chunk, metrics=metrics, chunk_id=idx)
 
         tasks = [_bounded(chunk, i) for i, chunk in enumerate(chunks)]
-        results = await asyncio.gather(*tasks)
-        logger.info("MAP phase complete: %d chunks processed", len(results))
-        return list(results)
+        nested = await asyncio.gather(*tasks)
+        results = [item for sublist in nested for item in sublist]
+        logger.info("MAP phase complete: %d chunks → %d results", len(chunks), len(results))
+        return results
 
     async def process_chunk(
         self,
@@ -86,8 +85,11 @@ class MapProcessor:
         metrics: Optional[list[MetricRow]] = None,
         chunk_id: int = 0,
         _depth: int = 0,
-    ) -> BatchAnalysis:
+    ) -> list[BatchAnalysis]:
         """Обрабатывает один чанк. При ContextOverflowError делит пополам.
+
+        Возвращает список: обычно из одного элемента, при split — два отдельных
+        BatchAnalysis, которые REDUCE-фаза потом свяжет через LLM.
 
         Args:
             chunk: Батч логов.
@@ -101,7 +103,7 @@ class MapProcessor:
                 self.config.max_split_depth,
                 chunk_id,
             )
-            return self._empty_analysis(chunk)
+            return [self._empty_analysis(chunk)]
 
         log_budget = int(self.config.max_context_tokens * 0.55)
         system = self._build_system_prompt()
@@ -120,7 +122,7 @@ class MapProcessor:
             )
             logger.debug("Chunk %d → %d events, %d evidence", chunk_id, len(result.events), len(result.evidence))
             self._save_chunk_result(chunk_id, result)
-            return result
+            return [result]
         except ContextOverflowError:
             if len(chunk.rows) <= self.config.min_batch_lines:
                 logger.warning(
@@ -128,7 +130,7 @@ class MapProcessor:
                     chunk_id,
                     len(chunk.rows),
                 )
-                return self._empty_analysis(chunk)
+                return [self._empty_analysis(chunk)]
 
             logger.warning(
                 "Chunk %d context overflow (%d rows) — splitting in half (depth=%d)",
@@ -141,7 +143,8 @@ class MapProcessor:
                 self.process_chunk(left_chunk, metrics=metrics, chunk_id=chunk_id * 10, _depth=_depth + 1),
                 self.process_chunk(right_chunk, metrics=metrics, chunk_id=chunk_id * 10 + 1, _depth=_depth + 1),
             )
-            return self._merge_halves(left, right)
+            # Оба результата идут в REDUCE как отдельные элементы — LLM их смержит
+            return left + right
 
     # ── Вспомогательные ───────────────────────────────────────────────
 
@@ -160,55 +163,6 @@ class MapProcessor:
             incident_context=self.config.incident_context or "No additional context provided.",
             incident_start=start,
             incident_end=end,
-        )
-
-    @staticmethod
-    def _merge_halves(left: BatchAnalysis, right: BatchAnalysis) -> BatchAnalysis:
-        """Программно сливает два BatchAnalysis в один (без LLM).
-
-        Объединяет события, evidence и гипотезы; дедуплицирует по id.
-        """
-        # time_range: берём минимум/максимум
-        all_ts = [left.time_range[0], left.time_range[1], right.time_range[0], right.time_range[1]]
-        merged_range = (min(all_ts), max(all_ts))
-
-        # События: дедуп по id (левый имеет приоритет)
-        events: dict[str, Event] = {}
-        for ev in (*left.events, *right.events):
-            events.setdefault(ev.id, ev)
-
-        # Evidence: дедуп по raw_line
-        evidence: dict[str, Evidence] = {}
-        for e in (*left.evidence, *right.evidence):
-            evidence.setdefault(e.raw_line, e)
-
-        # Гипотезы: дедуп по id
-        hypotheses: dict[str, Hypothesis] = {}
-        for h in (*left.hypotheses, *right.hypotheses):
-            hypotheses.setdefault(h.id, h)
-
-        # Аномалии: дедуп по description
-        anomalies: dict[str, Anomaly] = {}
-        for a in (*left.anomalies, *right.anomalies):
-            anomalies.setdefault(a.description, a)
-
-        # Нарратив: объединяем
-        narratives = [n for n in (left.narrative, right.narrative) if n.strip()]
-        narrative = " ".join(narratives)
-
-        # Метрики и качество данных
-        metrics_parts = [m for m in (left.metrics_context, right.metrics_context) if m]
-        quality_parts = [q for q in (left.data_quality, right.data_quality) if q]
-
-        return BatchAnalysis(
-            time_range=merged_range,
-            narrative=narrative,
-            events=list(events.values()),
-            evidence=list(evidence.values()),
-            hypotheses=list(hypotheses.values()),
-            anomalies=list(anomalies.values()),
-            metrics_context="; ".join(metrics_parts) if metrics_parts else None,
-            data_quality="; ".join(quality_parts) if quality_parts else None,
         )
 
     def _save_chunk_result(self, chunk_id: int, result: BatchAnalysis) -> None:
