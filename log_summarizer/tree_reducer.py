@@ -179,9 +179,91 @@ class TreeReducer:
         self._run_dir.mkdir(parents=True, exist_ok=True)
         fname = name or f"round_{round_num:02d}_group_{group_idx:02d}"
         path = self._run_dir / f"{fname}.json"
-        # Сохраняем без evidence_bank (он большой и хранится отдельно)
         path.write_text(result.to_json_str(), encoding="utf-8")
         logger.info("REDUCE %s saved → %s", fname, path)
+
+    def _save_merge_report(
+        self,
+        round_num: int,
+        group_idx: int,
+        group: list[_Item],
+        result: MergedAnalysis,
+    ) -> None:
+        """Сохраняет читаемый отчёт: входы → результат одного merge-шага."""
+        if self._run_dir is None:
+            return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+
+        sep  = "═" * 68
+        sep2 = "─" * 68
+        lines: list[str] = [
+            sep,
+            f"MERGE  round={round_num}  group={group_idx}  ({len(group)} inputs → 1 result)",
+            sep,
+        ]
+
+        for i, item in enumerate(group, 1):
+            t0 = item.time_range[0].strftime("%H:%M:%S")
+            t1 = item.time_range[1].strftime("%H:%M:%S")
+            events     = item.events
+            hypotheses = item.hypotheses
+            narrative  = item.narrative
+
+            sev_counts: dict[str, int] = {}
+            for e in events:
+                sev_counts[e.severity.value] = sev_counts.get(e.severity.value, 0) + 1
+            sev_str = "  ".join(f"{k}={v}" for k, v in sorted(sev_counts.items()))
+
+            conf_counts: dict[str, int] = {}
+            for h in hypotheses:
+                conf_counts[h.confidence] = conf_counts.get(h.confidence, 0) + 1
+            conf_str = "  ".join(f"{k}×{v}" for k, v in sorted(conf_counts.items()))
+
+            kind = "BatchAnalysis" if isinstance(item, BatchAnalysis) else "MergedAnalysis"
+            causal_str = ""
+            if isinstance(item, MergedAnalysis) and item.causal_chains:
+                causal_str = f"  causal={len(item.causal_chains)}"
+
+            # Сохраняем входной JSON
+            in_path = self._run_dir / f"round_{round_num:02d}_group_{group_idx:02d}_in_{i}.json"
+            in_path.write_text(item.to_json_str(), encoding="utf-8")
+
+            lines += [
+                "",
+                f"── INPUT {i}  [{t0} → {t1}]  {kind}  {sep2[len(f'── INPUT {i}  [{t0} → {t1}]  {kind}  '):]}" ,
+                f"   events     : {len(events)}   {sev_str}",
+                f"   hypotheses : {len(hypotheses)}   {conf_str}{causal_str}",
+                f"   narrative  : {narrative[:200].strip()}",
+                f"   → {in_path}",
+            ]
+
+        # Результат
+        t0r = result.time_range[0].strftime("%H:%M:%S")
+        t1r = result.time_range[1].strftime("%H:%M:%S")
+        sev_r: dict[str, int] = {}
+        for e in result.events:
+            sev_r[e.severity.value] = sev_r.get(e.severity.value, 0) + 1
+        conf_r: dict[str, int] = {}
+        for h in result.hypotheses:
+            conf_r[h.confidence] = conf_r.get(h.confidence, 0) + 1
+
+        result_path = self._run_dir / f"round_{round_num:02d}_group_{group_idx:02d}.json"
+        lines += [
+            "",
+            f"── RESULT   [{t0r} → {t1r}]  MergedAnalysis  {sep2[len(f'── RESULT   [{t0r} → {t1r}]  MergedAnalysis  '):]}" ,
+            f"   events     : {len(result.events)}   {'  '.join(f'{k}={v}' for k, v in sorted(sev_r.items()))}",
+            f"   causal     : {len(result.causal_chains)}",
+            f"   hypotheses : {len(result.hypotheses)}   {'  '.join(f'{k}×{v}' for k, v in sorted(conf_r.items()))}",
+            f"   gaps       : {len(result.gaps)}",
+            f"   narrative  : {result.narrative[:200].strip()}",
+            f"   → {result_path}",
+            "",
+            sep,
+        ]
+
+        report_path = self._run_dir / f"round_{round_num:02d}_group_{group_idx:02d}_merge.txt"
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info("Merge report → %s", report_path)
 
     async def _merge_group(
         self,
@@ -209,6 +291,7 @@ class TreeReducer:
                 len(group),
                 len(result.events),
             )
+            self._save_merge_report(round_num, group_idx, group, result)
             return result
         except ContextOverflowError:
             if len(group) <= 2:
