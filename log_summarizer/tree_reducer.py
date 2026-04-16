@@ -285,11 +285,14 @@ class TreeReducer:
                 response_model=MergedAnalysis,
                 temperature=self.config.temperature_reduce,
             )
+            # zones_covered: union of all input zones — set programmatically, not by LLM
+            result = result.model_copy(update={"zones_covered": self._merge_zones(group)})
             logger.debug(
-                "Round %d merge: %d items → %d events",
+                "Round %d merge: %d items → %d events, zones=%s",
                 round_num,
                 len(group),
                 len(result.events),
+                result.zones_covered,
             )
             self._save_merge_report(round_num, group_idx, group, result)
             return result
@@ -454,31 +457,50 @@ class TreeReducer:
     # ── Промпты ───────────────────────────────────────────────────────
 
     def _build_merge_system(self) -> str:
-        start = (
-            self.config.incident_start.isoformat()
-            if self.config.incident_start
-            else "unknown"
-        )
-        end = (
-            self.config.incident_end.isoformat()
-            if self.config.incident_end
-            else "unknown"
-        )
+        inc_start = self.config.incident_start_iso() or "unknown"
+        inc_end = self.config.incident_end_iso() or "unknown"
+
+        if self.config.has_context_window():
+            ctx_start = self.config.context_start_iso() or inc_start
+            ctx_end = self.config.context_end_iso() or inc_end
+            context_note = (
+                f"Context window (logs loaded): {ctx_start} → {ctx_end}\n"
+                "Events may come from context_before / incident / context_after zones.\n"
+            )
+        else:
+            context_note = ""
+
         return REDUCE_MERGE_SYSTEM_TEMPLATE.format(
             incident_context=self.config.incident_context or "No additional context provided.",
-            incident_start=start,
-            incident_end=end,
+            incident_start=inc_start,
+            incident_end=inc_end,
+            context_note=context_note,
         )
 
     @staticmethod
     def _build_merge_user(group: list[_Item]) -> str:
-        """Форматируем user-промпт: список JSON-объектов для merge."""
-        parts = [
-            f"Merge the following {len(group)} analyses into one MergedAnalysis.\n"
-        ]
+        """Форматируем user-промпт: список JSON-объектов для merge.
+
+        Включает зоны текущей группы и предупреждение о кросс-зональном merge.
+        """
+        zones = TreeReducer._merge_zones(group)
+        is_cross_zone = "context_before" in zones and "incident" in zones
+
+        parts = [f"Merge the following {len(group)} analyses into one MergedAnalysis.\n"]
+
+        parts.append(f"Zones covered by this group: {', '.join(zones)}")
+        if is_cross_zone:
+            parts.append(
+                "⚠ This group SPANS zone boundaries — actively search for cross-zone "
+                "causal_chains where a context_before event caused or preceded an incident "
+                "event. These are the most valuable links: build them explicitly."
+            )
+        parts.append("")
+
         for i, item in enumerate(group, 1):
             item_json = TreeReducer._item_to_json(item)
-            parts.append(f"### Analysis {i}")
+            item_zones = TreeReducer._zones_of(item)
+            parts.append(f"### Analysis {i}  [zones: {', '.join(item_zones)}]")
             parts.append("```json")
             parts.append(item_json)
             parts.append("```")
@@ -496,6 +518,13 @@ class TreeReducer:
     @staticmethod
     def _batch_to_merged(batch: BatchAnalysis) -> MergedAnalysis:
         """Конвертируем одиночный BatchAnalysis в MergedAnalysis."""
+        # Раскрываем batch_zone в список зон
+        bz = batch.batch_zone
+        if bz == "mixed":
+            zones: list[str] = ["context_before", "incident", "context_after"]
+        else:
+            zones = [bz]
+
         return MergedAnalysis(
             time_range=batch.time_range,
             narrative=batch.narrative,
@@ -506,9 +535,27 @@ class TreeReducer:
             gaps=[],
             impact_summary=batch.metrics_context or "",
             preliminary_recommendations=batch.preliminary_recommendations,
+            zones_covered=zones,
             evidence_bank=batch.evidence,
             alert_refs=[],  # управляются отдельно
         )
+
+    @staticmethod
+    def _zones_of(item: _Item) -> list[str]:
+        """Возвращает список зон из BatchAnalysis или MergedAnalysis."""
+        if isinstance(item, BatchAnalysis):
+            bz = item.batch_zone
+            return ["context_before", "incident", "context_after"] if bz == "mixed" else [bz]
+        return list(item.zones_covered)
+
+    @staticmethod
+    def _merge_zones(group: list[_Item]) -> list[str]:
+        """Union всех зон группы в уникальный отсортированный список."""
+        order = {"context_before": 0, "incident": 1, "context_after": 2}
+        seen: set[str] = set()
+        for item in group:
+            seen.update(TreeReducer._zones_of(item))
+        return sorted(seen, key=lambda z: order.get(z, 9))
 
     @staticmethod
     def _programmatic_merge(group: list[_Item]) -> MergedAnalysis:
@@ -572,5 +619,6 @@ class TreeReducer:
             gaps=all_gaps,
             impact_summary="; ".join(impacts),
             preliminary_recommendations=all_recs,
+            zones_covered=TreeReducer._merge_zones(group),
             alert_refs=[],  # управляются отдельно
         )

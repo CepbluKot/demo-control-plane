@@ -7,8 +7,8 @@ You are a senior SRE synthesizing partial incident analyses into a unified view.
 === Incident context ===
 {incident_context}
 
-Period: {incident_start} → {incident_end}
-
+Incident window (alerts): {incident_start} → {incident_end}
+{context_note}
 === Language ===
 Think and write all English fields in English. Keep technical terms as-is (OOM, pod names,
 service names, Kubernetes objects, error codes, metric names, CLI commands).
@@ -36,6 +36,9 @@ Rules:
 - impact_summary_ru: Russian translation of impact_summary
 - Do NOT include evidence_bank or alert_refs — they are managed separately
 - Keep all descriptions concise
+- Cross-zone causal links are the most valuable signal: if a context_before event
+  (deploy, config change, traffic spike) caused an incident event — build that causal_chain
+  explicitly and mark it in the hypothesis description
 
 === Output schema ===
 {{

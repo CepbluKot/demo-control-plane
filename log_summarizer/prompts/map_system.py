@@ -1,6 +1,7 @@
 """Системный промпт для MAP-фазы."""
 
-# {incident_context}, {incident_start}, {incident_end}, {alerts_section} подставляются при вызове
+# {incident_context}, {incident_start}, {incident_end}, {alerts_section}, {zone_section}
+# подставляются при вызове
 MAP_SYSTEM_TEMPLATE = """\
 You are a senior SRE analyzing a production log batch during an active incident.
 
@@ -8,7 +9,7 @@ You are a senior SRE analyzing a production log batch during an active incident.
 {incident_context}
 
 Period under investigation: {incident_start} → {incident_end}
-{alerts_section}
+{alerts_section}{zone_section}
 === Language ===
 Think and respond in English. The incident context may be in Russian — understand it but
 always output English. Keep technical terms as-is (OOM, pod names, service names,
@@ -83,6 +84,45 @@ Output a single JSON object — no prose before or after.
 - preliminary_recommendations: only if a specific fix is visible in THIS batch (e.g. "increase heap to 4Gi"); omit if nothing concrete
 - narrative: plain prose, specific times and names, no bullet points
 - Keep all string values concise; do not pad with filler text
+"""
+
+
+def format_zone_section(
+    context_start: str,
+    context_end: str,
+    incident_start: str,
+    incident_end: str,
+) -> str:
+    """Секция с инструкциями по зонам для подстановки в MAP_SYSTEM_TEMPLATE.
+
+    Возвращает пустую строку если context == incident (режим без контекста).
+    """
+    if context_start == incident_start and context_end == incident_end:
+        return ""
+    return f"""\
+=== Context & Incident zones ===
+Logs are loaded for the wider context window: {context_start} → {context_end}
+Alerts and symptoms are within the incident window: {incident_start} → {incident_end}
+
+Each log line in mixed batches is prefixed:
+  [CB]  = context_before — before incident window
+  [INC] = incident       — within incident window
+  [CA]  = context_after  — after incident window
+
+Zone-specific guidance:
+- [CB] events that may explain the incident: deploys, config changes, traffic spikes,
+  resource exhaustion beginning, feature flag toggles, scheduled jobs — assign HIGH
+  importance and try to link them to [INC] events via causal_chains.
+- [CB] routine events (healthcheck OK, normal requests) — LOW importance, treat as noise.
+- [INC] events — standard importance based on relevance to alerts; fill alert_refs.
+- [CA] events — recovery actions or cascading failures; moderate importance.
+- Root cause is often in [CB]; symptoms are in [INC].
+- In mixed batches: build causal_chains across zones when you have event IDs for both ends.
+- In pure [INC] or pure [CB] batches: cross-zone causal_chains cannot be built here (the
+  other zone's events are absent); they will be inferred at REDUCE when batches are combined.
+  You may still note a suspected cross-zone root cause in a hypothesis description.
+- Hypotheses about root cause MAY reference context_before causes in text even if not in batch.
+
 """
 
 

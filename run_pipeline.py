@@ -172,8 +172,15 @@ INCIDENTS = [
                 "severity": "high",
             },
         ],
-        "start": datetime(2026, 3, 18, 2, 0, 0, tzinfo=timezone.utc),
-        "end":   datetime(2026, 3, 18, 3, 0, 0, tzinfo=timezone.utc),
+        # Узкое окно: когда наблюдались проблемы и сработали алерты.
+        # Алерты должны попасть ВНУТРЬ этого окна.
+        "incident_start": datetime(2026, 3, 18, 2, 5, 0, tzinfo=timezone.utc),
+        "incident_end":   datetime(2026, 3, 18, 2, 45, 0, tzinfo=timezone.utc),
+
+        # Широкое окно: откуда грузить логи (контекст вокруг инцидента).
+        # По умолчанию ±1 час от incident window. Можно убрать — тогда == incident.
+        "context_start": datetime(2026, 3, 18, 1, 0, 0, tzinfo=timezone.utc),
+        "context_end":   datetime(2026, 3, 18, 4, 0, 0, tzinfo=timezone.utc),
     },
     # Пример второго инцидента — раскомментируй и заполни:
     # {
@@ -226,12 +233,21 @@ async def run_incident(ch, incident: dict) -> tuple[str, str | Exception]:
     log  = logging.getLogger(f"run_pipeline.{name}")
     log.info("=== START: %s  [%s → %s] ===", name, incident["start"], incident["end"])
 
+    # Поддержка обоих форматов: новый (incident_start/context_start)
+    # и старый (start/end) для обратной совместимости
+    inc_start = incident.get("incident_start") or incident.get("start")
+    inc_end   = incident.get("incident_end")   or incident.get("end")
+    ctx_start = incident.get("context_start")
+    ctx_end   = incident.get("context_end")
+
     config = PipelineConfig(
         logs_sql_template=LOGS_SQL.strip(),
         metrics_sql_template=METRICS_SQL.strip() or None,
         incident_context=incident["context"].strip(),
-        incident_start=incident["start"],
-        incident_end=incident["end"],
+        incident_start=inc_start,
+        incident_end=inc_end,
+        context_start=ctx_start,
+        context_end=ctx_end,
         alerts=make_alerts(incident.get("alerts", [])),
         model=MODEL,
         api_base=API_BASE,

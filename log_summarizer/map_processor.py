@@ -19,7 +19,11 @@ from log_summarizer.models import (
     Chunk,
     MetricRow,
 )
-from log_summarizer.prompts.map_system import MAP_SYSTEM_TEMPLATE, format_alerts_section
+from log_summarizer.prompts.map_system import (
+    MAP_SYSTEM_TEMPLATE,
+    format_alerts_section,
+    format_zone_section,
+)
 from log_summarizer.prompts.map_user import format_map_user_prompt
 from log_summarizer.utils.logging import get_logger
 from log_summarizer.utils.tokens import estimate_tokens
@@ -111,6 +115,8 @@ class MapProcessor:
             chunk,
             metrics=metrics,
             log_budget_tokens=log_budget,
+            incident_start=self.config.incident_start_iso(),
+            incident_end=self.config.incident_end_iso(),
         )
 
         try:
@@ -120,7 +126,12 @@ class MapProcessor:
                 response_model=BatchAnalysis,
                 temperature=self.config.temperature_map,
             )
-            logger.debug("Chunk %d → %d events, %d evidence", chunk_id, len(result.events), len(result.evidence))
+            # batch_zone проставляем программно — не доверяем LLM
+            result = result.model_copy(update={"batch_zone": chunk.batch_zone})
+            logger.debug(
+                "Chunk %d [%s] → %d events, %d evidence",
+                chunk_id, chunk.batch_zone, len(result.events), len(result.evidence),
+            )
             self._save_chunk_result(chunk_id, result)
             return [result]
         except ContextOverflowError:
@@ -149,21 +160,16 @@ class MapProcessor:
     # ── Вспомогательные ───────────────────────────────────────────────
 
     def _build_system_prompt(self) -> str:
-        start = (
-            self.config.incident_start.isoformat()
-            if self.config.incident_start
-            else "unknown"
-        )
-        end = (
-            self.config.incident_end.isoformat()
-            if self.config.incident_end
-            else "unknown"
-        )
+        inc_start = self.config.incident_start_iso() or "unknown"
+        inc_end = self.config.incident_end_iso() or "unknown"
+        ctx_start = self.config.context_start_iso() or inc_start
+        ctx_end = self.config.context_end_iso() or inc_end
         return MAP_SYSTEM_TEMPLATE.format(
             incident_context=self.config.incident_context or "No additional context provided.",
-            incident_start=start,
-            incident_end=end,
+            incident_start=inc_start,
+            incident_end=inc_end,
             alerts_section=format_alerts_section(self.config.alerts),
+            zone_section=format_zone_section(ctx_start, ctx_end, inc_start, inc_end),
         )
 
     def _save_chunk_result(self, chunk_id: int, result: BatchAnalysis) -> None:

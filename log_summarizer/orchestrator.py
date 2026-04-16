@@ -30,6 +30,7 @@ from log_summarizer.config import PipelineConfig
 from log_summarizer.data_loader import DataLoader
 from log_summarizer.llm_client import LLMClient
 from log_summarizer.map_processor import MapProcessor
+from log_summarizer.markdown_renderer import MarkdownRenderer
 from log_summarizer.models import BatchAnalysis, Chunk, MergedAnalysis, MetricRow
 from log_summarizer.report_generator import ReportGenerator
 from log_summarizer.tree_reducer import TreeReducer
@@ -86,12 +87,28 @@ class PipelineOrchestrator:
     async def run(self) -> str:
         """Запускает пайплайн и возвращает Markdown-отчёт."""
         t0 = time.monotonic()
-        logger.info(
-            "Pipeline starting: model=%s, incident=%s → %s",
-            self.config.model,
-            self.config.incident_start,
-            self.config.incident_end,
-        )
+
+        # Валидация временных окон
+        errors = self.config.validate_windows()
+        for err in errors:
+            logger.warning("Window validation: %s", err)
+
+        if self.config.has_context_window():
+            logger.info(
+                "Pipeline starting: model=%s  context=%s → %s  incident=%s → %s",
+                self.config.model,
+                self.config.context_start_actual(),
+                self.config.context_end_actual(),
+                self.config.incident_start,
+                self.config.incident_end,
+            )
+        else:
+            logger.info(
+                "Pipeline starting: model=%s, incident=%s → %s",
+                self.config.model,
+                self.config.incident_start,
+                self.config.incident_end,
+            )
         if self._run_dir:
             logger.info("Run artifacts → %s", self._run_dir.resolve())
 
@@ -131,7 +148,10 @@ class PipelineOrchestrator:
 
         self._log_merged_summary(merged)
 
-        # ── 4. Финальный отчёт ────────────────────────────────────────
+        # ── 4а. Программный Markdown-отчёт (детерминированный) ───────
+        self._save_structured_report(merged)
+
+        # ── 4б. LLM-отчёт (нарративный) ──────────────────────────────
         report = await self._report_generator.generate(
             merged=merged,
             early_summaries=[],
@@ -194,11 +214,11 @@ class PipelineOrchestrator:
             "MAP summary: %d batches | events=%d | evidence=%d | hypotheses=%d",
             len(batch_results), total_events, total_evidence, total_hyp,
         )
-        sep = "─" * 72
+        sep = "─" * 80
         logger.info(sep)
         logger.info(
-            "  %-5s  %-17s  %-6s  %-8s  %-3s  %-5s  %s",
-            "batch", "period", "events", "evidence", "hyp", "alert", "top severity",
+            "  %-5s  %-17s  %-14s  %-6s  %-8s  %-3s  %s",
+            "batch", "period", "zone", "events", "evidence", "hyp", "top severity",
         )
         logger.info(sep)
         for i, b in enumerate(batch_results):
@@ -207,11 +227,14 @@ class PipelineOrchestrator:
             for e in b.events:
                 sev[e.severity.value] = sev.get(e.severity.value, 0) + 1
             sev_str = " ".join(f"{k}={v}" for k, v in sorted(sev.items()))
+            # zone берём из первого события или из нарратива — если нет, "?"
+            zone = getattr(b, "batch_zone", "?") if hasattr(b, "batch_zone") else "?"
             logger.info(
-                "  %03d    %s→%s  %-6d  %-8d  %-3d  %-5d  %s",
+                "  %03d    %s→%s  %-14s  %-6d  %-8d  %-3d  %s",
                 i,
                 t0.strftime("%H:%M:%S"), t1.strftime("%H:%M:%S"),
-                len(b.events), len(b.evidence), len(b.hypotheses), len(b.alert_refs),
+                zone,
+                len(b.events), len(b.evidence), len(b.hypotheses),
                 sev_str or "—",
             )
         logger.info(sep)
@@ -251,6 +274,21 @@ class PipelineOrchestrator:
         narrative = (merged.narrative_ru or merged.narrative)[:120].replace("\n", " ")
         logger.info("  narrative: %s…", narrative)
         logger.info(sep)
+
+    def _save_structured_report(self, merged: MergedAnalysis) -> None:
+        """Сохраняет программный Markdown-отчёт из MergedAnalysis (без LLM)."""
+        try:
+            md = MarkdownRenderer(merged, self.config).render()
+        except Exception as exc:
+            logger.warning("MarkdownRenderer failed: %s — skipping report_data.md", exc)
+            return
+
+        if self._run_dir:
+            path = self._run_dir / "report_data.md"
+            path.write_text(md, encoding="utf-8")
+            logger.info("Structured report → %s", path.resolve())
+        else:
+            logger.debug("report_data.md not saved (no run_dir configured)")
 
     def _load_data(self) -> tuple[list[Chunk], Optional[list[MetricRow]]]:
         """Загрузка логов и метрик (синхронная, вызывается из executor)."""

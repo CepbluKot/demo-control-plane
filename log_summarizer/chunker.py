@@ -119,8 +119,14 @@ class Chunker:
         last_ts = rows[-1].timestamp
         if first_ts > last_ts:
             first_ts, last_ts = last_ts, first_ts
+
+        # batch_zone: если все строки одной зоны — эта зона, иначе "mixed"
+        zones = {r.zone for r in rows}
+        batch_zone = zones.pop() if len(zones) == 1 else "mixed"
+
         return Chunk(
             rows=rows,
             time_range=(first_ts, last_ts),
             token_estimate=token_estimate,
+            batch_zone=batch_zone,
         )

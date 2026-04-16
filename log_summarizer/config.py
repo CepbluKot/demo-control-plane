@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from log_summarizer.models import Alert
@@ -27,8 +27,22 @@ class PipelineConfig:
     # ── Контекст инцидента ────────────────────────────────────────────
     # Описание инцидента словами: что случилось, какие сервисы затронуты.
     incident_context: str = ""
+
+    # Узкое окно: когда сработали алерты / наблюдались проблемы.
+    # Используется для zone-разметки логов и фокуса анализа.
     incident_start: Optional[datetime] = None
     incident_end: Optional[datetime] = None
+
+    # Широкое окно: откуда грузить логи (контекст вокруг инцидента).
+    # Если не задано — автоматически расширяется на context_auto_expand_hours в каждую сторону.
+    # Пример: инцидент в 14:15-14:35, контекст 13:15-15:35 (±1 час).
+    # Задать явно чтобы переопределить авто-расширение.
+    context_start: Optional[datetime] = None
+    context_end: Optional[datetime] = None
+
+    # Часов расширения в каждую сторону от incident_start/end если context не задан явно.
+    # 0 — отключить авто-расширение (context == incident).
+    context_auto_expand_hours: float = 1.0
 
     # Алерты, сработавшие во время инцидента. Создаются через make_alerts().
     # MAP-фаза проставляет статус по каждому алерту; REDUCE мержит программно.
@@ -85,6 +99,63 @@ class PipelineConfig:
     # Пустая строка = не сохранять артефакты.
     runs_dir: str = "runs"
 
+    # ── Вспомогательные методы ───────────────────────────────────────
+
+    def context_start_actual(self) -> Optional[datetime]:
+        """Фактическое начало окна загрузки логов.
+
+        Приоритет: явный context_start → авто-расширение на N часов → incident_start.
+        """
+        if self.context_start is not None:
+            return self.context_start
+        if self.incident_start is not None and self.context_auto_expand_hours > 0:
+            return self.incident_start - timedelta(hours=self.context_auto_expand_hours)
+        return self.incident_start
+
+    def context_end_actual(self) -> Optional[datetime]:
+        """Фактическое окончание окна загрузки логов.
+
+        Приоритет: явный context_end → авто-расширение на N часов → incident_end.
+        """
+        if self.context_end is not None:
+            return self.context_end
+        if self.incident_end is not None and self.context_auto_expand_hours > 0:
+            return self.incident_end + timedelta(hours=self.context_auto_expand_hours)
+        return self.incident_end
+
+    def has_context_window(self) -> bool:
+        """True если окно загрузки шире окна инцидента."""
+        cs = self.context_start_actual()
+        ce = self.context_end_actual()
+        return (cs != self.incident_start) or (ce != self.incident_end)
+
+    def validate_windows(self) -> list[str]:
+        """Проверяет согласованность временных окон. Возвращает список ошибок."""
+        errors: list[str] = []
+        cs = self.context_start_actual()
+        ce = self.context_end_actual()
+        ins = self.incident_start
+        ine = self.incident_end
+
+        if cs and ce and cs > ce:
+            errors.append(f"context_start ({cs}) > context_end ({ce})")
+        if ins and ine and ins > ine:
+            errors.append(f"incident_start ({ins}) > incident_end ({ine})")
+        if cs and ins and cs > ins:
+            errors.append(f"context_start ({cs}) > incident_start ({ins})")
+        if ce and ine and ine > ce:
+            errors.append(f"incident_end ({ine}) > context_end ({ce})")
+
+        # Проверяем алерты внутри incident window
+        for alert in self.alerts:
+            if alert.fired_at and ins and ine:
+                if not (ins <= alert.fired_at <= ine):
+                    errors.append(
+                        f"Alert '{alert.name}' fired_at={alert.fired_at} "
+                        f"outside incident window [{ins}, {ine}]"
+                    )
+        return errors
+
     def map_batch_tokens(self) -> int:
         """Бюджет токенов на один MAP-вызов (55% от контекста)."""
         return int(self.max_context_tokens * 0.55)
@@ -95,12 +166,16 @@ class PipelineConfig:
 
     def incident_start_iso(self) -> str:
         """ISO-строка начала инцидента для промптов."""
-        if self.incident_start is None:
-            return ""
-        return self.incident_start.isoformat()
+        return self.incident_start.isoformat() if self.incident_start else ""
 
     def incident_end_iso(self) -> str:
         """ISO-строка конца инцидента для промптов."""
-        if self.incident_end is None:
-            return ""
-        return self.incident_end.isoformat()
+        return self.incident_end.isoformat() if self.incident_end else ""
+
+    def context_start_iso(self) -> str:
+        cs = self.context_start_actual()
+        return cs.isoformat() if cs else ""
+
+    def context_end_iso(self) -> str:
+        ce = self.context_end_actual()
+        return ce.isoformat() if ce else ""

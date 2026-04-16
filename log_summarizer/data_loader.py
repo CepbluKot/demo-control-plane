@@ -33,16 +33,20 @@ class DataLoader:
     def iter_log_pages(self, page_size: int = 1000) -> Iterator[list[LogRow]]:
         """Постраничная выгрузка логов.
 
-        Yield'ит страницы (list[LogRow]). Каждая страница не больше page_size.
-        Пагинация через OFFSET или через timestamp-фильтр если шаблон содержит
-        плейсхолдер {last_ts}.
+        Логи грузятся за context-окно (context_start..context_end).
+        Если context-окно не задано — используется incident-окно.
+        Каждая строка получает zone-метку относительно incident-окна.
 
         Args:
             page_size: Размер одной страницы (строк).
         """
         template = self.config.logs_sql_template
-        start = self._fmt_dt(self.config.incident_start)
-        end = self._fmt_dt(self.config.incident_end)
+        # Грузим логи за ШИРОКОЕ окно (контекст), не за узкое (инцидент)
+        start = self._fmt_dt(self.config.context_start_actual())
+        end = self._fmt_dt(self.config.context_end_actual())
+
+        inc_start = self.config.incident_start
+        inc_end = self.config.incident_end
 
         uses_keyset = "{last_ts}" in template
         offset = 0
@@ -62,7 +66,10 @@ class DataLoader:
             if not rows:
                 break
 
-            page = [self._row_to_log(r) for r in rows]
+            page = [
+                self._row_to_log(r, inc_start=inc_start, inc_end=inc_end)
+                for r in rows
+            ]
             yield page
             logger.debug("Fetched %d log rows", len(page))
 
@@ -179,8 +186,12 @@ class DataLoader:
         return dt.isoformat()
 
     @staticmethod
-    def _row_to_log(row: dict) -> LogRow:
-        """Конвертируем dict-строку ClickHouse в LogRow."""
+    def _row_to_log(
+        row: dict,
+        inc_start: Optional[datetime] = None,
+        inc_end: Optional[datetime] = None,
+    ) -> LogRow:
+        """Конвертируем dict-строку ClickHouse в LogRow с zone-разметкой."""
         ts = row.get("timestamp") or row.get("time") or row.get("ts")
         message = (
             row.get("message")
@@ -190,6 +201,20 @@ class DataLoader:
             or ""
         )
         raw_line = row.get("raw_line") or str(row)
+
+        # Определяем зону строки относительно окна инцидента
+        zone = "incident"
+        if ts is not None and inc_start is not None and inc_end is not None:
+            if hasattr(ts, "replace"):
+                # datetime-объект из clickhouse_connect
+                ts_dt = ts if ts.tzinfo is not None else ts.replace(tzinfo=inc_start.tzinfo)
+            else:
+                ts_dt = ts
+            if ts_dt < inc_start:
+                zone = "context_before"
+            elif ts_dt > inc_end:
+                zone = "context_after"
+
         return LogRow(
             timestamp=ts,
             level=row.get("level") or row.get("severity"),
@@ -202,6 +227,7 @@ class DataLoader:
             ),
             message=str(message),
             raw_line=str(raw_line),
+            zone=zone,
         )
 
     @staticmethod

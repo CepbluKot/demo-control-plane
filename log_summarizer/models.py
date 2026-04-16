@@ -108,6 +108,7 @@ class LogRow(BaseModel):
     source: Optional[str] = None   # сервис / контейнер / pod
     message: str
     raw_line: str                  # оригинальная строка целиком
+    zone: str = "incident"         # "context_before" | "incident" | "context_after"
 
 
 class MetricRow(BaseModel):
@@ -125,6 +126,7 @@ class Chunk(BaseModel):
     rows: list[LogRow]
     time_range: tuple[datetime, datetime]
     token_estimate: int
+    batch_zone: str = "incident"   # "context_before"|"incident"|"context_after"|"mixed"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -198,6 +200,7 @@ class BatchAnalysis(BaseModel):
     data_quality: Optional[str] = None     # "шумные логи" / "пустой батч" / ...
     alert_refs: list[AlertRef] = Field(default_factory=list)            # статус по каждому алерту
     preliminary_recommendations: list[str] = Field(default_factory=list)  # ранние рекомендации
+    batch_zone: str = "incident"         # зона батча (заполняется MapProcessor, не LLM)
 
     def to_json_str(self) -> str:
         """Сериализация для REDUCE-промптов.
@@ -248,6 +251,9 @@ class MergedAnalysis(BaseModel):
     preliminary_recommendations: list[str] = Field(default_factory=list)          # из MAP-фазы (English)
     preliminary_recommendations_ru: list[str] = Field(default_factory=list)       # перевод на русский
 
+    # Зоны, охваченные данным MergedAnalysis (заполняется программно, не LLM)
+    zones_covered: list[str] = Field(default_factory=lambda: ["incident"])
+
     # Прикрепляются в конце REDUCE — НЕ проходят через LLM
     evidence_bank: list[Evidence] = Field(default_factory=list)
     alert_refs: list[AlertRef] = Field(default_factory=list)
@@ -256,6 +262,7 @@ class MergedAnalysis(BaseModel):
         """Сериализация для REDUCE-промптов.
 
         Исключает evidence_bank и alert_refs — они обрабатываются отдельно.
+        zones_covered включается — помогает REDUCE понять границы зон при merge.
         """
         return self.model_copy(
             update={"evidence_bank": [], "alert_refs": []}
