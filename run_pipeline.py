@@ -5,6 +5,11 @@ run_pipeline.py — запуск пайплайна log_summarizer для спи
     python run_pipeline.py
     python run_pipeline.py --only airflow-oom  # один инцидент по имени
     python run_pipeline.py --list              # показать список инцидентов
+
+Быстрый режим — саммари за произвольный период без описания инцидента:
+    python run_pipeline.py --quick
+    Заполни QUICK_START, QUICK_END (и опционально QUICK_CONTEXT) ниже.
+    INCIDENTS при этом полностью игнорируется.
 """
 from __future__ import annotations
 
@@ -209,6 +214,21 @@ INCIDENTS = [
 ]
 
 # ══════════════════════════════════════════════════════════════════════
+#  QUICK MODE — саммари за произвольный период (python run_pipeline.py --quick)
+#
+#  Заполни QUICK_START и QUICK_END — пайплайн загрузит логи за этот период
+#  и сгенерирует отчёт без привязки к конкретному инциденту.
+#  INCIDENTS при этом полностью игнорируется.
+#
+#  QUICK_CONTEXT — опциональное описание: что ищем, на что обратить внимание.
+#  Оставь пустым если хочешь просто "покажи что происходило".
+# ══════════════════════════════════════════════════════════════════════
+
+QUICK_START:   datetime | None = None   # datetime(2026, 3, 18, 18, 30, 0, tzinfo=MSK)
+QUICK_END:     datetime | None = None   # datetime(2026, 3, 18, 20,  0, 0, tzinfo=MSK)
+QUICK_CONTEXT: str             = ""     # "Посмотреть что происходило с кластером в этот период"
+
+# ══════════════════════════════════════════════════════════════════════
 #  Параметры пайплайна
 # ══════════════════════════════════════════════════════════════════════
 
@@ -301,7 +321,7 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
         return name, exc, None
 
 
-async def main(only: str | None) -> None:
+async def main(only: str | None, quick: bool = False) -> None:
     from log_summarizer.utils.logging import setup_pipeline_logging
 
     # ── Корневая папка этого запуска ──────────────────────────────────
@@ -328,6 +348,36 @@ async def main(only: str | None) -> None:
         username=CH_USER, password=CH_PASSWORD,
         database=CH_DATABASE,
     )
+
+    # ── Quick mode ────────────────────────────────────────────────────
+    if quick:
+        if not QUICK_START or not QUICK_END:
+            raise SystemExit(
+                "QUICK_START и QUICK_END должны быть заданы для --quick режима.\n"
+                "Заполни их в run_pipeline.py."
+            )
+        name = "quick-" + QUICK_START.strftime("%Y-%m-%dT%H-%M")
+        incident = {
+            "name": name,
+            "context": QUICK_CONTEXT or f"Анализ логов за период {QUICK_START} — {QUICK_END}",
+            "alerts": [],
+            "incident_start": QUICK_START,
+            "incident_end":   QUICK_END,
+            # контекстное окно == период (авто-расширение отключено)
+            "context_start":  QUICK_START,
+            "context_end":    QUICK_END,
+        }
+        log.info("Quick mode: %s → %s", QUICK_START, QUICK_END)
+        name, result, orchestrator = await run_incident(ch, incident, run_dir)
+        if isinstance(result, Exception):
+            raise SystemExit(f"Пайплайн завершился с ошибкой: {result}")
+        artifact_dir = orchestrator.run_dir if orchestrator is not None else None
+        if artifact_dir is not None:
+            mono_path = artifact_dir / "report.md"
+            mono_path.write_text(result, encoding="utf-8")
+            log.info("report.md → %s", mono_path.resolve())
+        log.info("Quick mode завершён. Артефакты: %s", run_dir.resolve())
+        return
 
     incidents = INCIDENTS
     if only:
@@ -423,6 +473,8 @@ if __name__ == "__main__":
                    help="Запустить только один инцидент по имени")
     p.add_argument("--list", action="store_true",
                    help="Показать список инцидентов и выйти")
+    p.add_argument("--quick", action="store_true",
+                   help="Быстрый режим: саммари за период QUICK_START..QUICK_END (INCIDENTS игнорируется)")
     args = p.parse_args()
 
     if args.list:
@@ -431,4 +483,4 @@ if __name__ == "__main__":
             e = i.get("incident_end")   or i.get("end",   "?")
             print(f"  {i['name']}  {s} → {e}")
     else:
-        asyncio.run(main(args.only))
+        asyncio.run(main(args.only, quick=args.quick))
