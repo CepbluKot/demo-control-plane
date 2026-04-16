@@ -26,6 +26,7 @@ from log_summarizer.prompts.map_system import (
 )
 from log_summarizer.prompts.map_user import format_map_user_prompt
 from log_summarizer.utils.logging import get_logger
+from log_summarizer.utils.progress import ProgressTracker, fmt_dur
 from log_summarizer.utils.tokens import estimate_tokens
 
 logger = get_logger("map_processor")
@@ -71,16 +72,34 @@ class MapProcessor:
         Returns:
             Плоский список BatchAnalysis (может быть больше len(chunks) при split).
         """
+        import time as _time
         semaphore = asyncio.Semaphore(self.config.map_concurrency)
+        tracker = ProgressTracker(total=len(chunks), label="MAP")
 
         async def _bounded(chunk: Chunk, idx: int) -> list[BatchAnalysis]:
+            t_chunk = _time.monotonic()
             async with semaphore:
-                return await self.process_chunk(chunk, metrics=metrics, chunk_id=idx)
+                results = await self.process_chunk(chunk, metrics=metrics, chunk_id=idx)
+
+            elapsed_chunk = _time.monotonic() - t_chunk
+            t0c, t1c = chunk.time_range
+            events_found = sum(len(r.events) for r in results)
+            status = tracker.tick(
+                detail=(
+                    f"chunk-{idx:03d}  "
+                    f"{t0c.strftime('%H:%M:%S')}→{t1c.strftime('%H:%M:%S')}  "
+                    f"{len(chunk.rows)} строк  "
+                    f"{events_found} событий  "
+                    f"[{fmt_dur(elapsed_chunk)}]"
+                )
+            )
+            logger.info("  %s", status)
+            return results
 
         tasks = [_bounded(chunk, i) for i, chunk in enumerate(chunks)]
         nested = await asyncio.gather(*tasks)
         results = [item for sublist in nested for item in sublist]
-        logger.info("MAP phase complete: %d chunks → %d results", len(chunks), len(results))
+        logger.info("  %s", tracker.summary())
         return results
 
     async def process_chunk(

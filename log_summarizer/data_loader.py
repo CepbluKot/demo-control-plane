@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from log_summarizer.config import PipelineConfig
@@ -191,23 +191,51 @@ class DataLoader:
         inc_start: Optional[datetime] = None,
         inc_end: Optional[datetime] = None,
     ) -> LogRow:
-        """Конвертируем dict-строку ClickHouse в LogRow с zone-разметкой."""
+        """Конвертируем dict-строку ClickHouse в LogRow с zone-разметкой.
+
+        Поддерживаемые форматы:
+          - Классический: message/msg/log + source/service + level/severity
+          - Kubernetes-агрегированный: namespace + container_name + raw_line
+            (raw_line содержит весь текст лога, level вытаскивается парсером)
+        """
         ts = row.get("timestamp") or row.get("time") or row.get("ts")
+        raw_line = row.get("raw_line") or str(row)
+
+        # source: явное поле → kubernetes_container_name → namespace/container_name → container/pod
+        source = (
+            row.get("source")
+            or row.get("service")
+            or row.get("kubernetes_container_name")
+        )
+        if not source:
+            ns = row.get("namespace")
+            cn = row.get("container_name") or row.get("container") or row.get("pod")
+            if ns and cn:
+                source = f"{ns}/{cn}"
+            else:
+                source = cn or ns
+
+        # message: явное поле → fallback на raw_line (для агрегированного формата)
         message = (
             row.get("message")
             or row.get("msg")
             or row.get("log")
             or row.get("value")
-            or ""
+            or raw_line
         )
-        raw_line = row.get("raw_line") or str(row)
 
-        # Определяем зону строки относительно окна инцидента
+        # level: явное поле → распознавание из raw_line
+        level = row.get("level") or row.get("severity")
+        if not level:
+            level = DataLoader._extract_level(raw_line)
+
+        # Определяем зону строки относительно окна инцидента.
+        # ClickHouse возвращает DateTime как UTC-наивные объекты — нормализуем к UTC,
+        # тогда сравнение с МСК-aware inc_start/inc_end работает корректно.
         zone = "incident"
         if ts is not None and inc_start is not None and inc_end is not None:
             if hasattr(ts, "replace"):
-                # datetime-объект из clickhouse_connect
-                ts_dt = ts if ts.tzinfo is not None else ts.replace(tzinfo=inc_start.tzinfo)
+                ts_dt = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
             else:
                 ts_dt = ts
             if ts_dt < inc_start:
@@ -217,18 +245,32 @@ class DataLoader:
 
         return LogRow(
             timestamp=ts,
-            level=row.get("level") or row.get("severity"),
-            source=(
-                row.get("source")
-                or row.get("service")
-                or row.get("kubernetes_container_name")
-                or row.get("container")
-                or row.get("pod")
-            ),
+            level=level,
+            source=source,
             message=str(message),
             raw_line=str(raw_line),
             zone=zone,
         )
+
+    @staticmethod
+    def _extract_level(raw_line: str) -> Optional[str]:
+        """Пытается определить уровень лога из текста строки.
+
+        Поддерживает два паттерна:
+          1. structured: level=warning / level=error / level=info / level=debug
+          2. klog (Kubernetes): E0317 / W0317 / I0317 / D0317 после пробелов или ']'
+        """
+        import re
+        # structured logs: level=<value>
+        m = re.search(r'\blevel=(\w+)', raw_line)
+        if m:
+            return m.group(1).lower()
+        # klog prefix: E/W/I/D + MMDD
+        # Варианты: в начале строки, после '] ×N  ' (агрегированный формат), после обычного ']'
+        m = re.search(r'(?:]\s*(?:×\d+\s+)?|^\s*)([EWID])\d{4}\s', raw_line)
+        if m:
+            return {"E": "error", "W": "warning", "I": "info", "D": "debug"}.get(m.group(1))
+        return None
 
     @staticmethod
     def _row_to_metric(row: dict) -> MetricRow:

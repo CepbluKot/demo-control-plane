@@ -73,6 +73,12 @@ class MarkdownRenderer:
 
     def render(self) -> str:
         """Возвращает полный Markdown-документ."""
+        # Строим один раз — используется в causal_chains, hypotheses, anomalies
+        self._evt_map: dict[str, str] = {
+            e.id: _ru(e.description, getattr(e, "description_ru", None))
+            for e in self.merged.events
+        }
+
         parts: list[str] = []
 
         parts.append(self._header())
@@ -100,6 +106,7 @@ class MarkdownRenderer:
         if self.merged.gaps:
             parts.append(self._gaps())
 
+        parts.append(self._events_index())
         parts.append(self._footer())
 
         return "\n\n".join(p for p in parts if p.strip())
@@ -234,10 +241,6 @@ class MarkdownRenderer:
 
         parts = ["## Причинно-следственные цепочки"]
 
-        # Строим карту event_id → description для человекочитаемых ссылок
-        evt_map = {e.id: _ru(e.description, getattr(e, "description_ru", None))
-                   for e in self.merged.events}
-
         conf_order = {"high": 0, "medium": 1, "low": 2}
         chains = sorted(
             self.merged.causal_chains,
@@ -246,8 +249,8 @@ class MarkdownRenderer:
 
         for chain in chains:
             conf_label = _CONF_LABELS.get(chain.confidence, chain.confidence)
-            from_desc = evt_map.get(chain.from_event_id, chain.from_event_id)
-            to_desc   = evt_map.get(chain.to_event_id,   chain.to_event_id)
+            from_desc = self._evt_map.get(chain.from_event_id, chain.from_event_id)
+            to_desc   = self._evt_map.get(chain.to_event_id,   chain.to_event_id)
             desc = _ru(chain.description, getattr(chain, "description_ru", None))
             mechanism = getattr(chain, "mechanism", None)
             mechanism_line = f"\n\n**Механизм:** {mechanism}" if mechanism else ""
@@ -280,15 +283,17 @@ class MarkdownRenderer:
             section.append(desc)
 
             if h.supporting_event_ids:
-                section.append(
-                    "**Подтверждающие события:** "
-                    + ", ".join(f"`{eid}`" for eid in h.supporting_event_ids)
-                )
+                items = [
+                    f"`{eid}` {self._evt_map[eid]}" if eid in self._evt_map else f"`{eid}`"
+                    for eid in h.supporting_event_ids
+                ]
+                section.append("**Подтверждающие события:**\n" + "\n".join(f"- {it}" for it in items))
             if h.contradicting_event_ids:
-                section.append(
-                    "**Опровергающие события:** "
-                    + ", ".join(f"`{eid}`" for eid in h.contradicting_event_ids)
-                )
+                items = [
+                    f"`{eid}` {self._evt_map[eid]}" if eid in self._evt_map else f"`{eid}`"
+                    for eid in h.contradicting_event_ids
+                ]
+                section.append("**Опровергающие события:**\n" + "\n".join(f"- {it}" for it in items))
             if h.related_alert_ids:
                 section.append(
                     "**Связанные алерты:** "
@@ -322,10 +327,14 @@ class MarkdownRenderer:
         parts = ["## Аномалии"]
         for a in self.merged.anomalies:
             desc = _ru(a.description, getattr(a, "description_ru", None))
-            related = ""
             if a.related_event_ids:
-                related = " (" + ", ".join(f"`{eid}`" for eid in a.related_event_ids) + ")"
-            parts.append(f"- {desc}{related}")
+                refs = ", ".join(
+                    f"`{eid}` {self._evt_map[eid]}" if eid in self._evt_map else f"`{eid}`"
+                    for eid in a.related_event_ids
+                )
+                parts.append(f"- {desc} ({refs})")
+            else:
+                parts.append(f"- {desc}")
         return "\n".join(parts)
 
     def _evidence(self) -> str:
@@ -358,6 +367,27 @@ class MarkdownRenderer:
                 f"- **{_ts_short(g.start)} → {_ts_short(g.end)}**: {desc}"
             )
         return "\n".join(parts)
+
+    def _events_index(self) -> str:
+        """Справочник событий: ID → время, сервис, описание, severity."""
+        events = sorted(self.merged.events, key=lambda e: e.timestamp)
+        if not events:
+            return ""
+
+        header = (
+            "## Справочник событий\n\n"
+            "| ID | Время | Сервис | Описание | Severity |\n"
+            "|-------|-------|--------|---------|----------|\n"
+        )
+        rows = []
+        for e in events:
+            sev_icon = _SEV_EMOJI.get(e.severity, "")
+            desc = _ru(e.description, getattr(e, "description_ru", None))
+            rows.append(
+                f"| `{e.id}` | `{_ts_short(e.timestamp)}` | `{e.source}` "
+                f"| {desc} | {sev_icon} {e.severity.value} |"
+            )
+        return header + "\n".join(rows)
 
     def _footer(self) -> str:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

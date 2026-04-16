@@ -28,6 +28,7 @@ from log_summarizer.models import (
 from log_summarizer.prompts.reduce_compress import REDUCE_COMPRESS_SYSTEM_TEMPLATE
 from log_summarizer.prompts.reduce_merge import REDUCE_MERGE_SYSTEM_TEMPLATE
 from log_summarizer.utils.logging import get_logger
+from log_summarizer.utils.progress import fmt_dur
 from log_summarizer.utils.tokens import estimate_tokens, tokens_to_chars
 
 logger = get_logger("tree_reducer")
@@ -72,38 +73,76 @@ class TreeReducer:
         Returns:
             Финальный MergedAnalysis с заполненным evidence_bank.
         """
+        import time as _time
+
         if not batch_results:
             raise ValueError("Cannot reduce empty list of batch results")
+
+        _SEP = "─" * 68
 
         # Collect evidence and alert_refs upfront — never pass through LLM
         evidence_bank = self._collect_evidence(batch_results)
         alert_refs = self._merge_alert_refs(batch_results)
 
         items: list[_Item] = list(batch_results)
+        t_reduce = _time.monotonic()
 
         for round_num in range(1, self.config.max_reduce_rounds + 1):
             if len(items) == 1:
                 break
 
-            logger.info(
-                "Reduce round %d: %d items remaining", round_num, len(items)
-            )
-
             group_size = self._adaptive_group_size(items)
             groups = self._make_groups(items, group_size)
+            n_merge_groups = sum(1 for g in groups if len(g) > 1)
+
+            # Временной охват всех текущих items
+            all_ts = [ts for item in items for ts in item.time_range]
+            span_start = min(all_ts).strftime("%H:%M:%S")
+            span_end   = max(all_ts).strftime("%H:%M:%S")
+
+            logger.info("")
+            logger.info(_SEP)
+            logger.info(
+                "REDUCE раунд %d  |  %d элементов → ~%d групп по %d  |  период %s → %s",
+                round_num, len(items), n_merge_groups, group_size, span_start, span_end,
+            )
 
             next_items: list[_Item] = []
             for g_idx, group in enumerate(groups):
                 if len(group) == 1:
                     next_items.append(group[0])
                     continue
+
+                g_ts = [ts for item in group for ts in item.time_range]
+                g_start = min(g_ts).strftime("%H:%M:%S")
+                g_end   = max(g_ts).strftime("%H:%M:%S")
+                g_events = sum(len(item.events) for item in group)
+                g_hyp    = sum(len(item.hypotheses) for item in group)
+
+                logger.info(
+                    "  MERGE  раунд %d  группа %d/%d  |  %d items  %s→%s  "
+                    "%d событий  %d гипотез",
+                    round_num, g_idx + 1, n_merge_groups,
+                    len(group), g_start, g_end, g_events, g_hyp,
+                )
+                t_merge = _time.monotonic()
                 merged = await self._merge_group(group, round_num, g_idx)
                 merged = self._trim_events(merged)
                 merged = await self._maybe_compress(merged)
                 self._save_reduce_result(round_num, g_idx, merged)
+                logger.info(
+                    "  MERGE  ✓  раунд %d  группа %d/%d  [%s]  →  %d событий  %d гипотез  %d цепочек",
+                    round_num, g_idx + 1, n_merge_groups,
+                    fmt_dur(_time.monotonic() - t_merge),
+                    len(merged.events), len(merged.hypotheses), len(merged.causal_chains),
+                )
                 next_items.append(merged)
 
             items = next_items
+            logger.info(
+                "REDUCE раунд %d  ✓  осталось элементов: %d  |  раунд за %s",
+                round_num, len(items), fmt_dur(_time.monotonic() - t_reduce),
+            )
         else:
             logger.warning(
                 "Reduce did not converge in %d rounds — forcing final merge",
@@ -113,13 +152,11 @@ class TreeReducer:
                 items = [await self._merge_group(items, self.config.max_reduce_rounds + 1)]
 
         result = items[0]
-        self._save_reduce_result(0, 0, result, name="final_merged")  # перед evidence
+        self._save_reduce_result(0, 0, result, name="final_merged")
 
-        # Если результат — BatchAnalysis (edge case: один батч), конвертируем
         if isinstance(result, BatchAnalysis):
             result = self._batch_to_merged(result)
 
-        # Присоединяем evidence_bank и alert_refs — никогда не проходят через LLM
         evidence_bank = self._dedup_evidence(
             evidence_bank + list(result.evidence_bank)
         )
@@ -128,8 +165,10 @@ class TreeReducer:
             "alert_refs": alert_refs,
         })
 
+        logger.info(_SEP)
         logger.info(
-            "Reduce complete: %d events, %d evidence, %d hypotheses",
+            "REDUCE завершён  ✓  [%s]  →  %d событий  ·  %d доказательств  ·  %d гипотез",
+            fmt_dur(_time.monotonic() - t_reduce),
             len(result.events),
             len(result.evidence_bank),
             len(result.hypotheses),

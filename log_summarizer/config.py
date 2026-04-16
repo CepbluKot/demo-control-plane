@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+# Московское время — UTC+3, переход на летнее время в России отменён.
+MSK = timezone(timedelta(hours=3))
 
 from log_summarizer.models import Alert
 
@@ -60,6 +63,11 @@ class PipelineConfig:
     max_split_depth: int = 6        # максимум рекурсивных делений
     min_batch_lines: int = 20       # минимум строк при split
 
+    # Максимум токенов на один MAP-батч.
+    # None → вычисляется автоматически как 55% от max_context_tokens.
+    # Задай явно если хочешь контролировать размер батча независимо от контекста.
+    max_batch_tokens: Optional[int] = None
+
     # ── Параметры REDUCE ─────────────────────────────────────────────
     max_group_size: int = 4         # макс элементов в REDUCE-группе
     max_item_chars: int = 40_000    # лимит на 1 item перед merge
@@ -104,6 +112,10 @@ class PipelineConfig:
     # промежуточными результатами и финальным отчётом.
     # Пустая строка = не сохранять артефакты.
     runs_dir: str = "runs"
+
+    # Заполняется оркестратором после загрузки данных — число строк логов.
+    # Отображается в секции 1 отчёта.
+    total_log_rows: int = 0
 
     # ── Вспомогательные методы ───────────────────────────────────────
 
@@ -163,7 +175,13 @@ class PipelineConfig:
         return errors
 
     def map_batch_tokens(self) -> int:
-        """Бюджет токенов на один MAP-вызов (55% от контекста)."""
+        """Бюджет токенов на один MAP-батч.
+
+        Если max_batch_tokens задан явно — используется как есть.
+        Иначе: 55% от max_context_tokens (оставшееся — промпт + ответ LLM).
+        """
+        if self.max_batch_tokens is not None:
+            return self.max_batch_tokens
         return int(self.max_context_tokens * 0.55)
 
     def reduce_budget_tokens(self) -> int:

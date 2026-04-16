@@ -36,6 +36,7 @@ from log_summarizer.multipass_report_generator import MultipassReportGenerator
 from log_summarizer.report_generator import ReportGenerator
 from log_summarizer.tree_reducer import TreeReducer
 from log_summarizer.utils.logging import get_logger
+from log_summarizer.utils.progress import fmt_dur
 
 logger = get_logger("orchestrator")
 
@@ -51,12 +52,17 @@ class PipelineOrchestrator:
     def __init__(self, clickhouse_client: Any, config: PipelineConfig) -> None:
         self.config = config
 
+        # Финальный MergedAnalysis после REDUCE-фазы; доступен после run().
+        self.last_merged: Optional[MergedAnalysis] = None
+
         # Создаём папку для артефактов этого прогона
         self._run_dir: Optional[Path] = self._make_run_dir(config.runs_dir)
 
-        max_batch_tokens = int(config.max_context_tokens * 0.55)
+        # Публичный псевдоним — доступен снаружи без обращения к приватному атрибуту
+        self.run_dir: Optional[Path] = self._run_dir
+
         self._chunker = Chunker(
-            max_batch_tokens=max_batch_tokens,
+            max_batch_tokens=config.map_batch_tokens(),
             min_batch_lines=config.min_batch_lines,
         )
         self._llm = LLMClient(
@@ -91,74 +97,129 @@ class PipelineOrchestrator:
 
     async def run(self) -> str:
         """Запускает пайплайн и возвращает Markdown-отчёт."""
-        t0 = time.monotonic()
+        _SEP  = "═" * 72
+        _SEP2 = "─" * 72
+        t_pipeline = time.monotonic()
+        _TOTAL_STAGES = 6
 
-        # Валидация временных окон
+        # ── Шапка пайплайна ───────────────────────────────────────────
         errors = self.config.validate_windows()
         for err in errors:
             logger.warning("Window validation: %s", err)
 
-        if self.config.has_context_window():
-            logger.info(
-                "Pipeline starting: model=%s  context=%s → %s  incident=%s → %s",
-                self.config.model,
-                self.config.context_start_actual(),
-                self.config.context_end_actual(),
-                self.config.incident_start,
-                self.config.incident_end,
-            )
-        else:
-            logger.info(
-                "Pipeline starting: model=%s, incident=%s → %s",
-                self.config.model,
-                self.config.incident_start,
-                self.config.incident_end,
-            )
-        if self._run_dir:
-            logger.info("Run artifacts → %s", self._run_dir.resolve())
+        cfg = self.config
+        ctx_start = cfg.context_start_actual()
+        ctx_end   = cfg.context_end_actual()
 
-        # ── 1. Загрузка данных ────────────────────────────────────────
+        logger.info(_SEP)
+        logger.info("ПАЙПЛАЙН ИНЦИДЕНТНОЙ СУММАРИЗАЦИИ")
+        logger.info("  Модель    : %s", cfg.model)
+        logger.info("  API       : %s", cfg.api_base)
+        if cfg.incident_start and cfg.incident_end:
+            logger.info(
+                "  Инцидент  : %s  →  %s",
+                cfg.incident_start.strftime("%Y-%m-%d %H:%M %Z"),
+                cfg.incident_end.strftime("%H:%M %Z"),
+            )
+        if cfg.has_context_window() and ctx_start and ctx_end:
+            logger.info(
+                "  Окно логов: %s  →  %s",
+                ctx_start.strftime("%Y-%m-%d %H:%M %Z"),
+                ctx_end.strftime("%H:%M %Z"),
+            )
+        if cfg.incident_context:
+            logger.info("  Контекст  : %s", cfg.incident_context.strip()[:120].replace("\n", " "))
+        if self._run_dir:
+            logger.info("  Артефакты : %s", self._run_dir.resolve())
+        logger.info(_SEP)
+
+        # ── СТАДИЯ 1: Загрузка данных ─────────────────────────────────
+        logger.info("")
+        logger.info("СТАДИЯ 1/%d  ▶  Загрузка данных из ClickHouse", _TOTAL_STAGES)
+        if ctx_start and ctx_end:
+            logger.info(
+                "  Запрашиваем: %s  →  %s",
+                ctx_start.strftime("%Y-%m-%d %H:%M %Z"),
+                ctx_end.strftime("%H:%M %Z"),
+            )
+        t1 = time.monotonic()
         chunks, metrics = await asyncio.get_event_loop().run_in_executor(
             None, self._load_data
         )
+        t1_elapsed = time.monotonic() - t1
 
         if not chunks:
             logger.warning("No log data found for the specified period")
             return "# Incident Analysis\n\nNo log data found for the specified period."
 
+        total_rows = sum(len(c.rows) for c in chunks)
+        self.config.total_log_rows = total_rows  # доступно снаружи через orchestrator.config
         logger.info(
-            "Data loaded: %d chunks, %d metric rows",
-            len(chunks),
-            len(metrics) if metrics else 0,
+            "СТАДИЯ 1/%d  ✓  Данные загружены  [%s]  →  %d строк  ·  %d чанков%s",
+            _TOTAL_STAGES, fmt_dur(t1_elapsed), total_rows, len(chunks),
+            f"  ·  {len(metrics)} метрик" if metrics else "",
         )
         self._save_chunks_meta(chunks)
 
-        # ── 2. MAP-фаза ───────────────────────────────────────────────
+        # ── СТАДИЯ 2: MAP-фаза ────────────────────────────────────────
+        logger.info("")
+        logger.info(
+            "СТАДИЯ 2/%d  ▶  MAP-фаза  (%d чанков  ·  параллельность %d)",
+            _TOTAL_STAGES, len(chunks), cfg.map_concurrency,
+        )
+        if chunks:
+            t0_map = chunks[0].time_range[0]
+            t1_map = chunks[-1].time_range[1]
+            logger.info(
+                "  Период MAP: %s  →  %s",
+                t0_map.strftime("%Y-%m-%d %H:%M %Z"),
+                t1_map.strftime("%H:%M %Z"),
+            )
+        t2 = time.monotonic()
         batch_results: list[BatchAnalysis] = await self._map_processor.process_all(
             chunks, metrics=metrics
         )
+        t2_elapsed = time.monotonic() - t2
 
-        # Статистика деградации MAP — считаем ДО фильтрации пустых батчей
         processing_error_batches = sum(
             1 for b in batch_results if b.data_quality == "processing_error"
         )
-
         batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
         if not batch_results:
             logger.warning("MAP phase produced no useful results")
             return "# Incident Analysis\n\nNo significant events found in the log data."
 
+        total_events_map = sum(len(b.events) for b in batch_results)
+        total_hyp_map    = sum(len(b.hypotheses) for b in batch_results)
+        logger.info(
+            "СТАДИЯ 2/%d  ✓  MAP завершён  [%s]  →  %d батчей  ·  %d событий  ·  %d гипотез%s",
+            _TOTAL_STAGES, fmt_dur(t2_elapsed), len(batch_results),
+            total_events_map, total_hyp_map,
+            f"  ·  ⚠ ошибок обработки: {processing_error_batches}" if processing_error_batches else "",
+        )
         self._log_map_summary(batch_results)
 
-        # ── 3. REDUCE-фаза ────────────────────────────────────────────
+        # ── СТАДИЯ 3: REDUCE-фаза ─────────────────────────────────────
+        logger.info("")
+        logger.info(
+            "СТАДИЯ 3/%d  ▶  REDUCE-фаза  (%d батчей → 1 MergedAnalysis)",
+            _TOTAL_STAGES, len(batch_results),
+        )
+        t3 = time.monotonic()
         merged = await self._tree_reducer.reduce(
             batch_results=batch_results,
             early_summaries=[],
         )
+        self.last_merged = merged
+        t3_elapsed = time.monotonic() - t3
 
+        logger.info(
+            "СТАДИЯ 3/%d  ✓  REDUCE завершён  [%s]  →  %d событий  ·  %d цепочек  ·  %d гипотез",
+            _TOTAL_STAGES, fmt_dur(t3_elapsed),
+            len(merged.events), len(merged.causal_chains), len(merged.hypotheses),
+        )
         self._log_merged_summary(merged)
 
-        # Финальная статистика деградации
         degradation = {
             "processing_error_batches": processing_error_batches,
             "programmatic_merges": self._tree_reducer.programmatic_merge_count,
@@ -166,22 +227,46 @@ class PipelineOrchestrator:
         if any(degradation.values()):
             logger.warning("Degradation stats: %s", degradation)
 
-        # ── 4а. Программный Markdown-отчёт (детерминированный) ───────
+        # ── СТАДИЯ 4: Программный отчёт ───────────────────────────────
+        logger.info("")
+        logger.info("СТАДИЯ 4/%d  ▶  Программный Markdown-отчёт (детерминированный, без LLM)", _TOTAL_STAGES)
+        t4 = time.monotonic()
         self._save_structured_report(merged)
+        t4_elapsed = time.monotonic() - t4
+        logger.info("СТАДИЯ 4/%d  ✓  report_data.md  [%s]", _TOTAL_STAGES, fmt_dur(t4_elapsed))
 
-        # ── 4б. Многопроходный LLM-отчёт (13 секций параллельно) ────
+        # ── СТАДИЯ 5: Многопроходный LLM-отчёт ───────────────────────
+        logger.info("")
+        logger.info("СТАДИЯ 5/%d  ▶  Многопроходный LLM-отчёт (14 секций последовательно)", _TOTAL_STAGES)
+        t5 = time.monotonic()
         await self._multipass_generator.generate(merged, degradation=degradation)
+        t5_elapsed = time.monotonic() - t5
+        logger.info("СТАДИЯ 5/%d  ✓  report_multipass.md  [%s]", _TOTAL_STAGES, fmt_dur(t5_elapsed))
 
-        # ── 4в. Монолитный LLM-отчёт (нарративный, один вызов) ──────
+        # ── СТАДИЯ 6: Монолитный LLM-отчёт ───────────────────────────
+        logger.info("")
+        logger.info("СТАДИЯ 6/%d  ▶  Монолитный LLM-отчёт (нарративный, один вызов)", _TOTAL_STAGES)
+        t6 = time.monotonic()
         report = await self._report_generator.generate(
             merged=merged,
             early_summaries=[],
         )
+        t6_elapsed = time.monotonic() - t6
+        logger.info("СТАДИЯ 6/%d  ✓  report.md  [%s]", _TOTAL_STAGES, fmt_dur(t6_elapsed))
 
-        elapsed = time.monotonic() - t0
-        logger.info("Pipeline complete in %.1fs", elapsed)
+        # ── Итог ──────────────────────────────────────────────────────
+        total_elapsed = time.monotonic() - t_pipeline
+        logger.info("")
+        logger.info(_SEP)
+        logger.info("ПАЙПЛАЙН ЗАВЕРШЁН  ✓  Общее время: %s", fmt_dur(total_elapsed))
+        logger.info(
+            "  Загрузка: %s  ·  MAP: %s  ·  REDUCE: %s  ·  Отчёты: %s",
+            fmt_dur(t1_elapsed), fmt_dur(t2_elapsed), fmt_dur(t3_elapsed),
+            fmt_dur(t4_elapsed + t5_elapsed + t6_elapsed),
+        )
         if self._run_dir:
-            logger.info("All artifacts saved in %s", self._run_dir.resolve())
+            logger.info("  Все артефакты: %s", self._run_dir.resolve())
+        logger.info(_SEP)
         return report
 
     def run_sync(self) -> str:

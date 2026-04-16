@@ -17,6 +17,7 @@ from log_summarizer.config import PipelineConfig
 from log_summarizer.llm_client import ContextOverflowError, LLMClient
 from log_summarizer.models import MergedAnalysis
 from log_summarizer.utils.logging import get_logger
+from log_summarizer.utils.progress import ProgressTracker, fmt_dur
 
 logger = get_logger("multipass_report")
 
@@ -59,6 +60,7 @@ class MultipassReportGenerator:
         self.llm = llm
         self.config = config
         self._run_dir = run_dir
+        self._progress: Optional[ProgressTracker] = None  # живёт только во время generate()
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -80,6 +82,13 @@ class MultipassReportGenerator:
         Returns:
             Готовый Markdown-документ.
         """
+        import time as _time
+        _t0_report = _time.monotonic()
+
+        # 13 LLM-вызовов: sec3,4,5,5a,6,8,9,10,11,12,13,14 + sec2 (последний)
+        _LLM_TOTAL = 13
+        self._progress = ProgressTracker(total=_LLM_TOTAL, label="REPORT")
+
         # Общие данные, вычисляются один раз
         events_index = {
             e.id: _ru(e.description, getattr(e, "description_ru", None))
@@ -93,24 +102,40 @@ class MultipassReportGenerator:
             for h in merged.hypotheses
         ]
 
+        t0_rep, t1_rep = merged.time_range
+        logger.info(
+            "  Генерация отчёта: %d событий · %d гипотез · %d цепочек  |  период %s→%s",
+            len(merged.events), len(merged.hypotheses), len(merged.causal_chains),
+            t0_rep.strftime("%H:%M:%S"), t1_rep.strftime("%H:%M:%S"),
+        )
+
         # Секция 1 — программно, без LLM
         sec1  = self._sec_incident_context()
 
-        # Секции 3–13 — строго последовательно, по одному LLM-вызову
+        # Секции 3–14 — строго последовательно, по одному LLM-вызову.
+        # sec5 (технические цепочки) и sec5a (объяснение для человека) генерируются
+        # первыми, чтобы все последующие секции могли использовать их как контекст.
         sec3  = await self._sec_data_coverage(merged)
         sec4  = await self._sec_chronology(merged)
         sec5  = await self._sec_causal_chains(merged, events_index)
-        sec6  = await self._sec_alert_links(merged, events_index)
+        sec5a = await self._sec_root_cause_explanation(merged, sec5)
+
+        # sec6–sec11 получают цепочку как контекст
+        sec6  = await self._sec_alert_links(merged, events_index, sec5a)
         sec7  = await self._sec_metrics(merged)
-        sec8  = await self._sec_hypotheses(merged, events_index)
-        sec9  = await self._sec_conflicts(merged, events_index)
-        sec10 = await self._sec_gaps(merged, events_index)
-        sec11 = await self._sec_impact(merged)
-        sec12 = await self._sec_recommendations(merged, hypotheses_short)
+        sec8  = await self._sec_hypotheses(merged, events_index, sec5a)
+        sec9  = await self._sec_conflicts(merged, events_index, sec5a)
+        sec10 = await self._sec_gaps(merged, events_index, sec5a)
+        sec11 = await self._sec_impact(merged, sec5a)
+        sec12 = await self._sec_recommendations(merged, hypotheses_short, sec5a)
         sec13 = await self._sec_limitations(merged, hypotheses_short, degradation or {})
+        sec14 = await self._sec_coverage_recommendations(merged, events_index)
 
         # Секция 2 — последняя
-        sec2  = await self._sec_summary(merged, sec13)
+        sec2  = await self._sec_summary(merged, sec13, sec5a)
+
+        # Справочник событий — программно, без LLM
+        events_ref = self._sec_events_reference(merged)
 
         # Сборка
         order = [
@@ -119,6 +144,7 @@ class MultipassReportGenerator:
             ("3. Покрытие данных",                   sec3),
             ("4. Хронология событий",                sec4),
             ("5. Причинно-следственные цепочки",     sec5),
+            ("5а. Объяснение первопричины",          sec5a),
             ("6. Связь с алертами",                  sec6),
             ("7. Аномалии метрик",                   sec7),
             ("8. Гипотезы первопричин",              sec8),
@@ -127,11 +153,29 @@ class MultipassReportGenerator:
             ("11. Масштаб и влияние",                sec11),
             ("12. Рекомендации для SRE",             sec12),
             ("13. Уровень уверенности и ограничения", sec13),
+            ("14. Рекомендации по расширению анализа", sec14),
+            ("Приложение: Справочник событий",       events_ref),
         ]
 
-        parts = [f"## {title}\n\n{text}" for title, text in order]
+        parts = [f"## {title}\n\n{text}" for title, text in order if text.strip()]
         report = "\n\n---\n\n".join(parts)
-        self._save("report_multipass.md", report)
+
+        if self._run_dir:
+            rpath = self._run_dir / "report_multipass.md"
+            self._save("report_multipass.md", report)
+            logger.info(
+                "  %s  →  %s",
+                self._progress.summary() if self._progress else "REPORT done",
+                rpath,
+            )
+        else:
+            self._save("report_multipass.md", report)
+            logger.info(
+                "  %s",
+                self._progress.summary() if self._progress else "REPORT done",
+            )
+
+        self._progress = None  # сброс
         return report
 
     # ── Секции ────────────────────────────────────────────────────────
@@ -151,6 +195,8 @@ class MultipassReportGenerator:
             lines.append(
                 f"**Окно загрузки логов:** {cs.isoformat()} → {ce.isoformat()}"
             )
+        if cfg.total_log_rows:
+            lines.append(f"**Обработано строк логов:** {cfg.total_log_rows:,}")
         if cfg.alerts:
             alert_lines = [
                 f"- `{a.id}` **{a.name}** ({a.severity.value})"
@@ -258,12 +304,20 @@ class MultipassReportGenerator:
             } for c in chs])
 
         system = _LANG + (
-            "Ты генерируешь раздел «Причинно-следственные цепочки» отчёта об инциденте.\n"
-            "Опиши каждую связь не как «A → B», а с конкретным механизмом: ПОЧЕМУ именно "
-            "причина привела к следствию. Укажи уровень уверенности.\n"
-            "Построй связный нарратив: сначала основная цепочка (root cause → следствия), "
-            "затем побочные. Кросс-зональные связи (context_before → incident) — самые ценные, "
-            "выдели их."
+            "Ты генерируешь раздел «Причинно-следственные цепочки» отчёта об инциденте.\n\n"
+            "ОБЯЗАТЕЛЬНАЯ СТРУКТУРА РАЗДЕЛА:\n\n"
+            "### Цепочка возникновения инцидента\n"
+            "Пронумерованная последовательность от первопричины до пика инцидента.\n"
+            "Каждый шаг: время → событие → ПОЧЕМУ оно привело к следующему.\n"
+            "Если есть кросс-зональные связи (context_before → incident) — они идут первыми,\n"
+            "это самые ценные ссылки: изменение/деплой ДО инцидента, которое его породило.\n"
+            "Пример формата:\n"
+            "1. `HH:MM` **[evt-id]** Название события — механизм перехода к следующему шагу\n"
+            "2. `HH:MM` **[evt-id]** ...\n\n"
+            "### Побочные цепочки\n"
+            "Остальные причинно-следственные связи, не входящие в основную цепочку.\n"
+            "Для каждой: уровень уверенности и конкретный механизм.\n\n"
+            "Если данных для построения цепочки недостаточно — явно укажи, какого звена не хватает."
         )
         user = (
             f"Причинные связи:\n{_payload(chains)}\n\n"
@@ -281,7 +335,50 @@ class MultipassReportGenerator:
             )
             return await self._call_or_stub("causal_chains", system, user)
 
-    async def _sec_alert_links(self, merged: MergedAnalysis, events_index: dict) -> str:
+    async def _sec_root_cause_explanation(self, merged: MergedAnalysis, sec5_text: str) -> str:
+        """Секция 5а — объяснение первопричины для человека (3-4 абзаца).
+
+        Берёт sec5 (причинно-следственные цепочки) как контекст и пишет
+        понятное объяснение: симптомы → деградация → корень.
+        """
+        leading_hyp = max(
+            merged.hypotheses,
+            key=lambda h: _conf_float(h.confidence),
+            default=None,
+        )
+        hyp_text = ""
+        if leading_hyp:
+            hyp_text = (
+                f"Ведущая гипотеза: {_ru(leading_hyp.title, getattr(leading_hyp, 'title_ru', None))} "
+                f"(уверенность: {leading_hyp.confidence})\n"
+                f"{_ru(leading_hyp.description, getattr(leading_hyp, 'description_ru', None))}"
+            )
+
+        system = _LANG + (
+            "Ты пишешь раздел «Объяснение первопричины» для SRE-отчёта.\n\n"
+            "Задача: понятно объяснить дежурному инженеру ЧТО произошло и ПОЧЕМУ.\n"
+            "Не используй технический жаргон без расшифровки.\n\n"
+            "Структура (4 абзаца):\n"
+            "1. **Симптомы** — что наблюдал дежурный (алерты, ошибки, жалобы)\n"
+            "2. **Цепочка деградации** — как одно событие привело к другому (шаг за шагом)\n"
+            "3. **Корень проблемы** — где и почему система дала сбой\n"
+            "4. **Почему именно сейчас** — что изменилось или что достигло предела\n\n"
+            "Каждый абзац: 2–4 предложения. Говори уверенно там, где данные есть; "
+            "явно обозначай неопределённость там, где данных нет.\n"
+            "Не повторяй технические ID событий — пиши человеческим языком."
+        )
+        user = f"Причинно-следственные цепочки:\n{sec5_text}"
+        if hyp_text:
+            user += f"\n\n{hyp_text}"
+
+        return await self._call_or_stub("root_cause_explanation", system, user)
+
+    async def _sec_alert_links(
+        self,
+        merged: MergedAnalysis,
+        events_index: dict,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 6 — связь с алертами."""
         if not merged.alert_refs:
             return "Алертов для анализа не было."
@@ -300,12 +397,17 @@ class MultipassReportGenerator:
             "- ОБЪЯСНЁН — найдены события, полностью объясняющие алерт\n"
             "- ЧАСТИЧНО ОБЪЯСНЁН — частичные данные; укажи чего не хватает\n"
             "- НЕ ОБЪЯСНЁН — объяснение не найдено; укажи где искали\n"
-            "Ссылайся на конкретные события из индекса."
+            "Ссылайся на конкретные события из индекса.\n"
+            "Если доступна цепочка первопричины — покажи, в каком звене цепочки "
+            "алерт сработал: это самая ценная информация для SRE."
         )
         user = (
             f"Алерты:\n{payload}\n\n"
             f"Индекс событий:\n{_jdump(events_index)}"
         )
+        if root_cause_text.strip():
+            user += f"\n\nЦепочка деградации (контекст):\n{root_cause_text}"
+
         return await self._call_or_stub("alert_links", system, user)
 
     async def _sec_metrics(self, merged: MergedAnalysis) -> str:
@@ -316,7 +418,12 @@ class MultipassReportGenerator:
             "для затронутых сервисов."
         )
 
-    async def _sec_hypotheses(self, merged: MergedAnalysis, events_index: dict) -> str:
+    async def _sec_hypotheses(
+        self,
+        merged: MergedAnalysis,
+        events_index: dict,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 8 — гипотезы первопричин."""
         if not merged.hypotheses:
             return "Гипотез не сформулировано."
@@ -342,19 +449,30 @@ class MultipassReportGenerator:
             "- Название и уровень уверенности с ОБОСНОВАНИЕМ (не просто число)\n"
             "- Развёрнутое обоснование (3–5 предложений)\n"
             "- Подтверждающие и опровергающие события (ссылки из индекса)\n"
-            "Гипотезы с низким confidence — в конце, свёрнуто."
+            "Гипотезы с низким confidence — в конце, свёрнуто.\n"
+            "Если доступна цепочка деградации — сверь каждую гипотезу с ней: "
+            "подтверждает ли цепочка гипотезу или опровергает? "
+            "Явно укажи это в обосновании."
         )
         user = f"Гипотезы:\n{_payload(hyps)}\n\nИндекс событий:\n{_jdump(events_index)}"
+        if root_cause_text.strip():
+            user += f"\n\nЦепочка деградации (для сверки с гипотезами):\n{root_cause_text}"
 
         try:
             return await self._call("hypotheses", system, user)
         except ContextOverflowError:
-            # Убрать гипотезы с confidence "low"
             filtered = [h for h in hyps if _conf_float(h.confidence) >= 0.5]
             user = f"Гипотезы (только medium/high confidence):\n{_payload(filtered)}\n\nИндекс событий:\n{_jdump(events_index)}"
+            if root_cause_text.strip():
+                user += f"\n\nЦепочка деградации:\n{root_cause_text}"
             return await self._call_or_stub("hypotheses", system, user)
 
-    async def _sec_conflicts(self, merged: MergedAnalysis, events_index: dict) -> str:
+    async def _sec_conflicts(
+        self,
+        merged: MergedAnalysis,
+        events_index: dict,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 9 — конфликтующие версии / аномалии."""
         if not merged.anomalies:
             return "Конфликтующих интерпретаций не обнаружено."
@@ -367,12 +485,23 @@ class MultipassReportGenerator:
         system = _LANG + (
             "Ты генерируешь раздел «Конфликтующие версии» отчёта об инциденте.\n"
             "Опиши аномалии и противоречия в данных: что выглядит необычно или "
-            "не вписывается в основную версию. Ссылайся на конкретные события из индекса."
+            "не вписывается в основную версию. Ссылайся на конкретные события из индекса.\n"
+            "Если доступна цепочка деградации — для каждой аномалии явно укажи: "
+            "вписывается ли она в эту цепочку, или это альтернативная версия событий? "
+            "Если альтернативная — чем она опасна и почему не стала основной?"
         )
         user = f"Аномалии:\n{payload}\n\nИндекс событий:\n{_jdump(events_index)}"
+        if root_cause_text.strip():
+            user += f"\n\nОсновная цепочка деградации:\n{root_cause_text}"
+
         return await self._call_or_stub("conflicts", system, user)
 
-    async def _sec_gaps(self, merged: MergedAnalysis, events_index: dict) -> str:
+    async def _sec_gaps(
+        self,
+        merged: MergedAnalysis,
+        events_index: dict,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 10 — разрывы в цепочках."""
         if not merged.gaps:
             return "Значимых разрывов в причинно-следственных цепочках не обнаружено."
@@ -386,24 +515,45 @@ class MultipassReportGenerator:
         system = _LANG + (
             "Ты генерируешь раздел «Разрывы в цепочках» отчёта об инциденте.\n"
             "Для каждого разрыва объясни: что происходило до и после, "
-            "какие данные отсутствуют и как это влияет на уверенность в диагнозе."
+            "какие данные отсутствуют и как это влияет на уверенность в диагнозе.\n"
+            "Если доступна цепочка деградации — покажи, в каком звене цепочки "
+            "находится этот разрыв: пропущено звено в начале (неизвестна первопричина), "
+            "в середине (неизвестен механизм перехода) или в конце (неизвестно разрешение)? "
+            "Это определяет, насколько критичен разрыв для диагноза."
         )
         user = f"Разрывы:\n{payload}\n\nИндекс событий:\n{_jdump(events_index)}"
+        if root_cause_text.strip():
+            user += f"\n\nЦепочка деградации (для локализации разрыва):\n{root_cause_text}"
+
         return await self._call_or_stub("gaps", system, user)
 
-    async def _sec_impact(self, merged: MergedAnalysis) -> str:
+    async def _sec_impact(
+        self,
+        merged: MergedAnalysis,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 11 — масштаб и влияние."""
         impact_text = _ru(merged.impact_summary, merged.impact_summary_ru) or "Данных о масштабе нет."
         system = _LANG + (
             "Ты генерируешь раздел «Масштаб и влияние» отчёта об инциденте.\n"
             "Укажи: затронутые сервисы, пострадавшие пользовательские сценарии, "
             "количественные данные об ошибках, общую длительность, общую оценку серьёзности. "
-            "Будь конкретным, используй цифры и названия сервисов."
+            "Будь конкретным, используй цифры и названия сервисов.\n"
+            "Если доступна цепочка деградации — объясни, как именно первопричина "
+            "распространилась и какие сервисы затронула на каждом шаге."
         )
         user = f"Данные о влиянии:\n{impact_text}"
+        if root_cause_text.strip():
+            user += f"\n\nЦепочка деградации (как распространялась проблема):\n{root_cause_text}"
+
         return await self._call_or_stub("impact", system, user)
 
-    async def _sec_recommendations(self, merged: MergedAnalysis, hypotheses_short: list) -> str:
+    async def _sec_recommendations(
+        self,
+        merged: MergedAnalysis,
+        hypotheses_short: list,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 12 — рекомендации для SRE."""
         recs = merged.preliminary_recommendations_ru or merged.preliminary_recommendations
         if not recs:
@@ -415,13 +565,19 @@ class MultipassReportGenerator:
             "- P0 — немедленно (инцидент продолжается или повторится)\n"
             "- P1 — в ближайшее время (серьёзный риск)\n"
             "- P2 — улучшения (предотвращение повторения)\n"
-            "Для каждой рекомендации: конкретное действие, зачем (ссылка на гипотезу), ожидаемый эффект.\n"
-            "«Увеличить пул соединений с 50 до 150» — хорошо. «Посмотреть на базу данных» — плохо."
+            "Для каждой рекомендации: конкретное действие, зачем (привязка к конкретному звену "
+            "причинно-следственной цепочки), ожидаемый эффект.\n"
+            "«Увеличить пул соединений с 50 до 150» — хорошо. «Посмотреть на базу данных» — плохо.\n"
+            "Если объяснение первопричины доступно — каждая рекомендация должна явно прерывать "
+            "одно из звеньев описанной цепочки деградации."
         )
         user = (
             f"Черновые рекомендации:\n{_jdump(recs)}\n\n"
             f"Гипотезы для привязки (title, confidence):\n{_jdump(hypotheses_short)}"
         )
+        if root_cause_text.strip():
+            user += f"\n\nОбъяснение первопричины (цепочка деградации):\n{root_cause_text}"
+
         return await self._call_or_stub("recommendations", system, user)
 
     async def _sec_limitations(self, merged: MergedAnalysis, hypotheses_short: list, degradation: dict) -> str:
@@ -467,7 +623,12 @@ class MultipassReportGenerator:
         )
         return await self._call_or_stub("limitations", system, user)
 
-    async def _sec_summary(self, merged: MergedAnalysis, limitations_section: str) -> str:
+    async def _sec_summary(
+        self,
+        merged: MergedAnalysis,
+        limitations_section: str,
+        root_cause_text: str = "",
+    ) -> str:
         """Секция 2 — резюме. Генерируется последней, получает скелет."""
         # Скелет из программно вычисленных фактов
         events_sorted = sorted(merged.events, key=lambda e: e.timestamp)
@@ -520,23 +681,175 @@ class MultipassReportGenerator:
             "- Что произошло (кратко)\n"
             "- Когда (временные рамки)\n"
             "- Какие сервисы затронуты\n"
-            "- Наиболее вероятная первопричина (со ссылкой на ведущую гипотезу)\n"
+            "- Наиболее вероятная первопричина — используй объяснение цепочки деградации "
+            "если оно доступно, не пересказывай технические ID\n"
             "- Текущий статус (разрешён / продолжается / неизвестен)\n"
             "Будь предельно кратким. Это TL;DR для занятого SRE."
         )
         user = _jdump(skeleton)
+        if root_cause_text.strip():
+            user += f"\n\nОбъяснение первопричины (цепочка деградации):\n{root_cause_text}"
+
         return await self._call_or_stub("summary", system, user)
 
     # ── Вспомогательные ───────────────────────────────────────────────
 
+    async def _sec_coverage_recommendations(
+        self, merged: MergedAnalysis, events_index: dict
+    ) -> str:
+        """Секция 14 — рекомендации по расширению анализа.
+
+        Отвечает на два вопроса:
+        1. Нужно ли расширить временное окно (и в какую сторону)?
+        2. Нужно ли добавить логи других сервисов?
+        """
+        cfg = self.config
+        ctx_start = cfg.context_start_actual()
+        ctx_end   = cfg.context_end_actual()
+        inc_start = cfg.incident_start
+        inc_end   = cfg.incident_end
+
+        events_sorted = sorted(merged.events, key=lambda e: e.timestamp)
+        first_evt = events_sorted[0]  if events_sorted else None
+        last_evt  = events_sorted[-1] if events_sorted else None
+
+        # Сервисы, реально присутствующие в событиях
+        seen_services = sorted({e.source for e in merged.events if e.source})
+
+        # Близость первого события к левой границе окна: сигнал что надо смотреть глубже
+        proximity_warning = ""
+        if first_evt and ctx_start:
+            try:
+                # Нормализуем tzinfo для сравнения
+                fe_ts = first_evt.timestamp
+                cs    = ctx_start
+                if fe_ts.tzinfo is None and cs.tzinfo is not None:
+                    from datetime import timezone as _tz
+                    fe_ts = fe_ts.replace(tzinfo=_tz.utc)
+                delta_min = (fe_ts - cs).total_seconds() / 60
+                if 0 <= delta_min < 10:
+                    proximity_warning = (
+                        f"⚠ Первое событие ({fe_ts.strftime('%H:%M')}) "
+                        f"всего в {delta_min:.0f} мин от начала окна загрузки — "
+                        "возможно, root cause возник раньше."
+                    )
+            except Exception:
+                pass
+
+        user = _jdump({
+            "окно_загрузки_логов": {
+                "start": ctx_start.isoformat() if ctx_start else None,
+                "end":   ctx_end.isoformat()   if ctx_end   else None,
+            },
+            "окно_инцидента": {
+                "start": inc_start.isoformat() if inc_start else None,
+                "end":   inc_end.isoformat()   if inc_end   else None,
+            },
+            "зоны_покрытия": merged.zones_covered,
+            "первое_событие": (
+                {"id": first_evt.id, "time": first_evt.timestamp.isoformat(),
+                 "desc": events_index.get(first_evt.id, "")}
+                if first_evt else None
+            ),
+            "последнее_событие": (
+                {"id": last_evt.id, "time": last_evt.timestamp.isoformat(),
+                 "desc": events_index.get(last_evt.id, "")}
+                if last_evt else None
+            ),
+            "сервисы_в_анализе": seen_services,
+            "разрывы_в_данных": [
+                {"start": g.start.isoformat(), "end": g.end.isoformat(),
+                 "desc": _ru(g.description, getattr(g, "description_ru", None))}
+                for g in merged.gaps
+            ],
+            "гипотезы": [
+                {"title": _ru(h.title, getattr(h, "title_ru", None)),
+                 "confidence": h.confidence,
+                 "description": _ru(h.description, getattr(h, "description_ru", None))}
+                for h in merged.hypotheses
+            ],
+            "предупреждение": proximity_warning or None,
+        })
+
+        system = _LANG + (
+            "Ты генерируешь раздел «Рекомендации по расширению анализа» отчёта об инциденте.\n\n"
+            "Ответь на два вопроса — конкретно, с обоснованием:\n\n"
+            "### 1. Временное окно\n"
+            "Нужно ли расширить окно загрузки логов? В какую сторону и на сколько?\n"
+            "Сигналы что надо расширить НАЗАД:\n"
+            "- первое событие анализа близко к началу окна (< 10 мин)\n"
+            "- в гипотезах упоминаются изменения/деплои «до инцидента» без конкретных событий\n"
+            "- root cause цепочка оборвана: начинается с середины без предшествующего триггера\n"
+            "- зона context_before не покрыта или покрыта мало\n"
+            "Сигналы что надо расширить ВПЕРЁД:\n"
+            "- последнее событие близко к концу окна\n"
+            "- нет события «восстановление» / «сервис вернулся в норму»\n"
+            "Если окно достаточное — прямо скажи: «Окно достаточное, расширять не нужно».\n\n"
+            "### 2. Набор сервисов\n"
+            "Нужно ли добавить логи других сервисов?\n"
+            "Смотри: какие сервисы упоминаются в гипотезах и описаниях событий, "
+            "но ОТСУТСТВУЮТ в списке сервисов анализа?\n"
+            "Для каждого предложенного сервиса: почему его логи важны и что они могут объяснить.\n"
+            "Если набор сервисов достаточный — скажи об этом явно.\n\n"
+            "Формат: два подраздела с конкретными выводами. "
+            "«Рассмотреть возможность» — плохо. «Расширить окно на 2 часа назад» — хорошо."
+        )
+
+        return await self._call_or_stub("coverage_recommendations", system, user)
+
+    @staticmethod
+    def _sec_events_reference(merged: MergedAnalysis) -> str:
+        """Программный справочник событий: полная таблица ID → детали.
+
+        Генерируется без LLM. Позволяет по ID из любой секции найти
+        время, сервис и описание события.
+        """
+        events = sorted(merged.events, key=lambda e: e.timestamp)
+        if not events:
+            return ""
+
+        rows = [
+            "| ID | Время (UTC) | Сервис | Описание | Severity | Важность |",
+            "|-------|-------------|--------|---------|----------|----------|",
+        ]
+        for e in events:
+            desc = _ru(e.description, getattr(e, "description_ru", None))
+            imp_flag = "⚠" if e.importance >= 0.8 else ""
+            rows.append(
+                f"| `{e.id}` | `{e.timestamp.strftime('%H:%M:%S')}` "
+                f"| `{e.source}` | {desc} | {e.severity.value} | {imp_flag} {e.importance:.1f} |"
+            )
+        return "\n".join(rows)
+
     async def _call(self, name: str, system: str, user: str) -> str:
         """LLM-вызов; пробрасывает ContextOverflowError для обработки выше."""
+        import time as _time
+
+        if self._progress:
+            next_n = self._progress.done + 1
+            logger.info(
+                "  [секция %d/%d] ▶  %s",
+                next_n, self._progress.total, name,
+            )
+
+        t_sec = _time.monotonic()
         result = await self.llm.call_text(
             system=system,
             user=user,
             temperature=self.config.temperature_report,
         )
-        self._save(f"multipass_{name}.md", result)
+        elapsed_sec = _time.monotonic() - t_sec
+
+        path = self._save(f"multipass_{name}.md", result)
+
+        if self._progress:
+            status = self._progress.tick()
+            logger.info(
+                "  %s  [%s]  →  %s",
+                status, fmt_dur(elapsed_sec),
+                path if path else f"multipass_{name}.md",
+            )
+
         return result
 
     async def _call_or_stub(self, name: str, system: str, user: str) -> str:
@@ -544,11 +857,15 @@ class MultipassReportGenerator:
         try:
             return await self._call(name, system, user)
         except Exception as exc:
-            logger.error("Section '%s' failed: %s — using placeholder", name, exc)
+            if self._progress:
+                self._progress.tick()  # считаем как выполненный шаг
+            logger.error("  Section '%s' failed: %s — using placeholder", name, exc)
             return _PLACEHOLDER
 
-    def _save(self, filename: str, content: str) -> None:
+    def _save(self, filename: str, content: str) -> Optional[Path]:
         if self._run_dir is None:
-            return
+            return None
         self._run_dir.mkdir(parents=True, exist_ok=True)
-        (self._run_dir / filename).write_text(content, encoding="utf-8")
+        path = self._run_dir / filename
+        path.write_text(content, encoding="utf-8")
+        return path
