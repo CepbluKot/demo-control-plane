@@ -214,18 +214,24 @@ INCIDENTS = [
 ]
 
 # ══════════════════════════════════════════════════════════════════════
-#  QUICK MODE — саммари за произвольный период (python run_pipeline.py --quick)
+#  РЕЖИМ ЗАПУСКА
 #
-#  Заполни QUICK_START и QUICK_END — пайплайн загрузит логи за этот период
-#  и сгенерирует отчёт без привязки к конкретному инциденту.
-#  INCIDENTS при этом полностью игнорируется.
+#  "incidents" — обрабатывает список INCIDENTS ниже (дефолт)
+#  "quick"     — саммари за произвольный период QUICK_START..QUICK_END;
+#                INCIDENTS при этом полностью игнорируется
+# ══════════════════════════════════════════════════════════════════════
+
+MODE = "incidents"   # "incidents" | "quick"
+
+# ══════════════════════════════════════════════════════════════════════
+#  QUICK MODE — заполни если MODE = "quick"
 #
 #  QUICK_CONTEXT — опциональное описание: что ищем, на что обратить внимание.
 #  Оставь пустым если хочешь просто "покажи что происходило".
 # ══════════════════════════════════════════════════════════════════════
 
-QUICK_START:   datetime | None = None   # datetime(2026, 3, 18, 18, 30, 0, tzinfo=MSK)
-QUICK_END:     datetime | None = None   # datetime(2026, 3, 18, 20,  0, 0, tzinfo=MSK)
+QUICK_START:   datetime | None = None   # datetime(2026, 3, 18, 1, 30, 0, tzinfo=MSK)
+QUICK_END:     datetime | None = None   # datetime(2026, 3, 18, 19, 30, 0, tzinfo=MSK)
 QUICK_CONTEXT: str             = ""     # "Посмотреть что происходило с кластером в этот период"
 
 # ══════════════════════════════════════════════════════════════════════
@@ -324,6 +330,9 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
 async def main(only: str | None, quick: bool = False) -> None:
     from log_summarizer.utils.logging import setup_pipeline_logging
 
+    # MODE-переменная имеет приоритет над --quick флагом
+    use_quick = (MODE == "quick") or quick
+
     # ── Корневая папка этого запуска ──────────────────────────────────
     # Одна папка на весь вызов python run_pipeline.py.
     # Структура: runs/{run_timestamp}/{incident_name}/{artifact_timestamp}/
@@ -350,7 +359,7 @@ async def main(only: str | None, quick: bool = False) -> None:
     )
 
     # ── Quick mode ────────────────────────────────────────────────────
-    if quick:
+    if use_quick:
         if not QUICK_START or not QUICK_END:
             raise SystemExit(
                 "QUICK_START и QUICK_END должны быть заданы для --quick режима.\n"
