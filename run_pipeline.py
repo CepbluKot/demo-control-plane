@@ -1,15 +1,15 @@
 """
-run_pipeline.py — запуск пайплайна log_summarizer для списка инцидентов.
+run_pipeline.py — запуск пайплайна log_summarizer для анализа инцидентов.
 
-Заполни INCIDENTS и запусти:
+Режимы (переменная MODE):
+  "incidents" — обрабатывает список INCIDENTS; время берётся из incident_start/end.
+  "freeform"  — один инцидент с явным периодом FREEFORM_START..FREEFORM_END
+                и алертами FREEFORM_ALERTS; удобно когда нужен произвольный отрезок.
+
+Запуск:
     python run_pipeline.py
-    python run_pipeline.py --only airflow-oom  # один инцидент по имени
-    python run_pipeline.py --list              # показать список инцидентов
-
-Быстрый режим — саммари за произвольный период без описания инцидента:
-    python run_pipeline.py --quick
-    Заполни QUICK_START, QUICK_END (и опционально QUICK_CONTEXT) ниже.
-    INCIDENTS при этом полностью игнорируется.
+    python run_pipeline.py --only airflow-oom   # только один инцидент (только incidents)
+    python run_pipeline.py --list               # показать список инцидентов
 """
 from __future__ import annotations
 
@@ -216,23 +216,46 @@ INCIDENTS = [
 # ══════════════════════════════════════════════════════════════════════
 #  РЕЖИМ ЗАПУСКА
 #
-#  "incidents" — обрабатывает список INCIDENTS ниже (дефолт)
-#  "quick"     — саммари за произвольный период QUICK_START..QUICK_END;
-#                INCIDENTS при этом полностью игнорируется
-# ══════════════════════════════════════════════════════════════════════
-
-MODE = "incidents"   # "incidents" | "quick"
-
-# ══════════════════════════════════════════════════════════════════════
-#  QUICK MODE — заполни если MODE = "quick"
+#  "incidents" — обрабатывает список INCIDENTS ниже (дефолт).
+#               Время инцидента и контекстное окно берутся из каждой записи.
 #
-#  QUICK_CONTEXT — опциональное описание: что ищем, на что обратить внимание.
-#  Оставь пустым если хочешь просто "покажи что происходило".
+#  "freeform"  — один инцидент с явным отрезком FREEFORM_START..FREEFORM_END.
+#               Алерты и контекст задаются через FREEFORM_ALERTS / FREEFORM_CONTEXT.
+#               Удобно когда нужно разобрать произвольный период без добавления
+#               записи в INCIDENTS.
 # ══════════════════════════════════════════════════════════════════════
 
-QUICK_START:   datetime | None = None   # datetime(2026, 3, 18, 1, 30, 0, tzinfo=MSK)
-QUICK_END:     datetime | None = None   # datetime(2026, 3, 18, 19, 30, 0, tzinfo=MSK)
-QUICK_CONTEXT: str             = ""     # "Посмотреть что происходило с кластером в этот период"
+MODE = "incidents"   # "incidents" | "freeform"
+
+# ══════════════════════════════════════════════════════════════════════
+#  AUTO_TRIM_AFTER_LAST_ALERT
+#
+#  True  — конец периода загрузки логов обрезается до
+#          max(alert.fired_at) + TRIM_BUFFER_MINUTES.
+#          Логи после последнего алерта обычно не нужны для анализа причины.
+#  False — конец периода не меняется (context_end / FREEFORM_END как задано).
+#
+#  Работает в обоих режимах: incidents и freeform.
+# ══════════════════════════════════════════════════════════════════════
+
+AUTO_TRIM_AFTER_LAST_ALERT = False
+TRIM_BUFFER_MINUTES        = 15   # сколько минут оставить после последнего алерта
+
+# ══════════════════════════════════════════════════════════════════════
+#  FREEFORM MODE — заполни если MODE = "freeform"
+#
+#  FREEFORM_START / FREEFORM_END — явный период загрузки логов (МСК).
+#  Алерты должны попасть внутрь этого диапазона.
+#  FREEFORM_CONTEXT — описание для LLM: что случилось, что ищем.
+# ══════════════════════════════════════════════════════════════════════
+
+FREEFORM_START:   datetime | None = None   # datetime(2026, 3, 18, 1, 30, 0, tzinfo=MSK)
+FREEFORM_END:     datetime | None = None   # datetime(2026, 3, 18, 19, 30, 0, tzinfo=MSK)
+FREEFORM_CONTEXT: str             = ""     # "Разобраться что происходило с кластером"
+FREEFORM_ALERTS: list[dict]       = [
+    # Тот же формат что в INCIDENTS:
+    # {"name": "AlertName", "fired_at": datetime(..., tzinfo=MSK), "severity": "critical", "description": "..."},
+]
 
 # ══════════════════════════════════════════════════════════════════════
 #  Параметры пайплайна
@@ -327,20 +350,42 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
         return name, exc, None
 
 
-async def main(only: str | None, quick: bool = False) -> None:
+def _apply_trim(incident: dict, log: logging.Logger) -> dict:
+    """Обрезает context_end до max(alert.fired_at) + TRIM_BUFFER_MINUTES.
+
+    Возвращает изменённую копию словаря инцидента.
+    Если алертов нет или ни у одного нет fired_at — возвращает оригинал без изменений.
+    """
+    alerts = incident.get("alerts", [])
+    fired_times = [a["fired_at"] for a in alerts if a.get("fired_at")]
+    if not fired_times:
+        return incident
+
+    last_alert = max(fired_times)
+    trim_end = last_alert + timedelta(minutes=TRIM_BUFFER_MINUTES)
+
+    ctx_end = incident.get("context_end") or incident.get("incident_end")
+    if ctx_end and trim_end >= ctx_end:
+        # Обрезать нечего — конец и так раньше или совпадает
+        return incident
+
+    log.info(
+        "AUTO_TRIM: context_end %s → %s (последний алерт %s + %d мин)",
+        ctx_end, trim_end, last_alert, TRIM_BUFFER_MINUTES,
+    )
+    result = dict(incident)
+    result["context_end"] = trim_end
+    return result
+
+
+async def main(only: str | None) -> None:
     from log_summarizer.utils.logging import setup_pipeline_logging
 
-    # MODE-переменная имеет приоритет над --quick флагом
-    use_quick = (MODE == "quick") or quick
-
     # ── Корневая папка этого запуска ──────────────────────────────────
-    # Одна папка на весь вызов python run_pipeline.py.
-    # Структура: runs/{run_timestamp}/{incident_name}/{artifact_timestamp}/
     run_ts = datetime.now(MSK).strftime("%Y-%m-%dT%H-%M-%S")
     run_dir = Path(RUNS_DIR) / run_ts
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Лог пишем в папку запуска (и на stderr)
     log_path = run_dir / "pipeline.log" if LOG_FILE else None
     setup_pipeline_logging(LOG_LEVEL, log_file=str(log_path) if log_path else None)
 
@@ -358,25 +403,39 @@ async def main(only: str | None, quick: bool = False) -> None:
         database=CH_DATABASE,
     )
 
-    # ── Quick mode ────────────────────────────────────────────────────
-    if use_quick:
-        if not QUICK_START or not QUICK_END:
+    # ── Freeform mode ─────────────────────────────────────────────────
+    if MODE == "freeform":
+        if not FREEFORM_START or not FREEFORM_END:
             raise SystemExit(
-                "QUICK_START и QUICK_END должны быть заданы для --quick режима.\n"
+                "FREEFORM_START и FREEFORM_END должны быть заданы для MODE=\"freeform\".\n"
                 "Заполни их в run_pipeline.py."
             )
-        name = "quick-" + QUICK_START.strftime("%Y-%m-%dT%H-%M")
+        if not FREEFORM_ALERTS:
+            raise SystemExit(
+                "FREEFORM_ALERTS пуст. Укажи хотя бы один алерт — "
+                "без алертов анализ инцидента не имеет смысла."
+            )
+        # Проверяем что все алерты попадают в заданный период
+        for a in FREEFORM_ALERTS:
+            ft = a.get("fired_at")
+            if ft and not (FREEFORM_START <= ft <= FREEFORM_END):
+                raise SystemExit(
+                    f"Алерт '{a['name']}' fired_at={ft} выходит за пределы "
+                    f"FREEFORM_START..FREEFORM_END ({FREEFORM_START} — {FREEFORM_END})."
+                )
+        name = "freeform-" + FREEFORM_START.strftime("%Y-%m-%dT%H-%M")
         incident = {
             "name": name,
-            "context": QUICK_CONTEXT or f"Анализ логов за период {QUICK_START} — {QUICK_END}",
-            "alerts": [],
-            "incident_start": QUICK_START,
-            "incident_end":   QUICK_END,
-            # контекстное окно == период (авто-расширение отключено)
-            "context_start":  QUICK_START,
-            "context_end":    QUICK_END,
+            "context": FREEFORM_CONTEXT or f"Анализ логов за период {FREEFORM_START} — {FREEFORM_END}",
+            "alerts": FREEFORM_ALERTS,
+            "incident_start": FREEFORM_START,
+            "incident_end":   FREEFORM_END,
+            "context_start":  FREEFORM_START,
+            "context_end":    FREEFORM_END,
         }
-        log.info("Quick mode: %s → %s", QUICK_START, QUICK_END)
+        if AUTO_TRIM_AFTER_LAST_ALERT:
+            incident = _apply_trim(incident, log)
+        log.info("Freeform mode: %s → %s", FREEFORM_START, FREEFORM_END)
         name, result, orchestrator = await run_incident(ch, incident, run_dir)
         if isinstance(result, Exception):
             raise SystemExit(f"Пайплайн завершился с ошибкой: {result}")
@@ -385,9 +444,10 @@ async def main(only: str | None, quick: bool = False) -> None:
             mono_path = artifact_dir / "report.md"
             mono_path.write_text(result, encoding="utf-8")
             log.info("report.md → %s", mono_path.resolve())
-        log.info("Quick mode завершён. Артефакты: %s", run_dir.resolve())
+        log.info("Freeform mode завершён. Артефакты: %s", run_dir.resolve())
         return
 
+    # ── Incidents mode ────────────────────────────────────────────────
     incidents = INCIDENTS
     if only:
         incidents = [i for i in INCIDENTS if i["name"] == only]
@@ -402,6 +462,8 @@ async def main(only: str | None, quick: bool = False) -> None:
     merged_list: list[tuple[str, object, object]] = []
 
     for incident in incidents:
+        if AUTO_TRIM_AFTER_LAST_ALERT:
+            incident = _apply_trim(incident, log)
         name, result, orchestrator = await run_incident(ch, incident, run_dir)
         if isinstance(result, Exception):
             failed.append(name)
@@ -479,17 +541,18 @@ async def main(only: str | None, quick: bool = False) -> None:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--only", default=None, metavar="NAME",
-                   help="Запустить только один инцидент по имени")
+                   help="Запустить только один инцидент по имени (только режим incidents)")
     p.add_argument("--list", action="store_true",
                    help="Показать список инцидентов и выйти")
-    p.add_argument("--quick", action="store_true",
-                   help="Быстрый режим: саммари за период QUICK_START..QUICK_END (INCIDENTS игнорируется)")
     args = p.parse_args()
 
     if args.list:
-        for i in INCIDENTS:
-            s = i.get("incident_start") or i.get("start", "?")
-            e = i.get("incident_end")   or i.get("end",   "?")
-            print(f"  {i['name']}  {s} → {e}")
+        if MODE == "freeform":
+            print(f"  freeform  {FREEFORM_START} → {FREEFORM_END}")
+        else:
+            for i in INCIDENTS:
+                s = i.get("incident_start") or i.get("start", "?")
+                e = i.get("incident_end")   or i.get("end",   "?")
+                print(f"  {i['name']}  {s} → {e}")
     else:
-        asyncio.run(main(args.only, quick=args.quick))
+        asyncio.run(main(args.only))
