@@ -32,6 +32,7 @@ from log_summarizer.llm_client import LLMClient
 from log_summarizer.map_processor import MapProcessor
 from log_summarizer.markdown_renderer import MarkdownRenderer
 from log_summarizer.models import BatchAnalysis, Chunk, MergedAnalysis, MetricRow
+from log_summarizer.multipass_report_generator import MultipassReportGenerator
 from log_summarizer.report_generator import ReportGenerator
 from log_summarizer.tree_reducer import TreeReducer
 from log_summarizer.utils.logging import get_logger
@@ -78,6 +79,10 @@ class PipelineOrchestrator:
             run_dir=self._run_dir / "reduce" if self._run_dir else None,
         )
         self._report_generator = ReportGenerator(
+            self._llm, config,
+            run_dir=self._run_dir,
+        )
+        self._multipass_generator = MultipassReportGenerator(
             self._llm, config,
             run_dir=self._run_dir,
         )
@@ -133,6 +138,11 @@ class PipelineOrchestrator:
             chunks, metrics=metrics
         )
 
+        # Статистика деградации MAP — считаем ДО фильтрации пустых батчей
+        processing_error_batches = sum(
+            1 for b in batch_results if b.data_quality == "processing_error"
+        )
+
         batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
         if not batch_results:
             logger.warning("MAP phase produced no useful results")
@@ -148,10 +158,21 @@ class PipelineOrchestrator:
 
         self._log_merged_summary(merged)
 
+        # Финальная статистика деградации
+        degradation = {
+            "processing_error_batches": processing_error_batches,
+            "programmatic_merges": self._tree_reducer.programmatic_merge_count,
+        }
+        if any(degradation.values()):
+            logger.warning("Degradation stats: %s", degradation)
+
         # ── 4а. Программный Markdown-отчёт (детерминированный) ───────
         self._save_structured_report(merged)
 
-        # ── 4б. LLM-отчёт (нарративный) ──────────────────────────────
+        # ── 4б. Многопроходный LLM-отчёт (13 секций параллельно) ────
+        await self._multipass_generator.generate(merged, degradation=degradation)
+
+        # ── 4в. Монолитный LLM-отчёт (нарративный, один вызов) ──────
         report = await self._report_generator.generate(
             merged=merged,
             early_summaries=[],

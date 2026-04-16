@@ -249,11 +249,13 @@ class MarkdownRenderer:
             from_desc = evt_map.get(chain.from_event_id, chain.from_event_id)
             to_desc   = evt_map.get(chain.to_event_id,   chain.to_event_id)
             desc = _ru(chain.description, getattr(chain, "description_ru", None))
+            mechanism = getattr(chain, "mechanism", None)
+            mechanism_line = f"\n\n**Механизм:** {mechanism}" if mechanism else ""
             parts.append(
                 f"**{conf_label}**\n\n"
                 f"> `{chain.from_event_id}` {from_desc}\n"
                 f"> → `{chain.to_event_id}` {to_desc}\n\n"
-                f"{desc}"
+                f"{desc}{mechanism_line}"
             )
 
         return "\n\n".join(parts)

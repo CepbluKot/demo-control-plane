@@ -53,6 +53,7 @@ class TreeReducer:
         self.llm = llm
         self.config = config
         self._run_dir = run_dir
+        self.programmatic_merge_count: int = 0  # сколько раз сработал fallback без LLM
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -273,9 +274,23 @@ class TreeReducer:
     ) -> MergedAnalysis:
         """Отправляем группу в LLM, получаем MergedAnalysis.
 
+        Если payload превышает pre_compress_threshold — превентивно сжимаем входы.
         Если ContextOverflowError — делаем попарный merge рекурсивно.
         """
         system = self._build_merge_system()
+
+        # Превентивная компрессия: если суммарный payload "опасного" размера —
+        # сжимаем входы ДО LLM-вызова, не дожидаясь 400.
+        threshold = self.config.pre_compress_threshold
+        if threshold > 0:
+            payload_size = sum(len(self._item_to_json(i)) for i in group)
+            if payload_size > threshold:
+                logger.info(
+                    "Pre-compressing: payload=%d chars > threshold=%d, items=%d",
+                    payload_size, threshold, len(group),
+                )
+                group = await self._compress_group_inputs(group)
+
         user = self._build_merge_user(group)
 
         try:
@@ -380,6 +395,28 @@ class TreeReducer:
             logger.error("ContextOverflow during compression — returning uncompressed")
             return analysis
 
+    async def _compress_group_inputs(self, group: list[_Item]) -> list[MergedAnalysis]:
+        """Последовательно сжимает все элементы группы до LLM-вызова merge.
+
+        Вызывается только при превышении pre_compress_threshold — превентивная мера
+        перед отправкой в LLM, не замена реактивному _compress_and_merge при 400.
+        """
+        items = [
+            item if isinstance(item, MergedAnalysis) else self._batch_to_merged(item)
+            for item in group
+        ]
+        compressed: list[MergedAnalysis] = []
+        for i, item in enumerate(items):
+            before = len(item.to_json_str())
+            c = await self._compress(item)
+            after = len(c.to_json_str())
+            logger.debug(
+                "Pre-compress item %d/%d: %d → %d chars (%.0f%%)",
+                i + 1, len(items), before, after, 100 * after / before if before else 0,
+            )
+            compressed.append(c)
+        return compressed
+
     async def _compress_and_merge(self, group: list[_Item]) -> MergedAnalysis:
         """Сжимаем элементы по одному и пробуем merge после каждого сжатия.
 
@@ -413,6 +450,7 @@ class TreeReducer:
                     )
 
         logger.error("ContextOverflow even after compressing all items — falling back to programmatic merge")
+        self.programmatic_merge_count += 1
         return self._programmatic_merge(items)
 
     # ── Evidence bank ─────────────────────────────────────────────────

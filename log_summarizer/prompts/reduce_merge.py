@@ -63,6 +63,7 @@ Rules:
       "to_event_id": "<evt-id>",
       "description": "<what caused what, English>",
       "description_ru": "<Russian translation>",
+      "mechanism": "<how exactly the cause led to the effect, e.g. 'exhausted connection pool starved workers'>",
       "confidence": "low|medium|high"
     }}
   ],

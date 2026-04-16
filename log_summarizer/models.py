@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+_models_log = logging.getLogger("log_summarizer.models")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -223,6 +226,7 @@ class CausalLink(BaseModel):
     to_event_id: str
     description: str                     # "OOM in payments caused by request surge from api-gateway"
     description_ru: Optional[str] = None # перевод на русский (заполняется REDUCE)
+    mechanism: Optional[str] = None      # КАК именно причина привела к следствию (конкретный механизм)
     confidence: str                      # "low" | "medium" | "high"
 
 
@@ -257,6 +261,27 @@ class MergedAnalysis(BaseModel):
     # Прикрепляются в конце REDUCE — НЕ проходят через LLM
     evidence_bank: list[Evidence] = Field(default_factory=list)
     alert_refs: list[AlertRef] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_referential_integrity(self) -> "MergedAnalysis":
+        """Логирует WARNING при висячих ссылках на event_id. Не бросает исключение."""
+        event_ids = {e.id for e in self.events}
+        for chain in self.causal_chains:
+            if chain.from_event_id not in event_ids:
+                _models_log.warning(
+                    "CausalLink dangling from_event_id=%r (not in events)", chain.from_event_id
+                )
+            if chain.to_event_id not in event_ids:
+                _models_log.warning(
+                    "CausalLink dangling to_event_id=%r (not in events)", chain.to_event_id
+                )
+        for hyp in self.hypotheses:
+            for eid in hyp.supporting_event_ids:
+                if eid not in event_ids:
+                    _models_log.warning(
+                        "Hypothesis %r dangling supporting_event_id=%r", hyp.id, eid
+                    )
+        return self
 
     def to_json_str(self) -> str:
         """Сериализация для REDUCE-промптов.
