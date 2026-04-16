@@ -67,7 +67,7 @@ class Chunker:
         if current:
             chunks.append(self._make_chunk(current, current_tokens))
 
-        logger.info(
+        logger.debug(
             "Chunked %d rows into %d chunks (max_batch_tokens=%d)",
             len(rows), len(chunks), self.max_batch_tokens,
         )

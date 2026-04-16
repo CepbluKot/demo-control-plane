@@ -1,388 +1,693 @@
-# LLM Context: Demo Control Plane
+# LLM Context: Log Summarizer Pipeline
 
-Этот файл предназначен для LLM/агентов, которые подключаются к проекту и должны быстро понять архитектуру, контракты и ограничения.
+Этот файл — полная документация для LLM/агентов. Прочитай его перед любым изменением кода.
 
-## 1) Цель проекта
+---
 
-Pipeline для SRE-кейса:
+## 1. Продукт: что это и зачем
 
-1. Получить `actual` метрику за окно времени.
-2. Получить `predictions` (forecast).
-3. Найти аномалии на фактических данных.
-4. По Top-N аномалиям сделать map-reduce суммаризацию логов.
-5. Сгенерировать уведомление.
-6. Показать live-прогресс и результаты в Streamlit UI.
+**Log Summarizer** — пайплайн для SRE, который автоматически расследует инциденты по логам.
 
-## 2) Точки входа
+**Проблема, которую он решает:** Во время инцидента у дежурного инженера есть сотни тысяч строк логов за нужный период, несколько сработавших алертов и вопрос: «что именно сломалось и почему?» Листать логи вручную — медленно. LLM за один вызов видит только часть данных — слишком много строк не помещаются в контекст.
 
-- CLI loop: `control-plane.py` -> `control_plane.pipeline.main()`.
-- Streamlit: `streamlit_app.py`.
-- Streamlit содержит 2 страницы:
-  - `Control Plane` (основной end-to-end pipeline по аномалиям).
-  - `Logs Summarizer` (ручной map-reduce анализ логов).
+**Решение:** MAP-REDUCE пайплайн. Логи нарезаются на чанки, каждый анализируется LLM параллельно (MAP), затем результаты итеративно сворачиваются в единый анализ (REDUCE), из которого генерируется структурированный отчёт в 14 секциях.
 
-## 3) Основные модули
+**Результат:** Markdown-отчёт с хронологией событий, причинно-следственными цепочками, объяснением каждого алерта, гипотезами первопричин и конкретными рекомендациями для SRE.
 
-- `control_plane/config.py`
-  - читает runtime-конфиг через `settings.py` (Pydantic Settings)
-  - хранит runtime-конфиг
-- `control_plane/actuals.py`
-  - единый интерфейс получения `actual`
-  - источники: `prometheus` и `clickhouse`
-- `control_plane/predictions_db.py`
-  - чтение forecast из БД (`metrics_forecast`)
-- `control_plane/anomaly_detectors.py`
-  - интерфейс детектора + реестр
-  - built-ins: `rolling_iqr`, `residual_zscore`, `pyod_ecod`, `pyod_iforest`, `ruptures_pelt`
-- `control_plane/processing.py`
-  - orchestration обработки аномалий
-  - события map/reduce/alert
-- `ui/pages/logs_summary_page.py`
-  - ручной интерактивный map-reduce UI
-  - поддержка нескольких SQL-шаблонов с двухуровневой суммаризацией (see §7)
-  - live-прогресс, ETA по timestamp, итоговый отчет и сохранение артефактов
-- `control_plane/summarizer.py`
-  - дефолтный адаптер к `my_summarizer.summarize_logs`
-- `control_plane/alerts.py`
-  - интерфейс отправки алерта (сейчас stub)
-- `control_plane/visualization.py`
-  - генерация графиков
-- `control_plane/predictions_db.py`, `control_plane/actuals.py`, `my_summarizer.py`
-  - ClickHouse-запросы выполняются через `clickhouse_connect.get_client(...).query_df(...)`
+**Точка входа:** `run_pipeline.py` — заполни `INCIDENTS` и запусти `python run_pipeline.py`.
 
-## 4) Ключевые DataFrame-контракты
+---
 
-### 4.1 `actual_df`
+## 2. Архитектура: полный поток данных
 
-Обязательные колонки:
-
-- `timestamp` (datetime-like, UTC)
-- `value` (numeric)
-
-### 4.2 `predictions_df`
-
-Обязательные колонки:
-
-- `timestamp` (datetime-like, UTC)
-- `predicted` (numeric)
-
-### 4.3 `merged_df`
-
-После merge содержит минимум:
-
-- `timestamp`
-- `value`
-- `predicted`
-- `residual` (после детекции)
-- `is_anomaly` (после детекции)
-
-### 4.4 `anomalies_df`
-
-Подмножество `merged_df` плюс:
-
-- `source` (для actual-аномалий обычно `actual`)
-
-## 5) Контракты расширения
-
-## 5.1 Аномали-детектор
-
-Протокол: `AnomalyDetector` (`control_plane/anomaly_detectors.py`)
-
-```python
-def detect(actual_df: pd.DataFrame, predictions_df: pd.DataFrame, step: str) -> DetectionResult
+```
+ClickHouse
+    ↓  (DataLoader.iter_log_pages — keyset pagination)
+list[LogRow]   ← каждая строка с zone-меткой (context_before / incident / context_after)
+    ↓  (Chunker.chunk — нарезка по токеновому бюджету)
+list[Chunk]   ← батчи строк, помещающихся в MAP-промпт
+    ↓  (MapProcessor.process_all — параллельно, asyncio semaphore)
+list[BatchAnalysis]   ← события, гипотезы, доказательства за каждый батч
+    ↓  (TreeReducer.reduce — итеративный LLM merge)
+MergedAnalysis   ← единый дедуплицированный анализ всего периода
+    ↓
+    ├── MultipassReportGenerator.generate()  →  report_multipass.md  (14 секций, ~13 LLM-вызовов)
+    ├── ReportGenerator.generate()           →  report.md            (монолитный нарратив, 1 вызов)
+    └── MarkdownRenderer.render()            →  report_data.md       (детерминированный, без LLM)
 ```
 
-Возвращает `DetectionResult(merged_df, anomalies_df)`.
-
-## 5.2 Суммаризатор (`my_summarizer.py`)
-
-Используется один из вариантов:
-
-1. `CONTROL_PLANE_SUMMARIZER_CALLABLE` (приоритет)
-2. дефолт `control_plane/summarizer.py::do_summary`
-3. шаблон для быстрой интеграции: `my_summarizer.py::summarize_logs`
-
-### Алгоритм `PeriodLogSummarizer`
-
-MAP-REDUCE пайплайн внутри `my_summarizer.py`:
-
-- **MAP**: постраничная загрузка из ClickHouse; каждая страница делится на LLM-чанки (`llm_chunk_rows`); LLM анализирует каждый чанк независимо
-- Параллельный MAP: `map_workers > 1` → `ThreadPoolExecutor`; внутри каждого источника батчи отправляются параллельно; порядок результатов сохраняется
-- **REDUCE**: адаптивное объединение MAP-результатов (single-pass → adaptive group-merge при переполнении контекста)
-- **Freeform**: финальный нарратив (3-5 абзацев) после REDUCE
-
-### LLM-промпты (инцидент-ориентированные)
-
-**System prompt**: senior SRE-инженер, специализирующийся на расследовании инцидентов.
-- Факты из логов → `[ФАКТ]`, гипотезы → `[ГИПОТЕЗА]`
-- Если данных нет → честно пишет "данных недостаточно"
-
-**MAP-промпт** (`_build_chunk_prompt`): секции:
-- `СОБЫТИЯ` — конкретные события с timestamp и цитатами из логов
-- `ПРИЗНАКИ ИНЦИДЕНТА` — привязка к алертам из контекста (формат: "Алерт X ← строка N: цитата")
-- `АНОМАЛИИ` — что выглядит ненормально
-- `ВОПРОСЫ` — что непонятно, что искать дальше
-- Если в данных есть `_source`: статистика по источникам + инструкция искать межисточниковые связи
-
-**REDUCE-промпт** (`_build_reduce_prompt`): секции:
-- `ХРОНОЛОГИЯ` — события с реальными timestamp'ами из логов (не сочинёнными)
-- `ПЕРВОПРИЧИНА` — одно утверждение + `[ФАКТ]`/`[ГИПОТЕЗА]` + доказательство
-- `ОБЪЯСНЕНИЕ АЛЕРТОВ` — для каждого алерта из контекста: лог-объяснение + цитата
-- `ЦЕПОЧКА СОБЫТИЙ` — конкретная цепочка A(ts) → B(ts) → алерт C (только если подтверждена)
-- `ПРОБЕЛЫ` — необъяснённое, что проверить дополнительно
-
-**Freeform-промпт** (внутренний, `_build_freeform_prompt`): черновой нарратив из REDUCE-результата.
-
-**Финальный freeform** (UI-уровень, `_build_freeform_summary_prompt`): структурированный отчёт для SRE:
-- Что произошло / Хронология / Объяснение алертов / Первопричина / Что делать прямо сейчас
-- Все утверждения привязаны к конкретным алертам из пользовательского контекста
-
-**Контекст-инцидента** (`context_prefix`): prepend к каждому LLM-запросу в директивном формате:
+При нескольких инцидентах дополнительно:
 ```
-ИНЦИДЕНТ ДЛЯ РАССЛЕДОВАНИЯ:
-{user_goal}
-
-ТВОЯ ЗАДАЧА: найти в логах конкретные события, которые объясняют перечисленные алерты...
+list[(name, MergedAnalysis, PipelineConfig)]
+    ↓  (CrossIncidentAnalyzer.generate_combined_report)
+combined_report.md   ← 14 секций по объединённым данным всех инцидентов
 ```
 
-### LLM retry-логика
+---
 
-`_make_llm_call(max_retries, retry_base_delay, on_retry)`:
-- При ошибке LLM делает retry с экспоненциальной задержкой: `2^attempt × retry_base_delay` секунд
-- `on_retry(attempt, total, exc)` callback → событие в UI-чате
-- После исчерпания попыток → `_heuristic_llm_call(prompt, error=str(exc))` (показывает реальный текст ошибки)
-- Из воркер-потоков (параллельный MAP) Streamlit-рендер НЕ вызывается (защита от thread-safety)
+## 3. Файловая структура проекта
 
-### Пагинация и keyset
-
-Плейсхолдеры SQL: `{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{last_ts}`, `{service}`
-
-- `{last_ts}` → keyset-пейджинг: cursor = max(timestamp) предыдущей страницы, первая страница = period_start
-- Если нет ни `{offset}`, ни `{last_ts}` → single-shot (одна страница)
-- `uses_paging_template=True` если `{last_ts}` ИЛИ оба `{limit}+{offset}` → шаблон управляет пейджингом сам (без внешней обёртки)
-
-### API `summarize_logs`
-
-```python
-summarize_logs(period_start, period_end, anomaly, on_progress) -> dict
+```
+run_pipeline.py                    ← ТОЧКА ВХОДА: настройки, список инцидентов, запуск
+log_summarizer/
+  config.py                        ← PipelineConfig — единственное место для всех настроек
+  models.py                        ← Pydantic-модели: LogRow, Chunk, BatchAnalysis, MergedAnalysis, ...
+  orchestrator.py                  ← PipelineOrchestrator — управляет 6 стадиями пайплайна
+  data_loader.py                   ← DataLoader — выгрузка логов и метрик из ClickHouse
+  chunker.py                       ← Chunker — нарезка LogRow на Chunk по токеновому бюджету
+  map_processor.py                 ← MapProcessor — параллельная MAP-фаза
+  tree_reducer.py                  ← TreeReducer — итеративная REDUCE-фаза
+  llm_client.py                    ← LLMClient — HTTP к LLM, retry, JSON/TOOLS mode
+  multipass_report_generator.py    ← MultipassReportGenerator — 14-секционный отчёт
+  report_generator.py              ← ReportGenerator — монолитный нарратив (1 LLM-вызов)
+  markdown_renderer.py             ← MarkdownRenderer — программный отчёт без LLM
+  cross_incident_analyzer.py       ← CrossIncidentAnalyzer — объединённый анализ инцидентов
+  prompts/
+    map_system.py                  ← MAP system prompt (роль SRE-аналитика, алерты, зоны)
+    map_user.py                    ← MAP user prompt (форматирование строк лога)
+    reduce_merge.py                ← REDUCE merge system prompt
+    reduce_compress.py             ← REDUCE compress system prompt
+  utils/
+    logging.py                     ← setup_pipeline_logging(), get_logger()
+    progress.py                    ← ProgressTracker, fmt_dur(), bar()
+    tokens.py                      ← estimate_tokens(), tokens_to_chars()
 ```
 
-Возвращает: `summary`, `freeform_summary`, `chunk_summaries`, `fetch_errors`, `stats`.
-
-### `build_cross_source_reduce_prompt`
-
-Standalone-функция для финального cross-source REDUCE (два-уровневая суммаризация):
-
-```python
-build_cross_source_reduce_prompt(
-    summaries_by_source: Dict[str, str],
-    period_start: str,
-    period_end: str,
-) -> str
+**Артефакты каждого запуска:**
+```
+runs/
+  {run_timestamp}/               ← одна папка на весь вызов python run_pipeline.py
+    pipeline.log                 ← лог всего запуска
+    combined_report.md           ← (только при ≥2 инцидентах) объединённый отчёт
+    _combined/                   ← артефакты combined_report (промпты, промежуточные данные)
+    {incident_name}/
+      {artifact_timestamp}/      ← одна папка на один прогон оркестратора
+        report_multipass.md      ← ГЛАВНЫЙ отчёт (14 секций)
+        report.md                ← монолитный нарратив
+        report_data.md           ← программный детерминированный отчёт
+        chunks_meta.json         ← метаданные чанков (без сырых строк)
+        llm/                     ← промпты и ответы LLM (call_NNNN_{type}_{system/user/response}.txt)
+        map/                     ← BatchAnalysis по каждому чанку (chunk_NNN.json)
+        reduce/                  ← MergedAnalysis после каждого merge-шага
 ```
 
-Секции: ХРОНОЛОГИЯ / ПЕРВОПРИЧИНА / ОБЪЯСНЕНИЕ АЛЕРТОВ / ЦЕПОЧКА СОБЫТИЙ / ПРОБЕЛЫ — с явными ссылками на источник каждого события.
+---
 
-Поддерживаемые сигнатуры callable суммаризатора:
+## 4. Ключевые модели данных (models.py)
 
-- `fn(period_start: str, period_end: str, anomaly: dict)`
-- `fn(start_dt: datetime, end_dt: datetime, anomaly: dict)`
-- `fn(start_dt: datetime, end_dt: datetime)`
+### 4.1 Входные данные
 
-Ожидаемый результат:
+**`LogRow`** — одна строка лога из ClickHouse:
+- `timestamp: datetime`
+- `level: Optional[str]` — error/warning/info/debug
+- `source: Optional[str]` — сервис / pod / контейнер
+- `message: str`
+- `raw_line: str` — оригинальная строка целиком (передаётся в LLM)
+- `zone: str` — `"context_before"` | `"incident"` | `"context_after"` (проставляется DataLoader)
 
-- строка, или
-- объект/dict с `summary`
+**`Chunk`** — нарезанный батч строк (входная единица MAP):
+- `rows: list[LogRow]`
+- `time_range: tuple[datetime, datetime]`
+- `token_estimate: int`
+- `batch_zone: str` — зона батча в целом (`"incident"` | `"context_before"` | `"context_after"` | `"mixed"`)
 
-Для красивого live map UI желательно возвращать один из list-полей:
+**`Alert`** — алерт, сработавший во время инцидента:
+- `id: str` — `"alert-001"`, `"alert-002"`, ... (присваивается через `make_alerts()`)
+- `name: str` — имя алерта, e.g. `"AirflowKubernetesExecutorFailed"`
+- `fired_at: Optional[datetime]`
+- `severity: Severity`
+- `description: Optional[str]`
 
-- `map_summaries`
-- `batch_summaries`
-- `chunk_summaries`
-- `partial_summaries`
-- `map_results`
-- `chunks`
+**`MetricRow`** — одна точка метрики:
+- `timestamp: datetime`, `service: str`, `metric_name: str`, `value: float`
 
-## 5.3 Alert sender
+### 4.2 MAP-фаза: BatchAnalysis
 
-Используется один из вариантов:
+**`BatchAnalysis`** — результат LLM-анализа одного чанка логов:
+- `time_range: tuple[datetime, datetime]`
+- `narrative: str` — связный текст (3-5 предложений) что происходило
+- `events: list[Event]` — ключевые события, выделенные LLM
+- `evidence: list[Evidence]` — дословные цитаты из логов (не сжимаются через LLM)
+- `hypotheses: list[Hypothesis]` — гипотезы о причинах
+- `anomalies: list[Anomaly]` — что выглядит ненормально
+- `alert_refs: list[AlertRef]` — статус объяснённости каждого алерта
+- `preliminary_recommendations: list[str]`
+- `data_quality: Optional[str]` — `"processing_error"` если произошла ошибка
+- `batch_zone: str` — проставляется MapProcessor программно, не LLM
 
-1. `CONTROL_PLANE_ALERT_CALLABLE` (приоритет)
-2. `control_plane/alerts.py::make_alert` (stub)
-3. шаблон для быстрой интеграции: `my_alert.py::send_sre_alert`
+**`Event`** — ключевое событие:
+- `id: str` — e.g. `"evt-007-001"`
+- `timestamp: datetime`
+- `source: str` — сервис/pod
+- `description: str` (English) / `description_ru: Optional[str]` (русский, заполняется REDUCE)
+- `severity: Severity` — critical/high/medium/low/info
+- `importance: float` — 0.0–1.0, релевантность для данного расследования
+- `tags: list[str]` — oom/connection/timeout/...
 
-Поддерживаемые сигнатуры callable:
+**`Evidence`** — дословная цитата:
+- `id: str`, `timestamp: datetime`, `source: str`
+- `raw_line: str` — точная строка из лога; **никогда не проходит через LLM-сжатие**
+- `severity: Severity`, `linked_event_id: Optional[str]`
 
-- `fn(text: str)`
+**`Hypothesis`** — гипотеза:
+- `id: str`, `title: str`, `title_ru: Optional[str]`
+- `description: str`, `description_ru: Optional[str]`
+- `confidence: str` — `"low"` | `"medium"` | `"high"`
+- `supporting_event_ids: list[str]`, `contradicting_event_ids: list[str]`
+- `related_alert_ids: list[str]`
 
-## 6) Runtime-события обработки аномалий
+### 4.3 REDUCE-фаза: MergedAnalysis
 
-Источник: `process_anomalies(..., on_event=...)` в `control_plane/processing.py`.
+**`MergedAnalysis`** — результат REDUCE, объединённый анализ:
+- `time_range: tuple[datetime, datetime]`
+- `narrative: str` / `narrative_ru: Optional[str]`
+- `events: list[Event]` — дедуплицированный timeline
+- `causal_chains: list[CausalLink]` — причинно-следственные связи между событиями
+- `hypotheses: list[Hypothesis]`
+- `anomalies: list[Anomaly]`
+- `gaps: list[TimeGap]` — разрывы в данных
+- `impact_summary: str` / `impact_summary_ru: Optional[str]`
+- `preliminary_recommendations: list[str]` / `preliminary_recommendations_ru: list[str]`
+- `zones_covered: list[str]` — проставляется программно, не LLM
+- `evidence_bank: list[Evidence]` — НЕ проходит через LLM-merge; concat + dedup
+- `alert_refs: list[AlertRef]` — лучший статус по каждому алерту; программный merge
 
-Основные события:
+**`CausalLink`** — причинно-следственная связь:
+- `from_event_id: str`, `to_event_id: str`
+- `description: str` / `description_ru: Optional[str]`
+- `mechanism: Optional[str]` — КАК именно одно событие привело к другому
+- `confidence: str` — low/medium/high
 
-- `process_start`
-- `anomaly_start`
-- `summary_start`
-- `map_start`
-- `map_batch_start`
-- `map_batch`
-- `map_done`
-- `reduce_start`
-- `reduce_group_start`
-- `reduce_group_done`
-- `summary_done`
-- `reduce_done`
-- `notification_ready`
-- `alert_start`
-- `alert_done`
-- `anomaly_done`
-- `anomaly_error`
-- `process_done`
+**`TimeGap`** — разрыв в данных:
+- `start: datetime`, `end: datetime`
+- `description: str` / `description_ru: Optional[str]`
 
-`streamlit_app.py` ожидает эти события и рендерит live-чат по ним.
+**`AlertRef`** — статус объяснённости алерта:
+- `alert_id: str`, `status: AlertStatus`, `comment: Optional[str]`
+- `AlertStatus`: `EXPLAINED` > `PARTIAL` > `NOT_EXPLAINED` > `NOT_SEEN` (priority для merge)
 
-Для `Logs Summarizer`-страницы (ручной режим) дополнительно:
-- `page_fetched` — страница загружена из ClickHouse
-- `map_batch_start` / `map_batch` — начало/конец LLM-анализа чанка
-- `map_start` / `map_done`
-- `reduce_start` / `reduce_group_start` / `reduce_group_done` / `reduce_done`
-- `freeform_start` / `freeform_done` — генерация внутреннего нарратива (per-source)
-- `fetch_error` — ошибка ClickHouse на отдельной странице (не ломает пайплайн)
+### 4.4 Сериализация: что и когда исключается
 
-## 7) Ручная страница Logs Summarizer: поведение
+| Метод | Исключает | Причина |
+|---|---|---|
+| `BatchAnalysis.to_json_str()` | `evidence`, `alert_refs` | Evidence → evidence_bank, alert_refs → программный merge |
+| `MergedAnalysis.to_json_str()` | `evidence_bank`, `alert_refs` | Не гонять через LLM |
+| `MergedAnalysis.to_json_str_with_evidence()` | ничего | Полная сериализация |
 
-### 7.1 Общее
+---
 
-- SQL-поле принимает несколько запросов; разделитель: `-- QUERY --`
-- Одиночный запрос → single-query mode; два и более → multi-query mode
-- Перед запуском: `SELECT count()` по каждому шаблону → точный прогресс-бар с первого батча
-- Прогресс: **timestamp-based** (по `last_batch_ts` vs период), без подсчёта батчей заранее
-- Все timestamps в UI отображаются в **МСК (UTC+3)**; дефолты полей ввода тоже в МСК
-- Метрики-контекст ограничен 50 000 строк суммарно (константа `MAX_METRICS_ROWS_TOTAL`)
-- На время выполнения параметры формы блокируются
+## 5. PipelineConfig — конфигурация
 
-### 7.2 Single-query mode
+Создаётся один раз в `run_pipeline.py` и передаётся во все модули.
 
-1. `_db_fetch_page` → `PeriodLogSummarizer.summarize_period`
-2. Все строки из одного источника
-3. MAP → REDUCE → финальный freeform (UI-уровень)
+### Обязательные поля
 
-### 7.3 Multi-query mode (двухуровневая суммаризация)
+| Поле | Тип | Описание |
+|---|---|---|
+| `logs_sql_template` | `str` | SQL с плейсхолдерами `{start_time}`, `{end_time}`, `{last_ts}`, `{limit}` |
+| `incident_context` | `str` | Свободный текст: что случилось, какие алерты |
+| `model` | `str` | Название модели |
+| `api_base` | `str` | URL LLM API (например `http://localhost:8000`) |
+| `api_key` | `str` | API-ключ |
 
-**Алгоритм**:
+### Временные окна
 
-1. **Per-source MAP→REDUCE** (последовательно по источникам, параллельно внутри каждого):
-   - Для каждого SQL-шаблона создаётся независимый `_db_fetch_page` с собственным keyset-курсором
-   - Создаётся отдельный `PeriodLogSummarizer` → `summarize_period(total_rows_estimate=None)`
-   - MAP-воркеры (`map_workers`) параллельны внутри одного источника; источники обрабатываются последовательно (нет конкурентных ThreadPoolExecutor)
-   - В UI-чате появляется разделитель `--- Источник: query_N (N/M) ---`; `last_batch_ts` сбрасывается перед каждым источником
+Пайплайн работает с двумя окнами:
 
-2. **Cross-source REDUCE** (один LLM-вызов):
-   - После обработки всех источников вызывается `build_cross_source_reduce_prompt(summaries_by_source, period_start, period_end)`
-   - Промпт явно требует найти межисточниковые причинно-следственные связи
-   - Контекст инцидента (alert context) prepend'ится к cross-source промпту аналогично MAP/REDUCE
+**Узкое (incident window)** — когда наблюдался инцидент и сработали алерты:
+- `incident_start: Optional[datetime]`
+- `incident_end: Optional[datetime]`
+- Алерты должны попасть внутрь этого окна
 
-3. **Финальный freeform** (UI-уровень, общий для обоих режимов):
-   - `_build_freeform_summary_prompt(final_summary, user_goal, period, stats, metrics_context)`
-   - Структурированный шаблон отчёта SRE
+**Широкое (context window)** — откуда грузить логи (предыстория + постсоставная):
+- `context_start: Optional[datetime]` и `context_end: Optional[datetime]` — явное задание
+- Или автоматически: `incident ± context_auto_expand_hours` (по умолчанию ±1 час)
+- `context_auto_expand_hours: float = 1.0`
 
-**Важно**: `_StreamingLogsMerger` (`_db_fetch_page` multi-query ветка) больше НЕ используется в основном пайплайне. Он остался в коде для возможного переиспользования, но `streaming_logs_merger = None` всегда.
+Пример: инцидент 14:15–14:35 → логи грузятся 13:15–15:35.
 
-### 7.4 Ошибки и неполная суммаризация
+Методы: `context_start_actual()`, `context_end_actual()`, `has_context_window()`, `validate_windows()`.
 
-- Ошибка ClickHouse на отдельной странице: `_register_query_error` → событие в чате + `state["query_errors"]`
-- В UI во время выполнения: `st.warning("Ошибок ClickHouse: N")` если `query_errors` непустой
-- После MAP: если `query_errors` непустой → в events добавляется `⚠️ ВНИМАНИЕ: часть данных не получена из БД — суммаризация неполная`
-- Финальный отчёт: раскрывающийся expander "Ошибки ClickHouse" с текстами всех ошибок
+### MAP-параметры
 
-### 7.5 После завершения
+| Поле | Дефолт | Описание |
+|---|---|---|
+| `batch_size` | 200 | Строк из ClickHouse за один запрос |
+| `map_concurrency` | 5 | Параллельных LLM-вызовов в MAP |
+| `max_batch_tokens` | None | Токенов на MAP-батч (None → 55% от max_context_tokens) |
+| `max_split_depth` | 6 | Максимум рекурсивных делений чанка при overflow |
+| `min_batch_lines` | 20 | Минимум строк — меньше этого не делить |
 
-- Структурированный итоговый summary (post-mortem формат из REDUCE)
-- Дополнительный freeform-нарратив (секции: Что произошло / Хронология / Объяснение алертов / Первопричина / Что делать)
-- Результаты сохраняются в `json/md` + `jsonl` live-артефакты
+### REDUCE-параметры
 
-### 7.6 Поддерживаемые плейсхолдеры в SQL
+| Поле | Дефолт | Описание |
+|---|---|---|
+| `max_group_size` | 4 | Максимум элементов в одной REDUCE-группе |
+| `max_item_chars` | 40 000 | Лимит символов на item перед merge |
+| `compression_target_pct` | 50 | % сжатия при overflow |
+| `max_reduce_rounds` | 15 | Максимум раундов дерева |
+| `max_events_per_merge` | 30 | Максимум событий после каждого merge-шага |
+| `pre_compress_threshold` | 50 000 | Символов — порог превентивной компрессии |
 
-| Плейсхолдер | Назначение |
+### Отчёт
+
+| Поле | Дефолт | Описание |
+|---|---|---|
+| `report_budget_analysis_pct` | 0.50 | Доля контекста под MergedAnalysis |
+| `report_budget_evidence_pct` | 0.30 | Доля контекста под evidence_bank |
+| `report_response_reserve_tokens` | 30 000 | Резерв токенов на ответ LLM |
+
+### Прочие
+
+| Поле | Дефолт | Описание |
+|---|---|---|
+| `max_context_tokens` | 150 000 | Размер контекстного окна модели |
+| `use_instructor` | True | Использовать instructor для JSON-вывода |
+| `model_supports_tool_calling` | False | False → JSON mode, True → TOOLS mode |
+| `temperature_map` | 0.2 | Температура MAP |
+| `temperature_reduce` | 0.2 | Температура REDUCE |
+| `temperature_report` | 0.3 | Температура финального отчёта |
+| `runs_dir` | `"runs"` | Корень для артефактов (пустая строка → не сохранять) |
+| `total_log_rows` | 0 | Заполняется оркестратором после загрузки; выводится в отчёте |
+| `alerts` | `[]` | Список Alert (создавать через `make_alerts()`) |
+
+---
+
+## 6. Пайплайн: 6 стадий (PipelineOrchestrator)
+
+`orchestrator.run()` — async, выполняет 6 стадий последовательно.
+
+### Стадия 1: Загрузка данных
+
+`DataLoader.iter_log_pages()` постранично выгружает логи из ClickHouse за **context-окно** (не incident).
+
+- Поддерживает **keyset-пагинацию** через `{last_ts}` — каждая следующая страница начинается с `max(timestamp)` предыдущей. Это критично для больших таблиц: `OFFSET` вызывает `MEMORY_LIMIT_EXCEEDED`.
+- Каждой строке проставляется `zone`:
+  - `"context_before"` — до `incident_start`
+  - `"incident"` — в окне инцидента
+  - `"context_after"` — после `incident_end`
+- Параллельно загружаются метрики (`DataLoader.fetch_metrics()`), если задан `metrics_sql_template`.
+- `config.total_log_rows` заполняется суммарным числом строк.
+
+**SQL-плейсхолдеры:**
+
+| Плейсхолдер | Что подставляется |
 |---|---|
-| `{period_start}` | Начало временного окна (ISO) |
-| `{period_end}` | Конец временного окна (ISO) |
+| `{start_time}` / `{period_start}` | Начало context-окна |
+| `{end_time}` / `{period_end}` | Конец context-окна |
 | `{limit}` | Размер страницы |
 | `{offset}` | Смещение (LIMIT/OFFSET пагинация) |
-| `{last_ts}` | Keyset-пагинация: max timestamp предыдущей страницы |
+| `{last_ts}` | Keyset: max timestamp предыдущей страницы |
 
-**Рекомендация**: использовать `{last_ts}` вместо `{offset}` на больших таблицах — ClickHouse использует индекс, нет MEMORY_LIMIT_EXCEEDED.
+**Рекомендация:** всегда использовать `{last_ts}` вместо `{offset}`.
 
-## 8) UI-инварианты (важно не ломать)
+Обязательные колонки в SELECT:
+- `timestamp` — DataLoader ищет это имя для keyset и zone-разметки
+- `raw_line` — текст лога, передаётся в LLM; fallback: `message` / `msg` / `log` / `value`
 
-На странице в main-area должен быть порядок:
+Опциональные для `source`: `source` / `service` / `kubernetes_container_name`; или `namespace` + `container_name`.
 
-1. График прошлое + будущее + аномалии.
-2. Таблица аномалий.
-3. Чат-процесс обработки Top-N аномалий.
+### Стадия 2: MAP-фаза (MapProcessor)
 
-Дополнительные требования:
+`MapProcessor.process_all()` обрабатывает чанки **параллельно** через `asyncio.Semaphore(map_concurrency)`.
 
-- карточки аномалий появляются последовательно, по мере обработки;
-- никаких лишних блоков в main-area;
-- предикт на графиках должен быть только в будущем (после последней actual-точки).
+Для каждого чанка:
+1. Строит system prompt (MAP_SYSTEM_TEMPLATE с контекстом инцидента, алертами, зонами)
+2. Строит user prompt (отформатированные строки лога + метрики)
+3. Вызывает `LLMClient.call_json()` → `BatchAnalysis`
+4. Проставляет `batch_zone` программно (не доверяет LLM)
+5. При `ContextOverflowError` — делит чанк пополам рекурсивно (до `max_split_depth`)
 
-## 9) Конфиг, который критичен для интеграции
+После split оба результата идут в REDUCE как **отдельные элементы** — LLM свяжет их через causal_chains.
 
-### Базовый
+**Что LLM извлекает из каждого батча:**
+- `events` — ключевые события с timestamp, severity, importance (0–1)
+- `evidence` — дословные цитаты строк лога
+- `hypotheses` — гипотезы о причинах
+- `anomalies` — аномалии
+- `alert_refs` — статус каждого алерта (EXPLAINED / PARTIAL / NOT_EXPLAINED / NOT_SEEN)
+- `preliminary_recommendations` — ранние рекомендации
 
-- `CONTROL_PLANE_METRICS_SOURCE=prometheus|clickhouse`
-- `CONTROL_PLANE_CLICKHOUSE_METRICS_HOST|PORT|USERNAME|PASSWORD|SECURE|QUERY` (если source=clickhouse)
-- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_HOST|PORT|USERNAME|PASSWORD|SECURE`
-- `CONTROL_PLANE_CLICKHOUSE_PREDICTIONS_QUERY` (опциональный полный SQL для forecast)
-- `CONTROL_PLANE_FORECAST_*` для таблицы прогнозов
-- `CONTROL_PLANE_SUMMARIZER_CALLABLE` (опционально)
-- `CONTROL_PLANE_ALERT_CALLABLE` (опционально)
+**Прогресс:** `ProgressTracker(total=len(chunks))` логирует ASCII-бар + ETA после каждого чанка.
 
-### Logs Summarizer (my_summarizer pipeline)
+### Стадия 3: REDUCE-фаза (TreeReducer)
 
-- `CONTROL_PLANE_LOGS_CLICKHOUSE_HOST|PORT|USERNAME|PASSWORD`
-- `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY` — полный SQL с плейсхолдерами
-- `CONTROL_PLANE_LOGS_PAGE_LIMIT` — размер страницы (default: 1000)
-- `CONTROL_PLANE_LOGS_FETCH_MODE=time_window|tail_n_logs`
-- `CONTROL_PLANE_LOGS_TAIL_LIMIT` — tail-limit для tail_n_logs режима (default: 1000)
+Итеративно сворачивает `list[BatchAnalysis]` → один `MergedAnalysis`.
 
-### Logs Summarizer UI
+**Алгоритм одного раунда:**
+1. `_adaptive_group_size()` — вычисляет сколько items влезает в 55% контекста (по среднему токенов первых 5 элементов)
+2. `_make_groups()` — нарезает список на группы
+3. Для каждой группы из >1 элемента → `_merge_group()` → один `MergedAnalysis`
+4. `_trim_events()` — обрезает события до `max_events_per_merge` по severity (без LLM)
+5. `_maybe_compress()` — сжимает через LLM если результат > `compression_target_pct` контекста
+6. Повторяем до одного элемента или `max_reduce_rounds`
 
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_SQL` — дефолтный SQL в UI
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_DEFAULT_METRICS_SQL` — дефолтный SQL метрик в UI
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE` — страница из ClickHouse (default: 1000)
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE` — строк на один LLM-запрос (default: 200)
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_MAP_WORKERS` — параллельных LLM-воркеров в MAP (default: 1)
-- `CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES` — ретраев LLM при ошибке (default: 3)
+**Работа с evidence и alert_refs:**
+- `evidence` из всех батчей собирается в `evidence_bank` **до** reduce-цикла и **никогда** не проходит через LLM
+- `alert_refs` объединяются программно: для каждого `alert_id` берётся лучший статус (EXPLAINED > PARTIAL > NOT_EXPLAINED > NOT_SEEN)
 
-### LLM
+**При ContextOverflowError в merge:**
+- Группа >2 элементов → рекурсивный split на две половины
+- Пара (2 элемента) → `_compress_and_merge()`: сжимаем по одному и пробуем merge
+- Если всё равно overflow → `_programmatic_merge()` без LLM (программная конкатенация); счётчик `programmatic_merge_count`
 
-- `OPENAI_API_BASE_DB` — base URL LLM API (OpenAI-совместимый)
-- `OPENAI_API_KEY_DB` — API-ключ
-- `LLM_MODEL_ID` — идентификатор модели
+**Превентивная компрессия:** если суммарный размер payload группы > `pre_compress_threshold` символов — сжимаем все входы ДО отправки в LLM.
 
-## 10) Ограничения/риски
+**Кросс-зональные связи:** при merge группы, покрывающей зоны `context_before` + `incident`, в user-промпт добавляется явная инструкция искать causal_chains через границу зон — это самые ценные связи: изменение/деплой до инцидента, которое его породило.
 
-- В окружениях без writable `~/.config/matplotlib` возможен warning; используйте `MPLCONFIGDIR`.
-- Реальные интеграции суммаризатора/алертов не тестируются в `TEST_MODE`.
-- Для `clickhouse`-source query обязан вернуть корректные `timestamp/value`.
-- **MEMORY_LIMIT_EXCEEDED (code 241)**: запросы с `LIMIT N OFFSET M` на больших таблицах ClickHouse читают все строки до OFFSET в RAM. Симптом: суммаризация внезапно останавливается после первой страницы. Решение — keyset-пейджинг через `{last_ts}`.
-- При keyset-пейджинге дубли строк с одинаковым timestamp на границе страниц теоретически возможны — используй миллисекундную точность в `timestamp`.
-- Метрики-контекст в `Logs Summarizer` ограничен 50 000 строк (константа `MAX_METRICS_ROWS_TOTAL`).
-- **Demo mode и размер выборки**: в demo-режиме генерируется `max(LOGS_TAIL_LIMIT, DB_BATCH_SIZE×4, 4000)` строк; значения меньше `DB_BATCH_SIZE` не дадут пагинации (одна страница → стоп).
-- **Параллельный MAP и Streamlit**: `on_retry` callback из воркер-потоков не вызывает `_render_logs_summary_chat` — рендер только из main thread. GIL защищает `state["events"].append()`.
-- В multi-query mode источники обрабатываются **последовательно** (не параллельно между собой). Добавление межисточниковой параллельности потребует thread-safe аккумуляции `state` и единого executor.
+**Zones_covered** проставляется программно как union зон входных items.
 
-## 11) Рекомендуемый smoke-check перед merge
+**Финальный результат** хранится в `orchestrator.last_merged`.
 
-```bash
-python -m py_compile control-plane.py streamlit_app.py control_plane/*.py my_summarizer.py ui/pages/logs_summary_page.py
+### Стадия 4: Программный отчёт (MarkdownRenderer)
+
+Детерминированный, без LLM. Сохраняется как `report_data.md`. Полезен для отладки — показывает точно то, что извлечено из MergedAnalysis.
+
+### Стадия 5: Многопроходный LLM-отчёт (MultipassReportGenerator)
+
+14 секций, каждая — отдельный LLM-вызов. Строго последовательно.
+
+### Стадия 6: Монолитный LLM-отчёт (ReportGenerator)
+
+Один LLM-вызов → нарративный текст. Сохраняется как `report.md`.
+
+---
+
+## 7. Многопроходный отчёт: 14 секций (MultipassReportGenerator)
+
+Главный выход пайплайна. ~13 LLM-вызовов (секция 7 — программная заглушка).
+
+### Порядок генерации
+
+Сначала генерируются секции 5 и 5а — они служат контекстом для всех последующих.
+
+```
+sec1  ← программно (контекст инцидента, алерты, строки логов)
+sec3  ← data_coverage (покрытие данных)
+sec4  ← chronology (хронология событий)
+sec5  ← causal_chains (технические цепочки с ID/timestamp/механизмами)
+sec5a ← root_cause_explanation (объяснение первопричины для человека)
+sec6  ← alert_links (sec5a как контекст)
+sec7  ← metrics (программная заглушка)
+sec8  ← hypotheses (sec5a как контекст)
+sec9  ← conflicts (sec5a как контекст)
+sec10 ← gaps (sec5a как контекст)
+sec11 ← impact (sec5a как контекст)
+sec12 ← recommendations (sec5a как контекст)
+sec13 ← limitations
+sec14 ← coverage_recommendations
+sec2  ← summary (последним; получает sec13 + sec5a)
+events_ref ← программный справочник событий (таблица ID → детали)
 ```
 
-И базовый прогон синтетики:
+### Секции отчёта
+
+| № | Название | LLM | Ключевой контент |
+|---|---|---|---|
+| 1 | Контекст инцидента | ❌ | Incident context, время, алерты, строк логов |
+| 2 | Резюме инцидента | ✅ | TL;DR для SRE (генерируется последним) |
+| 3 | Покрытие данных | ✅ | Период, зоны, объём, SQL |
+| 4 | Хронология событий | ✅ | Все события хронологически, цитаты [ФАКТ] |
+| 5 | Причинно-следственные цепочки | ✅ | Технические цепочки с event ID + механизм |
+| 5а | Объяснение первопричины | ✅ | Человеческий язык: симптомы → деградация → корень |
+| 6 | Связь с алертами | ✅ | Статус каждого алерта + где в цепочке сработал |
+| 7 | Аномалии метрик | ❌ | Заглушка (метрики не передаются в MergedAnalysis) |
+| 8 | Гипотезы первопричин | ✅ | Ранжированные гипотезы + сверка с цепочкой |
+| 9 | Конфликтующие версии | ✅ | Аномалии и альтернативные версии событий |
+| 10 | Разрывы в цепочках | ✅ | Пробелы в данных + где разрыв в цепочке |
+| 11 | Масштаб и влияние | ✅ | Затронутые сервисы, длительность, масштаб |
+| 12 | Рекомендации для SRE | ✅ | P0/P1/P2, каждая рвёт звено цепочки |
+| 13 | Уровень уверенности | ✅ | Честная оценка ограничений и пробелов |
+| 14 | Рекомендации по анализу | ✅ | Расширить окно? Добавить сервисы? |
+| — | Справочник событий | ❌ | Таблица ID → время/сервис/описание |
+
+### Роль секции 5а (root_cause_explanation)
+
+Это связующий элемент между техническим анализом (sec5) и человеческим пониманием. Структура:
+1. **Симптомы** — что наблюдал дежурный (алерты, ошибки)
+2. **Цепочка деградации** — как одно событие привело к другому шаг за шагом
+3. **Корень проблемы** — где и почему дал сбой
+4. **Почему именно сейчас** — что изменилось или достигло предела
+
+Текст 5а передаётся как `root_cause_text` в sec6, sec8, sec9, sec10, sec11, sec12, sec2.
+
+### Fallback при ContextOverflowError
+
+- `sec4` (хронология): обрезка до importance > 0.7, затем только top-20, затем `_call_or_stub()`
+- `sec5` (цепочки): обрезка до confidence > 0.5
+- `sec8` (гипотезы): обрезка до medium/high confidence
+- Остальные секции: `_call_or_stub()` — при любой ошибке возвращает `_PLACEHOLDER`
+
+### Прогресс
+
+`ProgressTracker(total=13, label="REPORT")` — логирует бар + ETA после каждой секции.
+
+---
+
+## 8. LLMClient — HTTP к LLM
+
+Единственное место, которое знает про HTTP, retry и JSON-парсинг.
+
+### Два метода
+
+**`call_json(system, user, response_model, temperature)`** → Pydantic-объект
+
+Режимы (определяются при инициализации):
+- `use_instructor=True` + `model_supports_tool_calling=False` → **JSON mode** через instructor
+- `use_instructor=True` + `model_supports_tool_calling=True` → **TOOLS mode** через instructor
+- Автоматический fallback TOOLS→JSON при grammar ошибках vLLM (`invalid grammar` / `tool_call_parser`)
+- `use_instructor=False` → прямой вызов с `response_format={"type": "json_object"}` + ручной parse
+
+**`call_text(system, user, temperature)`** → `str`
+
+Plain text — используется для финального отчёта.
+
+### Retry-логика
+
+- Retry на: 500/502/503/504/timeout/connection error
+- Exponential backoff: `retry_backoff_base ** attempt` секунд (2, 4, 8 по умолчанию)
+- **Не retry** на: 400 (→ `ContextOverflowError`)
+- JSON parse error → одна попытка с temperature=0.0
+- После исчерпания попыток → `LLMUnavailableError`
+
+### ContextOverflowError
+
+Бросается при HTTP 400 с маркерами: `context_length_exceeded`, `context length`, `maximum context`, `prompt is too long`, `input is too long`, `invalid grammar` (vLLM grammar overflow).
+
+Это сигнал для MapProcessor (split чанка) и TreeReducer (split группы или компрессия).
+
+### Аудит промптов
+
+Если `audit_dir` задан, каждый вызов сохраняет:
+- `call_NNNN_json_system.txt` — system prompt
+- `call_NNNN_json_user.txt` — user prompt
+- `call_NNNN_json_response.txt` — ответ LLM (или `_error.txt` при ошибке)
+
+Аудит-папка: `{run_dir}/llm/` (передаётся оркестратором).
+
+---
+
+## 9. CrossIncidentAnalyzer — объединённый анализ
+
+При ≥2 инцидентах в INCIDENTS запускается автоматически.
+
+### generate() — вспомогательный кросс-анализ
+
+Входные данные: `list[(name, MergedAnalysis)]`.
+
+1. **Шаг 1/2:** LLM-карточка для каждого инцидента (название, период, первопричина, ключевой механизм, топ-рекомендации)
+2. **Шаг 2/2:** LLM ищет мета-цепочку — реальные причинно-следственные связи между инцидентами. Критерии: один инцидент создал условия для следующего / общая первопричина в разных формах / побочный эффект восстановления. Если связей нет — явно пишет «Связей не обнаружено».
+
+Результат: `cross_incident_report.md` в папке запуска.
+
+### generate_combined_report() — объединённый 14-секционный отчёт
+
+Входные данные: `list[(name, MergedAnalysis, PipelineConfig)]`.
+
+1. Вызывает `generate()` для кросс-инцидентного текста (используется как контекст)
+2. `TreeReducer._programmatic_merge(all_merged)` → объединённый `MergedAnalysis`
+3. `_make_combined_config()` → `PipelineConfig` охватывающий все инциденты:
+   - `incident_start = min(all starts)`, `incident_end = max(all ends)`
+   - `context_start = min(all context_starts)`, `context_end = max(all context_ends)`
+   - `context_auto_expand_hours = 0` (окна заданы явно)
+   - `alerts` — union всех алертов без дублей по id
+   - `total_log_rows = sum(all total_log_rows)`
+   - `incident_context` — сводный текст всех инцидентов + первые 1500 символов кросс-анализа
+4. Запускает `MultipassReportGenerator` → та же 14-секционная структура
+
+Результат: `combined_report.md` в папке запуска.
+
+---
+
+## 10. Настройка в run_pipeline.py
+
+### Подключение к LLM
+
+```python
+API_BASE = "http://localhost:8000"   # vLLM / OpenAI-совместимый сервер (без /v1)
+API_KEY  = "sk-placeholder"          # для vLLM — любая строка
+MODEL    = "Qwen3-235B"              # точное имя из /v1/models
+MAX_CONTEXT_TOKENS = 100_000         # размер контекстного окна модели
+MODEL_SUPPORTS_TOOL_CALLING = False  # False = JSON mode (безопаснее с vLLM)
+```
+
+### Подключение к ClickHouse
+
+```python
+CH_HOST     = "localhost"
+CH_PORT     = 8123          # HTTP-порт
+CH_USER     = "default"
+CH_PASSWORD = ""
+CH_DATABASE = "default"
+```
+
+### SQL-шаблон (LOGS_SQL)
+
+Обязательные колонки в SELECT: `timestamp`, `raw_line`.
+
+Рекомендуемый паттерн с keyset-пагинацией:
+```sql
+SELECT
+    timestamp,
+    source,
+    raw_line
+FROM your_logs_table
+WHERE timestamp BETWEEN '{start_time}' AND '{end_time}'
+  AND timestamp > '{last_ts}'   -- keyset pagination
+  -- ... фильтры по сервисам/ошибкам
+ORDER BY timestamp ASC
+LIMIT {limit}
+```
+
+**Не используй `{offset}`** — на больших таблицах ClickHouse читает все строки до смещения в RAM → `MEMORY_LIMIT_EXCEEDED`.
+
+### Список инцидентов (INCIDENTS)
+
+```python
+INCIDENTS = [
+    {
+        "name": "my-incident-2026-04-16",    # slug: только латиница, цифры, дефисы
+        "context": """
+            Описание: что случилось, какие сервисы затронуты.
+            Чем конкретнее — тем точнее анализ.
+        """,
+        "alerts": [
+            {
+                "name": "AlertName",
+                "fired_at": datetime(2026, 4, 16, 14, 15, 0, tzinfo=MSK),
+                "severity": "critical",              # critical/high/medium/low/info
+                "description": "Текст алерта",       # опционально
+            },
+        ],
+        "incident_start": datetime(2026, 4, 16, 14, 10, 0, tzinfo=MSK),
+        "incident_end":   datetime(2026, 4, 16, 14, 50, 0, tzinfo=MSK),
+        # Опциональное широкое окно (по умолчанию ±1 час от incident):
+        "context_start":  datetime(2026, 4, 16, 13, 0, 0, tzinfo=MSK),
+        "context_end":    datetime(2026, 4, 16, 16, 0, 0, tzinfo=MSK),
+    },
+]
+```
+
+**Важно:** `fired_at` алертов должны попасть внутрь `incident_start...incident_end`. Время задавать в МСК (UTC+3): `MSK = timezone(timedelta(hours=3))`.
+
+### Запуск
 
 ```bash
-CONTROL_PLANE_TEST_MODE=true CONTROL_PLANE_PROCESS_ALERTS=false python -c "from streamlit_app import run_single_iteration; from control_plane.config import *; r=run_single_iteration(test_mode=True, query=PROM_QUERY, detector_name=ANOMALY_DETECTOR, data_lookback_minutes=DATA_LOOKBACK_MINUTES, prediction_lookahead_minutes=PREDICTION_LOOKAHEAD_MINUTES, analyze_top_n=ANALYZE_TOP_N_ANOMALIES, process_lookback_minutes=LOOPBACK_MINUTES, process_alerts=False); print(len(r['actual_df']), len(r['predictions_df']), len(r['anomalies']))"
+python run_pipeline.py                         # все инциденты из INCIDENTS
+python run_pipeline.py --only my-incident-name # один инцидент
+python run_pipeline.py --list                  # список инцидентов
+```
+
+---
+
+## 11. Логирование и прогресс
+
+Все модули используют `get_logger(name)` — стандартный Python logging с префиксом `log_summarizer.{name}`.
+
+Настройка: `setup_pipeline_logging(level, log_file)` — пишет на stderr и в файл одновременно.
+
+**Что логируется на уровне INFO:**
+
+- **Оркестратор:** шапка с параметрами, старт/конец каждой из 6 стадий с elapsed, итоговый summary
+- **MAP:** `ProgressTracker` — после каждого чанка: N/M ████ % elapsed ETA | chunk-NNN HH:MM→HH:MM строк событий
+- **REDUCE:** каждый раунд (items → groups), каждый merge (период, события, гипотезы до → после), финал
+- **REPORT:** `ProgressTracker` — после каждой секции: N/M ████ % elapsed ETA → путь к файлу
+- **Cross-incident:** шаги 1/2 и 2/2 с elapsed
+
+**Что НЕ логируется (пишется в файлы):**
+- Промпты (→ `llm/call_NNNN_*_system.txt`)
+- Ответы LLM (→ `llm/call_NNNN_*_response.txt`)
+- BatchAnalysis по чанкам (→ `map/chunk_NNN.json`)
+- MergedAnalysis после каждого merge (→ `reduce/round_NN_group_NN.json`)
+
+**`ProgressTracker`:**
+```
+MAP  3/12  ████████░░░░░░  25%  elapsed 45s  ETA ~2m 15s  | chunk-003  14:15:00→14:20:00  200 строк  7 событий  [15s]
+```
+
+**`fmt_dur(seconds)`:** `"45s"` | `"3m 12s"` | `"1h 04m"` | `"<1s"`
+
+---
+
+## 12. Зоны логов (zone system)
+
+Пайплайн разделяет логи на три зоны относительно incident-окна:
+
+| Зона | Когда | Назначение |
+|---|---|---|
+| `context_before` | До `incident_start` | Предыстория: деплои, изменения, накопленная нагрузка |
+| `incident` | В окне инцидента | Основные события инцидента |
+| `context_after` | После `incident_end` | Восстановление, последствия |
+
+**Применение:**
+- `LogRow.zone` — проставляется DataLoader по каждой строке
+- `Chunk.batch_zone` — зона батча; `"mixed"` если батч пересекает границу
+- `MergedAnalysis.zones_covered` — union зон; проставляется TreeReducer программно
+- В REDUCE-промпте: при merge группы с `context_before` + `incident` LLM получает явную инструкцию строить кросс-зональные causal_chains — это самые ценные связи
+
+---
+
+## 13. Ограничения и риски
+
+### MEMORY_LIMIT_EXCEEDED в ClickHouse
+`LIMIT N OFFSET M` читает все строки до M в RAM. Симптом: суммаризация останавливается после первой страницы. **Решение: всегда использовать `{last_ts}`** keyset-пагинацию.
+
+### Дубли строк при keyset-пагинации
+При одинаковом timestamp у нескольких строк на границе страниц возможны дубли. Используй миллисекундную точность в `timestamp`.
+
+### Параллельный MAP и GIL
+asyncio — однопоточный, поэтому `ProgressTracker.tick()` из параллельных чанков безопасен (нет гонок). LLM-вызовы выполняются в `run_in_executor()`, но GIL не мешает — вызовы I/O-bound.
+
+### Программный merge (fallback)
+Если после нескольких раундов компрессии merge всё равно не помещается в контекст — включается `_programmatic_merge()` без LLM: простая конкатенация без семантического объединения. Счётчик: `orchestrator._tree_reducer.programmatic_merge_count`. Факт программного merge логируется и отражается в секции 13 отчёта.
+
+### Висячие ссылки в MergedAnalysis
+После `_trim_events()` ID в `causal_chains` и `hypotheses` могут ссылаться на удалённые события. `MergedAnalysis._check_referential_integrity()` логирует WARNING, но не бросает исключение — REDUCE-фаза на следующем раунде исправляет.
+
+### Температуры
+- MAP и REDUCE: `0.2` — детерминированность важна для точности извлечения событий
+- Отчёт: `0.3` — небольшая вариативность для читаемости
+
+---
+
+## 14. Расширение: добавление нового SQL-шаблона или источника
+
+1. В `LOGS_SQL` (или в `incident["context"]`) добавить нужный фильтр
+2. Обязательные колонки: `timestamp` и `raw_line` (или `message`/`msg`/`log`)
+3. DataLoader автоматически парсит zone и source из стандартных имён колонок
+4. Для нескольких источников: создай несколько записей в `INCIDENTS` или запусти несколько раз
+
+---
+
+## 15. Smoke-check перед изменениями
+
+```bash
+python -m py_compile run_pipeline.py log_summarizer/*.py log_summarizer/utils/*.py log_summarizer/prompts/*.py
+```
+
+Проверка импортов:
+```bash
+python -c "from log_summarizer.orchestrator import PipelineOrchestrator; print('ok')"
+python -c "from log_summarizer.cross_incident_analyzer import CrossIncidentAnalyzer; print('ok')"
+python -c "from log_summarizer.multipass_report_generator import MultipassReportGenerator; print('ok')"
 ```

@@ -400,19 +400,20 @@ class PipelineOrchestrator:
         """Загрузка логов и метрик (синхронная, вызывается из executor)."""
         all_chunks: list[Chunk] = []
         total_rows = 0
+        page_count = 0
 
         for page in self._data_loader.iter_log_pages(page_size=self.config.batch_size):
             if not page:
                 continue
+            page_count += 1
             total_rows += len(page)
             page_chunks = self._chunker.chunk(page)
             all_chunks.extend(page_chunks)
-            logger.debug("Loaded page: %d rows → %d chunks", len(page), len(page_chunks))
+            logger.debug("Loaded page %d: %d rows → %d chunks", page_count, len(page), len(page_chunks))
 
         logger.info(
-            "Log loading complete: %d total rows → %d chunks",
-            total_rows,
-            len(all_chunks),
+            "Log loading complete: %d страниц · %d строк → %d чанков",
+            page_count, total_rows, len(all_chunks),
         )
 
         metrics = self._data_loader.fetch_metrics(
