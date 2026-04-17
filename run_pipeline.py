@@ -111,19 +111,14 @@ FROM (
                     1, 0
                 ) AS is_new_group
             FROM raw_lm.log_k8s_containers_MT   -- ← таблица с логами
-            -- Keyset: берём строки строго после последнего полученного raw-timestamp.
-            -- {last_ts} = max(end_time) предыдущего батча; DataLoader обновляет автоматически.
-            -- {period_end} ограничивает период сверху.
-            -- LIMIT {limit} здесь — на сырых строках — поэтому ClickHouse обрабатывает
-            -- ровно {limit} строк через оконные функции, не держа весь период в памяти.
+            -- Без LIMIT здесь — обрабатываем все сырые строки периода,
+            -- чтобы группировка была полной. LIMIT перенесён на уровень групп.
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
               AND ext_ClusterName = 'ndp-p01'   -- ← кластер
               AND (
-                    -- Ветка 1: любой airflow-контейнер
                     kubernetes_container_name LIKE '%airflow%'
                     OR
-                    -- Ветка 2: весь kube-system, кроме kube-apiserver
                     (
                         kubernetes_namespace_name LIKE '%kube-system%'
                         AND kubernetes_container_name NOT LIKE '%kube-apiserver%'
@@ -146,12 +141,13 @@ FROM (
                     'object has no attribute ''upper'''
                 ])
             ORDER BY timestamp ASC
-            LIMIT {limit}
         )
     )
     GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
 )
+-- LIMIT на группах: теперь каждая страница содержит ровно {limit} групп
 ORDER BY start_time ASC
+LIMIT {limit}
 """
 
 # SQL для метрик — опционально.

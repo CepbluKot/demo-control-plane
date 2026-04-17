@@ -12,6 +12,8 @@ from typing import Any, Iterator, Optional
 from log_summarizer.config import PipelineConfig
 from log_summarizer.models import LogRow, MetricRow
 from log_summarizer.utils.logging import get_logger
+from log_summarizer.utils.progress import TimeProgress
+from log_summarizer.utils.tokens import estimate_tokens
 
 logger = get_logger("data_loader")
 
@@ -86,7 +88,14 @@ class DataLoader:
         # с start_time == slice_start точно пропускались бы.
         last_ts = self._fmt_dt(slice_start - timedelta(microseconds=1)) if slice_start else start
 
+        tracker = (
+            TimeProgress(slice_start, slice_end, label="LOAD")
+            if slice_start is not None and slice_end is not None
+            else None
+        )
+        total_rows_loaded = 0
         page_num = 0
+        import time as _time
         while True:
             sql = self._render_logs_sql(
                 template=template,
@@ -96,7 +105,6 @@ class DataLoader:
                 offset=offset,
                 last_ts=last_ts,
             )
-            import time as _time
             _t = _time.monotonic()
             rows = self._execute_query(sql)
             _elapsed = _time.monotonic() - _t
@@ -104,14 +112,34 @@ class DataLoader:
                 break
 
             page_num += 1
-            logger.info(
-                "  Страница %d: %d групп за %.1fс  (last_ts=%s)",
-                page_num, len(rows), _elapsed, last_ts,
-            )
+            total_rows_loaded += len(rows)
+
             page = [
                 self._row_to_log(r, inc_start=inc_start, inc_end=inc_end)
                 for r in rows
             ]
+            page_tok = sum(estimate_tokens(row.raw_line) for row in page)
+
+            if tracker is not None:
+                cur_dt = None
+                for row in rows:
+                    ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
+                    if ts is not None and hasattr(ts, "replace"):
+                        if cur_dt is None or ts > cur_dt:
+                            cur_dt = ts
+                if cur_dt is not None:
+                    logger.info("  %s", tracker.line(cur_dt, page_num, total_rows_loaded, _elapsed, page_tok))
+                else:
+                    logger.info(
+                        "  Страница %d: %d групп  ~%d tok  за %.1fс  (last_ts=%s)",
+                        page_num, len(rows), page_tok, _elapsed, last_ts,
+                    )
+            else:
+                logger.info(
+                    "  Страница %d: %d групп  ~%d tok  за %.1fс  (last_ts=%s)",
+                    page_num, len(rows), page_tok, _elapsed, last_ts,
+                )
+
             yield page
             logger.debug("Fetched %d log rows", len(page))
 
@@ -119,6 +147,9 @@ class DataLoader:
                 last_ts = self._max_ts_from_rows(rows, last_ts)
             else:
                 offset += page_size
+
+        if tracker is not None and page_num > 0:
+            logger.info("  %s", tracker.summary(page_num, total_rows_loaded))
 
     def fetch_metrics(
         self,

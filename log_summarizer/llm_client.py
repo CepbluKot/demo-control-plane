@@ -330,11 +330,20 @@ class LLMClient:
         """Записывает промпт и ответ в файлы; логирует пути."""
         if prefix is None:
             return
-        (Path(f"{prefix}_system.txt")).write_text(system, encoding="utf-8")
-        (Path(f"{prefix}_user.txt")).write_text(user, encoding="utf-8")
+        from log_summarizer.utils.tokens import estimate_tokens
+        sys_tok  = estimate_tokens(system)
+        user_tok = estimate_tokens(user)
+        resp_tok = estimate_tokens(response) if response else 0
+        header = (
+            f"# tokens: system={sys_tok:,}  user={user_tok:,}"
+            + (f"  response={resp_tok:,}" if response else "")
+            + f"  total={sys_tok + user_tok + resp_tok:,}\n\n"
+        )
+        (Path(f"{prefix}_system.txt")).write_text(header + system, encoding="utf-8")
+        (Path(f"{prefix}_user.txt")).write_text(header + user, encoding="utf-8")
         if response is not None:
             resp_path = Path(f"{prefix}_response.txt")
-            resp_path.write_text(response, encoding="utf-8")
+            resp_path.write_text(header + response, encoding="utf-8")
             logger.debug("LLM call_%04d → %s", n, resp_path)
         if error is not None:
             err_path = Path(f"{prefix}_error.txt")

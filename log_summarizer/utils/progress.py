@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+from datetime import timezone
+from typing import Any
 
 
 def fmt_dur(seconds: float) -> str:
@@ -79,3 +81,62 @@ class ProgressTracker:
         """Итоговая строка после завершения фазы."""
         elapsed = time.monotonic() - self._t0
         return f"{self.label}  {self.total}/{self.total}  ✓  total {fmt_dur(elapsed)}"
+
+
+class TimeProgress:
+    """Прогресс выгрузки по временной оси (доля покрытого временного окна).
+
+    Используется в DataLoader: прогресс = (last_ts - start) / (end - start).
+
+    Args:
+        start: Начало периода (datetime, tz-aware или naive UTC).
+        end: Конец периода.
+        label: Метка фазы.
+    """
+
+    def __init__(self, start: Any, end: Any, label: str = "LOAD") -> None:
+        self.label = label
+        self._t0 = time.monotonic()
+        self._start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None else start
+        self._end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end
+        self._total_sec = max(1.0, (self._end - self._start).total_seconds())
+
+    def line(self, current: Any, page: int, total_rows: int, query_sec: float, page_tokens: int = 0) -> str:
+        """Строка прогресса после очередной страницы.
+
+        Args:
+            current: Текущий last_ts как datetime (последняя строка страницы).
+            page: Номер страницы.
+            total_rows: Накопленное кол-во групп за все страницы.
+            query_sec: Время выполнения последнего SQL-запроса.
+            page_tokens: Кол-во токенов в строках этой страницы.
+        """
+        elapsed = time.monotonic() - self._t0
+        cur = current.replace(tzinfo=timezone.utc) if current.tzinfo is None else current
+        done_sec = max(0.0, (cur - self._start).total_seconds())
+        pct = min(100.0, 100.0 * done_sec / self._total_sec)
+        if 0 < pct < 100 and elapsed > 0:
+            eta_sec = elapsed / (pct / 100.0) - elapsed
+            eta_str = f"~{fmt_dur(eta_sec)}"
+        else:
+            eta_str = "?"
+        parts = [
+            self.label,
+            f"стр.{page}",
+            bar(int(pct), 100),
+            f"{pct:.0f}%",
+            f"{total_rows:,} гр.",
+        ]
+        if page_tokens:
+            parts.append(f"~{page_tokens:,} tok")
+        parts += [
+            f"запрос {query_sec:.1f}s",
+            f"elapsed {fmt_dur(elapsed)}",
+            f"ETA {eta_str}",
+        ]
+        return "  ".join(parts)
+
+    def summary(self, pages: int, total_rows: int) -> str:
+        """Итоговая строка после завершения выгрузки."""
+        elapsed = time.monotonic() - self._t0
+        return f"{self.label}  100%  ✓  {pages} стр.  {total_rows:,} гр.  {fmt_dur(elapsed)}"
