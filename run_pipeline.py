@@ -78,10 +78,13 @@ SELECT
     end_time,
     namespace,
     container_name,
+    pod_name,
+    image_tag,
     concat(
         '[', toString(start_time),
         ' → ', toString(end_time), ']',
         ' ×', toString(cnt),
+        '  ', namespace, '/', pod_name,
         '  ', log_text
     )                                 AS raw_line
 FROM (
@@ -91,7 +94,11 @@ FROM (
         min(log)                           AS log_text,
         count()                            AS cnt,
         any(kubernetes_namespace_name)     AS namespace,
-        any(kubernetes_container_name)     AS container_name
+        any(kubernetes_container_name)     AS container_name,
+        any(kubernetes_pod_name)           AS pod_name,
+        -- Берём только имя образа с тегом (без registry-префикса):
+        -- 'registry.example.com/org/name:v1.2.3' → 'name:v1.2.3'
+        arrayElement(splitByChar('/', any(kubernetes_container_image)), -1) AS image_tag
     FROM (
         SELECT *,
             sum(is_new_group) OVER (

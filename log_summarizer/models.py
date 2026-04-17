@@ -174,8 +174,10 @@ class Hypothesis(BaseModel):
     id: str
     title: str
     title_ru: Optional[str] = None       # перевод title на русский (заполняется REDUCE)
-    description: str
+    description: str                     # что произошло по версии этой гипотезы
     description_ru: Optional[str] = None # перевод description на русский (заполняется REDUCE)
+    reasoning: str                       # почему считаем эту гипотезу верной (доказательства, логика)
+    reasoning_ru: Optional[str] = None   # перевод reasoning на русский (заполняется REDUCE)
     confidence: str                      # "low" | "medium" | "high"
     supporting_event_ids: list[str]      # ссылки на Event.id
     contradicting_event_ids: list[str] = Field(default_factory=list)

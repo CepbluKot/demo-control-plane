@@ -145,7 +145,7 @@ class DataLoader:
             logger.debug("Fetched %d log rows", len(page))
 
             if uses_keyset:
-                last_ts = self._max_ts_from_rows(rows, last_ts)
+                last_ts = self._max_ts_from_rows(rows, last_ts, last_page=(len(rows) < page_size))
             else:
                 offset += page_size
 
@@ -273,19 +273,18 @@ class DataLoader:
         ts = row.get("timestamp") or row.get("time") or row.get("ts")
         raw_line = row.get("raw_line") or str(row)
 
-        # source: явное поле → kubernetes_container_name → namespace/container_name → container/pod
-        source = (
-            row.get("source")
-            or row.get("service")
-            or row.get("kubernetes_container_name")
-        )
+        # source: явное поле → namespace/pod_name → namespace/container_name → container/pod
+        # pod_name предпочтительнее container_name: позволяет отличить реплики одного контейнера.
+        source = row.get("source") or row.get("service")
         if not source:
-            ns = row.get("namespace")
-            cn = row.get("container_name") or row.get("container") or row.get("pod")
-            if ns and cn:
-                source = f"{ns}/{cn}"
+            ns = row.get("namespace") or row.get("kubernetes_namespace_name")
+            pod = row.get("pod_name") or row.get("kubernetes_pod_name")
+            cn = row.get("container_name") or row.get("kubernetes_container_name") or row.get("container")
+            identity = pod or cn
+            if ns and identity:
+                source = f"{ns}/{identity}"
             else:
-                source = cn or ns
+                source = identity or ns
 
         # message: явное поле → fallback на raw_line (для агрегированного формата)
         message = (
@@ -356,22 +355,37 @@ class DataLoader:
         )
 
     @staticmethod
-    def _max_ts_from_rows(rows: list[dict], fallback: str) -> str:
-        """Возвращает end_time последней строки для keyset-пагинации.
+    def _max_ts_from_rows(rows: list[dict], fallback: str, last_page: bool = False) -> str:
+        """Возвращает watermark для keyset-пагинации.
 
-        Строки отсортированы по start_time ASC — берём end_time последней.
-        ВАЖНО: нельзя брать max(end_time) по всем строкам — ранняя группа
-        с долгим повторением (start_time=01:30, end_time=19:22) создаёт гэп:
-        следующий запрос начинается с 19:22 и пропускает всё между последней
-        возвращённой группой и 19:22.
+        Два режима:
+        - last_page=True  (len(rows) < page_size): последняя страница, берём
+          max(end_time) по всем строкам — иначе «хвосты» длинных групп утекут
+          на следующую страницу и создадут дубли.
+        - last_page=False (len(rows) == page_size): промежуточная страница,
+          берём end_time ПОСЛЕДНЕЙ строки (по start_time ASC) — иначе группа
+          с ранним start_time и поздним end_time создаст гэп в следующей странице.
+
+        Строки приходят уже отсортированными по start_time ASC из SQL.
         """
         if not rows:
             return fallback
-        last_row = rows[-1]
-        ts = (
-            last_row.get("end_time")
-            or last_row.get("timestamp")
-            or last_row.get("time")
-            or last_row.get("ts")
-        )
-        return str(ts) if ts is not None else fallback
+
+        if last_page:
+            # Последняя страница: нужен глобальный max чтобы page следующий был пустым
+            ts_values = []
+            for row in rows:
+                ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
+                if ts is not None:
+                    ts_values.append(str(ts))
+            return max(ts_values) if ts_values else fallback
+        else:
+            # Промежуточная страница: берём end_time последней строки чтобы не было гэпов
+            last_row = rows[-1]
+            ts = (
+                last_row.get("end_time")
+                or last_row.get("timestamp")
+                or last_row.get("time")
+                or last_row.get("ts")
+            )
+            return str(ts) if ts is not None else fallback

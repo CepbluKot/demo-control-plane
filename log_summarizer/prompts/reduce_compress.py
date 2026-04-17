@@ -18,8 +18,8 @@ Compression rules:
 - events: shorten each description / description_ru to ≤60 chars; keep all events (do not remove any);
   preserve importance scores exactly
 - causal_chains: shorten each description / description_ru to ≤80 chars; keep all chains
-- hypotheses: shorten title/title_ru to ≤40 chars, description/description_ru to ≤120 chars;
-  keep all hypotheses and their IDs; preserve related_alert_ids exactly
+- hypotheses: shorten title/title_ru to ≤40 chars, description/description_ru to ≤120 chars,
+  reasoning/reasoning_ru to ≤120 chars; keep all hypotheses and their IDs; preserve related_alert_ids exactly
 - anomalies: shorten each description / description_ru to ≤80 chars; keep all anomalies
 - gaps: shorten description / description_ru to ≤60 chars; keep all gaps
 - impact_summary / impact_summary_ru: shorten to ≤120 chars
@@ -58,8 +58,10 @@ Compression rules:
       "id": "<original hyp-id — do not change>",
       "title": "<title, English>",
       "title_ru": "<title, Russian>",
-      "description": "<compressed ≤120 chars, English>",
-      "description_ru": "<compressed ≤120 chars, Russian>",
+      "description": "<what happened, compressed ≤120 chars, English>",
+      "description_ru": "<what happened, compressed ≤120 chars, Russian>",
+      "reasoning": "<why we believe this, compressed ≤120 chars, English>",
+      "reasoning_ru": "<why we believe this, compressed ≤120 chars, Russian>",
       "confidence": "low|medium|high",
       "supporting_event_ids": ["<evt-id>"],
       "contradicting_event_ids": [],

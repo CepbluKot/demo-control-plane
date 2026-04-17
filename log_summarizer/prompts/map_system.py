@@ -48,7 +48,8 @@ Output a single JSON object — no prose before or after.
     {{
       "id": "<hyp-BATCH-SEQ>",
       "title": "<short title ≤60 chars>",
-      "description": "<what this hypothesis claims and why>",
+      "description": "<what happened according to this hypothesis — plain narrative of the failure scenario>",
+      "reasoning": "<why we believe this is correct — specific evidence, log lines, timing that supports it>",
       "confidence": "low|medium|high",
       "supporting_event_ids": ["<evt-id>"],
       "contradicting_event_ids": [],
@@ -74,6 +75,14 @@ Output a single JSON object — no prose before or after.
     "<concrete action item seen directly in this batch, ≤80 chars>"
   ]
 }}
+
+=== Log line format ===
+Each log line looks like:
+  [start → end] ×N  namespace/pod-name  <log text>
+- ×N: how many consecutive identical messages were deduplicated into this line
+- namespace/pod-name: Kubernetes namespace and exact pod instance (use this in event source)
+- If the same error appears from multiple different pods — note this; it signals cluster-wide impact
+- If errors concentrate in one specific pod — note this; it may indicate a bad replica or node
 
 === Rules ===
 - events: only significant events; skip healthy/routine lines (200 OK, heartbeat, etc.)
