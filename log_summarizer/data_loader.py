@@ -86,6 +86,7 @@ class DataLoader:
         # с start_time == slice_start точно пропускались бы.
         last_ts = self._fmt_dt(slice_start - timedelta(microseconds=1)) if slice_start else start
 
+        page_num = 0
         while True:
             sql = self._render_logs_sql(
                 template=template,
@@ -95,11 +96,18 @@ class DataLoader:
                 offset=offset,
                 last_ts=last_ts,
             )
-            logger.debug("Fetching log page: offset=%d, last_ts=%s", offset, last_ts)
+            import time as _time
+            _t = _time.monotonic()
             rows = self._execute_query(sql)
+            _elapsed = _time.monotonic() - _t
             if not rows:
                 break
 
+            page_num += 1
+            logger.info(
+                "  Страница %d: %d групп за %.1fс  (last_ts=%s)",
+                page_num, len(rows), _elapsed, last_ts,
+            )
             page = [
                 self._row_to_log(r, inc_start=inc_start, inc_end=inc_end)
                 for r in rows
