@@ -89,6 +89,7 @@ class MapProcessor:
                     f"chunk-{idx:03d}  "
                     f"{t0c.strftime('%H:%M:%S')}→{t1c.strftime('%H:%M:%S')}  "
                     f"{len(chunk.rows)} строк  "
+                    f"~{chunk.token_estimate:,} tok  "
                     f"{events_found} событий  "
                     f"[{fmt_dur(elapsed_chunk)}]"
                 )

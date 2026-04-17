@@ -399,8 +399,7 @@ class PipelineOrchestrator:
 
     def _load_data(self) -> tuple[list[Chunk], Optional[list[MetricRow]]]:
         """Загрузка логов и метрик (синхронная, вызывается из executor)."""
-        all_chunks: list[Chunk] = []
-        total_rows = 0
+        all_rows: list = []
         page_count = 0
 
         raw_dir = self._run_dir / "raw" if self._run_dir else None
@@ -411,10 +410,8 @@ class PipelineOrchestrator:
             if not page:
                 continue
             page_count += 1
-            total_rows += len(page)
-            page_chunks = self._chunker.chunk(page)
-            all_chunks.extend(page_chunks)
-            logger.debug("Loaded page %d: %d rows → %d chunks", page_count, len(page), len(page_chunks))
+            all_rows.extend(page)
+            logger.debug("Loaded page %d: %d rows (total so far: %d)", page_count, len(page), len(all_rows))
 
             if raw_dir:
                 path = raw_dir / f"page_{page_count:03d}.txt"
@@ -424,9 +421,14 @@ class PipelineOrchestrator:
                         if not row.raw_line.endswith("\n"):
                             f.write("\n")
 
+        # Чанкуем все строки разом — каждый чанк заполняется до токенового бюджета.
+        # Если чанковать по страницам, чанки получаются маленькими (~4k токенов
+        # вместо ~55k бюджета) и MAP делает в 10× больше вызовов чем нужно.
+        all_chunks = self._chunker.chunk(all_rows)
+
         logger.info(
-            "Log loading complete: %d страниц · %d строк → %d чанков%s",
-            page_count, total_rows, len(all_chunks),
+            "Log loading complete: %d страниц · %d строк → %d чанков (бюджет ~%d tok/чанк)%s",
+            page_count, len(all_rows), len(all_chunks), self.config.map_batch_tokens(),
             f"  ·  raw/ → {raw_dir}" if raw_dir else "",
         )
 
