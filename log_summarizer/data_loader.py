@@ -107,9 +107,6 @@ class DataLoader:
             yield page
             logger.debug("Fetched %d log rows", len(page))
 
-            if len(rows) < page_size:
-                break  # последняя страница слайса
-
             if uses_keyset:
                 last_ts = self._max_ts_from_rows(rows, last_ts)
             else:
@@ -318,10 +315,16 @@ class DataLoader:
 
     @staticmethod
     def _max_ts_from_rows(rows: list[dict], fallback: str) -> str:
-        """Извлекаем максимальный timestamp для keyset-пагинации."""
+        """Извлекаем максимальный timestamp для keyset-пагинации.
+
+        Для агрегированных запросов (GROUP BY группы повторяющихся строк)
+        используем end_time (= max(raw_timestamp) группы) — иначе следующий батч
+        начнётся с середины последней группы и строки задублируются.
+        Для простых запросов fallback на timestamp.
+        """
         ts_values = []
         for row in rows:
-            ts = row.get("timestamp") or row.get("time") or row.get("ts")
+            ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
             if ts is not None:
                 ts_values.append(str(ts))
         if not ts_values:
