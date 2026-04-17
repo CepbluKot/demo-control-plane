@@ -104,6 +104,7 @@ class DataLoader:
                 limit=page_size,
                 offset=offset,
                 last_ts=last_ts,
+                raw_limit=page_size * self.config.batch_raw_multiplier,
             )
             _t = _time.monotonic()
             rows = self._execute_query(sql)
@@ -212,12 +213,14 @@ class DataLoader:
         limit: int,
         offset: int,
         last_ts: str,
+        raw_limit: int = 0,
     ) -> str:
         """Подставляет плейсхолдеры в SQL-шаблон логов."""
         replacements = {
             "start_time": start_time,
             "end_time": end_time,
             "limit": str(limit),
+            "raw_limit": str(raw_limit or limit),
             "offset": str(offset),
             "last_ts": last_ts,
             # Совместимость с my_summarizer плейсхолдерами
@@ -354,18 +357,21 @@ class DataLoader:
 
     @staticmethod
     def _max_ts_from_rows(rows: list[dict], fallback: str) -> str:
-        """Извлекаем максимальный timestamp для keyset-пагинации.
+        """Возвращает end_time последней строки для keyset-пагинации.
 
-        Для агрегированных запросов (GROUP BY группы повторяющихся строк)
-        используем end_time (= max(raw_timestamp) группы) — иначе следующий батч
-        начнётся с середины последней группы и строки задублируются.
-        Для простых запросов fallback на timestamp.
+        Строки отсортированы по start_time ASC — берём end_time последней.
+        ВАЖНО: нельзя брать max(end_time) по всем строкам — ранняя группа
+        с долгим повторением (start_time=01:30, end_time=19:22) создаёт гэп:
+        следующий запрос начинается с 19:22 и пропускает всё между последней
+        возвращённой группой и 19:22.
         """
-        ts_values = []
-        for row in rows:
-            ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
-            if ts is not None:
-                ts_values.append(str(ts))
-        if not ts_values:
+        if not rows:
             return fallback
-        return max(ts_values)
+        last_row = rows[-1]
+        ts = (
+            last_row.get("end_time")
+            or last_row.get("timestamp")
+            or last_row.get("time")
+            or last_row.get("ts")
+        )
+        return str(ts) if ts is not None else fallback

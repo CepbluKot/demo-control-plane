@@ -111,8 +111,9 @@ FROM (
                     1, 0
                 ) AS is_new_group
             FROM raw_lm.log_k8s_containers_MT   -- ← таблица с логами
-            -- Без LIMIT здесь — обрабатываем все сырые строки периода,
-            -- чтобы группировка была полной. LIMIT перенесён на уровень групп.
+            -- {raw_limit} = BATCH_SIZE * BATCH_RAW_MULTIPLIER сырых строк.
+            -- Ограничивает память под оконные функции; при высокой повторяемости
+            -- гарантирует достаточно сырых строк для формирования BATCH_SIZE групп.
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
               AND ext_ClusterName = 'ndp-p01'   -- ← кластер
@@ -141,6 +142,7 @@ FROM (
                     'object has no attribute ''upper'''
                 ])
             ORDER BY timestamp ASC
+            LIMIT {raw_limit}
         )
     )
     GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
@@ -269,9 +271,15 @@ FREEFORM_ALERTS: list[dict]       = [
 # Больше = быстрее, но выше нагрузка на LLM-сервер.
 MAP_CONCURRENCY = 5
 
-# Сколько строк тащить из ClickHouse за один запрос.
+# Сколько групп (агрегированных строк) тащить из ClickHouse за один запрос.
 # Не влияет на размер промпта — после выборки строки нарезаются по токенам.
 BATCH_SIZE = 1000
+
+# Множитель для лимита сырых строк внутри запроса.
+# raw_limit = BATCH_SIZE * BATCH_RAW_MULTIPLIER.
+# Чем выше повторяемость логов — тем больше нужен множитель чтобы гарантировать
+# BATCH_SIZE групп на странице. 50 покрывает компрессию до 50:1.
+BATCH_RAW_MULTIPLIER = 50
 
 # Максимум токенов на один MAP-батч (размер одного чанка логов в промпте).
 # None → автоматически 55% от MAX_CONTEXT_TOKENS.
@@ -342,6 +350,7 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
         model_supports_tool_calling=MODEL_SUPPORTS_TOOL_CALLING,
         map_concurrency=MAP_CONCURRENCY,
         batch_size=BATCH_SIZE,
+        batch_raw_multiplier=BATCH_RAW_MULTIPLIER,
         max_events_per_merge=MAX_EVENTS_PER_MERGE,
         max_batch_tokens=MAX_BATCH_TOKENS,
         query_time_slice_hours=QUERY_TIME_SLICE_HOURS,

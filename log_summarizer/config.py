@@ -124,6 +124,13 @@ class PipelineConfig:
     # Рекомендовано: 2.0 для периодов > 4 часов с оконными функциями в SQL.
     query_time_slice_hours: float = 0.0
 
+    # Множитель для лимита сырых строк во внутреннем подзапросе.
+    # raw_limit = batch_size * batch_raw_multiplier.
+    # Нужен чтобы GROUP BY всегда имел достаточно сырых строк для формирования
+    # batch_size групп даже при высокой степени повторяемости логов.
+    # Пример: batch_size=1000, multiplier=50 → обрабатываем до 50k сырых строк.
+    batch_raw_multiplier: int = 50
+
     # ── Вспомогательные методы ───────────────────────────────────────
 
     def context_start_actual(self) -> Optional[datetime]:
