@@ -75,8 +75,8 @@ CH_DATABASE = "default"     # база данных по умолчанию (м�
 LOGS_SQL = """
 SELECT
     start_time                        AS timestamp,
-    kubernetes_namespace_name         AS namespace,
-    kubernetes_container_name         AS container_name,
+    namespace,
+    container_name,
     concat(
         '[', toString(start_time),
         ' → ', toString(end_time), ']',
@@ -89,8 +89,8 @@ FROM (
         max(timestamp)                     AS end_time,
         min(log)                           AS log_text,
         count()                            AS cnt,
-        any(kubernetes_namespace_name)     AS kubernetes_namespace_name,
-        any(kubernetes_container_name)     AS kubernetes_container_name
+        any(kubernetes_namespace_name)     AS namespace,
+        any(kubernetes_container_name)     AS container_name
     FROM (
         SELECT *,
             sum(is_new_group) OVER (
