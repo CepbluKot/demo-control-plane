@@ -284,7 +284,8 @@ class PipelineOrchestrator:
         """Создаёт папку runs/{timestamp}/ для артефактов прогона."""
         if not runs_dir:
             return None
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+        from log_summarizer.config import MSK
+        ts = datetime.now(MSK).strftime("%Y-%m-%dT%H-%M-%S")
         run_dir = Path(runs_dir) / ts
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
@@ -402,6 +403,10 @@ class PipelineOrchestrator:
         total_rows = 0
         page_count = 0
 
+        raw_dir = self._run_dir / "raw" if self._run_dir else None
+        if raw_dir:
+            raw_dir.mkdir(exist_ok=True)
+
         for page in self._data_loader.iter_log_pages(page_size=self.config.batch_size):
             if not page:
                 continue
@@ -411,9 +416,18 @@ class PipelineOrchestrator:
             all_chunks.extend(page_chunks)
             logger.debug("Loaded page %d: %d rows → %d chunks", page_count, len(page), len(page_chunks))
 
+            if raw_dir:
+                path = raw_dir / f"page_{page_count:03d}.txt"
+                with path.open("w", encoding="utf-8") as f:
+                    for row in page:
+                        f.write(row.raw_line)
+                        if not row.raw_line.endswith("\n"):
+                            f.write("\n")
+
         logger.info(
-            "Log loading complete: %d страниц · %d строк → %d чанков",
+            "Log loading complete: %d страниц · %d строк → %d чанков%s",
             page_count, total_rows, len(all_chunks),
+            f"  ·  raw/ → {raw_dir}" if raw_dir else "",
         )
 
         metrics = self._data_loader.fetch_metrics(

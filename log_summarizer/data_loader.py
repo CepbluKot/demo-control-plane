@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 from log_summarizer.config import PipelineConfig
@@ -37,20 +37,54 @@ class DataLoader:
         Если context-окно не задано — используется incident-окно.
         Каждая строка получает zone-метку относительно incident-окна.
 
+        Если config.query_time_slice_hours > 0 — период разбивается на слайсы
+        и для каждого слайса выполняется отдельная серия запросов с пагинацией.
+        Это предотвращает OOM в ClickHouse при SQL с оконными функциями.
+
         Args:
             page_size: Размер одной страницы (строк).
         """
-        template = self.config.logs_sql_template
-        # Грузим логи за ШИРОКОЕ окно (контекст), не за узкое (инцидент)
-        start = self._fmt_dt(self.config.context_start_actual())
-        end = self._fmt_dt(self.config.context_end_actual())
-
+        ctx_start = self.config.context_start_actual()
+        ctx_end = self.config.context_end_actual()
         inc_start = self.config.incident_start
         inc_end = self.config.incident_end
+        slice_hours = self.config.query_time_slice_hours
 
+        if slice_hours and slice_hours > 0 and ctx_start and ctx_end:
+            slice_start = ctx_start
+            slice_num = 0
+            while slice_start < ctx_end:
+                slice_end = min(slice_start + timedelta(hours=slice_hours), ctx_end)
+                slice_num += 1
+                logger.debug(
+                    "Time slice %d: %s → %s",
+                    slice_num,
+                    slice_start.strftime("%H:%M"),
+                    slice_end.strftime("%H:%M"),
+                )
+                yield from self._iter_slice(slice_start, slice_end, inc_start, inc_end, page_size)
+                slice_start = slice_end
+        else:
+            yield from self._iter_slice(ctx_start, ctx_end, inc_start, inc_end, page_size)
+
+    def _iter_slice(
+        self,
+        slice_start: Optional[datetime],
+        slice_end: Optional[datetime],
+        inc_start: Optional[datetime],
+        inc_end: Optional[datetime],
+        page_size: int,
+    ) -> Iterator[list[LogRow]]:
+        """Постраничная выгрузка за один временно́й слайс."""
+        template = self.config.logs_sql_template
+        start = self._fmt_dt(slice_start)
+        end = self._fmt_dt(slice_end)
         uses_keyset = "{last_ts}" in template
         offset = 0
-        last_ts = start
+        # Инициализируем last_ts на 1 мкс раньше начала слайса:
+        # outer WHERE использует строгое >, поэтому без этого группы
+        # с start_time == slice_start точно пропускались бы.
+        last_ts = self._fmt_dt(slice_start - timedelta(microseconds=1)) if slice_start else start
 
         while True:
             sql = self._render_logs_sql(
@@ -74,10 +108,9 @@ class DataLoader:
             logger.debug("Fetched %d log rows", len(page))
 
             if len(rows) < page_size:
-                break  # последняя страница
+                break  # последняя страница слайса
 
             if uses_keyset:
-                # keyset: следующая страница начинается после max(timestamp)
                 last_ts = self._max_ts_from_rows(rows, last_ts)
             else:
                 offset += page_size

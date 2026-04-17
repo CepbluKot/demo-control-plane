@@ -14,7 +14,7 @@
 
 **Результат:** Markdown-отчёт с хронологией событий, причинно-следственными цепочками, объяснением каждого алерта, гипотезами первопричин и конкретными рекомендациями для SRE.
 
-**Точка входа:** `run_pipeline.py` — заполни `INCIDENTS` и запусти `python run_pipeline.py`.
+**Точка входа:** `run_pipeline.py` — задай режим `MODE` и запусти `python run_pipeline.py`.
 
 ---
 
@@ -561,12 +561,33 @@ LIMIT {limit}
 
 **Не используй `{offset}`** — на больших таблицах ClickHouse читает все строки до смещения в RAM → `MEMORY_LIMIT_EXCEEDED`.
 
-### Список инцидентов (INCIDENTS)
+### Режим запуска (MODE)
+
+```python
+MODE = "incidents"   # "incidents" | "freeform"
+```
+
+**`"incidents"`** (дефолт) — обрабатывает список `INCIDENTS`. Время инцидента и контекстное окно берутся из каждой записи. Поддерживает `--only name` и `--list`.
+
+**`"freeform"`** — один инцидент с явным периодом `FREEFORM_START..FREEFORM_END`. Алерты обязательны — задаются через `FREEFORM_ALERTS`. Удобно когда нужно разобрать произвольный период без добавления записи в `INCIDENTS`. `--only` в этом режиме игнорируется.
+
+### Обрезка периода по последнему алерту (AUTO_TRIM_AFTER_LAST_ALERT)
+
+```python
+AUTO_TRIM_AFTER_LAST_ALERT = False
+TRIM_BUFFER_MINUTES        = 15
+```
+
+При `True` — конец периода загрузки логов (`context_end` / `FREEFORM_END`) автоматически обрезается до `max(alert.fired_at) + TRIM_BUFFER_MINUTES`. Логи после последнего алерта обычно не нужны для анализа первопричины. Работает в обоих режимах. При срабатывании в лог пишется INFO с указанием старого и нового `context_end`.
+
+Реализовано в `_apply_trim(incident, log)` — возвращает копию словаря инцидента с изменённым `context_end`, оригинал не меняет. Если алертов с `fired_at` нет или обрезать нечего — возвращает оригинал.
+
+### Список инцидентов (INCIDENTS) — режим "incidents"
 
 ```python
 INCIDENTS = [
     {
-        "name": "my-incident-2026-04-16",    # slug: только латиница, цифры, дефисы
+        "name": "my-incident-2026-04-17",    # slug: только латиница, цифры, дефисы
         "context": """
             Описание: что случилось, какие сервисы затронуты.
             Чем конкретнее — тем точнее анализ.
@@ -574,28 +595,50 @@ INCIDENTS = [
         "alerts": [
             {
                 "name": "AlertName",
-                "fired_at": datetime(2026, 4, 16, 14, 15, 0, tzinfo=MSK),
+                "fired_at": datetime(2026, 4, 17, 14, 15, 0, tzinfo=MSK),
                 "severity": "critical",              # critical/high/medium/low/info
                 "description": "Текст алерта",       # опционально
             },
         ],
-        "incident_start": datetime(2026, 4, 16, 14, 10, 0, tzinfo=MSK),
-        "incident_end":   datetime(2026, 4, 16, 14, 50, 0, tzinfo=MSK),
+        "incident_start": datetime(2026, 4, 17, 14, 10, 0, tzinfo=MSK),
+        "incident_end":   datetime(2026, 4, 17, 14, 50, 0, tzinfo=MSK),
         # Опциональное широкое окно (по умолчанию ±1 час от incident):
-        "context_start":  datetime(2026, 4, 16, 13, 0, 0, tzinfo=MSK),
-        "context_end":    datetime(2026, 4, 16, 16, 0, 0, tzinfo=MSK),
+        "context_start":  datetime(2026, 4, 17, 13, 0, 0, tzinfo=MSK),
+        "context_end":    datetime(2026, 4, 17, 16, 0, 0, tzinfo=MSK),
     },
 ]
 ```
 
 **Важно:** `fired_at` алертов должны попасть внутрь `incident_start...incident_end`. Время задавать в МСК (UTC+3): `MSK = timezone(timedelta(hours=3))`.
 
+### Freeform-инцидент (FREEFORM_*) — режим "freeform"
+
+```python
+FREEFORM_START   = datetime(2026, 4, 17, 1, 30, 0, tzinfo=MSK)
+FREEFORM_END     = datetime(2026, 4, 17, 19, 30, 0, tzinfo=MSK)
+FREEFORM_CONTEXT = "Разобраться что происходило с кластером в этот период"
+FREEFORM_ALERTS  = [
+    {
+        "name": "AlertName",
+        "fired_at": datetime(2026, 4, 17, 5, 8, 0, tzinfo=MSK),
+        "severity": "critical",
+        "description": "Описание алерта",
+    },
+]
+```
+
+Ограничения и валидация при старте:
+- `FREEFORM_START` и `FREEFORM_END` — обязательны; отсутствие → `SystemExit`
+- `FREEFORM_ALERTS` — обязателен (минимум один алерт); пустой список → `SystemExit`
+- Все `fired_at` алертов должны попасть в `FREEFORM_START..FREEFORM_END` → `SystemExit` при нарушении
+- Папка артефактов называется `freeform-YYYY-MM-DDTHH-MM/`
+
 ### Запуск
 
 ```bash
-python run_pipeline.py                         # все инциденты из INCIDENTS
-python run_pipeline.py --only my-incident-name # один инцидент
-python run_pipeline.py --list                  # список инцидентов
+python run_pipeline.py                         # запуск в режиме MODE
+python run_pipeline.py --only my-incident-name # один инцидент (только режим incidents)
+python run_pipeline.py --list                  # список инцидентов (или freeform-период)
 ```
 
 ---
