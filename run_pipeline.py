@@ -127,6 +127,8 @@ FROM (
               AND ext_ClusterName = 'ndp-p01'
               AND (
                     kubernetes_container_name LIKE '%airflow%'
+                    OR kubernetes_container_name LIKE '%spark%'
+                    OR kubernetes_container_name LIKE '%flex%'
                     OR
                     (
                         kubernetes_namespace_name LIKE '%kube-system%'
@@ -205,11 +207,7 @@ FROM (
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
               AND ext_ClusterName = 'ndp-p01'
-              AND reason IN (
-                    'BackOff', 'Failed', 'OOMKilling', 'Killing', 'Evicted',
-                    'FailedScheduling', 'FailedMount', 'FailedAttachVolume',
-                    'NodeNotReady', 'Unhealthy', 'NetworkNotReady'
-              )
+              AND reason LIKE 'BackOff'
             ORDER BY timestamp ASC
             LIMIT {raw_limit}
         )
