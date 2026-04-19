@@ -207,7 +207,13 @@ FROM (
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
               AND ext_ClusterName = 'ndp-p01'
-              AND reason LIKE 'BackOff'
+              AND reason IN (
+                    'BackOff', 'ImagePullBackOff',
+                    'OOMKilling', 'Evicted',
+                    'Failed', 'FailedCreate', 'FailedScheduling', 'FailedMount',
+                    'Killing', 'NodeNotReady', 'Unhealthy',
+                    'CrashLoopBackOff'
+              )
             ORDER BY timestamp ASC
             LIMIT {raw_limit}
         )
