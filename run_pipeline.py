@@ -55,24 +55,30 @@ CH_PASSWORD = ""
 CH_DATABASE = "default"     # база данных по умолчанию (можно переопределить в SQL)
 
 # ══════════════════════════════════════════════════════════════════════
-#  SQL-шаблон для логов (общий для всех инцидентов)
+#  LOGS_SQLS — список SQL-шаблонов для загрузки логов
 #
-#  Плейсхолдеры — DataLoader подставляет их автоматически:
-#    {start_time}  — начало периода инцидента (ISO8601)
-#    {end_time}    — конец периода инцидента (ISO8601)
-#    {last_ts}     — keyset-пагинация: max timestamp предыдущей страницы;
-#                    первый вызов = {start_time}; заменяет OFFSET
-#    {limit}       — количество строк на страницу (= BATCH_SIZE ниже)
+#  Каждый элемент — отдельный источник данных. DataLoader запрашивает
+#  их независимо с одним last_ts-watermark и сортирует результаты в Python.
+#
+#  Обязательные плейсхолдеры (проверяются при старте):
+#    {last_ts}     — keyset-watermark; фильтрует timestamp > last_ts
+#    {period_end}  — верхняя граница периода; фильтрует timestamp <= period_end
+#    {limit}       — LIMIT на внешнем GROUP BY (= BATCH_SIZE групп на страницу)
+#    {raw_limit}   — LIMIT на внутренних сырых строках (= BATCH_SIZE × BATCH_RAW_MULTIPLIER)
 #
 #  Обязательные колонки в SELECT:
-#    timestamp     — DataLoader ищет именно это имя для keyset и сортировки
-#    raw_line      — текст лога, передаётся в LLM дословно; если колонки нет —
-#                    DataLoader попробует: message / msg / log / value
+#    timestamp     — start_time группы; используется для сортировки и zone-разметки
+#    end_time      — max timestamp сырых строк группы; используется для watermark
+#    raw_line      — текст для LLM; формат: [start → end] ×N  ns/pod  <текст>
 #
-#  Не используй OFFSET — на больших таблицах падает по памяти.
-#  Вместо этого фильтруй по start_time > '{last_ts}' (см. WHERE внизу).
+#  Не используй OFFSET — на больших таблицах OOM.
+#  Тег [EVT:reason] в raw_line помогает LLM отличать K8s-события от логов.
 # ══════════════════════════════════════════════════════════════════════
-LOGS_SQL = """
+
+LOGS_SQLS = [
+
+    # ── Источник 1: контейнерные логи (raw_lm.log_k8s_containers_MT) ─────────
+    """
 SELECT
     start_time                        AS timestamp,
     end_time,
@@ -89,15 +95,13 @@ SELECT
     )                                 AS raw_line
 FROM (
     SELECT
-        min(timestamp)                     AS start_time,
-        max(timestamp)                     AS end_time,
-        min(log)                           AS log_text,
-        count()                            AS cnt,
-        any(kubernetes_namespace_name)     AS namespace,
-        any(kubernetes_container_name)     AS container_name,
-        any(kubernetes_pod_name)           AS pod_name,
-        -- Берём только имя образа с тегом (без registry-префикса):
-        -- 'registry.example.com/org/name:v1.2.3' → 'name:v1.2.3'
+        min(timestamp)                                                      AS start_time,
+        max(timestamp)                                                      AS end_time,
+        min(log)                                                            AS log_text,
+        count()                                                             AS cnt,
+        any(kubernetes_namespace_name)                                      AS namespace,
+        any(kubernetes_container_name)                                      AS container_name,
+        any(kubernetes_pod_name)                                            AS pod_name,
         arrayElement(splitByChar('/', any(kubernetes_container_image)), -1) AS image_tag
     FROM (
         SELECT *,
@@ -117,13 +121,10 @@ FROM (
                     ),
                     1, 0
                 ) AS is_new_group
-            FROM raw_lm.log_k8s_containers_MT   -- ← таблица с логами
-            -- {raw_limit} = BATCH_SIZE * BATCH_RAW_MULTIPLIER сырых строк.
-            -- Ограничивает память под оконные функции; при высокой повторяемости
-            -- гарантирует достаточно сырых строк для формирования BATCH_SIZE групп.
+            FROM raw_lm.log_k8s_containers_MT
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND ext_ClusterName = 'ndp-p01'   -- ← кластер
+              AND ext_ClusterName = 'ndp-p01'
               AND (
                     kubernetes_container_name LIKE '%airflow%'
                     OR
@@ -154,10 +155,94 @@ FROM (
     )
     GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
 )
--- LIMIT на группах: теперь каждая страница содержит ровно {limit} групп
 ORDER BY start_time ASC
 LIMIT {limit}
-"""
+""",
+
+    # ── Источник 2: Kubernetes Events (raw_lm.log_k8s_events) ────────────────
+    # Тег [EVT:reason] в raw_line — LLM видит тип события (BackOff, OOMKilling, ...).
+    """
+SELECT
+    start_time                AS timestamp,
+    end_time,
+    namespace,
+    pod_name,
+    concat(
+        '[', toString(start_time),
+        ' → ', toString(end_time), ']',
+        ' ×', toString(cnt),
+        '  ', namespace, '/', pod_name,
+        '  [EVT:', reason, '] ', message_text
+    )                         AS raw_line
+FROM (
+    SELECT
+        min(timestamp)                AS start_time,
+        max(timestamp)               AS end_time,
+        any(message)                 AS message_text,
+        count()                      AS cnt,
+        any(involvedObject_namespace) AS namespace,
+        any(involvedObject_name)      AS pod_name,
+        any(reason)                  AS reason
+    FROM (
+        SELECT *,
+            sum(is_new_group) OVER (
+                PARTITION BY involvedObject_namespace, involvedObject_name
+                ORDER BY timestamp ASC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS group_id
+        FROM (
+            SELECT *,
+                if(
+                    message != ifNull(
+                        lagInFrame(message) OVER (
+                            PARTITION BY involvedObject_namespace, involvedObject_name
+                            ORDER BY timestamp ASC
+                        ), ''
+                    ),
+                    1, 0
+                ) AS is_new_group
+            FROM raw_lm.log_k8s_events
+            WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
+              AND timestamp <= parseDateTime64BestEffort('{period_end}')
+              AND ext_ClusterName = 'ndp-p01'
+              AND reason IN (
+                    'BackOff', 'Failed', 'OOMKilling', 'Killing', 'Evicted',
+                    'FailedScheduling', 'FailedMount', 'FailedAttachVolume',
+                    'NodeNotReady', 'Unhealthy', 'NetworkNotReady'
+              )
+            ORDER BY timestamp ASC
+            LIMIT {raw_limit}
+        )
+    )
+    GROUP BY group_id, involvedObject_namespace, involvedObject_name
+)
+ORDER BY start_time ASC
+LIMIT {limit}
+""",
+
+]
+
+# ── Валидация SQL-шаблонов ────────────────────────────────────────────────────
+# Проверяется один раз при старте main(). SystemExit если что-то не так.
+
+_REQUIRED_PLACEHOLDERS = ["{last_ts}", "{period_end}", "{limit}", "{raw_limit}"]
+_REQUIRED_COLUMNS      = ["timestamp", "end_time", "raw_line"]
+
+def _validate_sql_templates(sqls: list[str]) -> None:
+    """Проверяет что все SQL-шаблоны содержат нужные плейсхолдеры и колонки."""
+    if not sqls:
+        raise SystemExit("LOGS_SQLS пуст — добавь хотя бы один SQL-шаблон.")
+    errors = []
+    for i, sql in enumerate(sqls):
+        label = f"LOGS_SQLS[{i}]"
+        missing_ph = [p for p in _REQUIRED_PLACEHOLDERS if p not in sql]
+        if missing_ph:
+            errors.append(f"{label}: отсутствуют плейсхолдеры {missing_ph}")
+        missing_col = [c for c in _REQUIRED_COLUMNS if c not in sql]
+        if missing_col:
+            errors.append(f"{label}: отсутствуют колонки {missing_col} в SELECT")
+    if errors:
+        raise SystemExit("Ошибки в LOGS_SQLS:\n" + "\n".join(f"  • {e}" for e in errors))
 
 # SQL для метрик — опционально.
 # Те же плейсхолдеры: {start_time}, {end_time}.
@@ -342,7 +427,7 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
     ctx_end   = incident.get("context_end")
 
     config = PipelineConfig(
-        logs_sql_template=LOGS_SQL.strip(),
+        logs_sql_templates=[s.strip() for s in LOGS_SQLS],
         metrics_sql_template=METRICS_SQL.strip() or None,
         incident_context=incident["context"].strip(),
         incident_start=inc_start,
@@ -413,6 +498,9 @@ def _apply_trim(incident: dict, log: logging.Logger) -> dict:
 
 async def main(only: str | None) -> None:
     from log_summarizer.utils.logging import setup_pipeline_logging
+
+    # ── Валидация SQL-шаблонов ────────────────────────────────────────
+    _validate_sql_templates(LOGS_SQLS)
 
     # ── Корневая папка этого запуска ──────────────────────────────────
     run_ts = datetime.now(MSK).strftime("%Y-%m-%dT%H-%M-%S")

@@ -77,11 +77,18 @@ class DataLoader:
         inc_end: Optional[datetime],
         page_size: int,
     ) -> Iterator[list[LogRow]]:
-        """Постраничная выгрузка за один временно́й слайс."""
-        template = self.config.logs_sql_template
+        """Постраничная выгрузка за один временно́й слайс.
+
+        Поддерживает несколько SQL-шаблонов (config.extra_logs_sql_templates):
+        за каждый тик пагинации запрашиваем все источники с одним last_ts,
+        объединяем строки и сортируем по timestamp в Python (без нагрузки на ClickHouse).
+        Страница считается последней когда ВСЕ источники вернули < page_size строк.
+        """
+        all_templates = list(self.config.logs_sql_templates)
+
         start = self._fmt_dt(slice_start)
         end = self._fmt_dt(slice_end)
-        uses_keyset = "{last_ts}" in template
+        uses_keyset = bool(all_templates) and "{last_ts}" in all_templates[0]
         offset = 0
         # Инициализируем last_ts на 1 мкс раньше начала слайса:
         # outer WHERE использует строгое >, поэтому без этого группы
@@ -97,55 +104,73 @@ class DataLoader:
         page_num = 0
         import time as _time
         while True:
-            sql = self._render_logs_sql(
-                template=template,
-                start_time=start,
-                end_time=end,
-                limit=page_size,
-                offset=offset,
-                last_ts=last_ts,
-                raw_limit=page_size * self.config.batch_raw_multiplier,
-            )
-            _t = _time.monotonic()
-            rows = self._execute_query(sql)
-            _elapsed = _time.monotonic() - _t
-            if not rows:
+            combined_rows: list[dict] = []
+            all_sources_empty = True
+            all_sources_last = True
+            _total_elapsed = 0.0
+
+            for tmpl in all_templates:
+                sql = self._render_logs_sql(
+                    template=tmpl,
+                    start_time=start,
+                    end_time=end,
+                    limit=page_size,
+                    offset=offset,
+                    last_ts=last_ts,
+                    raw_limit=page_size * self.config.batch_raw_multiplier,
+                )
+                _t = _time.monotonic()
+                rows = self._execute_query(sql)
+                _total_elapsed += _time.monotonic() - _t
+                if rows:
+                    all_sources_empty = False
+                    combined_rows.extend(rows)
+                if len(rows) >= page_size:
+                    all_sources_last = False
+
+            if all_sources_empty:
                 break
 
+            # Сортировка в Python — не нагружаем ClickHouse межисточниковым merge
+            combined_rows.sort(
+                key=lambda r: r.get("timestamp") or r.get("start_time") or r.get("time") or r.get("ts") or ""
+            )
+
+            is_last_page = all_sources_last
             page_num += 1
-            total_rows_loaded += len(rows)
+            total_rows_loaded += len(combined_rows)
 
             page = [
                 self._row_to_log(r, inc_start=inc_start, inc_end=inc_end)
-                for r in rows
+                for r in combined_rows
             ]
             page_tok = sum(estimate_tokens(row.raw_line) for row in page)
 
             if tracker is not None:
                 cur_dt = None
-                for row in rows:
+                for row in combined_rows:
                     ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
                     if ts is not None and hasattr(ts, "replace"):
                         if cur_dt is None or ts > cur_dt:
                             cur_dt = ts
                 if cur_dt is not None:
-                    logger.info("  %s", tracker.line(cur_dt, page_num, total_rows_loaded, _elapsed, page_tok))
+                    logger.info("  %s", tracker.line(cur_dt, page_num, total_rows_loaded, _total_elapsed, page_tok))
                 else:
                     logger.info(
                         "  Страница %d: %d групп  ~%d tok  за %.1fс  (last_ts=%s)",
-                        page_num, len(rows), page_tok, _elapsed, last_ts,
+                        page_num, len(combined_rows), page_tok, _total_elapsed, last_ts,
                     )
             else:
                 logger.info(
                     "  Страница %d: %d групп  ~%d tok  за %.1fс  (last_ts=%s)",
-                    page_num, len(rows), page_tok, _elapsed, last_ts,
+                    page_num, len(combined_rows), page_tok, _total_elapsed, last_ts,
                 )
 
             yield page
-            logger.debug("Fetched %d log rows", len(page))
+            logger.debug("Fetched %d log rows (%d source(s))", len(page), len(all_templates))
 
             if uses_keyset:
-                last_ts = self._max_ts_from_rows(rows, last_ts, last_page=(len(rows) < page_size))
+                last_ts = self._max_ts_from_rows(combined_rows, last_ts, last_page=is_last_page)
             else:
                 offset += page_size
 

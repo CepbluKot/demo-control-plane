@@ -168,7 +168,7 @@ async def _main(argv: list[str] | None = None) -> int:
         return 2
 
     config = PipelineConfig(
-        logs_sql_template=logs_sql,
+        logs_sql_templates=[logs_sql] if logs_sql else [],
         metrics_sql_template=_read_sql(args.metrics_sql) or None,
         incident_context=args.context,
         incident_start=_parse_dt(args.start),

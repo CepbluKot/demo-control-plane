@@ -21,8 +21,11 @@ class PipelineConfig:
     """
 
     # ── SQL-шаблоны ──────────────────────────────────────────────────
-    # Плейсхолдеры: {start_time}, {end_time}, {limit}
-    logs_sql_template: str = ""
+    # Список SQL-шаблонов для загрузки логов. Первый элемент — основной источник,
+    # остальные — дополнительные (например, log_k8s_events). DataLoader запрашивает
+    # все источники независимо с одним last_ts, результаты сортируются в Python.
+    # Обязательные плейсхолдеры: {last_ts}, {period_end}, {limit}, {raw_limit}.
+    logs_sql_templates: list = field(default_factory=list)
 
     # Опционально: SQL для метрик сервисов
     metrics_sql_template: Optional[str] = None

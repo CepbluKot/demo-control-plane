@@ -210,7 +210,7 @@ class MultipassReportGenerator:
         """Секция 3 — покрытие данных."""
         t0, t1 = merged.time_range
         zones = ", ".join(merged.zones_covered) if merged.zones_covered else "incident"
-        sql_preview = (self.config.logs_sql_template or "")[:400].strip()
+        sql_preview = (self.config.logs_sql_templates[0] if self.config.logs_sql_templates else "")[:400].strip()
         user = (
             f"Период: {t0.isoformat()} → {t1.isoformat()}\n"
             f"Зоны анализа: {zones}\n"
