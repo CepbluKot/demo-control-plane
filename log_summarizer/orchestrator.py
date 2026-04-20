@@ -95,6 +95,95 @@ class PipelineOrchestrator:
 
     # ── Публичный API ─────────────────────────────────────────────────
 
+    async def run_from_map_dir(self, map_dir: Path) -> str:
+        """Продолжает пайплайн с той стадии, где он остановился.
+
+        Каждый шаг проверяет наличие своего выходного файла и пропускает его
+        если файл уже есть. Повторные resume используют результаты предыдущих.
+        Чтобы перегенерировать конкретный шаг — удали его файл:
+          reduce/final_merged.json → перезапустит REDUCE
+          report_data.md          → перезапустит программный отчёт
+          report_multipass.md     → перезапустит многопроходный LLM-отчёт
+          report.md               → перезапустит монолитный LLM-отчёт
+
+        Args:
+            map_dir: Папка с chunk_NNN.json (обычно <artifact_dir>/map/).
+                     reduce/ ищется рядом: map_dir.parent / "reduce".
+        """
+        from log_summarizer.models import BatchAnalysis, MergedAnalysis
+
+        artifact_dir = map_dir.parent
+        reduce_dir = artifact_dir / "reduce"
+        final_merged_path = reduce_dir / "final_merged.json"
+
+        degradation: dict = {"processing_error_batches": 0, "programmatic_merges": 0}
+
+        # ── СТАДИЯ 3: REDUCE ─────────────────────────────────────────────
+        if final_merged_path.exists():
+            logger.info("RESUME: reduce/final_merged.json найден — пропускаем REDUCE")
+            merged = MergedAnalysis.model_validate_json(
+                final_merged_path.read_text(encoding="utf-8")
+            )
+            self.last_merged = merged
+            self._log_merged_summary(merged)
+        else:
+            chunk_files = sorted(map_dir.glob("chunk_*.json"))
+            if not chunk_files:
+                raise FileNotFoundError(f"MAP-чанки не найдены в {map_dir}")
+
+            batch_results: list[BatchAnalysis] = [
+                BatchAnalysis.model_validate_json(f.read_text(encoding="utf-8"))
+                for f in chunk_files
+            ]
+            logger.info("RESUME: загружено %d MAP-чанков из %s", len(batch_results), map_dir)
+
+            degradation["processing_error_batches"] = sum(
+                1 for b in batch_results if b.data_quality == "processing_error"
+            )
+            batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
+            if not batch_results:
+                return "# Incident Analysis\n\nNo significant events found in the log data."
+
+            logger.info("")
+            logger.info("СТАДИЯ 3  ▶  REDUCE-фаза  (%d батчей → 1 MergedAnalysis)", len(batch_results))
+            t3 = time.monotonic()
+            merged = await self._tree_reducer.reduce(batch_results=batch_results, early_summaries=[])
+            self.last_merged = merged
+            degradation["programmatic_merges"] = self._tree_reducer.programmatic_merge_count
+            logger.info("СТАДИЯ 3  ✓  REDUCE завершён  [%.1fс]", time.monotonic() - t3)
+            self._log_merged_summary(merged)
+
+        # ── СТАДИЯ 4: Программный отчёт ──────────────────────────────────
+        report_data_path = artifact_dir / "report_data.md"
+        if report_data_path.exists():
+            logger.info("RESUME: report_data.md найден — пропускаем")
+        else:
+            logger.info("")
+            logger.info("СТАДИЯ 4  ▶  Программный отчёт")
+            self._save_structured_report(merged)
+
+        # ── СТАДИЯ 5: Многопроходный LLM-отчёт ──────────────────────────
+        multipass_path = artifact_dir / "report_multipass.md"
+        if multipass_path.exists():
+            logger.info("RESUME: report_multipass.md найден — пропускаем")
+        else:
+            logger.info("")
+            logger.info("СТАДИЯ 5  ▶  Многопроходный LLM-отчёт")
+            await self._multipass_generator.generate(merged, degradation=degradation)
+
+        # ── СТАДИЯ 6: Монолитный LLM-отчёт ──────────────────────────────
+        report_path = artifact_dir / "report.md"
+        if report_path.exists():
+            logger.info("RESUME: report.md найден — пропускаем")
+            report = report_path.read_text(encoding="utf-8")
+        else:
+            logger.info("")
+            logger.info("СТАДИЯ 6  ▶  Монолитный LLM-отчёт")
+            report = await self._report_generator.generate(merged=merged, early_summaries=[])
+
+        logger.info("RESUME завершён ✓")
+        return report
+
     async def run(self) -> str:
         """Запускает пайплайн и возвращает Markdown-отчёт."""
         _SEP  = "═" * 72

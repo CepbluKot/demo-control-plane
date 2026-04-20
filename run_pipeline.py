@@ -663,12 +663,108 @@ async def main(only: str | None) -> None:
         )
 
 
+async def resume(map_dir_path: str, incident_name: str | None) -> None:
+    """Продолжает пайплайн с REDUCE-фазы, загружая сохранённые MAP-чанки.
+
+    Args:
+        map_dir_path: Путь к папке map/ (или к artifact_dir — map/ найдём сами).
+        incident_name: Имя инцидента из INCIDENTS для восстановления конфига.
+                       Если None — используется первый инцидент из списка.
+    """
+    from log_summarizer.config import PipelineConfig
+    from log_summarizer.models import make_alerts
+    from log_summarizer.orchestrator import PipelineOrchestrator
+    from log_summarizer.utils.logging import setup_pipeline_logging
+    from pathlib import Path as _Path
+
+    # Ищем папку map/ — может быть передана напрямую или как artifact_dir
+    map_dir = _Path(map_dir_path)
+    if not (map_dir / "chunk_000.json").exists() and (map_dir / "map").is_dir():
+        map_dir = map_dir / "map"
+    if not map_dir.is_dir():
+        raise SystemExit(f"Папка не найдена: {map_dir}")
+
+    artifact_dir = map_dir.parent
+    log_path = artifact_dir / "pipeline_resume.log"
+    setup_pipeline_logging(LOG_LEVEL, log_file=str(log_path))
+    log = logging.getLogger("run_pipeline.resume")
+    log.info("Лог resume → %s", log_path.resolve())
+
+    # Находим конфиг инцидента
+    if MODE == "freeform":
+        incident = {
+            "name": "freeform-resume",
+            "context": FREEFORM_CONTEXT or "",
+            "alerts": FREEFORM_ALERTS,
+            "incident_start": FREEFORM_START,
+            "incident_end":   FREEFORM_END,
+            "context_start":  FREEFORM_START,
+            "context_end":    FREEFORM_END,
+        }
+    else:
+        candidates = [i for i in INCIDENTS if incident_name is None or i["name"] == incident_name]
+        if not candidates:
+            raise SystemExit(f"Инцидент '{incident_name}' не найден в INCIDENTS")
+        incident = candidates[0]
+
+    log.info("RESUME: инцидент=%s  map_dir=%s", incident["name"], map_dir.resolve())
+
+    config = PipelineConfig(
+        logs_sql_templates=[s.strip() for s in LOGS_SQLS],
+        incident_context=incident["context"].strip(),
+        incident_start=incident.get("incident_start") or incident.get("start"),
+        incident_end=incident.get("incident_end") or incident.get("end"),
+        context_start=incident.get("context_start"),
+        context_end=incident.get("context_end"),
+        alerts=make_alerts(incident.get("alerts", [])),
+        model=MODEL,
+        api_base=API_BASE,
+        api_key=API_KEY,
+        max_context_tokens=MAX_CONTEXT_TOKENS,
+        model_supports_tool_calling=MODEL_SUPPORTS_TOOL_CALLING,
+        runs_dir="",  # не создаём новую папку — пишем в artifact_dir
+    )
+
+    # Подключаемся к ClickHouse (нужен для инициализации оркестратора)
+    try:
+        import clickhouse_connect
+        ch = clickhouse_connect.get_client(
+            host=CH_HOST, port=CH_PORT,
+            username=CH_USER, password=CH_PASSWORD,
+            database=CH_DATABASE,
+        )
+    except Exception as exc:
+        raise SystemExit(f"ClickHouse: {exc}")
+
+    orchestrator = PipelineOrchestrator(ch, config)
+    # Перенаправляем артефакты в ту же папку что была при первом запуске
+    orchestrator._run_dir = artifact_dir
+    orchestrator.run_dir  = artifact_dir
+    orchestrator._multipass_generator._run_dir = artifact_dir
+    orchestrator._report_generator._run_dir    = artifact_dir
+
+    report = await orchestrator.run_from_map_dir(map_dir)
+
+    report_path = artifact_dir / "report.md"
+    report_path.write_text(report, encoding="utf-8")
+    log.info("report.md → %s", report_path.resolve())
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--only", default=None, metavar="NAME",
                    help="Запустить только один инцидент по имени (только режим incidents)")
     p.add_argument("--list", action="store_true",
                    help="Показать список инцидентов и выйти")
+    p.add_argument(
+        "--resume", default=None, metavar="MAP_DIR",
+        help=(
+            "Продолжить с REDUCE, загрузив MAP-чанки из указанной папки. "
+            "Пример: --resume runs/2026-04-01T10-00-00/flex-spark-.../2026-04-01T10-05-00"
+        ),
+    )
+    p.add_argument("--resume-incident", default=None, metavar="NAME",
+                   help="Имя инцидента для --resume (если несколько в INCIDENTS)")
     args = p.parse_args()
 
     if args.list:
@@ -679,5 +775,7 @@ if __name__ == "__main__":
                 s = i.get("incident_start") or i.get("start", "?")
                 e = i.get("incident_end")   or i.get("end",   "?")
                 print(f"  {i['name']}  {s} → {e}")
+    elif args.resume:
+        asyncio.run(resume(args.resume, args.resume_incident))
     else:
         asyncio.run(main(args.only))
