@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Optional, Union
@@ -500,12 +501,15 @@ class TreeReducer:
         group: list[_Item],
         round_num: int,
         group_idx: int = 0,
+        _save: bool = True,
     ) -> MergedAnalysis:
         """Отправляем группу в LLM, получаем MergedAnalysis.
 
         Если payload превышает pre_compress_threshold — превентивно сжимаем входы.
         Если ContextOverflowError — делаем попарный merge рекурсивно.
         Если LLMUnavailableError (timeout/None) — сжимаем и повторяем до 5 раз.
+        _save=False: внутренние рекурсивные вызовы — не пишем промежуточный файл,
+        чтобы не испортить checkpoint для resume.
         """
         system = self._build_merge_system()
 
@@ -539,38 +543,111 @@ class TreeReducer:
                 len(result.events),
                 result.zones_covered,
             )
-            self._save_merge_report(round_num, group_idx, group, result)
+            if _save:
+                self._save_merge_report(round_num, group_idx, group, result)
             return result
-        except LLMUnavailableError:
-            # Сжимаем и повторяем — до MAX_COMPRESS_RETRIES раз
+        except LLMUnavailableError as _first_unavail:
+            # Стратегия:
+            # 1. Если 502/503 (сервер лежит) — ждём 30 с и повторяем без изменений.
+            # 2. Иначе (timeout / payload слишком большой):
+            #    a. Сначала уменьшаем группу вдвое (рекурсивный merge подгрупп).
+            #    b. Если группа уже ≤ 2 — сжимаем тексты и повторяем (до 5 раз).
+            #    c. Если _compress_group_inputs сам упал с LLMUnavailableError —
+            #       ждём 30 с и пробуем ещё раз.
+            # Финальный fallback: _programmatic_merge.
+
+            def _exc_is_server_down(exc: Exception) -> bool:
+                txt = str(exc).lower()
+                return "502" in txt or "503" in txt or "bad gateway" in txt or "service unavailable" in txt
+
             MAX_COMPRESS_RETRIES = 5
-            for compress_attempt in range(1, MAX_COMPRESS_RETRIES + 1):
-                payload_size = sum(len(self._item_to_json(i)) for i in group)
+            current_group = group
+
+            # Шаг 1: если сервер лежит — подождём и сразу повторим
+            if _exc_is_server_down(_first_unavail):
                 logger.warning(
-                    "LLM timeout/unavailable (payload=%d chars) — "
-                    "сжимаем входы и повторяем (попытка %d/%d)",
-                    payload_size, compress_attempt, MAX_COMPRESS_RETRIES,
+                    "Server down (502/503) — ждём 30 с перед повторной попыткой"
                 )
-                group = await self._compress_group_inputs(group)
+                await asyncio.sleep(30)
                 try:
                     result: MergedAnalysis = await self.llm.call_json(
                         system=system,
-                        user=self._build_merge_user(group),
+                        user=self._build_merge_user(current_group),
                         response_model=MergedAnalysis,
                         temperature=self.config.temperature_reduce,
                     )
-                    result = result.model_copy(update={"zones_covered": self._merge_zones(group)})
-                    self._save_merge_report(round_num, group_idx, group, result)
+                    result = result.model_copy(update={"zones_covered": self._merge_zones(current_group)})
+                    if _save:
+                        self._save_merge_report(round_num, group_idx, current_group, result)
                     return result
-                except LLMUnavailableError:
+                except (LLMUnavailableError, Exception):
+                    pass  # падаем дальше в логику сжатия
+
+            # Шаг 2: если группа больше 2 — сначала дробим
+            if len(current_group) > 2:
+                logger.warning(
+                    "LLM unavailable with group size %d — splitting group in half before compressing",
+                    len(current_group),
+                )
+                mid = len(current_group) // 2
+                left = await self._merge_group(current_group[:mid], round_num, group_idx, _save=False)
+                right = await self._merge_group(current_group[mid:], round_num, group_idx, _save=False)
+                current_group = [left, right]
+                # Теперь пробуем смержить уже из 2 элементов
+                try:
+                    result: MergedAnalysis = await self.llm.call_json(
+                        system=system,
+                        user=self._build_merge_user(current_group),
+                        response_model=MergedAnalysis,
+                        temperature=self.config.temperature_reduce,
+                    )
+                    result = result.model_copy(update={"zones_covered": self._merge_zones(current_group)})
+                    if _save:
+                        self._save_merge_report(round_num, group_idx, current_group, result)
+                    return result
+                except (LLMUnavailableError, ContextOverflowError):
+                    pass  # падаем в цикл сжатия ниже
+
+            # Шаг 3: цикл сжатия (group уже ≤ 2 или дробление не помогло)
+            for compress_attempt in range(1, MAX_COMPRESS_RETRIES + 1):
+                payload_size = sum(len(self._item_to_json(i)) for i in current_group)
+                logger.warning(
+                    "LLM unavailable (payload=%d chars) — сжимаем входы (попытка %d/%d)",
+                    payload_size, compress_attempt, MAX_COMPRESS_RETRIES,
+                )
+                try:
+                    current_group = await self._compress_group_inputs(current_group)
+                except LLMUnavailableError as compress_exc:
+                    # Сжатие само упало — скорее всего сервер лежит, ждём
+                    logger.warning(
+                        "Compression also failed (%s) — ждём 30 с", compress_exc
+                    )
+                    await asyncio.sleep(30)
+                    continue  # повторим compress_group_inputs на следующей итерации
+
+                try:
+                    result: MergedAnalysis = await self.llm.call_json(
+                        system=system,
+                        user=self._build_merge_user(current_group),
+                        response_model=MergedAnalysis,
+                        temperature=self.config.temperature_reduce,
+                    )
+                    result = result.model_copy(update={"zones_covered": self._merge_zones(current_group)})
+                    if _save:
+                        self._save_merge_report(round_num, group_idx, current_group, result)
+                    return result
+                except LLMUnavailableError as retry_exc:
+                    if _exc_is_server_down(retry_exc):
+                        logger.warning("Server down после сжатия — ждём 30 с")
+                        await asyncio.sleep(30)
                     if compress_attempt == MAX_COMPRESS_RETRIES:
                         logger.error(
                             "LLM недоступен после %d попыток сжатия — programmatic fallback",
                             MAX_COMPRESS_RETRIES,
                         )
-                        return self._programmatic_merge(group)
+                        return self._programmatic_merge(current_group)
                 except ContextOverflowError:
-                    break  # payload слишком большой даже после сжатия — выходим на ContextOverflow handling
+                    pass  # продолжаем сжимать на следующей итерации
         except ContextOverflowError:
             if len(group) <= 2:
                 # Сжимаем по одному элементу и пробуем merge после каждого.
@@ -584,9 +661,9 @@ class TreeReducer:
                 len(group),
             )
             mid = len(group) // 2
-            left = await self._merge_group(group[:mid], round_num)
-            right = await self._merge_group(group[mid:], round_num)
-            return await self._merge_group([left, right], round_num)
+            left = await self._merge_group(group[:mid], round_num, group_idx, _save=False)
+            right = await self._merge_group(group[mid:], round_num, group_idx, _save=False)
+            return await self._merge_group([left, right], round_num, group_idx, _save=_save)
 
     # ── Events trimming ───────────────────────────────────────────────
 
