@@ -127,27 +127,45 @@ class PipelineOrchestrator:
             self.last_merged = merged
             self._log_merged_summary(merged)
         else:
-            chunk_files = sorted(map_dir.glob("chunk_*.json"))
-            if not chunk_files:
-                raise FileNotFoundError(f"MAP-чанки не найдены в {map_dir}")
-
-            batch_results: list[BatchAnalysis] = [
-                BatchAnalysis.model_validate_json(f.read_text(encoding="utf-8"))
-                for f in chunk_files
-            ]
-            logger.info("RESUME: загружено %d MAP-чанков из %s", len(batch_results), map_dir)
-
-            degradation["processing_error_batches"] = sum(
-                1 for b in batch_results if b.data_quality == "processing_error"
-            )
-            batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
-            if not batch_results:
-                return "# Incident Analysis\n\nNo significant events found in the log data."
+            from log_summarizer.tree_reducer import TreeReducer as _TR
+            checkpoint = _TR.load_latest_checkpoint(reduce_dir) if reduce_dir.exists() else None
 
             logger.info("")
-            logger.info("СТАДИЯ 3  ▶  REDUCE-фаза  (%d батчей → 1 MergedAnalysis)", len(batch_results))
             t3 = time.monotonic()
-            merged = await self._tree_reducer.reduce(batch_results=batch_results, early_summaries=[])
+
+            if checkpoint is not None:
+                round_completed, ck_items, ck_evidence, ck_alert_refs = checkpoint
+                logger.info(
+                    "СТАДИЯ 3  ▶  REDUCE с checkpoint раунда %d  (%d items)",
+                    round_completed, len(ck_items),
+                )
+                merged = await self._tree_reducer.reduce_from_checkpoint(
+                    items=ck_items,
+                    start_round=round_completed + 1,
+                    evidence_bank=ck_evidence,
+                    alert_refs=ck_alert_refs,
+                )
+            else:
+                chunk_files = sorted(map_dir.glob("chunk_*.json"))
+                if not chunk_files:
+                    raise FileNotFoundError(f"Нет ни MAP-чанков, ни REDUCE-checkpoint в {map_dir.parent}")
+
+                batch_results: list[BatchAnalysis] = [
+                    BatchAnalysis.model_validate_json(f.read_text(encoding="utf-8"))
+                    for f in chunk_files
+                ]
+                logger.info("RESUME: загружено %d MAP-чанков из %s", len(batch_results), map_dir)
+
+                degradation["processing_error_batches"] = sum(
+                    1 for b in batch_results if b.data_quality == "processing_error"
+                )
+                batch_results = [b for b in batch_results if b.events or b.hypotheses or b.narrative.strip()]
+                if not batch_results:
+                    return "# Incident Analysis\n\nNo significant events found in the log data."
+
+                logger.info("СТАДИЯ 3  ▶  REDUCE с нуля  (%d батчей)", len(batch_results))
+                merged = await self._tree_reducer.reduce(batch_results=batch_results, early_summaries=[])
+
             self.last_merged = merged
             degradation["programmatic_merges"] = self._tree_reducer.programmatic_merge_count
             logger.info("СТАДИЯ 3  ✓  REDUCE завершён  [%.1fс]", time.monotonic() - t3)

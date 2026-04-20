@@ -119,6 +119,16 @@ class TreeReducer:
                 g_events = sum(len(item.events) for item in group)
                 g_hyp    = sum(len(item.hypotheses) for item in group)
 
+                # Если группа уже была смёрджена в прерванном прогоне — переиспользуем
+                cached = self._load_group_result(round_num, g_idx)
+                if cached is not None:
+                    logger.info(
+                        "  MERGE  SKIP  раунд %d  группа %d/%d  — загружен сохранённый результат",
+                        round_num, g_idx + 1, n_merge_groups,
+                    )
+                    next_items.append(cached)
+                    continue
+
                 logger.info(
                     "  MERGE  раунд %d  группа %d/%d  |  %d items  %s→%s  "
                     "%d событий  %d гипотез",
@@ -139,6 +149,7 @@ class TreeReducer:
                 next_items.append(merged)
 
             items = next_items
+            self._save_round_checkpoint(round_num, items, evidence_bank, alert_refs)
             logger.info(
                 "REDUCE раунд %d  ✓  осталось элементов: %d  |  раунд за %s",
                 round_num, len(items), fmt_dur(_time.monotonic() - t_reduce),
@@ -175,6 +186,102 @@ class TreeReducer:
         )
         return result
 
+    async def reduce_from_checkpoint(
+        self,
+        items: list[_Item],
+        start_round: int,
+        evidence_bank: list[Evidence],
+        alert_refs: list[AlertRef],
+    ) -> MergedAnalysis:
+        """Продолжает REDUCE с сохранённого checkpoint.
+
+        Args:
+            items: Список items из checkpoint (уже частично смёрженные).
+            start_round: Номер раунда, с которого продолжаем.
+            evidence_bank: Сохранённый evidence_bank из checkpoint.
+            alert_refs: Сохранённые alert_refs из checkpoint.
+        """
+        import time as _time
+
+        _SEP = "─" * 68
+        t_reduce = _time.monotonic()
+
+        for round_num in range(start_round, self.config.max_reduce_rounds + 1):
+            if len(items) == 1:
+                break
+
+            group_size = self._adaptive_group_size(items)
+            groups = self._make_groups(items, group_size)
+            n_merge_groups = sum(1 for g in groups if len(g) > 1)
+
+            all_ts = [ts for item in items for ts in item.time_range]
+            span_start = min(all_ts).strftime("%H:%M:%S")
+            span_end   = max(all_ts).strftime("%H:%M:%S")
+
+            logger.info("")
+            logger.info(_SEP)
+            logger.info(
+                "REDUCE раунд %d  |  %d элементов → ~%d групп по %d  |  период %s → %s",
+                round_num, len(items), n_merge_groups, group_size, span_start, span_end,
+            )
+
+            next_items: list[_Item] = []
+            for g_idx, group in enumerate(groups):
+                if len(group) == 1:
+                    next_items.append(group[0])
+                    continue
+
+                # Проверяем: может эта группа уже была смёрджена в прерванном прогоне
+                cached = self._load_group_result(round_num, g_idx)
+                if cached is not None:
+                    logger.info(
+                        "  MERGE  SKIP  раунд %d  группа %d/%d  — загружен сохранённый результат",
+                        round_num, g_idx + 1, n_merge_groups,
+                    )
+                    next_items.append(cached)
+                    continue
+
+                t_merge = _time.monotonic()
+                merged = await self._merge_group(group, round_num, g_idx)
+                merged = self._trim_events(merged)
+                merged = await self._maybe_compress(merged)
+                self._save_reduce_result(round_num, g_idx, merged)
+                logger.info(
+                    "  MERGE  ✓  раунд %d  группа %d/%d  [%s]  →  %d событий  %d гипотез",
+                    round_num, g_idx + 1, n_merge_groups,
+                    fmt_dur(_time.monotonic() - t_merge),
+                    len(merged.events), len(merged.hypotheses),
+                )
+                next_items.append(merged)
+
+            items = next_items
+            self._save_round_checkpoint(round_num, items, evidence_bank, alert_refs)
+            logger.info(
+                "REDUCE раунд %d  ✓  осталось элементов: %d  |  раунд за %s",
+                round_num, len(items), fmt_dur(_time.monotonic() - t_reduce),
+            )
+        else:
+            logger.warning("Reduce did not converge — forcing final merge")
+            if len(items) > 1:
+                items = [await self._merge_group(items, self.config.max_reduce_rounds + 1)]
+
+        result = items[0]
+        self._save_reduce_result(0, 0, result, name="final_merged")
+
+        if isinstance(result, BatchAnalysis):
+            result = self._batch_to_merged(result)
+
+        evidence_bank = self._dedup_evidence(evidence_bank + list(result.evidence_bank))
+        result = result.model_copy(update={"evidence_bank": evidence_bank, "alert_refs": alert_refs})
+
+        logger.info(_SEP)
+        logger.info(
+            "REDUCE завершён  ✓  [%s]  →  %d событий  ·  %d доказательств  ·  %d гипотез",
+            fmt_dur(_time.monotonic() - t_reduce),
+            len(result.events), len(result.evidence_bank), len(result.hypotheses),
+        )
+        return result
+
     # ── Группировка ───────────────────────────────────────────────────
 
     def _adaptive_group_size(self, items: list[_Item]) -> int:
@@ -207,6 +314,19 @@ class TreeReducer:
 
     # ── Merge ─────────────────────────────────────────────────────────
 
+    def _load_group_result(self, round_num: int, group_idx: int) -> Optional[MergedAnalysis]:
+        """Загружает ранее сохранённый результат merge-группы, если он есть."""
+        if self._run_dir is None:
+            return None
+        path = self._run_dir / f"round_{round_num:02d}_group_{group_idx:02d}.json"
+        if not path.exists():
+            return None
+        try:
+            return MergedAnalysis.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Не удалось загрузить %s: %s — пересчитаем", path, exc)
+            return None
+
     def _save_reduce_result(
         self,
         round_num: int,
@@ -221,6 +341,76 @@ class TreeReducer:
         path = self._run_dir / f"{fname}.json"
         path.write_text(result.to_json_str(), encoding="utf-8")
         logger.info("REDUCE %s saved → %s", fname, path)
+
+    def _save_round_checkpoint(
+        self,
+        round_num: int,
+        items: list[_Item],
+        evidence_bank: list[Evidence],
+        alert_refs: list[AlertRef],
+    ) -> None:
+        """Сохраняет checkpoint после завершения раунда.
+
+        Содержит всё необходимое для продолжения REDUCE без оригинальных MAP-чанков:
+        текущий список items, собранный evidence_bank и alert_refs.
+        """
+        if self._run_dir is None:
+            return
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+
+        serialized_items = []
+        for item in items:
+            serialized_items.append({
+                "_type": type(item).__name__,
+                "json": item.model_dump_json(),
+            })
+
+        checkpoint = {
+            "round_completed": round_num,
+            "evidence_bank": [e.model_dump_json() for e in evidence_bank],
+            "alert_refs": [r.model_dump_json() for r in alert_refs],
+            "items": serialized_items,
+        }
+        path = self._run_dir / f"checkpoint_round_{round_num:02d}.json"
+        path.write_text(json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8")
+        logger.debug("REDUCE checkpoint saved → %s (%d items)", path, len(items))
+
+    @staticmethod
+    def load_latest_checkpoint(
+        reduce_dir: Path,
+    ) -> Optional[tuple[int, list[_Item], list[Evidence], list[AlertRef]]]:
+        """Загружает последний сохранённый checkpoint из reduce_dir.
+
+        Returns:
+            (round_completed, items, evidence_bank, alert_refs) или None если нет файлов.
+        """
+        import json as _json
+
+        checkpoints = sorted(reduce_dir.glob("checkpoint_round_*.json"), reverse=True)
+        if not checkpoints:
+            return None
+
+        latest = checkpoints[0]
+        data = _json.loads(latest.read_text(encoding="utf-8"))
+
+        items: list[_Item] = []
+        for entry in data["items"]:
+            raw = entry["json"]
+            if entry["_type"] == "MergedAnalysis":
+                items.append(MergedAnalysis.model_validate_json(raw))
+            else:
+                from log_summarizer.models import BatchAnalysis
+                items.append(BatchAnalysis.model_validate_json(raw))
+
+        evidence_bank = [Evidence.model_validate_json(e) for e in data["evidence_bank"]]
+        alert_refs = [AlertRef.model_validate_json(r) for r in data["alert_refs"]]
+        round_completed = data["round_completed"]
+
+        logger.info(
+            "REDUCE checkpoint loaded: round %d  items=%d  evidence=%d  alert_refs=%d",
+            round_completed, len(items), len(evidence_bank), len(alert_refs),
+        )
+        return round_completed, items, evidence_bank, alert_refs
 
     def _save_merge_report(
         self,

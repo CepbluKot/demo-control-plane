@@ -73,14 +73,20 @@ def _is_context_overflow(exc: Exception) -> bool:
 
 
 def _is_retryable(exc: Exception) -> bool:
-    """True если ошибку стоит retry-ть (500/502/503/504/timeout)."""
+    """True если ошибку стоит retry-ть (500/502/503/504/timeout/None completion)."""
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status in (500, 502, 503, 504):
         return True
     text = str(exc).lower()
-    for marker in ("timeout", "read timed out", "connection error", "gateway"):
+    for marker in ("timeout", "read timed out", "connection error", "gateway",
+                   "nonetype", "has no attribute 'choices'", "instructorretryexception",
+                   "retryerror"):
         if marker in text:
             return True
+    # InstructorRetryException / tenacity RetryError — сервер вернул None
+    exc_type = type(exc).__name__.lower()
+    if "retry" in exc_type or "instructor" in exc_type:
+        return True
     return False
 
 
@@ -195,9 +201,9 @@ class LLMClient:
                 last_exc = exc
                 if _is_context_overflow(exc):
                     raise ContextOverflowError(str(exc)) from exc
-                if not _is_retryable(exc) and attempt == 1:
-                    # Одна попытка для нестандартных ошибок JSON-parse
-                    if "json" in str(exc).lower() or "parse" in str(exc).lower():
+                if not _is_retryable(exc):
+                    if attempt == 1 and ("json" in str(exc).lower() or "parse" in str(exc).lower()):
+                        # Одна попытка для нестандартных ошибок JSON-parse
                         logger.warning(
                             "JSON parse error (attempt %d), retrying with temperature=0: %s",
                             attempt, exc,
