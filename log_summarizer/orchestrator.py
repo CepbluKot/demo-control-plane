@@ -73,6 +73,7 @@ class PipelineOrchestrator:
             retry_backoff_base=config.retry_backoff_base,
             use_instructor=config.use_instructor,
             model_supports_tool_calling=config.model_supports_tool_calling,
+            timeout=config.llm_timeout,
             audit_dir=self._run_dir / "llm" if self._run_dir else None,
         )
         self._data_loader = DataLoader(clickhouse_client, config)

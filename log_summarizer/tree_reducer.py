@@ -560,8 +560,19 @@ class TreeReducer:
                 txt = str(exc).lower()
                 return "502" in txt or "503" in txt or "bad gateway" in txt or "service unavailable" in txt
 
+            def _exc_is_timeout(exc: Exception) -> bool:
+                txt = str(exc).lower()
+                return "timeout" in txt or "read timed out" in txt or "timed out" in txt
+
+            def _maybe_double_timeout(exc: Exception) -> None:
+                if _exc_is_timeout(exc):
+                    self.llm.timeout *= 2
+                    logger.warning("Timeout detected — увеличиваем timeout до %.0fs", self.llm.timeout)
+
             MAX_COMPRESS_RETRIES = 5
             current_group = group
+
+            _maybe_double_timeout(_first_unavail)
 
             # Шаг 1: если сервер лежит — подождём и сразу повторим
             if _exc_is_server_down(_first_unavail):
@@ -637,6 +648,7 @@ class TreeReducer:
                         self._save_merge_report(round_num, group_idx, current_group, result)
                     return result
                 except LLMUnavailableError as retry_exc:
+                    _maybe_double_timeout(retry_exc)
                     if _exc_is_server_down(retry_exc):
                         logger.warning("Server down после сжатия — ждём 30 с")
                         await asyncio.sleep(30)

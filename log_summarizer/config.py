@@ -100,6 +100,7 @@ class PipelineConfig:
     # ── Retry / timeouts ─────────────────────────────────────────────
     max_retries: int = 3
     retry_backoff_base: float = 2.0  # 2, 4, 8 секунд
+    llm_timeout: float = 2400.0  # секунд на один LLM-вызов (удваивается при таймауте)
 
     # ── Temperature ──────────────────────────────────────────────────
     temperature_map: float = 0.2
