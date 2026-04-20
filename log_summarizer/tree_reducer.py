@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from log_summarizer.config import PipelineConfig
-from log_summarizer.llm_client import ContextOverflowError, LLMClient
+from log_summarizer.llm_client import ContextOverflowError, LLMClient, LLMUnavailableError
 from log_summarizer.models import (
     AlertRef,
     AlertStatus,
@@ -505,6 +505,7 @@ class TreeReducer:
 
         Если payload превышает pre_compress_threshold — превентивно сжимаем входы.
         Если ContextOverflowError — делаем попарный merge рекурсивно.
+        Если LLMUnavailableError (timeout/None) — сжимаем и повторяем до 5 раз.
         """
         system = self._build_merge_system()
 
@@ -540,6 +541,36 @@ class TreeReducer:
             )
             self._save_merge_report(round_num, group_idx, group, result)
             return result
+        except LLMUnavailableError:
+            # Сжимаем и повторяем — до MAX_COMPRESS_RETRIES раз
+            MAX_COMPRESS_RETRIES = 5
+            for compress_attempt in range(1, MAX_COMPRESS_RETRIES + 1):
+                payload_size = sum(len(self._item_to_json(i)) for i in group)
+                logger.warning(
+                    "LLM timeout/unavailable (payload=%d chars) — "
+                    "сжимаем входы и повторяем (попытка %d/%d)",
+                    payload_size, compress_attempt, MAX_COMPRESS_RETRIES,
+                )
+                group = await self._compress_group_inputs(group)
+                try:
+                    result: MergedAnalysis = await self.llm.call_json(
+                        system=system,
+                        user=self._build_merge_user(group),
+                        response_model=MergedAnalysis,
+                        temperature=self.config.temperature_reduce,
+                    )
+                    result = result.model_copy(update={"zones_covered": self._merge_zones(group)})
+                    self._save_merge_report(round_num, group_idx, group, result)
+                    return result
+                except LLMUnavailableError:
+                    if compress_attempt == MAX_COMPRESS_RETRIES:
+                        logger.error(
+                            "LLM недоступен после %d попыток сжатия — programmatic fallback",
+                            MAX_COMPRESS_RETRIES,
+                        )
+                        return self._programmatic_merge(group)
+                except ContextOverflowError:
+                    break  # payload слишком большой даже после сжатия — выходим на ContextOverflow handling
         except ContextOverflowError:
             if len(group) <= 2:
                 # Сжимаем по одному элементу и пробуем merge после каждого.
