@@ -125,19 +125,23 @@ return items[0]  # MergedAnalysis
 
 ## 3. Зависимости Python (sandbox)
 
-Кастомный образ `dify-sandbox`:
+Внешние пакеты не нужны — используем только стандартную библиотеку Python:
 
-```dockerfile
-FROM langgenius/dify-sandbox:latest
-RUN pip install clickhouse-driver pydantic requests
-```
+- **ClickHouse**: HTTP-интерфейс (порт 8123) через `urllib.request` + `FORMAT JSONEachRow`
+- **LLM**: OpenAI-совместимый HTTP через `urllib.request` (или `requests`, если уже есть в sandbox)
+- **Pydantic**: не используем в Code-нодах — работаем с обычными `dict`
 
-В `docker-compose.yaml`:
-```yaml
-sandbox:
-  build:
-    context: .
-    dockerfile: Dockerfile.sandbox
+```python
+# Пример запроса к ClickHouse без clickhouse-driver
+import urllib.request, urllib.parse, json
+
+def ch_query(host, port, user, password, sql):
+    url = f"http://{host}:{port}/?query={urllib.parse.quote(sql + ' FORMAT JSONEachRow')}"
+    req = urllib.request.Request(url)
+    req.add_header("X-ClickHouse-User", user)
+    req.add_header("X-ClickHouse-Key", password)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return [json.loads(line) for line in resp.read().splitlines() if line]
 ```
 
 ---
