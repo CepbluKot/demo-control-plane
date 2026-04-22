@@ -29,17 +29,17 @@ from datetime import datetime
 # ── ClickHouse ────────────────────────────────────────────────────────
 
 def ch_query(host, port, user, password, sql, timeout=120):
-    """POST-запрос к ClickHouse HTTP interface. Возвращает list[dict] из поля data."""
+    """POST-запрос к ClickHouse HTTP interface. Возвращает list[dict]."""
     url = f"http://{host}:{port}/"
-    body = (sql + " FORMAT JSON").encode("utf-8")
+    body = (sql + " FORMAT JSONEachRow").encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", user)
     req.add_header("X-ClickHouse-Key", password)
     req.add_header("Content-Type", "text/plain; charset=utf-8")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result["data"]
+            lines = resp.read().decode("utf-8").splitlines()
+            return [json.loads(line) for line in lines if line.strip()]
     except urllib.request.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"ClickHouse HTTP {e.code} at {url!r}: {body_text[:500]}") from e
@@ -47,23 +47,36 @@ def ch_query(host, port, user, password, sql, timeout=120):
 
 # ── Chunker ───────────────────────────────────────────────────────────
 
+_MAX_FIELD_CHARS = 2000  # обрезаем длинные поля чтобы один ряд не превысил лимит Dify
+
+
+def _truncate(row):
+    """Обрезает строковые поля до _MAX_FIELD_CHARS символов."""
+    return {
+        k: (v[:_MAX_FIELD_CHARS] + "…" if isinstance(v, str) and len(v) > _MAX_FIELD_CHARS else v)
+        for k, v in row.items()
+    }
+
+
 def estimate_tokens(text):
     return max(1, len(text) // 4)
 
 
 def chunk_rows(rows, token_budget=6000):
+    """rows: list[dict]. Возвращает list[str] где каждый элемент — JSON-массив строк батча."""
     if not rows:
         return []
     chunks, current, current_tokens = [], [], 0
     for row in rows:
-        t = estimate_tokens(row)
+        row_str = json.dumps(row, ensure_ascii=False, default=str)
+        t = estimate_tokens(row_str)
         if current and current_tokens + t > token_budget:
-            chunks.append("\n".join(current))
+            chunks.append(json.dumps(current, ensure_ascii=False))
             current, current_tokens = [], 0
         current.append(row)
         current_tokens += t
     if current:
-        chunks.append("\n".join(current))
+        chunks.append(json.dumps(current, ensure_ascii=False))
     return chunks
 
 
@@ -202,9 +215,7 @@ def main(
             break
 
         page_rows.sort(key=lambda r: r.get("timestamp", ""))
-        all_rows.extend(
-            json.dumps(r, ensure_ascii=False, default=str) for r in page_rows
-        )
+        all_rows.extend(_truncate(r) for r in page_rows)
 
         last_end = max(r.get("end_time", r.get("timestamp", "")) for r in page_rows)
         if last_end <= last_ts:
