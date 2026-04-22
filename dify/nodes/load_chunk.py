@@ -76,43 +76,53 @@ SQL_QUERIES = [
     # 0: container logs — ошибки, сгруппированные по повторяющимся строкам
     """
     SELECT
-        min(timestamp) AS timestamp,
-        max(timestamp) AS end_time,
-        count() AS cnt,
-        any(kubernetes_namespace_name) AS namespace,
-        any(kubernetes_pod_name) AS pod_name,
-        any(kubernetes_container_name) AS container_name,
-        min(log) AS log_text
+        start_time AS timestamp,
+        end_time,
+        cnt,
+        namespace,
+        pod_name,
+        container_name,
+        log_text
     FROM (
-        SELECT *,
-            sum(is_new_group) OVER (
-                PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-                ORDER BY timestamp ASC
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS group_id
+        SELECT
+            min(timestamp) AS start_time,
+            max(timestamp) AS end_time,
+            count() AS cnt,
+            any(kubernetes_namespace_name) AS namespace,
+            any(kubernetes_pod_name) AS pod_name,
+            any(kubernetes_container_name) AS container_name,
+            min(log) AS log_text
         FROM (
             SELECT *,
-                if(
-                    right(log, 10) != ifNull(lagInFrame(right(log, 10)) OVER (
-                        PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-                        ORDER BY timestamp ASC
-                    ), ''), 1, 0
-                ) AS is_new_group
-            FROM {database}.log_k8s_containers
-            WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
-              AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND multiSearchAny(lower(log), [
-                    'fatal','critical','error','exception','alert','panic',
-                    'failed','failure','crash','abort','timeout','timed out',
-                    'deadlock','out of memory','oom','disk full','no space left',
-                    'permission denied','access denied','unauthorized','forbidden',
-                    'connection refused','connection reset','ssl error','segfault',
-                    'killed','rollback','traceback','stack trace'
-              ])
-            ORDER BY timestamp ASC
+                sum(is_new_group) OVER (
+                    PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                    ORDER BY timestamp ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS group_id
+            FROM (
+                SELECT *,
+                    if(
+                        right(log, 10) != ifNull(lagInFrame(right(log, 10)) OVER (
+                            PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                            ORDER BY timestamp ASC
+                        ), ''), 1, 0
+                    ) AS is_new_group
+                FROM {database}.log_k8s_containers
+                WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
+                  AND timestamp <= parseDateTime64BestEffort('{period_end}')
+                  AND multiSearchAny(lower(log), [
+                        'fatal','critical','error','exception','alert','panic',
+                        'failed','failure','crash','abort','timeout','timed out',
+                        'deadlock','out of memory','oom','disk full','no space left',
+                        'permission denied','access denied','unauthorized','forbidden',
+                        'connection refused','connection reset','ssl error','segfault',
+                        'killed','rollback','traceback','stack trace'
+                  ])
+                ORDER BY timestamp ASC
+            )
         )
+        GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
     )
-    GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
     ORDER BY timestamp ASC
     LIMIT {limit}
     """,
