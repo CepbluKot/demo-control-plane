@@ -222,5 +222,5 @@ def main(
         if len(page_rows) < batch_size:
             break
 
-    batches = all_rows
+    batches = [json.dumps(r, ensure_ascii=False, default=str) for r in all_rows]
     return {"batches": batches, "batch_count": len(batches)}
