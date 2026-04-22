@@ -1,0 +1,75 @@
+<h2>Архитектура Dify Workflow — Вариант A</h2>
+<p class="subtitle">MAP через Iteration (параллельно) → REDUCE в Code-ноде (цикл)</p>
+
+<div style="display:flex; flex-direction:column; align-items:center; gap:0; margin-top:24px; font-family:monospace">
+
+  <!-- Start -->
+  <div style="background:#1e293b;border:2px solid #6366f1;border-radius:12px;padding:16px 32px;min-width:280px;text-align:center">
+    <div style="color:#818cf8;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:4px">START</div>
+    <div style="color:#e2e8f0;font-size:14px;font-weight:600">Входные параметры</div>
+    <div style="color:#94a3b8;font-size:12px;margin-top:6px">
+      <code>batches: list[str]</code><br>
+      <code>incident_info: str</code><br>
+      <code>alerts: str</code>
+    </div>
+  </div>
+
+  <div style="width:2px;height:28px;background:#6366f1;margin:0 auto"></div>
+  <div style="color:#6366f1;font-size:18px">▼</div>
+
+  <!-- MAP Iteration -->
+  <div style="background:#1e293b;border:2px solid #22c55e;border-radius:12px;padding:16px 32px;min-width:340px;text-align:center">
+    <div style="color:#86efac;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:4px">ITERATION (parallel=true) — MAP</div>
+    <div style="color:#e2e8f0;font-size:14px;font-weight:600">Для каждого батча логов</div>
+    <div style="margin-top:12px;background:#0f172a;border-radius:8px;padding:12px;border:1px solid #334155">
+      <div style="color:#fbbf24;font-size:11px;letter-spacing:1px;margin-bottom:6px">↳ LLM NODE (внутри итерации)</div>
+      <div style="color:#94a3b8;font-size:12px">system: MAP system prompt + alerts + incident_info</div>
+      <div style="color:#94a3b8;font-size:12px">user: batch текст лога</div>
+      <div style="color:#86efac;font-size:12px;margin-top:4px">output: BatchAnalysis (JSON schema)</div>
+    </div>
+    <div style="color:#86efac;font-size:12px;margin-top:10px">→ возвращает list[BatchAnalysis]</div>
+  </div>
+
+  <div style="width:2px;height:28px;background:#6366f1;margin:0 auto"></div>
+  <div style="color:#6366f1;font-size:18px">▼</div>
+
+  <!-- REDUCE Code Node -->
+  <div style="background:#1e293b;border:2px solid #f59e0b;border-radius:12px;padding:16px 32px;min-width:340px;text-align:center">
+    <div style="color:#fcd34d;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:4px">PYTHON CODE NODE — REDUCE</div>
+    <div style="color:#e2e8f0;font-size:14px;font-weight:600">Итеративный merge (цикл)</div>
+    <div style="margin-top:12px;background:#0f172a;border-radius:8px;padding:12px;border:1px solid #334155;text-align:left">
+      <div style="color:#94a3b8;font-size:12px;line-height:1.7">
+        <span style="color:#fbbf24">while</span> len(items) &gt; 1:<br>
+        &nbsp;&nbsp;groups = split_by(items, group_size=4)<br>
+        &nbsp;&nbsp;<span style="color:#fbbf24">for</span> group <span style="color:#fbbf24">in</span> groups:<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;result = <span style="color:#86efac">call_llm_http</span>(merge_prompt, group)<br>
+        &nbsp;&nbsp;items = merged_results<br>
+        <span style="color:#fbbf24">return</span> items[0]  <span style="color:#475569"># MergedAnalysis</span>
+      </div>
+    </div>
+    <div style="color:#fcd34d;font-size:12px;margin-top:10px">LLM endpoint передаётся как переменная workflow</div>
+  </div>
+
+  <div style="width:2px;height:28px;background:#6366f1;margin:0 auto"></div>
+  <div style="color:#6366f1;font-size:18px">▼</div>
+
+  <!-- Output -->
+  <div style="background:#1e293b;border:2px solid #6366f1;border-radius:12px;padding:16px 32px;min-width:280px;text-align:center">
+    <div style="color:#818cf8;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:4px">END</div>
+    <div style="color:#e2e8f0;font-size:14px;font-weight:600">Результат</div>
+    <div style="color:#94a3b8;font-size:12px;margin-top:6px">
+      <code>merged_analysis: MergedAnalysis JSON</code>
+    </div>
+  </div>
+
+</div>
+
+<div style="margin-top:32px;background:#1e293b;border-radius:12px;padding:16px 24px;border:1px solid #334155">
+  <div style="color:#818cf8;font-size:11px;font-weight:700;letter-spacing:2px;margin-bottom:12px">КОНФИГУРАЦИЯ WORKFLOW (переменные среды или параметры)</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#94a3b8">
+    <div><code>llm_api_base</code> — endpoint LLM</div>
+    <div><code>llm_api_key</code> — ключ</div>
+    <div><code>llm_model</code> — модель</div>
+    <div><code>group_size</code> — размер группы REDUCE (default: 4)</div>
+  </div>
+</div>

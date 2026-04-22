@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Настройка Dify Workflow</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; line-height: 1.6; }
+  h1 { color: #818cf8; font-size: 22px; border-bottom: 1px solid #1e293b; padding-bottom: 12px; }
+  h2 { color: #6366f1; font-size: 16px; margin-top: 32px; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+  .step-num { background: #6366f1; color: white; border-radius: 50%; width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex-shrink: 0; }
+  .node-box { border-radius: 10px; padding: 16px 20px; margin: 12px 0; border-left: 4px solid; }
+  .node-start  { background: #1e293b; border-color: #6366f1; }
+  .node-code   { background: #1e293b; border-color: #f59e0b; }
+  .node-iter   { background: #1e293b; border-color: #22c55e; }
+  .node-llm    { background: #0f172a; border-color: #38bdf8; margin-left: 20px; }
+  .node-end    { background: #1e293b; border-color: #6366f1; }
+  .node-label  { font-size: 11px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; }
+  .start-label { color: #818cf8; }
+  .code-label  { color: #fcd34d; }
+  .iter-label  { color: #86efac; }
+  .llm-label   { color: #7dd3fc; }
+  .end-label   { color: #818cf8; }
+  .field-row   { display: flex; margin: 5px 0; font-size: 13px; }
+  .field-name  { color: #94a3b8; min-width: 160px; }
+  .field-val   { color: #e2e8f0; }
+  code { background: #1e293b; color: #86efac; padding: 2px 6px; border-radius: 4px; font-size: 12px; font-family: 'Fira Code', monospace; }
+  pre  { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; font-size: 12px; font-family: 'Fira Code', monospace; color: #cbd5e1; overflow-x: auto; white-space: pre-wrap; }
+  .warn { background: #1e1a00; border: 1px solid #854d0e; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #fde68a; margin: 10px 0; }
+  .ok   { background: #001a0a; border: 1px solid #166534; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #86efac; margin: 10px 0; }
+  .test-box { background: #1a1033; border: 1px solid #4c1d95; border-radius: 8px; padding: 14px 16px; margin: 10px 0; }
+  .test-box .label { color: #a78bfa; font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-bottom: 8px; }
+  .tag { display: inline-block; background: #1e293b; border: 1px solid #334155; border-radius: 4px; padding: 1px 7px; font-size: 11px; color: #94a3b8; margin: 2px; }
+  .arrow { text-align: center; color: #334155; font-size: 20px; margin: 4px 0; }
+  hr { border: none; border-top: 1px solid #1e293b; margin: 24px 0; }
+  .inline-note { color: #64748b; font-size: 12px; font-style: italic; }
+  ul { margin: 8px 0; padding-left: 20px; }
+  li { margin: 4px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Настройка Dify Workflow: MAP-REDUCE пайплайн</h1>
+
+<!-- OVERVIEW -->
+<div style="background:#1e293b;border-radius:10px;padding:16px 20px;margin-bottom:24px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+  <div style="text-align:center;padding:8px 16px;background:#0f172a;border-radius:8px;border:1px solid #6366f1"><div style="color:#818cf8;font-size:11px">START</div><div style="color:#e2e8f0;font-size:12px;margin-top:2px">Параметры</div></div>
+  <div style="color:#334155">→</div>
+  <div style="text-align:center;padding:8px 16px;background:#0f172a;border-radius:8px;border:1px solid #f59e0b"><div style="color:#fcd34d;font-size:11px">CODE</div><div style="color:#e2e8f0;font-size:12px;margin-top:2px">Load & Chunk</div></div>
+  <div style="color:#334155">→</div>
+  <div style="text-align:center;padding:8px 16px;background:#0f172a;border-radius:8px;border:1px solid #22c55e"><div style="color:#86efac;font-size:11px">ITERATION</div><div style="color:#e2e8f0;font-size:12px;margin-top:2px">MAP (parallel)</div></div>
+  <div style="color:#334155">→</div>
+  <div style="text-align:center;padding:8px 16px;background:#0f172a;border-radius:8px;border:1px solid #f59e0b"><div style="color:#fcd34d;font-size:11px">CODE</div><div style="color:#e2e8f0;font-size:12px;margin-top:2px">REDUCE</div></div>
+  <div style="color:#334155">→</div>
+  <div style="text-align:center;padding:8px 16px;background:#0f172a;border-radius:8px;border:1px solid #6366f1"><div style="color:#818cf8;font-size:11px">END</div><div style="color:#e2e8f0;font-size:12px;margin-top:2px">Результат</div></div>
+</div>
+
+<hr>
+
+<!-- STEP 0: CREATE -->
+<h2><span class="step-num">0</span> Создать Workflow</h2>
+<ul>
+  <li>Dify → <b>Studio</b> → <b>Create App</b> → выбрать <b>Workflow</b></li>
+  <li>Название: <code>Log Incident Analyzer</code></li>
+  <li>Откроется пустой граф с нодой <b>Start</b> и <b>End</b></li>
+</ul>
+
+<hr>
+
+<!-- STEP 1: ENV VARS -->
+<h2><span class="step-num">1</span> Переменные среды</h2>
+<p style="font-size:13px">Dify → <b>Settings</b> → <b>Environment Variables</b> → добавить:</p>
+<pre>CH_HOST=clickhouse.internal
+CH_PORT=8123
+CH_USER=default
+CH_PASSWORD=ваш_пароль
+CH_DATABASE=default
+LLM_API_BASE=http://vllm.internal:8000
+LLM_API_KEY=none
+LLM_MODEL=llama-3-70b
+LLM_TIMEOUT=2400
+GROUP_SIZE=4
+BATCH_SIZE=200
+CHUNK_TOKEN_BUDGET=6000</pre>
+<div class="warn">⚠️ LLM_API_BASE — без /v1 на конце, нода добавит его сама</div>
+
+<hr>
+
+<!-- STEP 2: START NODE -->
+<h2><span class="step-num">2</span> Start Node</h2>
+<div class="node-box node-start">
+  <div class="node-label start-label">START NODE</div>
+  <p style="font-size:13px;margin:0 0 10px">Нажать на ноду Start → секция <b>Input Fields</b> → добавить 4 поля:</p>
+  <div class="field-row"><span class="field-name">Имя поля</span><span class="field-val">Тип</span></div>
+  <div class="field-row"><span class="field-name"><code>period_start</code></span><span class="field-val">String — начало периода, ISO 8601 (напр. <code>2024-01-15T10:00:00</code>)</span></div>
+  <div class="field-row"><span class="field-name"><code>period_end</code></span><span class="field-val">String</span></div>
+  <div class="field-row"><span class="field-name"><code>incident_info</code></span><span class="field-val">String — описание инцидента</span></div>
+  <div class="field-row"><span class="field-name"><code>alerts</code></span><span class="field-val">String — тексты алертов (можно пустая строка)</span></div>
+</div>
+
+<div class="test-box">
+  <div class="label">✓ КАК ПРОВЕРИТЬ</div>
+  <p style="font-size:13px;margin:0">Start node нельзя запустить отдельно — проверяется в шаге 3 вместе с Load&amp;Chunk</p>
+</div>
+
+<hr>
+
+<!-- STEP 3: LOAD & CHUNK -->
+<h2><span class="step-num">3</span> Code Node: Load &amp; Chunk</h2>
+<div class="node-box node-code">
+  <div class="node-label code-label">CODE NODE</div>
+
+  <p style="font-size:13px;margin:0 0 8px"><b>Создать ноду:</b> нажать <b>+</b> после Start → выбрать <b>Code</b></p>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>1. Вставить код</b> — скопировать <em>весь</em> файл <code>dify/nodes/load_chunk.py</code> в редактор</p>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>2. Input Variables</b> (вкладка Inputs слева):</p>
+  <div class="field-row"><span class="field-name"><code>period_start</code></span><span class="field-val">← <code>start.period_start</code></span></div>
+  <div class="field-row"><span class="field-name"><code>period_end</code></span><span class="field-val">← <code>start.period_end</code></span></div>
+  <div class="field-row"><span class="field-name"><code>incident_info</code></span><span class="field-val">← <code>start.incident_info</code></span></div>
+  <div class="field-row"><span class="field-name"><code>alerts</code></span><span class="field-val">← <code>start.alerts</code></span></div>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>3. Output Variables</b>:</p>
+  <div class="field-row"><span class="field-name"><code>batches</code></span><span class="field-val">Array[String]</span></div>
+  <div class="field-row"><span class="field-name"><code>batch_count</code></span><span class="field-val">Number</span></div>
+</div>
+
+<div class="test-box">
+  <div class="label">✓ КАК ПРОВЕРИТЬ</div>
+  <p style="font-size:13px;margin:0 0 8px">Нажать <b>▶ Run</b> на ноде → ввести в появившейся форме:</p>
+  <pre style="margin:0">{
+  "period_start": "2024-01-15T10:00:00",
+  "period_end": "2024-01-15T12:00:00",
+  "incident_info": "pods falling in namespace airflow",
+  "alerts": "AirflowKubernetesExecutorFailed fired at 10:15"
+}</pre>
+  <p style="font-size:13px;margin:8px 0 0"><b>Ожидаем:</b></p>
+  <pre style="margin:0">{
+  "batches": ["[2024-01-15T10:00:01 → ...] ×3  airflow/pod-xxx  ERROR ...", ...],
+  "batch_count": 12
+}</pre>
+  <div class="ok">✅ Если batch_count &gt; 0 — ClickHouse отвечает и данные загружены</div>
+  <div class="warn">⚠️ Если batches = [] — проверь что период реальный и данные в CH есть</div>
+  <div class="warn">⚠️ Если ошибка подключения — проверь CH_HOST/CH_PORT в env vars</div>
+</div>
+
+<hr>
+
+<!-- STEP 4: ITERATION (MAP) -->
+<h2><span class="step-num">4</span> Iteration Node: MAP</h2>
+<div class="node-box node-iter">
+  <div class="node-label iter-label">ITERATION NODE (parallel)</div>
+
+  <p style="font-size:13px;margin:0 0 8px"><b>Создать ноду:</b> нажать <b>+</b> → выбрать <b>Iteration</b></p>
+
+  <div class="field-row"><span class="field-name">Input Array</span><span class="field-val"><code>{{load_chunk.batches}}</code></span></div>
+  <div class="field-row"><span class="field-name">Parallel mode</span><span class="field-val">✅ включить</span></div>
+  <div class="field-row"><span class="field-name">Max concurrency</span><span class="field-val">4–8 (зависит от LLM)</span></div>
+
+  <p style="font-size:13px;margin:12px 0 6px"><b>Внутри Iteration добавить LLM Node:</b></p>
+
+  <div class="node-box node-llm">
+    <div class="node-label llm-label">LLM NODE (внутри Iteration)</div>
+
+    <div class="field-row"><span class="field-name">Model</span><span class="field-val">выбрать из настроек Dify</span></div>
+    <div class="field-row"><span class="field-name">Output format</span><span class="field-val">JSON — включить JSON mode</span></div>
+
+    <p style="font-size:13px;margin:8px 0 4px"><b>SYSTEM prompt</b> (вставить как есть, переменные Dify заменят значения):</p>
+    <pre>You are a senior SRE analyzing a production log batch during an active incident.
+
+=== Incident context ===
+{{start.incident_info}}
+
+Period under investigation: {{start.period_start}} → {{start.period_end}}
+
+=== Active alerts ===
+{{start.alerts}}
+
+=== Language ===
+Think and respond in English. Keep technical terms as-is (OOM, pod names,
+Kubernetes objects, error codes). The incident context may be in Russian.
+
+=== Task ===
+Analyze the log batch. Extract events, evidence, hypotheses.
+Output ONLY a JSON object, no prose.
+
+=== Output schema ===
+{
+  "time_range": ["&lt;ISO8601&gt;", "&lt;ISO8601&gt;"],
+  "narrative": "&lt;2-4 sentences: what happened&gt;",
+  "events": [
+    {
+      "id": "&lt;evt-NNN-SEQ&gt;",
+      "timestamp": "&lt;ISO8601&gt;",
+      "source": "&lt;pod/service&gt;",
+      "severity": "&lt;critical|high|medium|low|info&gt;",
+      "message": "&lt;что случилось&gt;",
+      "raw_refs": []
+    }
+  ],
+  "hypotheses": [
+    {
+      "id": "&lt;hyp-NNN-SEQ&gt;",
+      "statement": "&lt;гипотеза&gt;",
+      "confidence": "&lt;high|medium|low&gt;",
+      "supporting_event_ids": []
+    }
+  ],
+  "evidence": [{"id": "&lt;ev-NNN-SEQ&gt;", "text": "&lt;факт&gt;", "event_ids": []}],
+  "gaps": ["&lt;что не видно в этом батче&gt;"],
+  "alert_refs": []
+}</pre>
+
+    <p style="font-size:13px;margin:8px 0 4px"><b>USER prompt:</b></p>
+    <pre>=== Log batch ===
+{{item}}</pre>
+    <p class="inline-note">{{item}} — текущий батч из Iteration, подставляется автоматически</p>
+  </div>
+
+  <p style="font-size:13px;margin:10px 0 4px"><b>Output Variable Iteration:</b> Dify автоматически создаёт переменную с результатами — она будет называться <code>map.output</code> или <code>iteration_1.output</code> (зависит от версии)</p>
+</div>
+
+<div class="test-box">
+  <div class="label">✓ КАК ПРОВЕРИТЬ</div>
+  <p style="font-size:13px;margin:0 0 8px"><b>Вариант А — тест одной итерации:</b> Нажать <b>▶ Run</b> на LLM Node внутри, ввести один батч вручную:</p>
+  <pre style="margin:0">item: "[2024-01-15T10:05:01 → 10:05:03] ×5  airflow/scheduler-xxx  ERROR Failed to execute task"
+start.incident_info: "airflow scheduler crash"
+start.period_start: "2024-01-15T10:00:00"
+start.period_end: "2024-01-15T12:00:00"
+start.alerts: "AirflowSchedulerDown"</pre>
+  <p style="font-size:13px;margin:8px 0 0"><b>Ожидаем:</b> валидный JSON с полями <code>time_range</code>, <code>narrative</code>, <code>events</code></p>
+  <div class="ok">✅ Если вернулся JSON — MAP нода работает</div>
+  <div class="warn">⚠️ Если вернулся текст не-JSON — включи JSON mode в настройках LLM Node</div>
+
+  <p style="font-size:13px;margin:12px 0 4px"><b>Вариант Б — запустить всё до MAP:</b> нажать Run на Iteration ноде, она возьмёт batches из предыдущей ноды</p>
+</div>
+
+<hr>
+
+<!-- STEP 5: REDUCE -->
+<h2><span class="step-num">5</span> Code Node: REDUCE</h2>
+<div class="node-box node-code">
+  <div class="node-label code-label">CODE NODE</div>
+
+  <p style="font-size:13px;margin:0 0 8px"><b>Создать ноду:</b> нажать <b>+</b> после Iteration → выбрать <b>Code</b></p>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>1. Вставить код</b> — скопировать <em>весь</em> файл <code>dify/nodes/reduce.py</code></p>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>2. Input Variables:</b></p>
+  <div class="field-row"><span class="field-name"><code>map_results</code></span><span class="field-val">← вывод Iteration ноды (Array of Objects)</span></div>
+  <div class="field-row"><span class="field-name"><code>incident_info</code></span><span class="field-val">← <code>start.incident_info</code></span></div>
+  <div class="field-row"><span class="field-name"><code>period_start</code></span><span class="field-val">← <code>start.period_start</code></span></div>
+  <div class="field-row"><span class="field-name"><code>period_end</code></span><span class="field-val">← <code>start.period_end</code></span></div>
+
+  <p style="font-size:13px;margin:8px 0 4px"><b>3. Output Variables:</b></p>
+  <div class="field-row"><span class="field-name"><code>merged_analysis</code></span><span class="field-val">Object</span></div>
+
+  <div class="warn">⚠️ Важно: map_results должен быть <b>Array of Objects</b>, не Array of Strings. Убедись что LLM Node в MAP отдаёт JSON-объект, а не строку</div>
+</div>
+
+<div class="test-box">
+  <div class="label">✓ КАК ПРОВЕРИТЬ</div>
+  <p style="font-size:13px;margin:0 0 8px">Нажать <b>▶ Run</b> → ввести мокнутые map_results:</p>
+  <pre style="margin:0">{
+  "map_results": [
+    {
+      "time_range": ["2024-01-15T10:00:00", "2024-01-15T10:30:00"],
+      "narrative": "Scheduler crashed due to OOM",
+      "events": [{"id": "evt-001-001", "timestamp": "2024-01-15T10:05:00",
+                  "source": "airflow-scheduler", "severity": "critical",
+                  "message": "OOMKilled", "raw_refs": []}],
+      "hypotheses": [], "evidence": [], "gaps": [], "alert_refs": []
+    },
+    {
+      "time_range": ["2024-01-15T10:30:00", "2024-01-15T11:00:00"],
+      "narrative": "Workers failing to pull image",
+      "events": [{"id": "evt-002-001", "timestamp": "2024-01-15T10:35:00",
+                  "source": "worker-pod", "severity": "high",
+                  "message": "ImagePullBackOff", "raw_refs": []}],
+      "hypotheses": [], "evidence": [], "gaps": [], "alert_refs": []
+    }
+  ],
+  "incident_info": "airflow crash",
+  "period_start": "2024-01-15T10:00:00",
+  "period_end": "2024-01-15T12:00:00"
+}</pre>
+  <p style="font-size:13px;margin:8px 0 0"><b>Ожидаем:</b></p>
+  <pre style="margin:0">{
+  "merged_analysis": {
+    "narrative": "...",
+    "events": [{...}, {...}],
+    ...
+  }
+}</pre>
+  <div class="ok">✅ Если merged_analysis содержит события из обоих батчей — REDUCE работает</div>
+  <div class="warn">⚠️ Если timeout — проверь LLM_API_BASE и LLM_MODEL в env vars</div>
+</div>
+
+<hr>
+
+<!-- STEP 6: END NODE -->
+<h2><span class="step-num">6</span> End Node</h2>
+<div class="node-box node-end">
+  <div class="node-label end-label">END NODE</div>
+  <p style="font-size:13px;margin:0 0 8px">Нажать на End Node → добавить output:</p>
+  <div class="field-row"><span class="field-name"><code>merged_analysis</code></span><span class="field-val">← <code>reduce.merged_analysis</code></span></div>
+</div>
+
+<hr>
+
+<!-- STEP 7: FULL TEST -->
+<h2><span class="step-num">7</span> Полный запуск</h2>
+<p style="font-size:13px">Нажать <b>▶ Run</b> на всём Workflow → ввести параметры:</p>
+<pre>{
+  "period_start": "2024-01-15T10:00:00",
+  "period_end": "2024-01-15T12:00:00",
+  "incident_info": "Airflow scheduler falling, ImagePullBackOff on worker pods in namespace airflow",
+  "alerts": "AirflowKubernetesExecutorFailed fired 10:15\nImagePullBackOff on ndp-p01"
+}</pre>
+
+<div class="ok" style="margin-top:12px">
+  ✅ <b>Успех:</b> End node возвращает merged_analysis с narrative, events и hypotheses<br>
+  Время: зависит от количества батчей и LLM. Ожидай 5–30 минут на большой период.
+</div>
+
+<div class="warn">
+  ⚠️ <b>Если batch_count = 0</b> — данных нет за период, попробуй другой период<br>
+  ⚠️ <b>Если REDUCE зависает</b> — проверь LLM_TIMEOUT, увеличь до 3600<br>
+  ⚠️ <b>Если MAP возвращает строки вместо объектов</b> — включи JSON mode в LLM Node
+</div>
+
+</body>
+</html>

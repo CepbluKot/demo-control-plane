@@ -229,7 +229,8 @@ LIMIT {limit}
 # ── Валидация SQL-шаблонов ────────────────────────────────────────────────────
 # Проверяется один раз при старте main(). SystemExit если что-то не так.
 
-_REQUIRED_PLACEHOLDERS = ["{last_ts}", "{period_end}", "{limit}", "{raw_limit}"]
+_REQUIRED_PLACEHOLDERS = ["{last_ts}", "{period_end}", "{limit}"]
+# {raw_limit} опциональный — если в шаблоне есть, подставляется автоматически
 _REQUIRED_COLUMNS      = ["timestamp", "end_time", "raw_line"]
 
 def _validate_sql_templates(sqls: list[str]) -> None:

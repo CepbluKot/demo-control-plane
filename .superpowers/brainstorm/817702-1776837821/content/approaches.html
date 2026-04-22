@@ -1,0 +1,62 @@
+<h2>Три подхода к MAP-REDUCE в Dify</h2>
+<p class="subtitle">Главная сложность — REDUCE-фаза: Dify Workflow — это DAG, цикл "пока не останется 1 элемент" нельзя сделать нативно</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Гибрид: MAP в Dify Iteration, REDUCE в Code-ноде</h3>
+      <p><strong>Рекомендуем.</strong> MAP делается через Dify Iteration (параллельно) — визуально и удобно. REDUCE — Python Code-нода, которая сама крутит цикл и вызывает LLM через HTTP пока не останется 1 результат.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Плюсы</h4><ul>
+          <li>MAP виден как граф в Dify</li>
+          <li>REDUCE — настоящий цикл, без ограничений</li>
+          <li>Легко перенести нашу логику tree_reducer.py</li>
+          <li>LLM задаётся через Dify (не хардкодится в коде)</li>
+        </ul></div>
+        <div class="cons"><h4>Минусы</h4><ul>
+          <li>REDUCE-раунды не видны в UI Dify</li>
+          <li>Code-нода делает HTTP к LLM напрямую</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Весь MAP-REDUCE в одной Code-ноде</h3>
+      <p>Один большой Python-скрипт в Code-ноде: берёт батчи, делает MAP (параллельно через threading), делает REDUCE. Dify — просто обёртка/триггер.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Плюсы</h4><ul>
+          <li>Быстро реализовать (почти copy-paste нашего кода)</li>
+          <li>Полный контроль над логикой</li>
+        </ul></div>
+        <div class="cons"><h4>Минусы</h4><ul>
+          <li>Dify практически не используется как workflow</li>
+          <li>Таймаут Code-ноды (~300с) — может не хватить</li>
+          <li>Threading в sandbox ограничен</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Полностью нативный Dify Workflow (фиксированные раунды)</h3>
+      <p>MAP через Iteration-ноду, REDUCE — несколько последовательных Iteration-нод (раунд 1 → раунд 2 → раунд 3). Количество раундов фиксируется заранее.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Плюсы</h4><ul>
+          <li>Весь пайплайн виден визуально в Dify</li>
+          <li>Нет Code-нод — чисто</li>
+        </ul></div>
+        <div class="cons"><h4>Минусы</h4><ul>
+          <li>Количество раундов жёстко задано (не динамично)</li>
+          <li>Лишние раунды при малом числе батчей</li>
+          <li>Нельзя адаптироваться к размеру входных данных</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</div>
