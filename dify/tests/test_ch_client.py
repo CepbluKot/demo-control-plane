@@ -1,6 +1,7 @@
 import json
 import sys
 import os
+import urllib.request
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -30,3 +31,21 @@ def test_skips_empty_lines():
     m.read.return_value = body
     with patch("urllib.request.urlopen", return_value=m):
         assert len(ch_query("localhost", 8123, "u", "p", "SELECT 1")) == 2
+
+
+def test_raises_runtime_error_on_404():
+    err = urllib.request.HTTPError(
+        url="http://localhost:8123/",
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=None,
+    )
+    err.read = lambda: b"Table not found"
+    with patch("urllib.request.urlopen", side_effect=err):
+        try:
+            ch_query("localhost", 8123, "u", "p", "SELECT 1")
+            assert False, "должно бросить RuntimeError"
+        except RuntimeError as e:
+            assert "404" in str(e)
+            assert "Table not found" in str(e)

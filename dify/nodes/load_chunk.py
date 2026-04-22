@@ -16,22 +16,26 @@ Inputs:
 Outputs: batches (Array[String]), batch_count (Number)
 """
 import json
-import urllib.parse
 import urllib.request
-
 
 
 # ── ClickHouse ────────────────────────────────────────────────────────
 
 def ch_query(host, port, user, password, sql, timeout=120):
-    encoded = urllib.parse.quote(sql + " FORMAT JSONEachRow")
-    url = f"http://{host}:{port}/?query={encoded}"
-    req = urllib.request.Request(url)
+    """POST-запрос к ClickHouse HTTP interface. POST надёжнее GET (нет лимита URL)."""
+    url = f"http://{host}:{port}/"
+    body = (sql + " FORMAT JSONEachRow").encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", user)
     req.add_header("X-ClickHouse-Key", password)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        lines = resp.read().decode("utf-8").splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            lines = resp.read().decode("utf-8").splitlines()
+            return [json.loads(line) for line in lines if line.strip()]
+    except urllib.request.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"ClickHouse HTTP {e.code} at {url!r}: {body_text[:500]}") from e
 
 
 # ── Chunker ───────────────────────────────────────────────────────────
