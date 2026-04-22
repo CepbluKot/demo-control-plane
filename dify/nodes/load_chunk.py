@@ -13,14 +13,13 @@ Inputs:
   ch_database       (str) — ClickHouse database (default "default")
   batch_size        (str) — строк на страницу пагинации (default "200")
   chunk_token_budget(str) — токенов на батч (default "6000")
-  active_queries    (str) — какие запросы гнать, через запятую (default "containers,events")
-                            доступные имена: containers, events
+  active_queries    (str) — индексы запросов из SQL_QUERIES через запятую (default "0,1")
 Outputs: batches (Array[String]), batch_count (Number)
 
-Требования к кастомным SQL-шаблонам:
-  - обязательные плейсхолдеры: {database}, {last_ts}, {period_end}, {limit}
-  - обязательные колонки в SELECT: timestamp (DateTime), end_time (DateTime)
-  - любые дополнительные поля — попадут в JSON каждой строки батча
+Требования к SQL-шаблонам в SQL_QUERIES:
+  - плейсхолдеры: {database}, {last_ts}, {period_end}, {limit}
+  - обязательные колонки: timestamp (DateTime), end_time (DateTime)
+  - остальные поля — произвольные, попадут в JSON каждой строки батча
 """
 import json
 import urllib.request
@@ -30,17 +29,17 @@ from datetime import datetime
 # ── ClickHouse ────────────────────────────────────────────────────────
 
 def ch_query(host, port, user, password, sql, timeout=120):
-    """POST-запрос к ClickHouse HTTP interface. Возвращает list[dict]."""
+    """POST-запрос к ClickHouse HTTP interface. Возвращает list[dict] из поля data."""
     url = f"http://{host}:{port}/"
-    body = (sql + " FORMAT JSONEachRow").encode("utf-8")
+    body = (sql + " FORMAT JSON").encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", user)
     req.add_header("X-ClickHouse-Key", password)
     req.add_header("Content-Type", "text/plain; charset=utf-8")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            lines = resp.read().decode("utf-8").splitlines()
-            return [json.loads(line) for line in lines if line.strip()]
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["data"]
     except urllib.request.HTTPError as e:
         body_text = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"ClickHouse HTTP {e.code} at {url!r}: {body_text[:500]}") from e
@@ -68,72 +67,72 @@ def chunk_rows(rows, token_budget=6000):
     return chunks
 
 
-# ── SQL Registry ──────────────────────────────────────────────────────
-# Обязательные колонки: timestamp, end_time
-# Остальные поля свободные — попадут в JSON строки батча
+# ── SQL Queries ───────────────────────────────────────────────────────
+# Список SQL-шаблонов. Все должны возвращать: timestamp, end_time + любые поля.
+# Чтобы добавить источник — допишите новый шаблон в список.
+# active_queries выбирает по индексу (0-based).
 
-CONTAINERS_SQL = """
-SELECT
-    min(timestamp) AS timestamp,
-    max(timestamp) AS end_time,
-    count() AS cnt,
-    any(kubernetes_namespace_name) AS namespace,
-    any(kubernetes_pod_name) AS pod_name,
-    any(kubernetes_container_name) AS container_name,
-    min(log) AS log_text
-FROM (
-    SELECT *,
-        sum(is_new_group) OVER (
-            PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-            ORDER BY timestamp ASC
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS group_id
+SQL_QUERIES = [
+    # 0: container logs — ошибки, сгруппированные по повторяющимся строкам
+    """
+    SELECT
+        min(timestamp) AS timestamp,
+        max(timestamp) AS end_time,
+        count() AS cnt,
+        any(kubernetes_namespace_name) AS namespace,
+        any(kubernetes_pod_name) AS pod_name,
+        any(kubernetes_container_name) AS container_name,
+        min(log) AS log_text
     FROM (
         SELECT *,
-            if(
-                right(log, 10) != ifNull(lagInFrame(right(log, 10)) OVER (
-                    PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-                    ORDER BY timestamp ASC
-                ), ''), 1, 0
-            ) AS is_new_group
-        FROM {database}.log_k8s_containers
-        WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
-          AND timestamp <= parseDateTime64BestEffort('{period_end}')
-          AND multiSearchAny(lower(log), [
-                'fatal','critical','error','exception','alert','panic',
-                'failed','failure','crash','abort','timeout','timed out',
-                'deadlock','out of memory','oom','disk full','no space left',
-                'permission denied','access denied','unauthorized','forbidden',
-                'connection refused','connection reset','ssl error','segfault',
-                'killed','rollback','traceback','stack trace'
-          ])
-        ORDER BY timestamp ASC
+            sum(is_new_group) OVER (
+                PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                ORDER BY timestamp ASC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS group_id
+        FROM (
+            SELECT *,
+                if(
+                    right(log, 10) != ifNull(lagInFrame(right(log, 10)) OVER (
+                        PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                        ORDER BY timestamp ASC
+                    ), ''), 1, 0
+                ) AS is_new_group
+            FROM {database}.log_k8s_containers
+            WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
+              AND timestamp <= parseDateTime64BestEffort('{period_end}')
+              AND multiSearchAny(lower(log), [
+                    'fatal','critical','error','exception','alert','panic',
+                    'failed','failure','crash','abort','timeout','timed out',
+                    'deadlock','out of memory','oom','disk full','no space left',
+                    'permission denied','access denied','unauthorized','forbidden',
+                    'connection refused','connection reset','ssl error','segfault',
+                    'killed','rollback','traceback','stack trace'
+              ])
+            ORDER BY timestamp ASC
+        )
     )
-)
-GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
-ORDER BY timestamp ASC
-LIMIT {limit}
-"""
+    GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
+    ORDER BY timestamp ASC
+    LIMIT {limit}
+    """,
 
-EVENTS_SQL = """
-SELECT
-    timestamp,
-    timestamp AS end_time,
-    reason,
-    involvedObject_namespace AS namespace,
-    involvedObject_name AS object_name,
-    message
-FROM {database}.log_k8s_events
-WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
-  AND timestamp <= parseDateTime64BestEffort('{period_end}')
-ORDER BY timestamp ASC
-LIMIT {limit}
-"""
-
-SQL_REGISTRY = {
-    "containers": CONTAINERS_SQL,
-    "events": EVENTS_SQL,
-}
+    # 1: k8s events
+    """
+    SELECT
+        timestamp,
+        timestamp AS end_time,
+        reason,
+        involvedObject_namespace AS namespace,
+        involvedObject_name AS object_name,
+        message
+    FROM {database}.log_k8s_events
+    WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
+      AND timestamp <= parseDateTime64BestEffort('{period_end}')
+    ORDER BY timestamp ASC
+    LIMIT {limit}
+    """,
+]
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -150,7 +149,7 @@ def main(
     ch_database: str = "default",
     batch_size: str = "200",
     chunk_token_budget: str = "6000",
-    active_queries: str = "containers,events",
+    active_queries: str = "0,1",
 ) -> dict:
     start_dt = datetime.fromisoformat(period_start)
     end_dt   = datetime.fromisoformat(period_end)
@@ -168,12 +167,12 @@ def main(
     batch_size   = int(batch_size)
     token_budget = int(chunk_token_budget)
 
-    query_names = [q.strip() for q in active_queries.split(",") if q.strip()]
+    indices = [int(i.strip()) for i in active_queries.split(",") if i.strip()]
     sql_templates = []
-    for name in query_names:
-        if name not in SQL_REGISTRY:
-            raise ValueError(f"Неизвестный запрос: {name!r}. Доступные: {list(SQL_REGISTRY)}")
-        sql_templates.append(SQL_REGISTRY[name])
+    for idx in indices:
+        if idx < 0 or idx >= len(SQL_QUERIES):
+            raise ValueError(f"Индекс запроса {idx} выходит за границы (всего {len(SQL_QUERIES)})")
+        sql_templates.append(SQL_QUERIES[idx])
 
     all_rows = []
     last_ts = period_start
