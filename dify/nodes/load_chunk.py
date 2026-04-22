@@ -171,7 +171,6 @@ def main(
     ch_password: str = "",
     ch_database: str = "default",
     batch_size: str = "200",
-    chunk_token_budget: str = "6000",
     active_queries: str = "0,1",
 ) -> dict:
     start_dt = datetime.fromisoformat(period_start)
@@ -188,8 +187,6 @@ def main(
     password     = ch_password
     database     = ch_database
     batch_size   = int(batch_size)
-    token_budget = int(chunk_token_budget)
-
     indices = [int(i.strip()) for i in active_queries.split(",") if i.strip()]
     sql_templates = []
     for idx in indices:
@@ -225,5 +222,5 @@ def main(
         if len(page_rows) < batch_size:
             break
 
-    batches = chunk_rows(all_rows, token_budget=token_budget)
+    batches = [json.dumps(r, ensure_ascii=False, default=str) for r in all_rows]
     return {"batches": batches, "batch_count": len(batches)}
