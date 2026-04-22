@@ -130,19 +130,18 @@ FROM (
     SELECT
         min(timestamp) AS timestamp, max(timestamp) AS end_time,
         any(reason) AS reason,
-        any(kubernetes_namespace_name) AS namespace,
-        any(object_name) AS object_name,
+        any(involvedObject_namespace) AS namespace,
+        any(involvedObject_name) AS object_name,
         any(message) AS message
     FROM {database}.log_k8s_events
     WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
       AND timestamp <= parseDateTime64BestEffort('{period_end}')
-      AND ext_ClusterName = 'ndp-p01'
       AND reason IN (
             'BackOff','ImagePullBackOff','OOMKilling','Evicted','Failed',
             'FailedCreate','FailedScheduling','FailedMount','Killing',
             'NodeNotReady','Unhealthy','CrashLoopBackOff'
       )
-    GROUP BY timestamp, kubernetes_namespace_name, object_name
+    GROUP BY timestamp, involvedObject_namespace, involvedObject_name
 )
 ORDER BY timestamp ASC
 LIMIT {limit}
