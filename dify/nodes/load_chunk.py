@@ -1,16 +1,24 @@
 """Dify Code Node: Load & Chunk
 
 Copy-paste в Dify Code Node (Python).
-Inputs:  period_start (str), period_end (str), incident_info (str), alerts (str)
+Inputs:
+  period_start      (str) — начало периода, ISO 8601
+  period_end        (str) — конец периода, ISO 8601
+  incident_info     (str) — описание инцидента
+  alerts            (str) — тексты алертов
+  ch_host           (str) — ClickHouse host
+  ch_port           (str) — ClickHouse port (default "8123")
+  ch_user           (str) — ClickHouse user
+  ch_password       (str) — ClickHouse password
+  ch_database       (str) — ClickHouse database (default "default")
+  batch_size        (str) — строк на страницу пагинации (default "200")
+  chunk_token_budget(str) — токенов на батч (default "6000")
 Outputs: batches (Array[String]), batch_count (Number)
-
-Env vars: CH_HOST, CH_PORT, CH_USER, CH_PASSWORD, CH_DATABASE,
-          BATCH_SIZE (default 200), CHUNK_TOKEN_BUDGET (default 6000)
 """
 import json
-import os
 import urllib.parse
 import urllib.request
+
 
 
 # ── ClickHouse ────────────────────────────────────────────────────────
@@ -144,14 +152,26 @@ LIMIT {limit}
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-def main(period_start: str, period_end: str, incident_info: str, alerts: str) -> dict:
-    host         = os.environ.get("CH_HOST", "localhost")
-    port         = int(os.environ.get("CH_PORT", "8123"))
-    user         = os.environ.get("CH_USER", "default")
-    password     = os.environ.get("CH_PASSWORD", "")
-    database     = os.environ.get("CH_DATABASE", "default")
-    batch_size   = int(os.environ.get("BATCH_SIZE", "200"))
-    token_budget = int(os.environ.get("CHUNK_TOKEN_BUDGET", "6000"))
+def main(
+    period_start: str,
+    period_end: str,
+    incident_info: str,
+    alerts: str,
+    ch_host: str = "localhost",
+    ch_port: str = "8123",
+    ch_user: str = "default",
+    ch_password: str = "",
+    ch_database: str = "default",
+    batch_size: str = "200",
+    chunk_token_budget: str = "6000",
+) -> dict:
+    host         = ch_host
+    port         = int(ch_port)
+    user         = ch_user
+    password     = ch_password
+    database     = ch_database
+    batch_size   = int(batch_size)
+    token_budget = int(chunk_token_budget)
 
     all_rows = []
     last_ts = period_start

@@ -1,14 +1,19 @@
 """Dify Code Node: REDUCE
 
 Copy-paste в Dify Code Node (Python).
-Inputs:  map_results (Array[Object]), incident_info (str), period_start (str), period_end (str)
+Inputs:
+  map_results   (Array[Object]) — вывод MAP Iteration ноды
+  incident_info (str)
+  period_start  (str)
+  period_end    (str)
+  llm_api_base  (str) — endpoint LLM (без /v1)
+  llm_api_key   (str) — API ключ
+  llm_model     (str) — название модели
+  llm_timeout   (str) — таймаут в секундах (default "2400")
+  group_size    (str) — размер группы REDUCE (default "4")
 Outputs: merged_analysis (Object)
-
-Env vars: LLM_API_BASE, LLM_API_KEY, LLM_MODEL,
-          LLM_TIMEOUT (default 2400), GROUP_SIZE (default 4)
 """
 import json
-import os
 import time
 import urllib.request
 
@@ -112,12 +117,22 @@ def _merge_group(group, system, api_base, api_key, model, timeout, max_retries=5
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-def main(map_results: list, incident_info: str, period_start: str, period_end: str) -> dict:
-    api_base   = os.environ.get("LLM_API_BASE", "http://localhost:8000")
-    api_key    = os.environ.get("LLM_API_KEY", "none")
-    model      = os.environ.get("LLM_MODEL", "default")
-    timeout    = float(os.environ.get("LLM_TIMEOUT", "2400"))
-    group_size = int(os.environ.get("GROUP_SIZE", "4"))
+def main(
+    map_results: list,
+    incident_info: str,
+    period_start: str,
+    period_end: str,
+    llm_api_base: str = "http://localhost:8000",
+    llm_api_key: str = "none",
+    llm_model: str = "default",
+    llm_timeout: str = "2400",
+    group_size: str = "4",
+) -> dict:
+    api_base   = llm_api_base
+    api_key    = llm_api_key
+    model      = llm_model
+    timeout    = float(llm_timeout)
+    group_size = int(group_size)
 
     items = list(map_results)
 
