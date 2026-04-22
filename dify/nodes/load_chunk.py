@@ -70,6 +70,7 @@ SELECT
         '[', toString(start_time), ' \u2192 ', toString(end_time), ']',
         ' \xd7', toString(cnt),
         '  ', namespace, '/', pod_name,
+        '  [', container_name, ']',
         '  ', log_text
     ) AS raw_line
 FROM (
@@ -77,7 +78,8 @@ FROM (
         min(timestamp) AS start_time, max(timestamp) AS end_time,
         min(log) AS log_text, count() AS cnt,
         any(kubernetes_namespace_name) AS namespace,
-        any(kubernetes_pod_name) AS pod_name
+        any(kubernetes_pod_name) AS pod_name,
+        any(kubernetes_container_name) AS container_name
     FROM (
         SELECT *,
             sum(is_new_group) OVER (
@@ -93,7 +95,7 @@ FROM (
                         ORDER BY timestamp ASC
                     ), ''), 1, 0
                 ) AS is_new_group
-            FROM {database}.log_k8s_containers_MT
+            FROM {database}.log_k8s_containers
             WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
               AND ext_ClusterName = 'ndp-p01'
