@@ -17,6 +17,7 @@ Outputs: batches (Array[String]), batch_count (Number)
 """
 import json
 import urllib.request
+from datetime import datetime
 
 
 # ── ClickHouse ────────────────────────────────────────────────────────
@@ -98,14 +99,6 @@ FROM (
             FROM {database}.log_k8s_containers
             WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND ext_ClusterName = 'ndp-p01'
-              AND (
-                    kubernetes_container_name LIKE '%airflow%'
-                    OR kubernetes_container_name LIKE '%spark%'
-                    OR kubernetes_container_name LIKE '%flex%'
-                    OR (kubernetes_namespace_name LIKE '%kube-system%'
-                        AND kubernetes_container_name NOT LIKE '%kube-apiserver%')
-              )
               AND multiSearchAny(lower(log), [
                     'fatal','critical','error','exception','alert','panic',
                     'failed','failure','crash','abort','timeout','timed out',
@@ -171,6 +164,14 @@ def main(
     batch_size: str = "200",
     chunk_token_budget: str = "6000",
 ) -> dict:
+    start_dt = datetime.fromisoformat(period_start)
+    end_dt   = datetime.fromisoformat(period_end)
+    if (end_dt - start_dt).total_seconds() > 7 * 24 * 3600:
+        raise ValueError(
+            f"Период слишком большой: {(end_dt - start_dt).days} дн. "
+            "Максимум — 7 дней. Сократи период."
+        )
+
     host         = ch_host
     port         = int(ch_port)
     user         = ch_user
