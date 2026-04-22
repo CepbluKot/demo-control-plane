@@ -119,30 +119,21 @@ LIMIT {limit}
 EVENTS_SQL = """
 SELECT
     timestamp,
-    end_time,
+    timestamp AS end_time,
     concat(
         '[EVT:', reason, ']  ',
         '[', toString(timestamp), ']',
-        '  ', namespace, '  ', object_name,
+        '  ', involvedObject_namespace, '  ', involvedObject_name,
         '  ', message
     ) AS raw_line
-FROM (
-    SELECT
-        min(timestamp) AS timestamp, max(timestamp) AS end_time,
-        any(reason) AS reason,
-        any(involvedObject_namespace) AS namespace,
-        any(involvedObject_name) AS object_name,
-        any(message) AS message
-    FROM {database}.log_k8s_events
-    WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
-      AND timestamp <= parseDateTime64BestEffort('{period_end}')
-      AND reason IN (
-            'BackOff','ImagePullBackOff','OOMKilling','Evicted','Failed',
-            'FailedCreate','FailedScheduling','FailedMount','Killing',
-            'NodeNotReady','Unhealthy','CrashLoopBackOff'
-      )
-    GROUP BY timestamp, involvedObject_namespace, involvedObject_name
-)
+FROM {database}.log_k8s_events
+WHERE timestamp > parseDateTime64BestEffort('{last_ts}')
+  AND timestamp <= parseDateTime64BestEffort('{period_end}')
+  AND reason IN (
+        'BackOff','ImagePullBackOff','OOMKilling','Evicted','Failed',
+        'FailedCreate','FailedScheduling','FailedMount','Killing',
+        'NodeNotReady','Unhealthy','CrashLoopBackOff'
+  )
 ORDER BY timestamp ASC
 LIMIT {limit}
 """
