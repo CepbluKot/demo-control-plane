@@ -14,14 +14,20 @@ Inputs:
 Outputs: merged_analysis (Object)
 """
 import json
+import ssl
 import time
 import urllib.request
+
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
 # ── LLM HTTP ──────────────────────────────────────────────────────────
 
 def call_llm_http(api_base, api_key, model, system, user, timeout=2400):
-    url = api_base.rstrip("/") + "/v1/chat/completions"
+    base = api_base.rstrip("/")
+    url = (base if base.endswith("/v1") else base + "/v1") + "/chat/completions"
     payload = json.dumps({
         "model": model,
         "messages": [
@@ -34,7 +40,7 @@ def call_llm_http(api_base, api_key, model, system, user, timeout=2400):
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
         result = json.loads(resp.read().decode("utf-8"))
         return result["choices"][0]["message"]["content"]
 

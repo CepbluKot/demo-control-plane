@@ -26,7 +26,8 @@ _SSL_CTX.verify_mode = ssl.CERT_NONE
 # ── LLM ──────────────────────────────────────────────────────────────
 
 def _call_llm(api_base, api_key, model, messages, timeout):
-    url = api_base.rstrip("/") + "/v1/chat/completions"
+    base = api_base.rstrip("/")
+    url = (base if base.endswith("/v1") else base + "/v1") + "/chat/completions"
     payload = json.dumps({
         "model": model,
         "messages": messages,
