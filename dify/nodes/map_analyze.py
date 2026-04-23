@@ -99,17 +99,6 @@ def _validate(data):
     return errors
 
 
-def _fallback(item):
-    return {
-        "time_range": ["", ""],
-        "narrative": f"[parse error] raw batch: {item[:200]}",
-        "events": [],
-        "evidence": [],
-        "hypotheses": [],
-        "anomalies": [],
-        "preliminary_recommendations": [],
-    }
-
 
 # ── Промпты ───────────────────────────────────────────────────────────
 
@@ -207,31 +196,37 @@ def main(
         {"role": "user",   "content": user},
     ]
 
-    for attempt in range(retries):
+    for _ in range(retries):
+        # LLM-ошибки (коннект, авторизация, таймаут) — не глотаем, пробрасываем
+        raw = _call_llm(llm_api_base, llm_api_key, llm_model, messages, timeout)
+
         try:
-            raw = _call_llm(llm_api_base, llm_api_key, llm_model, messages, timeout)
             analysis = _extract_json(raw)
-
-            errors = _validate(analysis)
-            if not errors:
-                return {"analysis": analysis}
-
-            # Валидация не прошла — отправляем ошибки обратно в LLM (как instructor)
-            error_text = "\n".join(f"- {e}" for e in errors)
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Your response has validation errors, please fix them and return "
-                    f"the corrected JSON:\n{error_text}"
-                ),
-            })
-
         except Exception:
             # JSON не распарсился — просим переделать
+            messages.append({"role": "assistant", "content": raw})
             messages.append({
                 "role": "user",
                 "content": "Your response was not valid JSON. Return only a JSON object.",
             })
+            continue
 
-    return {"analysis": _fallback(item)}
+        errors = _validate(analysis)
+        if not errors:
+            return {"analysis": analysis}
+
+        # Валидация не прошла — отправляем ошибки обратно в LLM (как instructor)
+        error_text = "\n".join(f"- {e}" for e in errors)
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Your response has validation errors, please fix them and return "
+                f"the corrected JSON:\n{error_text}"
+            ),
+        })
+
+    last_msg = messages[-1].get("content", "") if messages else ""
+    raise RuntimeError(
+        f"MAP failed after {retries} attempts. Last error: {last_msg[:300]}"
+    )
