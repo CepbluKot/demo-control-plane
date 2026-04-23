@@ -172,6 +172,7 @@ def main(
     ch_database: str = "default",
     batch_size: str = "200",
     active_queries: str = "0,1",
+    rows_per_batch: str = "10",
 ) -> dict:
     start_dt = datetime.fromisoformat(period_start)
     end_dt   = datetime.fromisoformat(period_end)
@@ -222,5 +223,12 @@ def main(
         if len(page_rows) < batch_size:
             break
 
-    batches = all_rows
+    rpb = max(1, int(rows_per_batch))
+    max_batches = 29
+    # если при данном rpb батчей > 29 — увеличиваем chunk_size чтобы влезть в лимит Dify
+    chunk_size = max(rpb, (len(all_rows) + max_batches - 1) // max_batches)
+    batches = [
+        json.dumps(all_rows[i:i + chunk_size], ensure_ascii=False, default=str)
+        for i in range(0, len(all_rows), chunk_size)
+    ]
     return {"batches": batches, "batch_count": len(batches)}
