@@ -15,6 +15,7 @@ Outputs: analysis (Object)
 """
 import json
 import re
+import ssl
 import urllib.request
 
 
@@ -32,7 +33,10 @@ def _call_llm(api_base, api_key, model, messages, timeout):
     req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         result = json.loads(resp.read().decode("utf-8"))
         return result["choices"][0]["message"]["content"]
 
