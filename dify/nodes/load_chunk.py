@@ -15,6 +15,7 @@ Inputs:
   chunk_token_budget(str) — токенов на батч (default "6000")
   active_queries    (str) — индексы запросов из SQL_QUERIES через запятую (default "0,1")
 Outputs: batches (Array[String]), batch_count (Number)
+  Число батчей не ограничено — размер каждого задаётся rows_per_batch.
 
 Требования к SQL-шаблонам в SQL_QUERIES:
   - плейсхолдеры: {database}, {last_ts}, {period_end}, {limit}
@@ -196,6 +197,8 @@ def main(
             raise ValueError(f"Индекс запроса {idx} выходит за границы (всего {len(SQL_QUERIES)})")
         sql_templates.append(SQL_QUERIES[idx])
 
+    chunk_size = max(1, int(rows_per_batch))
+
     all_rows = []
     last_ts = period_start
 
@@ -224,10 +227,6 @@ def main(
         if len(page_rows) < batch_size:
             break
 
-    rpb = max(1, int(rows_per_batch))
-    max_batches = 29
-    # если при данном rpb батчей > 29 — увеличиваем chunk_size чтобы влезть в лимит Dify
-    chunk_size = max(rpb, (len(all_rows) + max_batches - 1) // max_batches)
     batches = [
         json.dumps(all_rows[i:i + chunk_size], ensure_ascii=False, default=str)
         for i in range(0, len(all_rows), chunk_size)
