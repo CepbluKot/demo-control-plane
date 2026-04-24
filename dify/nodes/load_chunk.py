@@ -1,4 +1,4 @@
-"""Dify Code Node: Load & Chunk
+"""Dify Code Node: Load & Chunk (с курсором для Loop)
 
 Copy-paste в Dify Code Node (Python).
 Inputs:
@@ -12,10 +12,22 @@ Inputs:
   ch_password       (str) — ClickHouse password
   ch_database       (str) — ClickHouse database (default "default")
   batch_size        (str) — строк на страницу пагинации (default "200")
-  chunk_token_budget(str) — токенов на батч (default "6000")
   active_queries    (str) — индексы запросов из SQL_QUERIES через запятую (default "0,1")
-Outputs: batches (Array[String]), batch_count (Number)
-  Число батчей не ограничено — размер каждого задаётся rows_per_batch.
+  rows_per_batch    (str) — строк в одном батче (default "10")
+  page_batches      (str) — макс. батчей за один вызов, ≤29 (default "25")
+  last_ts           (str) — курсор; пустая строка = начало периода
+Outputs:
+  batches     (Array[String]) — батчи этой страницы
+  batch_count (Number)
+  next_ts     (String)        — курсор для следующего вызова
+  has_more    (Number)        — 1 = есть ещё данные, 0 = всё загружено
+
+Использование в Dify Loop:
+  глобальная переменная all_batches: Array[String] = []
+  глобальная переменная cursor_ts:   String = ""
+  каждая итерация вызывает этот код с last_ts=cursor_ts,
+  затем Code Node дописывает batches в all_batches и обновляет cursor_ts.
+  Условие выхода: has_more == 0
 
 Требования к SQL-шаблонам в SQL_QUERIES:
   - плейсхолдеры: {database}, {last_ts}, {period_end}, {limit}
@@ -175,6 +187,8 @@ def main(
     batch_size: str = "200",
     active_queries: str = "0,1",
     rows_per_batch: str = "10",
+    page_batches: str = "25",
+    last_ts: str = "",
 ) -> dict:
     start_dt = datetime.fromisoformat(period_start)
     end_dt   = datetime.fromisoformat(period_end)
@@ -184,12 +198,15 @@ def main(
             "Максимум — 7 дней. Сократи период."
         )
 
-    host         = ch_host
-    port         = int(ch_port)
-    user         = ch_user
-    password     = ch_password
-    database     = ch_database
-    batch_size   = int(batch_size)
+    host       = ch_host
+    port       = int(ch_port)
+    user       = ch_user
+    password   = ch_password
+    database   = ch_database
+    fetch_size = int(batch_size)
+    chunk_size = max(1, int(rows_per_batch))
+    max_rows   = max(1, int(page_batches)) * chunk_size  # строк на эту страницу
+
     indices = [int(i.strip()) for i in active_queries.split(",") if i.strip()]
     sql_templates = []
     for idx in indices:
@@ -197,19 +214,18 @@ def main(
             raise ValueError(f"Индекс запроса {idx} выходит за границы (всего {len(SQL_QUERIES)})")
         sql_templates.append(SQL_QUERIES[idx])
 
-    chunk_size = max(1, int(rows_per_batch))
-
+    cursor   = last_ts if last_ts else period_start
     all_rows = []
-    last_ts = period_start
+    has_more = 0
 
     while True:
         page_rows = []
         for sql_tmpl in sql_templates:
             sql = sql_tmpl.format(
                 database=database,
-                last_ts=last_ts,
+                last_ts=cursor,
                 period_end=period_end,
-                limit=batch_size,
+                limit=fetch_size,
             )
             page_rows.extend(ch_query(host, port, user, password, sql))
 
@@ -219,16 +235,31 @@ def main(
         page_rows.sort(key=lambda r: r.get("timestamp", ""))
         all_rows.extend(_truncate(r) for r in page_rows)
 
-        last_end = max(r.get("end_time", r.get("timestamp", "")) for r in page_rows)
-        if last_end <= last_ts:
+        if len(all_rows) >= max_rows:
+            has_more = 1
             break
-        last_ts = last_end
 
-        if len(page_rows) < batch_size:
+        last_end = max(r.get("end_time", r.get("timestamp", "")) for r in page_rows)
+        if last_end <= cursor:
             break
+        cursor = last_end
+
+        if len(page_rows) < fetch_size:
+            break
+
+    all_rows = all_rows[:max_rows]
+
+    next_ts = ""
+    if all_rows:
+        next_ts = max(r.get("end_time", r.get("timestamp", "")) for r in all_rows)
 
     batches = [
         json.dumps(all_rows[i:i + chunk_size], ensure_ascii=False, default=str)
         for i in range(0, len(all_rows), chunk_size)
     ]
-    return {"batches": batches, "batch_count": len(batches)}
+    return {
+        "batches":     batches,
+        "batch_count": len(batches),
+        "next_ts":     next_ts,
+        "has_more":    has_more,
+    }
