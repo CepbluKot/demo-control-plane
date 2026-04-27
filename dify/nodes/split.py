@@ -1,47 +1,65 @@
 """Dify Code Node: Split
 
-Берёт плоский список логов и возвращает один батч,
-ограниченный токенным бюджетом И максимальным числом строк.
+Берёт плоский список логов и возвращает N батчей за раз (для параллельного
+запуска N LLM-нод). Каждый батч ограничен токенным бюджетом и макс. числом строк.
 
 Inputs:
   rows          (Array[Object]) — полный список логов (global переменная)
   offset        (Number)        — с какой строки начинать (global, начало = 0)
-  token_budget  (str)           — токенов на батч (default "6000")
-  max_batch     (str)           — макс. строк в батче (default "29")
+  token_budget  (str)           — токенов на один батч (default "6000")
+  max_batch     (str)           — макс. строк в одном батче (default "29")
+  n_parallel    (str)           — сколько батчей вернуть за раз (default "3")
 Outputs:
-  batch        (Array[Object]) — текущий батч
-  next_offset  (Number)        — offset для следующей итерации
-  has_more     (Number)        — 1 если ещё есть данные, 0 если конец
+  batches      (Array[Array[String]]) — N батчей для параллельной обработки
+  next_offset  (Number)               — offset для следующей итерации
+  has_more     (Number)               — 1 если ещё есть данные, 0 если конец
+  batch_starts (Array[String])        — period_start каждого батча
+  batch_ends   (Array[String])        — period_end каждого батча
 """
 import json
 
 
-def main(rows: list, offset: int = 0, token_budget: str = "6000", max_batch: str = "29") -> dict:
-    budget    = int(token_budget)
-    max_rows  = int(max_batch)
-    idx       = int(offset)
-
+def _take_batch(rows, idx, budget, max_rows):
+    """Берёт один батч начиная с idx. Возвращает (batch_strings, new_idx)."""
     batch  = []
     tokens = 0
-
     while idx < len(rows) and len(batch) < max_rows:
-        row = rows[idx]
-        row_str = json.dumps(row, ensure_ascii=False)
+        row_str = json.dumps(rows[idx], ensure_ascii=False)
         t = len(row_str) // 3
         if batch and tokens + t > budget:
             break
         batch.append(row_str)
         tokens += t
         idx += 1
+    return batch, idx
 
-    parsed = [json.loads(s) for s in batch]
-    batch_start = min((r.get("timestamp", "") for r in parsed), default="")
-    batch_end   = max((r.get("end_time") or r.get("timestamp", "") for r in parsed), default="")
+
+def main(rows: list, offset: int = 0, token_budget: str = "6000",
+         max_batch: str = "29", n_parallel: str = "3") -> dict:
+    budget     = int(token_budget)
+    max_rows   = int(max_batch)
+    n          = int(n_parallel)
+    idx        = int(offset)
+
+    batches      = []
+    batch_starts = []
+    batch_ends   = []
+
+    for _ in range(n):
+        if idx >= len(rows):
+            break
+        batch, idx = _take_batch(rows, idx, budget, max_rows)
+        if not batch:
+            break
+        parsed = [json.loads(s) for s in batch]
+        batches.append(batch)
+        batch_starts.append(min(r.get("timestamp", "") for r in parsed))
+        batch_ends.append(max(r.get("end_time") or r.get("timestamp", "") for r in parsed))
 
     return {
-        "batch":        batch,
+        "batches":      batches,
         "next_offset":  idx,
         "has_more":     1 if idx < len(rows) else 0,
-        "batch_start":  batch_start,
-        "batch_end":    batch_end,
+        "batch_starts": batch_starts,
+        "batch_ends":   batch_ends,
     }
