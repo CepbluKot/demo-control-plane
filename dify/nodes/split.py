@@ -34,8 +34,14 @@ def main(rows: list, offset: int = 0, token_budget: str = "6000", max_batch: str
         tokens += t
         idx += 1
 
+    parsed = [json.loads(s) for s in batch]
+    batch_start = min((r.get("timestamp", "") for r in parsed), default="")
+    batch_end   = max((r.get("end_time") or r.get("timestamp", "") for r in parsed), default="")
+
     return {
-        "batch":       batch,
-        "next_offset": idx,
-        "has_more":    1 if idx < len(rows) else 0,
+        "batch":        batch,
+        "next_offset":  idx,
+        "has_more":     1 if idx < len(rows) else 0,
+        "batch_start":  batch_start,
+        "batch_end":    batch_end,
     }
