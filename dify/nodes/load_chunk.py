@@ -174,7 +174,7 @@ def main(
     ch_password: str = "",
     ch_database: str = "default",
     active_queries: str = "0,1",
-    rows_per_batch: str = "10",
+
     max_rows: str = "1000000",
 ) -> dict:
     start_dt = datetime.fromisoformat(period_start)
@@ -191,7 +191,7 @@ def main(
     password   = ch_password
     database   = ch_database
     limit      = int(max_rows)
-    chunk_size = max(1, int(rows_per_batch))
+
 
     indices = [int(i.strip()) for i in active_queries.split(",") if i.strip()]
     sql_templates = []
@@ -213,8 +213,4 @@ def main(
     all_rows.sort(key=lambda r: r.get("timestamp", ""))
     all_rows = [_truncate(r) for r in all_rows[:limit]]
 
-    batches = [
-        json.dumps(all_rows[i:i + chunk_size], ensure_ascii=False, default=str)
-        for i in range(0, len(all_rows), chunk_size)
-    ]
-    return {"batches": batches, "batch_count": len(batches)}
+    return {"batches": all_rows, "batch_count": len(all_rows)}
