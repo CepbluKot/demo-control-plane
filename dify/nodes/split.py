@@ -1,12 +1,13 @@
 """Dify Code Node: Split
 
-Берёт плоский список логов и возвращает один батч по токенному бюджету,
-сдвигая offset для следующей итерации Loop.
+Берёт плоский список логов и возвращает один батч,
+ограниченный токенным бюджетом И максимальным числом строк.
 
 Inputs:
   rows          (Array[Object]) — полный список логов (global переменная)
   offset        (Number)        — с какой строки начинать (global, начало = 0)
   token_budget  (str)           — токенов на батч (default "6000")
+  max_batch     (str)           — макс. строк в батче (default "29")
 Outputs:
   batch        (Array[Object]) — текущий батч
   next_offset  (Number)        — offset для следующей итерации
@@ -15,14 +16,15 @@ Outputs:
 import json
 
 
-def main(rows: list, offset: int = 0, token_budget: str = "6000") -> dict:
-    budget = int(token_budget)
-    idx = int(offset)
+def main(rows: list, offset: int = 0, token_budget: str = "6000", max_batch: str = "29") -> dict:
+    budget    = int(token_budget)
+    max_rows  = int(max_batch)
+    idx       = int(offset)
 
-    batch = []
+    batch  = []
     tokens = 0
 
-    while idx < len(rows):
+    while idx < len(rows) and len(batch) < max_rows:
         row = rows[idx]
         t = len(json.dumps(row, ensure_ascii=False)) // 3
         if batch and tokens + t > budget:
