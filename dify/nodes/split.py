@@ -26,10 +26,11 @@ def main(rows: list, offset: int = 0, token_budget: str = "6000", max_batch: str
 
     while idx < len(rows) and len(batch) < max_rows:
         row = rows[idx]
-        t = len(json.dumps(row, ensure_ascii=False)) // 3
+        row_str = json.dumps(row, ensure_ascii=False)
+        t = len(row_str) // 3
         if batch and tokens + t > budget:
             break
-        batch.append(row)
+        batch.append(row_str)
         tokens += t
         idx += 1
 
