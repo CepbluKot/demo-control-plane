@@ -10,11 +10,9 @@ Inputs:
   max_batch     (str)           — макс. строк в одном батче (default "29")
   n_parallel    (str)           — сколько батчей вернуть за раз (default "3")
 Outputs:
-  batches      (Array[Array[String]]) — N батчей для параллельной обработки
-  next_offset  (Number)               — offset для следующей итерации
-  has_more     (Number)               — 1 если ещё есть данные, 0 если конец
-  batch_starts (Array[String])        — period_start каждого батча
-  batch_ends   (Array[String])        — period_end каждого батча
+  batches     (Array[Object]) — N объектов вида {rows, start, end}
+  next_offset (Number)
+  has_more    (Number)        — 1 если ещё есть данные, 0 если конец
 """
 import json
 
@@ -41,25 +39,25 @@ def main(rows: list, offset: int = 0, token_budget: str = "6000",
     n          = int(n_parallel)
     idx        = int(offset)
 
-    batches      = []
-    batch_starts = []
-    batch_ends   = []
+    batches = []
 
     for _ in range(n):
         if idx >= len(rows):
-            break
+            batches.append({"rows": [], "start": "", "end": ""})
+            continue
         batch, idx = _take_batch(rows, idx, budget, max_rows)
         if not batch:
-            break
+            batches.append({"rows": [], "start": "", "end": ""})
+            continue
         parsed = [json.loads(s) for s in batch]
-        batches.append(batch)
-        batch_starts.append(min(r.get("timestamp", "") for r in parsed))
-        batch_ends.append(max(r.get("end_time") or r.get("timestamp", "") for r in parsed))
+        batches.append({
+            "rows":  batch,
+            "start": min(r.get("timestamp", "") for r in parsed),
+            "end":   max(r.get("end_time") or r.get("timestamp", "") for r in parsed),
+        })
 
     return {
-        "batches":      batches,
-        "next_offset":  idx,
-        "has_more":     1 if idx < len(rows) else 0,
-        "batch_starts": batch_starts,
-        "batch_ends":   batch_ends,
+        "batches":     batches,
+        "next_offset": idx,
+        "has_more":    1 if idx < len(rows) else 0,
     }
