@@ -1,19 +1,45 @@
 """Dify Code Node: Reduce — Update State
 
-Дописывает merged в конец remaining, обновляет global items.
-
 Inputs:
-  remaining (Array[Object]) — из take_group
-  merged    (Object)        — распаршенный результат мержа
+  items      (Array[Object]) — global
+  next_items (Array[Object]) — global: аккумулятор текущего прохода
+  merged     (Object)        — распаршенный результат мержа
+  new_offset (Number)        — из take_group
+  has_more   (Number)        — из take_group
 Outputs:
-  items (Array[Object]) — новый global items
-  done  (Number)        — 1 если остался 1 элемент (финал)
+  items      (Array[Object]) — новый global items
+  next_items (Array[Object]) — новый global next_items
+  offset     (Number)        — новый global offset
+  done       (Number)        — 1 если финальный результат готов
 """
 
 
-def main(remaining: list, merged: dict) -> dict:
-    items = remaining + [merged]
-    return {
-        "items": items,
-        "done":  1 if len(items) == 1 else 0,
-    }
+def main(items: list, next_items: list, merged: dict,
+         new_offset: int, has_more: int) -> dict:
+    next_items = next_items + [merged]
+
+    if has_more:
+        # продолжаем текущий проход
+        return {
+            "items":      items,
+            "next_items": next_items,
+            "offset":     new_offset,
+            "done":       0,
+        }
+    else:
+        # проход завершён
+        if len(next_items) == 1:
+            return {
+                "items":      next_items,
+                "next_items": [],
+                "offset":     0,
+                "done":       1,
+            }
+        else:
+            # начинаем следующий проход
+            return {
+                "items":      next_items,
+                "next_items": [],
+                "offset":     0,
+                "done":       0,
+            }
