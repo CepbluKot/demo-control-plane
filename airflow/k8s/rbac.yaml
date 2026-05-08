@@ -1,0 +1,26 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: airflow-log-summarizer
+  namespace: airflow   # namespace где запускаются поды пайплайна
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: airflow-log-summarizer
+  namespace: airflow   # namespace где запускаются поды пайплайна
+subjects:
+  - kind: ServiceAccount
+    name: airflow-worker  # SA Airflow-воркера — поправь под свой кластер
+    namespace: airflow    # namespace где живёт Airflow
+roleRef:
+  kind: Role
+  name: airflow-log-summarizer
+  apiGroup: rbac.authorization.k8s.io
