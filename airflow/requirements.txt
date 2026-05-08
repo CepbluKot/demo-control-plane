@@ -1,0 +1,11 @@
+clickhouse-connect
+pydantic
+pydantic-settings
+instructor
+openai
+httpx
+numpy
+pandas
+prometheus-api-client
+pyod
+ruptures
