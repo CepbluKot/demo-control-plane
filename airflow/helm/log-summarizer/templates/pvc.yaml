@@ -1,10 +1,8 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "log-summarizer.dataPVC" . }}
+  name: log-summarizer-data
   namespace: {{ .Values.namespace }}
-  labels:
-    {{- include "log-summarizer.labels" . | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteMany
@@ -16,10 +14,8 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "log-summarizer.runsPVC" . }}
+  name: log-summarizer-runs
   namespace: {{ .Values.namespace }}
-  labels:
-    {{- include "log-summarizer.labels" . | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteMany
