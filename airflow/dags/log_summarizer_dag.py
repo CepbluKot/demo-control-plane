@@ -5,15 +5,10 @@ Airflow DAG: Log Summarizer (incident analysis)
 Читает логи из ClickHouse, применяет MAP-REDUCE через LLM,
 записывает Markdown-отчёт в примонтированный PVC /data.
 
-Airflow Variables (Admin → Variables):
-  LLM_API_BASE        — например http://llm-server:8000
-  LLM_API_KEY         — API ключ
-  LLM_MODEL           — название модели
-  CH_HOST             — хост ClickHouse
-  CH_PORT             — HTTP-порт ClickHouse (обычно 8123)
-  CH_USER             — пользователь ClickHouse
-  CH_PASSWORD         — пароль ClickHouse
-  CH_DATABASE         — база данных ClickHouse
+Credentials (LLM, ClickHouse) берутся из Kubernetes Secret «log-summarizer-credentials»,
+который создаётся Helm-чартом airflow/helm/log-summarizer.
+
+Airflow Variables (Admin → Variables) — только инфра:
   LOG_SUMMARIZER_IMAGE     — образ (default: registry.your-company.com/log-summarizer:latest)
   LOG_SUMMARIZER_NAMESPACE — namespace для подов (default: airflow)
   LOG_SUMMARIZER_DATA_PVC  — PVC с данными (default: log-summarizer-data)
@@ -49,6 +44,9 @@ IMAGE     = Variable.get("LOG_SUMMARIZER_IMAGE",     default_var="registry.your-
 NAMESPACE = Variable.get("LOG_SUMMARIZER_NAMESPACE", default_var="airflow")
 DATA_PVC  = Variable.get("LOG_SUMMARIZER_DATA_PVC",  default_var="log-summarizer-data")
 RUNS_PVC  = Variable.get("LOG_SUMMARIZER_RUNS_PVC",  default_var="log-summarizer-runs")
+
+# Secret создаётся Helm-чартом helm/log-summarizer
+CREDENTIALS_SECRET = "log-summarizer-credentials"
 
 # ── DAG ───────────────────────────────────────────────────────────────────────
 
@@ -140,19 +138,16 @@ with DAG(
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
-            # --tool-calling — флаг без значения, добавляем только если true
             "{% if params.tool_calling %}--tool-calling{% endif %}",
         ],
 
+        # Credentials берём из Secret; SQL передаём отдельно через env_vars
+        env_from=[
+            k8s.V1EnvFromSource(
+                secret_ref=k8s.V1SecretEnvSource(name=CREDENTIALS_SECRET),
+            ),
+        ],
         env_vars=[
-            k8s.V1EnvVar(name="LLM_API_BASE", value="{{ var.value.LLM_API_BASE }}"),
-            k8s.V1EnvVar(name="LLM_API_KEY",  value="{{ var.value.LLM_API_KEY }}"),
-            k8s.V1EnvVar(name="LLM_MODEL",    value="{{ var.value.LLM_MODEL }}"),
-            k8s.V1EnvVar(name="CH_HOST",      value="{{ var.value.CH_HOST }}"),
-            k8s.V1EnvVar(name="CH_PORT",      value="{{ var.value.CH_PORT }}"),
-            k8s.V1EnvVar(name="CH_USER",      value="{{ var.value.CH_USER }}"),
-            k8s.V1EnvVar(name="CH_PASSWORD",  value="{{ var.value.CH_PASSWORD }}"),
-            k8s.V1EnvVar(name="CH_DATABASE",  value="{{ var.value.CH_DATABASE }}"),
             # SQL через env — избегаем проблем с экранированием спецсимволов
             k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
             k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql }}"),

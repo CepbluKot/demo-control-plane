@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "log-summarizer.dataPVC" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "log-summarizer.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: {{ .Values.storage.data.size }}
+  storageClassName: {{ .Values.storage.className }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "log-summarizer.runsPVC" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "log-summarizer.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: {{ .Values.storage.runs.size }}
+  storageClassName: {{ .Values.storage.className }}

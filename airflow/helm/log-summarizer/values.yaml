@@ -1,0 +1,42 @@
+# Namespace где Airflow запускает поды пайплайна
+namespace: airflow
+
+image:
+  repository: registry.your-company.com/log-summarizer
+  tag: latest
+  pullPolicy: Always
+
+# PersistentVolumeClaims
+storage:
+  className: nfs   # замени на свой StorageClass
+  data:
+    size: 10Gi     # входные .sql-файлы и выходные отчёты
+  runs:
+    size: 50Gi     # артефакты pipeline: map/, reduce/, llm/
+
+# RBAC — какой ServiceAccount Airflow-воркера получает права создавать поды
+rbac:
+  serviceAccountName: airflow-worker   # SA воркера в airflowNamespace
+  airflowNamespace: airflow            # namespace где живёт Airflow
+
+# Credentials — кладутся в Secret и пробрасываются в под через envFrom
+llm:
+  apiBase: "http://llm-server:8000"
+  apiKey: "sk-placeholder"
+  model: "qwen2.5-72b-instruct"
+
+clickhouse:
+  host: "clickhouse"
+  port: "8123"
+  user: "default"
+  password: ""
+  database: "default"
+
+# Ресурсы пода пайплайна
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
