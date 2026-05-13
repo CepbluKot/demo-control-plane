@@ -6,3 +6,7 @@ storage:
     size: 10Gi
   runs:
     size: 50Gi
+
+rbac:
+  serviceAccountName: airflow-worker
+  airflowNamespace: airflow
