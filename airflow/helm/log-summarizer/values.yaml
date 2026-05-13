@@ -1,4 +1,4 @@
-namespace: airflow
+namespace: k-ndp-v01-ndp-monitor-clickhouse-full-benchmark
 
 storage:
   className: nfs
@@ -8,5 +8,5 @@ storage:
     size: 50Gi
 
 rbac:
-  serviceAccountName: airflow-worker
-  airflowNamespace: airflow
+  serviceAccountName: airflow-multiinstance
+  airflowNamespace: k-ndp-v01-ndp-monitor-airflow
