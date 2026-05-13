@@ -141,7 +141,6 @@ with DAG(
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
-            "{% if params.tool_calling %}--tool-calling{% endif %}",
         ],
 
         env_vars=[
@@ -153,14 +152,20 @@ with DAG(
             k8s.V1EnvVar(name="CH_USER",      value="{{ var.value.CH_USER }}"),
             k8s.V1EnvVar(name="CH_PASSWORD",  value="{{ var.value.CH_PASSWORD }}"),
             k8s.V1EnvVar(name="CH_DATABASE",  value="{{ var.value.CH_DATABASE }}"),
+            k8s.V1EnvVar(name="LLM_TOOL_CALLING", value="{{ 'true' if params.tool_calling else 'false' }}"),
             # SQL через env — избегаем проблем с экранированием спецсимволов
             k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
             k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql }}"),
         ],
 
-        security_context=k8s.V1PodSecurityContext(),
+        security_context=k8s.V1PodSecurityContext(
+            run_as_non_root=True,
+            run_as_user=1000,
+        ),
         container_security_context=k8s.V1SecurityContext(
             read_only_root_filesystem=True,
+            run_as_non_root=True,
+            run_as_user=1000,
         ),
 
         volumes=[
