@@ -158,6 +158,11 @@ with DAG(
             k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql }}"),
         ],
 
+        security_context=k8s.V1PodSecurityContext(),
+        container_security_context=k8s.V1SecurityContext(
+            read_only_root_filesystem=True,
+        ),
+
         volumes=[
             k8s.V1Volume(
                 name="data",
@@ -167,11 +172,16 @@ with DAG(
                 name="runs",
                 persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=RUNS_PVC),
             ),
+            k8s.V1Volume(
+                name="tmp",
+                empty_dir=k8s.V1EmptyDirVolumeSource(),
+            ),
         ],
 
         volume_mounts=[
             k8s.V1VolumeMount(name="data", mount_path="/data"),
             k8s.V1VolumeMount(name="runs", mount_path="/app/runs"),
+            k8s.V1VolumeMount(name="tmp",  mount_path="/tmp"),
         ],
 
         container_resources=k8s.V1ResourceRequirements(
