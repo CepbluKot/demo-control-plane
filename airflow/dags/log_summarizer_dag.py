@@ -14,18 +14,17 @@ Airflow Variables (Admin → Variables):
   CH_USER       — пользователь ClickHouse
   CH_PASSWORD   — пароль ClickHouse
   CH_DATABASE   — база данных ClickHouse
+  LOGS_SQL      — SQL-шаблон для логов (многострочный — редактировать здесь)
+  METRICS_SQL   — SQL-шаблон для метрик (опционально)
   LOG_SUMMARIZER_IMAGE     — образ (default: registry.your-company.com/log-summarizer:latest)
   LOG_SUMMARIZER_NAMESPACE — namespace для подов (default: airflow)
   LOG_SUMMARIZER_DATA_PVC  — PVC с данными (default: log-summarizer-data)
   LOG_SUMMARIZER_RUNS_PVC  — PVC для артефактов (default: log-summarizer-runs)
 
-Params (задаются при ручном триггере или в dag_run.conf):
+Params (задаются при ручном триггере):
   incident_context     — описание инцидента в свободной форме
   start                — начало инцидента ISO8601 (напр. 2024-01-15T14:00:00)
   end                  — конец инцидента ISO8601
-  logs_sql             — SQL-шаблон или путь к .sql-файлу в /data
-                         Плейсхолдеры: {last_ts}, {period_end}, {limit}, {raw_limit}
-  metrics_sql          — SQL-шаблон для метрик (опционально)
   output_path          — путь для отчёта внутри пода (/data/...)
   context_tokens       — размер контекста модели в токенах (default 150000)
   map_concurrency      — параллельность MAP (default 5)
@@ -46,10 +45,9 @@ from kubernetes.client import models as k8s
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
 IMAGE     = Variable.get("LOG_SUMMARIZER_IMAGE",     default_var="registry.your-company.com/log-summarizer:latest")
-NAMESPACE = Variable.get("LOG_SUMMARIZER_NAMESPACE", default_var="airflow")
+NAMESPACE = Variable.get("LOG_SUMMARIZER_NAMESPACE", default_var="k-ndp-v01-ndp-monitor-clickhouse-full-benchmark")
 DATA_PVC  = Variable.get("LOG_SUMMARIZER_DATA_PVC",  default_var="log-summarizer-data")
 RUNS_PVC  = Variable.get("LOG_SUMMARIZER_RUNS_PVC",  default_var="log-summarizer-runs")
-
 
 # ── DAG ───────────────────────────────────────────────────────────────────────
 
@@ -85,16 +83,12 @@ with DAG(
         "logs_sql": Param(
             "",
             type="string",
-            description=(
-                "SQL в base64. Закодировать: base64 -w0 logs.sql. "
-                "Плейсхолдеры: {last_ts}, {period_end}, {limit}, {raw_limit}. "
-                "Колонки: timestamp, end_time, raw_line."
-            ),
+            description="SQL-шаблон для логов. Плейсхолдеры: {last_ts}, {period_end}, {limit}, {raw_limit}.",
         ),
         "metrics_sql": Param(
             None,
             type=["null", "string"],
-            description="SQL-шаблон для метрик (опционально). Путь к .sql или inline SQL.",
+            description="SQL-шаблон для метрик (опционально).",
         ),
         "output_path": Param(
             "/data/report.md",
@@ -153,9 +147,8 @@ with DAG(
             k8s.V1EnvVar(name="CH_PASSWORD",  value="{{ var.value.CH_PASSWORD }}"),
             k8s.V1EnvVar(name="CH_DATABASE",  value="{{ var.value.CH_DATABASE }}"),
             k8s.V1EnvVar(name="LLM_TOOL_CALLING", value="{{ 'true' if params.tool_calling else 'false' }}"),
-            # SQL передаём base64 — избегаем проблем с переносами строк
-            k8s.V1EnvVar(name="LOGS_SQL_B64",    value="{{ params.logs_sql }}"),
-            k8s.V1EnvVar(name="METRICS_SQL_B64", value="{{ params.metrics_sql or '' }}"),
+            k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
+            k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql or '' }}"),
         ],
 
         security_context=k8s.V1PodSecurityContext(
