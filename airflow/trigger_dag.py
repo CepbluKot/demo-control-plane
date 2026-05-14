@@ -109,8 +109,8 @@ def main() -> None:
             "incident_context":     INCIDENT_CONTEXT,
             "start":                PERIOD_START,
             "end":                  PERIOD_END,
-            "logs_sql":             b64encode(LOGS_SQL.strip().encode()).decode(),
-            "metrics_sql":          b64encode(METRICS_SQL.strip().encode()).decode() if METRICS_SQL else None,
+            "logs_sql":             LOGS_SQL.strip(),
+            "metrics_sql":          METRICS_SQL,
             "output_path":          OUTPUT_PATH,
             "context_tokens":       CONTEXT_TOKENS,
             "map_concurrency":      MAP_CONCURRENCY,
@@ -141,8 +141,8 @@ def main() -> None:
         print(f"HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"dag_run_id : {result['dag_run_id']}")
-    print(f"state      : {result['state']}")
+    print(f"dag_run_id:   {result['dag_run_id']}")
+    print(f"state:        {result['state']}")
     print(f"logical_date: {result.get('logical_date', '—')}")
 
 

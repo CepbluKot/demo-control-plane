@@ -125,9 +125,15 @@ def _read_sql(value: str | None) -> str:
     """Если value — путь к файлу, читаем его; иначе возвращаем как есть."""
     if not value:
         return ""
-    path = Path(value)
-    if path.exists() and path.suffix in (".sql", ".txt"):
-        return path.read_text(encoding="utf-8").strip()
+    # Если строка содержит переносы или пробелы — это SQL, не путь
+    if "\n" in value or " " in value:
+        return value.strip()
+    try:
+        path = Path(value)
+        if path.exists() and path.suffix in (".sql", ".txt"):
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
     return value.strip()
 
 
