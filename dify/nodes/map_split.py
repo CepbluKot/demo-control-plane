@@ -3,6 +3,9 @@
 Берёт плоский список логов и возвращает N батчей за один вызов —
 по одному на каждый параллельный LLM-вызов в Dify.
 
+Каждый элемент батча — полная JSON-строка строки лога (никаких обрывков).
+Токенный бюджет контролирует сколько строк попадает в один батч.
+
 Inputs:
   rows          (Array[Object]) — полный список логов (global переменная)
   offset        (Number)        — с какой строки начинать (global, начало = 0)
@@ -11,7 +14,7 @@ Inputs:
   n_parallel    (str)           — сколько батчей за раз (default "3")
 
 Outputs:
-  batch_1 .. batch_N  (Array[String]) — строки батча (json-сериализованные)
+  batch_1 .. batch_N  (Array[String]) — полные JSON-строки строк лога
   next_offset         (Number)
   has_more            (Number)        — 1 если ещё есть данные, 0 если конец
   batch_start         (String)        — min timestamp по всем батчам итерации
@@ -33,8 +36,11 @@ def main(
     n        = int(n_parallel)
     idx      = int(offset)
 
-    result     = {}
-    all_parsed = []
+    if isinstance(rows, str):
+        rows = json.loads(rows)
+
+    result   = {}
+    all_rows = []
 
     for i in range(1, n + 1):
         batch  = []
@@ -47,13 +53,13 @@ def main(
                 break
             batch.append(row_str)
             tokens += t
+            all_rows.append(rows[idx])
             idx += 1
 
         result[f"batch_{i}"] = batch
-        all_parsed.extend(json.loads(s) for s in batch)
 
-    batch_start = min((r.get("timestamp", "") for r in all_parsed), default="")
-    batch_end   = max((r.get("end_time") or r.get("timestamp", "") for r in all_parsed), default="")
+    batch_start = min((_ts(r) for r in all_rows), default="")
+    batch_end   = max((_te(r) for r in all_rows), default="")
 
     result["next_offset"] = idx
     result["has_more"]    = 1 if idx < len(rows) else 0
@@ -61,3 +67,19 @@ def main(
     result["batch_end"]   = batch_end
 
     return result
+
+
+def _ts(row: dict) -> str:
+    for k in ("timestamp", "time", "ts"):
+        v = row.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _te(row: dict) -> str:
+    for k in ("end_time", "timestamp", "time", "ts"):
+        v = row.get(k)
+        if v:
+            return str(v)
+    return ""
