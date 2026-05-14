@@ -137,19 +137,19 @@ with DAG(
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
         ],
 
-        env_vars=[
-            k8s.V1EnvVar(name="LLM_API_BASE", value="{{ var.value.LLM_API_BASE }}"),
-            k8s.V1EnvVar(name="LLM_API_KEY",  value="{{ var.value.LLM_API_KEY }}"),
-            k8s.V1EnvVar(name="LLM_MODEL",    value="{{ var.value.LLM_MODEL }}"),
-            k8s.V1EnvVar(name="CH_HOST",      value="{{ var.value.CH_HOST }}"),
-            k8s.V1EnvVar(name="CH_PORT",      value="{{ var.value.CH_PORT }}"),
-            k8s.V1EnvVar(name="CH_USER",      value="{{ var.value.CH_USER }}"),
-            k8s.V1EnvVar(name="CH_PASSWORD",  value="{{ var.value.CH_PASSWORD }}"),
-            k8s.V1EnvVar(name="CH_DATABASE",  value="{{ var.value.CH_DATABASE }}"),
-            k8s.V1EnvVar(name="LLM_TOOL_CALLING", value="{{ 'true' if params.tool_calling else 'false' }}"),
-            k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
-            k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql or '' }}"),
-        ],
+        env_vars={
+            "LLM_API_BASE":    "{{ var.value.LLM_API_BASE }}",
+            "LLM_API_KEY":     "{{ var.value.LLM_API_KEY }}",
+            "LLM_MODEL":       "{{ var.value.LLM_MODEL }}",
+            "CH_HOST":         "{{ var.value.CH_HOST }}",
+            "CH_PORT":         "{{ var.value.CH_PORT }}",
+            "CH_USER":         "{{ var.value.CH_USER }}",
+            "CH_PASSWORD":     "{{ var.value.CH_PASSWORD }}",
+            "CH_DATABASE":     "{{ var.value.CH_DATABASE }}",
+            "LLM_TOOL_CALLING": "{{ 'true' if params.tool_calling else 'false' }}",
+            "LOGS_SQL":        "{{ params.logs_sql }}",
+            "METRICS_SQL":     "{{ params.metrics_sql or '' }}",
+        },
 
         security_context=k8s.V1PodSecurityContext(
             run_as_non_root=True,
