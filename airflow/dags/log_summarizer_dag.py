@@ -92,8 +92,8 @@ with DAG(
             ),
         ),
         "metrics_sql": Param(
-            "",
-            type="string",
+            None,
+            type=["null", "string"],
             description="SQL-шаблон для метрик (опционально). Путь к .sql или inline SQL.",
         ),
         "output_path": Param(
@@ -155,7 +155,7 @@ with DAG(
             k8s.V1EnvVar(name="LLM_TOOL_CALLING", value="{{ 'true' if params.tool_calling else 'false' }}"),
             # SQL через env — избегаем проблем с экранированием спецсимволов
             k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
-            k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql }}"),
+            k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql or '' }}"),
         ],
 
         security_context=k8s.V1PodSecurityContext(
