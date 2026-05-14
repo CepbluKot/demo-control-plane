@@ -1,72 +1,63 @@
-"""Dify Code Node: MAP Split
+"""Dify Code Node: Split (multi-batch)
 
-Splits log rows into N equal chunks for parallel MAP execution.
-The output array feeds into an Iteration node (parallel=true),
-each item becomes the user message for one LLM MAP call.
+Берёт плоский список логов и возвращает N батчей за один вызов —
+по одному на каждый параллельный LLM-вызов в Dify.
 
-IN:
-  logs           (str) — JSON string: list of log row objects from ClickHouse.
-                         Each row must have "raw_line" and optionally "timestamp".
-  n              (int) — number of chunks (= number of parallel LLM calls).
-  incident_start (str) — ISO8601 incident start, e.g. "2026-03-18T01:00:00"
-  incident_end   (str) — ISO8601 incident end
+Inputs:
+  rows          (Array[Object]) — полный список логов (global переменная)
+  offset        (Number)        — с какой строки начинать (global, начало = 0)
+  token_budget  (str)           — токенов на один батч (default "6000")
+  max_batch     (str)           — макс. строк в одном батче (default "29")
+  n_parallel    (str)           — сколько батчей за раз (default "3")
 
-OUT:
-  batches        (array[str]) — N formatted text blocks, one per LLM call.
-  chunk_count    (int)        — actual chunks produced (≤ n).
-
-Wire-up:
-  Iteration node → input array: map_split.batches
-  LLM node inside Iteration → user message: {{#item#}}
+Outputs:
+  batch_1 .. batch_N  (Array[String]) — строки батча (json-сериализованные)
+  next_offset         (Number)
+  has_more            (Number)        — 1 если ещё есть данные, 0 если конец
+  batch_start         (String)        — min timestamp по всем батчам итерации
+  batch_end           (String)        — max timestamp по всем батчам итерации
 """
 
 import json
-import math
 
 
-def main(logs: str, n: int, incident_start: str = "", incident_end: str = "") -> dict:
-    try:
-        rows = json.loads(logs) if isinstance(logs, str) else list(logs)
-    except (json.JSONDecodeError, ValueError):
-        return {"batches": [], "chunk_count": 0}
+def main(
+    rows: list,
+    offset: int = 0,
+    token_budget: str = "6000",
+    max_batch: str = "29",
+    n_parallel: str = "3",
+) -> dict:
+    budget   = int(token_budget)
+    max_rows = int(max_batch)
+    n        = int(n_parallel)
+    idx      = int(offset)
 
-    if not rows or n <= 0:
-        return {"batches": [], "chunk_count": 0}
+    result     = {}
+    all_parsed = []
 
-    n = min(n, len(rows))
-    size = math.ceil(len(rows) / n)
+    for i in range(1, n + 1):
+        batch  = []
+        tokens = 0
 
-    chunks = [rows[i : i + size] for i in range(0, len(rows), size)]
-    batches = [_format_chunk(chunk, incident_start, incident_end) for chunk in chunks]
+        while idx < len(rows) and len(batch) < max_rows:
+            row_str = json.dumps(rows[idx], ensure_ascii=False)
+            t = len(row_str) // 3
+            if batch and tokens + t > budget:
+                break
+            batch.append(row_str)
+            tokens += t
+            idx += 1
 
-    return {"batches": batches, "chunk_count": len(batches)}
+        result[f"batch_{i}"] = batch
+        all_parsed.extend(json.loads(s) for s in batch)
 
+    batch_start = min((r.get("timestamp", "") for r in all_parsed), default="")
+    batch_end   = max((r.get("end_time") or r.get("timestamp", "") for r in all_parsed), default="")
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+    result["next_offset"] = idx
+    result["has_more"]    = 1 if idx < len(rows) else 0
+    result["batch_start"] = batch_start
+    result["batch_end"]   = batch_end
 
-def _zone(ts: str, start: str, end: str) -> str:
-    """Return zone prefix based on ISO8601 string comparison."""
-    if not ts or not start or not end:
-        return "INC"
-    t = ts[:19]
-    if t < start[:19]:
-        return "CB"
-    if t > end[:19]:
-        return "CA"
-    return "INC"
-
-
-def _format_chunk(rows: list, incident_start: str, incident_end: str) -> str:
-    """Format a list of log row dicts as a single text block for the LLM."""
-    lines = []
-    for row in rows:
-        if isinstance(row, str):
-            lines.append(row)
-            continue
-        raw = row.get("raw_line") or json.dumps(row, ensure_ascii=False)
-        ts = str(
-            row.get("timestamp") or row.get("time") or row.get("ts") or ""
-        )
-        prefix = _zone(ts, incident_start, incident_end)
-        lines.append(f"[{prefix}] {raw}")
-    return "\n".join(lines)
+    return result
