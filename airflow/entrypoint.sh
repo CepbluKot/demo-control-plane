@@ -14,8 +14,9 @@ for arg in "$@"; do
 done
 
 if [ -n "$OUTPUT_ARG" ] && [ -f "$OUTPUT_ARG" ]; then
+    mkdir -p /airflow/xcom
     python3 -c "
-import json, sys
+import json
 text = open('$OUTPUT_ARG').read()
 json.dump({'report': text}, open('/airflow/xcom/return.json', 'w'))
 "
