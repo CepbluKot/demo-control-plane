@@ -74,6 +74,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.getenv("INCIDENT_END"),
         help="Incident end time in ISO8601 format",
     )
+    inc.add_argument(
+        "--context-start",
+        default=os.getenv("CONTEXT_START"),
+        help="Log window start (default: incident_start - 1h)",
+    )
+    inc.add_argument(
+        "--context-end",
+        default=os.getenv("CONTEXT_END"),
+        help="Log window end (default: incident_end + 1h)",
+    )
 
     # ── LLM ────────────────────────────────────────────────────────────
     llm = p.add_argument_group("LLM")
@@ -179,6 +189,8 @@ async def _main(argv: list[str] | None = None) -> int:
         incident_context=args.context,
         incident_start=_parse_dt(args.start),
         incident_end=_parse_dt(args.end),
+        context_start=_parse_dt(args.context_start),
+        context_end=_parse_dt(args.context_end),
         model=args.model,
         api_base=args.api_base,
         api_key=args.api_key,

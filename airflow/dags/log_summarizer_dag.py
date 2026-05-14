@@ -90,6 +90,16 @@ with DAG(
             type=["null", "string"],
             description="SQL-шаблон для метрик (опционально).",
         ),
+        "context_start": Param(
+            None,
+            type=["null", "string"],
+            description="Начало окна загрузки логов ISO8601. По умолчанию: start - 1h.",
+        ),
+        "context_end": Param(
+            None,
+            type=["null", "string"],
+            description="Конец окна загрузки логов ISO8601. По умолчанию: end + 1h.",
+        ),
         "output_path": Param(
             "/data/report.md",
             type="string",
@@ -135,6 +145,10 @@ with DAG(
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
+            "{% if params.context_start %}--context-start{% endif %}",
+            "{% if params.context_start %}{{ params.context_start }}{% endif %}",
+            "{% if params.context_end %}--context-end{% endif %}",
+            "{% if params.context_end %}{{ params.context_end }}{% endif %}",
         ],
 
         env_vars={
@@ -161,6 +175,8 @@ with DAG(
             run_as_user=1000,
         ),
 
+        do_xcom_push=True,
+
         volumes=[
             k8s.V1Volume(
                 name="data",
@@ -174,12 +190,17 @@ with DAG(
                 name="tmp",
                 empty_dir=k8s.V1EmptyDirVolumeSource(),
             ),
+            k8s.V1Volume(
+                name="xcom",
+                empty_dir=k8s.V1EmptyDirVolumeSource(),
+            ),
         ],
 
         volume_mounts=[
             k8s.V1VolumeMount(name="data", mount_path="/data"),
             k8s.V1VolumeMount(name="runs", mount_path="/app/runs"),
             k8s.V1VolumeMount(name="tmp",  mount_path="/tmp"),
+            k8s.V1VolumeMount(name="xcom", mount_path="/airflow/xcom"),
         ],
 
         container_resources=k8s.V1ResourceRequirements(
