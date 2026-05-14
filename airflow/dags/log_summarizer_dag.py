@@ -9,11 +9,11 @@ Airflow Variables (Admin → Variables):
   LLM_API_BASE  — например http://llm-server:8000
   LLM_API_KEY   — API ключ
   LLM_MODEL     — название модели
-  CH_HOST       — хост ClickHouse
-  CH_PORT       — HTTP-порт ClickHouse (обычно 8123)
-  CH_USER       — пользователь ClickHouse
-  CH_PASSWORD   — пароль ClickHouse
-  CH_DATABASE   — база данных ClickHouse
+  CLICKHOUSE_MONLOG_HOST     — хост ClickHouse
+  CLICKHOUSE_MONLOG_PORT     — HTTP-порт ClickHouse (обычно 8123)
+  CLICKHOUSE_MONLOG_USER     — пользователь ClickHouse
+  CLICKHOUSE_MONLOG_PASSWORD — пароль ClickHouse
+  CH_DATABASE                — база данных ClickHouse
   LOGS_SQL      — SQL-шаблон для логов (многострочный — редактировать здесь)
   METRICS_SQL   — SQL-шаблон для метрик (опционально)
   LOG_SUMMARIZER_IMAGE     — образ (default: registry.your-company.com/log-summarizer:latest)
@@ -155,10 +155,10 @@ with DAG(
             "LLM_API_BASE":    "{{ var.value.LLM_API_BASE }}",
             "LLM_API_KEY":     "{{ var.value.LLM_API_KEY }}",
             "LLM_MODEL":       "{{ var.value.LLM_MODEL }}",
-            "CH_HOST":         "{{ var.value.CH_HOST }}",
-            "CH_PORT":         "{{ var.value.CH_PORT }}",
-            "CH_USER":         "{{ var.value.CH_USER }}",
-            "CH_PASSWORD":     "{{ var.value.CH_PASSWORD }}",
+            "CH_HOST":         "{{ var.value.CLICKHOUSE_MONLOG_HOST }}",
+            "CH_PORT":         "{{ var.value.CLICKHOUSE_MONLOG_PORT }}",
+            "CH_USER":         "{{ var.value.CLICKHOUSE_MONLOG_USER }}",
+            "CH_PASSWORD":     "{{ var.value.CLICKHOUSE_MONLOG_PASSWORD }}",
             "CH_DATABASE":     "{{ var.value.CH_DATABASE }}",
             "LLM_TOOL_CALLING": "{{ 'true' if params.tool_calling else 'false' }}",
             "LOGS_SQL":        "{{ params.logs_sql }}",
