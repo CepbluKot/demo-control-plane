@@ -83,10 +83,10 @@ with DAG(
             description="Конец инцидента ISO8601, напр. 2024-01-15T15:00:00",
         ),
         "logs_sql": Param(
-            "/data/logs.sql",
+            "",
             type="string",
             description=(
-                "SQL-шаблон или путь к .sql-файлу в /data. "
+                "SQL в base64. Закодировать: base64 -w0 logs.sql. "
                 "Плейсхолдеры: {last_ts}, {period_end}, {limit}, {raw_limit}. "
                 "Колонки: timestamp, end_time, raw_line."
             ),
@@ -153,9 +153,9 @@ with DAG(
             k8s.V1EnvVar(name="CH_PASSWORD",  value="{{ var.value.CH_PASSWORD }}"),
             k8s.V1EnvVar(name="CH_DATABASE",  value="{{ var.value.CH_DATABASE }}"),
             k8s.V1EnvVar(name="LLM_TOOL_CALLING", value="{{ 'true' if params.tool_calling else 'false' }}"),
-            # SQL через env — избегаем проблем с экранированием спецсимволов
-            k8s.V1EnvVar(name="LOGS_SQL",    value="{{ params.logs_sql }}"),
-            k8s.V1EnvVar(name="METRICS_SQL", value="{{ params.metrics_sql or '' }}"),
+            # SQL передаём base64 — избегаем проблем с переносами строк
+            k8s.V1EnvVar(name="LOGS_SQL_B64",    value="{{ params.logs_sql }}"),
+            k8s.V1EnvVar(name="METRICS_SQL_B64", value="{{ params.metrics_sql or '' }}"),
         ],
 
         security_context=k8s.V1PodSecurityContext(

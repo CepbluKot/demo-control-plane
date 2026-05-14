@@ -9,5 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY log_summarizer/ ./log_summarizer/
+COPY airflow/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-ENTRYPOINT ["python", "-m", "log_summarizer.main"]
+ENTRYPOINT ["/entrypoint.sh"]
