@@ -175,8 +175,6 @@ with DAG(
             run_as_user=1000,
         ),
 
-        do_xcom_push=True,
-
         volumes=[
             k8s.V1Volume(
                 name="data",
