@@ -25,6 +25,8 @@ Params (задаются при ручном триггере):
   incident_context     — описание инцидента в свободной форме
   start                — начало инцидента ISO8601 (напр. 2024-01-15T14:00:00)
   end                  — конец инцидента ISO8601
+  logs_sql             — SQL-шаблон для логов
+  metrics_sql          — SQL-шаблон для метрик (опционально)
   output_path          — путь для отчёта внутри пода (/data/...)
   context_tokens       — размер контекста модели в токенах (default 150000)
   map_concurrency      — параллельность MAP (default 5)
@@ -90,16 +92,6 @@ with DAG(
             type=["null", "string"],
             description="SQL-шаблон для метрик (опционально).",
         ),
-        "context_start": Param(
-            None,
-            type=["null", "string"],
-            description="Начало окна загрузки логов ISO8601. По умолчанию: start - 1h.",
-        ),
-        "context_end": Param(
-            None,
-            type=["null", "string"],
-            description="Конец окна загрузки логов ISO8601. По умолчанию: end + 1h.",
-        ),
         "output_path": Param(
             "/data/report.md",
             type="string",
@@ -145,10 +137,6 @@ with DAG(
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
-            "{% if params.context_start %}--context-start{% endif %}",
-            "{% if params.context_start %}{{ params.context_start }}{% endif %}",
-            "{% if params.context_end %}--context-end{% endif %}",
-            "{% if params.context_end %}{{ params.context_end }}{% endif %}",
         ],
 
         env_vars={

@@ -217,7 +217,6 @@ class DataLoader:
 
     def _execute_query(self, sql: str) -> list[dict]:
         """Выполняет SQL и возвращает список строк как dict."""
-        logger.info("Executing SQL:\n%s", sql)
         try:
             result = self.client.query(sql)
             if hasattr(result, "named_results"):

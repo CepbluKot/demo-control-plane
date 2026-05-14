@@ -20,10 +20,6 @@ INCIDENT_CONTEXT = "Airflow: массовые ошибки Pod creation failed (
 PERIOD_START     = "2026-03-18T01:00:00"   # UTC
 PERIOD_END       = "2026-03-18T04:00:00"   # UTC
 
-# Явное окно загрузки логов. None = автоматически ±1h от инцидента.
-CONTEXT_START    = None   # или "2026-03-18T01:00:00"
-CONTEXT_END      = None   # или "2026-03-18T04:00:00"
-
 OUTPUT_PATH          = "/data/report.md"
 CONTEXT_TOKENS       = 150000
 MAP_CONCURRENCY      = 5
@@ -113,8 +109,6 @@ def main() -> None:
             "incident_context":     INCIDENT_CONTEXT,
             "start":                PERIOD_START,
             "end":                  PERIOD_END,
-            "context_start":        CONTEXT_START,
-            "context_end":          CONTEXT_END,
             "logs_sql":             LOGS_SQL.strip(),
             "metrics_sql":          METRICS_SQL,
             "output_path":          OUTPUT_PATH,
