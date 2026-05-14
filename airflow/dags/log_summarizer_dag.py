@@ -190,17 +190,12 @@ with DAG(
                 name="tmp",
                 empty_dir=k8s.V1EmptyDirVolumeSource(),
             ),
-            k8s.V1Volume(
-                name="xcom",
-                empty_dir=k8s.V1EmptyDirVolumeSource(),
-            ),
         ],
 
         volume_mounts=[
             k8s.V1VolumeMount(name="data", mount_path="/data"),
             k8s.V1VolumeMount(name="runs", mount_path="/app/runs"),
             k8s.V1VolumeMount(name="tmp",  mount_path="/tmp"),
-            k8s.V1VolumeMount(name="xcom", mount_path="/airflow/xcom"),
         ],
 
         container_resources=k8s.V1ResourceRequirements(
