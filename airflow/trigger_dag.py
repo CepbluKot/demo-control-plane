@@ -33,55 +33,49 @@ LOGS_SQL = """
 SELECT
     start_time                        AS timestamp,
     end_time,
-    namespace,
-    container_name,
-    pod_name,
-    image_tag,
+    container,
+    pod,
+    node,
+    cluster,
     concat(
         '[', toString(start_time),
         ' → ', toString(end_time), ']',
         ' ×', toString(cnt),
-        '  ', namespace, '/', pod_name,
-        '  ', log_text
+        '  ', pod, '/', container,
+        '  ', message
     )                                 AS raw_line
 FROM (
     SELECT
-        min(timestamp)                                                      AS start_time,
-        max(timestamp)                                                      AS end_time,
-        min(log)                                                            AS log_text,
-        count()                                                             AS cnt,
-        any(kubernetes_namespace_name)                                      AS namespace,
-        any(kubernetes_container_name)                                      AS container_name,
-        any(kubernetes_pod_name)                                            AS pod_name,
-        arrayElement(splitByChar('/', any(kubernetes_container_image)), -1) AS image_tag
+        min(timestamp)  AS start_time,
+        max(timestamp)  AS end_time,
+        min(message)    AS message,
+        count()         AS cnt,
+        any(container)  AS container,
+        any(pod)        AS pod,
+        any(node)       AS node,
+        any(cluster)    AS cluster
     FROM (
         SELECT *,
             sum(is_new_group) OVER (
-                PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                PARTITION BY container, pod
                 ORDER BY timestamp ASC
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ) AS group_id
         FROM (
             SELECT *,
                 if(
-                    right(log, 10) != ifNull(
-                        lagInFrame(right(log, 10)) OVER (
-                            PARTITION BY kubernetes_namespace_name, kubernetes_container_name
+                    right(message, 10) != ifNull(
+                        lagInFrame(right(message, 10)) OVER (
+                            PARTITION BY container, pod
                             ORDER BY timestamp ASC
                         ), ''
                     ),
                     1, 0
                 ) AS is_new_group
-            FROM raw_lm.log_k8s_containers_MT
+            FROM shards.`logs_k8s_k-ndp-v01-dadm-streaming`
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND ext_ClusterName = 'ndp-p01'
-              AND (
-                    kubernetes_container_name LIKE '%airflow%'
-                    OR kubernetes_container_name LIKE '%spark%'
-                    OR kubernetes_namespace_name LIKE '%kube-system%'
-              )
-              AND multiSearchAny(lower(log), [
+              AND multiSearchAny(lower(message), [
                     'fatal', 'critical', 'error', 'exception',
                     'failed', 'failure', 'crash', 'timeout',
                     'out of memory', 'oom', 'killed', 'traceback'
@@ -90,7 +84,7 @@ FROM (
             LIMIT {raw_limit}
         )
     )
-    GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
+    GROUP BY group_id, container, pod
 )
 ORDER BY start_time ASC
 LIMIT {limit}
