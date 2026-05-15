@@ -16,10 +16,10 @@ Airflow Variables (Admin → Variables):
   CH_DATABASE                — база данных ClickHouse
   LOGS_SQL      — SQL-шаблон для логов (многострочный — редактировать здесь)
   METRICS_SQL   — SQL-шаблон для метрик (опционально)
-  LOG_SUMMARIZER_IMAGE     — образ (default: registry.your-company.com/log-summarizer:latest)
-  LOG_SUMMARIZER_NAMESPACE — namespace для подов (default: airflow)
-  LOG_SUMMARIZER_DATA_PVC  — PVC с данными (default: log-summarizer-data)
-  LOG_SUMMARIZER_RUNS_PVC  — PVC для артефактов (default: log-summarizer-runs)
+  LLM_LOG_SUMMARIZER_IMAGE     — образ (default: registry.your-company.com/log-summarizer:latest)
+  LLM_LOG_SUMMARIZER_NAMESPACE — namespace для подов (default: airflow)
+  LLM_LOG_SUMMARIZER_DATA_PVC  — PVC с данными (default: log-summarizer-data)
+  LLM_LOG_SUMMARIZER_RUNS_PVC  — PVC для артефактов (default: log-summarizer-runs)
 
 Params (задаются при ручном триггере):
   incident_context     — описание инцидента в свободной форме
@@ -46,10 +46,10 @@ from kubernetes.client import models as k8s
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-IMAGE     = Variable.get("LOG_SUMMARIZER_IMAGE",     default_var="registry.your-company.com/log-summarizer:latest")
-NAMESPACE = Variable.get("LOG_SUMMARIZER_NAMESPACE", default_var="k-ndp-v01-ndp-monitor-clickhouse-full-benchmark")
-DATA_PVC  = Variable.get("LOG_SUMMARIZER_DATA_PVC",  default_var="log-summarizer-data")
-RUNS_PVC  = Variable.get("LOG_SUMMARIZER_RUNS_PVC",  default_var="log-summarizer-runs")
+IMAGE     = Variable.get("LLM_LOG_SUMMARIZER_IMAGE",     default_var="registry.your-company.com/log-summarizer:latest")
+NAMESPACE = Variable.get("LLM_LOG_SUMMARIZER_NAMESPACE", default_var="k-ndp-v01-ndp-monitor-clickhouse-full-benchmark")
+DATA_PVC  = Variable.get("LLM_LOG_SUMMARIZER_DATA_PVC",  default_var="log-summarizer-data")
+RUNS_PVC  = Variable.get("LLM_LOG_SUMMARIZER_RUNS_PVC",  default_var="log-summarizer-runs")
 
 # ── DAG ───────────────────────────────────────────────────────────────────────
 
