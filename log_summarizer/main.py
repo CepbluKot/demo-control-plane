@@ -117,6 +117,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     out.add_argument("--log-file", default=None, help="Optional log file path")
 
+    # ── Сохранение в ClickHouse ────────────────────────────────────────
+    ch_out = p.add_argument_group("ClickHouse result")
+    ch_out.add_argument(
+        "--save-to-ch",
+        action="store_true",
+        default=os.getenv("SAVE_TO_CH", "").lower() in ("1", "true", "yes"),
+        help="Save report to ClickHouse table log_summarizer_runs",
+    )
+    ch_out.add_argument(
+        "--run-id",
+        default=os.getenv("AIRFLOW_RUN_ID", ""),
+        help="Run identifier stored in ClickHouse (dag_run_id from Airflow)",
+    )
+
     return p.parse_args(argv)
 
 
@@ -219,6 +233,22 @@ async def _main(argv: list[str] | None = None) -> int:
         print(f"Report written to: {args.output}", file=sys.stderr)
     else:
         print(report)
+
+    if args.save_to_ch:
+        from log_summarizer.ch_writer import save_report
+        save_report(
+            host=args.ch_host,
+            port=args.ch_port,
+            user=args.ch_user,
+            password=args.ch_password,
+            database=args.ch_database,
+            run_id=args.run_id,
+            incident_context=args.context,
+            incident_start=args.start or "",
+            incident_end=args.end or "",
+            report=report,
+            logs_sql=logs_sql,
+        )
 
     return 0
 

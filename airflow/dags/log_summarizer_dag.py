@@ -137,6 +137,8 @@ with DAG(
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
             "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
+            "--save-to-ch",
+            "--run-id",               "{{ run_id }}",
         ],
 
         env_vars={
@@ -148,7 +150,8 @@ with DAG(
             "CH_USER":         "{{ var.value.CLICKHOUSE_MONLOG_USER }}",
             "CH_PASSWORD":     "{{ var.value.CLICKHOUSE_MONLOG_PASSWORD }}",
             "CH_DATABASE":     "{{ var.value.CH_DATABASE }}",
-            "LLM_TOOL_CALLING": "{{ 'true' if params.tool_calling else 'false' }}",
+            "LLM_TOOL_CALLING":  "{{ 'true' if params.tool_calling else 'false' }}",
+            "AIRFLOW_RUN_ID":    "{{ run_id }}",
             "LOGS_SQL":        "{{ params.logs_sql }}",
             "METRICS_SQL":     "{{ params.metrics_sql or '' }}",
         },
