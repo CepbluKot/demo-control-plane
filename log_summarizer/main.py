@@ -100,7 +100,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pipe.add_argument("--map-concurrency", type=int, default=5)
     pipe.add_argument("--batch-size", type=int, default=1000, help="Log rows per ClickHouse page")
     pipe.add_argument("--max-events-per-merge", type=int, default=30)
-    pipe.add_argument("--max-reduce-rounds", type=int, default=15)
 
     # ── Вывод ──────────────────────────────────────────────────────────
     out = p.add_argument_group("Output")
@@ -204,7 +203,6 @@ async def _main(argv: list[str] | None = None) -> int:
         batch_size=args.batch_size,
         map_concurrency=args.map_concurrency,
         max_events_per_merge=args.max_events_per_merge,
-        max_reduce_rounds=args.max_reduce_rounds,
         model_supports_tool_calling=args.tool_calling,
     )
 

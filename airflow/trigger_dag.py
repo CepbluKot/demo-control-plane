@@ -25,7 +25,6 @@ CONTEXT_TOKENS       = 150000
 MAP_CONCURRENCY      = 5
 BATCH_SIZE           = 1000
 MAX_EVENTS_PER_MERGE = 30
-MAX_REDUCE_ROUNDS    = 15
 TOOL_CALLING         = False
 
 # ── SQL ───────────────────────────────────────────────────────────────────────
@@ -116,7 +115,6 @@ def main() -> None:
             "map_concurrency":      MAP_CONCURRENCY,
             "batch_size":           BATCH_SIZE,
             "max_events_per_merge": MAX_EVENTS_PER_MERGE,
-            "max_reduce_rounds":    MAX_REDUCE_ROUNDS,
             "tool_calling":         TOOL_CALLING,
         }
     }

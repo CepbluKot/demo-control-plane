@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from pathlib import Path
 from typing import Optional, Union
@@ -88,7 +89,7 @@ class TreeReducer:
         items: list[_Item] = list(batch_results)
         t_reduce = _time.monotonic()
 
-        for round_num in range(1, self.config.max_reduce_rounds + 1):
+        for round_num in itertools.count(1):
             if len(items) == 1:
                 break
 
@@ -155,13 +156,6 @@ class TreeReducer:
                 "REDUCE раунд %d  ✓  осталось элементов: %d  |  раунд за %s",
                 round_num, len(items), fmt_dur(_time.monotonic() - t_reduce),
             )
-        else:
-            logger.warning(
-                "Reduce did not converge in %d rounds — forcing final merge",
-                self.config.max_reduce_rounds,
-            )
-            if len(items) > 1:
-                items = [await self._merge_group(items, self.config.max_reduce_rounds + 1)]
 
         result = items[0]
         self._save_reduce_result(0, 0, result, name="final_merged")
@@ -207,7 +201,7 @@ class TreeReducer:
         _SEP = "─" * 68
         t_reduce = _time.monotonic()
 
-        for round_num in range(start_round, self.config.max_reduce_rounds + 1):
+        for round_num in itertools.count(start_round):
             if len(items) == 1:
                 break
 
@@ -261,10 +255,6 @@ class TreeReducer:
                 "REDUCE раунд %d  ✓  осталось элементов: %d  |  раунд за %s",
                 round_num, len(items), fmt_dur(_time.monotonic() - t_reduce),
             )
-        else:
-            logger.warning("Reduce did not converge — forcing final merge")
-            if len(items) > 1:
-                items = [await self._merge_group(items, self.config.max_reduce_rounds + 1)]
 
         result = items[0]
         self._save_reduce_result(0, 0, result, name="final_merged")

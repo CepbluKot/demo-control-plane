@@ -32,7 +32,6 @@ Params (задаются при ручном триггере):
   map_concurrency      — параллельность MAP (default 5)
   batch_size           — строк ClickHouse на страницу (default 1000)
   max_events_per_merge — макс. событий при слиянии REDUCE (default 30)
-  max_reduce_rounds    — макс. раундов REDUCE (default 15)
   tool_calling         — включить TOOLS mode в instructor (default false)
 """
 from __future__ import annotations
@@ -111,7 +110,6 @@ with DAG(
             description="Строк ClickHouse на страницу",
         ),
         "max_events_per_merge": Param(30, type="integer", minimum=5),
-        "max_reduce_rounds": Param(15, type="integer", minimum=1),
         "tool_calling": Param(
             False,
             type="boolean",
@@ -136,9 +134,6 @@ with DAG(
             "--map-concurrency",      "{{ params.map_concurrency | string }}",
             "--batch-size",           "{{ params.batch_size | string }}",
             "--max-events-per-merge", "{{ params.max_events_per_merge | string }}",
-            "--max-reduce-rounds",    "{{ params.max_reduce_rounds | string }}",
-            "--save-to-ch",
-            "--run-id",               "{{ run_id }}",
         ],
 
         env_vars={
@@ -150,6 +145,7 @@ with DAG(
             "CH_USER":         "{{ var.value.CLICKHOUSE_MONLOG_USER }}",
             "CH_PASSWORD":     "{{ var.value.CLICKHOUSE_MONLOG_PASSWORD }}",
             "CH_DATABASE":        "{{ var.value.CH_DATABASE }}",
+            "SAVE_TO_CH":         "true",
             "CH_RESULT_DATABASE": "{{ var.value.CH_RESULT_DATABASE }}",
             "LLM_TOOL_CALLING":   "{{ 'true' if params.tool_calling else 'false' }}",
             "AIRFLOW_RUN_ID":    "{{ run_id }}",

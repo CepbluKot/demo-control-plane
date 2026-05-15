@@ -75,7 +75,6 @@ class PipelineConfig:
     max_group_size: int = 4         # макс элементов в REDUCE-группе
     max_item_chars: int = 40_000    # лимит на 1 item перед merge
     compression_target_pct: int = 50    # % сжатия при overflow
-    max_reduce_rounds: int = 15     # максимум раундов дерева
     max_events_per_merge: int = 30  # макс events после каждого merge
 
     # Порог превентивной компрессии перед merge (суммарный размер входного payload в символах).
