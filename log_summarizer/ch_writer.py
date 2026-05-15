@@ -42,7 +42,7 @@ def save_report(
     port: int,
     user: str,
     password: str,
-    database: str,
+    result_database: str,
     run_id: str,
     incident_context: str,
     incident_start: str,
@@ -50,10 +50,10 @@ def save_report(
     report: str,
     logs_sql: str = "",
 ) -> None:
-    url = f"clickhouse+http://{user}:{password}@{host}:{port}/{database}"
+    url = f"clickhouse+http://{user}:{password}@{host}:{port}/{result_database}"
     engine = create_engine(url)
 
-    Base, LogSummarizerRun = _model(database)
+    Base, LogSummarizerRun = _model(result_database)
     Base.metadata.create_all(engine, checkfirst=True)
 
     with Session(engine) as session:
