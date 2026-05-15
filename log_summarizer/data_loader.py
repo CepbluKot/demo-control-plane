@@ -334,9 +334,11 @@ class DataLoader:
                 ts_dt = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
             else:
                 ts_dt = ts
-            if ts_dt < inc_start:
+            _start = inc_start.replace(tzinfo=timezone.utc) if inc_start.tzinfo is None else inc_start
+            _end   = inc_end.replace(tzinfo=timezone.utc)   if inc_end.tzinfo is None   else inc_end
+            if ts_dt < _start:
                 zone = "context_before"
-            elif ts_dt > inc_end:
+            elif ts_dt > _end:
                 zone = "context_after"
 
         return LogRow(
