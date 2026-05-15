@@ -33,27 +33,25 @@ LOGS_SQL = """
 SELECT
     start_time                        AS timestamp,
     end_time,
-    container,
-    pod,
-    node,
-    cluster,
+    ''                                AS namespace,
+    container_name,
+    pod_name,
+    ''                                AS image_tag,
     concat(
         '[', toString(start_time),
         ' → ', toString(end_time), ']',
         ' ×', toString(cnt),
-        '  ', pod, '/', container,
-        '  ', message
+        '  ', pod_name, '/', container_name,
+        '  ', log_text
     )                                 AS raw_line
 FROM (
     SELECT
         min(timestamp)  AS start_time,
         max(timestamp)  AS end_time,
-        min(message)    AS message,
+        min(message)    AS log_text,
         count()         AS cnt,
-        any(container)  AS container,
-        any(pod)        AS pod,
-        any(node)       AS node,
-        any(cluster)    AS cluster
+        any(container)  AS container_name,
+        any(pod)        AS pod_name
     FROM (
         SELECT *,
             sum(is_new_group) OVER (
@@ -75,6 +73,7 @@ FROM (
             FROM shards.`logs_k8s_k-ndp-v01-dadm-streaming`
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
+              AND cluster = 'ndp-v01'
               AND multiSearchAny(lower(message), [
                     'fatal', 'critical', 'error', 'exception',
                     'failed', 'failure', 'crash', 'timeout',

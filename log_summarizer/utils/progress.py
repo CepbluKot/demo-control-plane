@@ -112,9 +112,12 @@ class TimeProgress:
             page_tokens: Кол-во токенов в строках этой страницы.
         """
         elapsed = time.monotonic() - self._t0
-        cur = current.replace(tzinfo=timezone.utc) if current.tzinfo is None else current
-        done_sec = max(0.0, (cur - self._start).total_seconds())
-        pct = min(100.0, 100.0 * done_sec / self._total_sec)
+        cur_naive = current.replace(tzinfo=None) if hasattr(current, "replace") else current
+        start_naive = self._start.replace(tzinfo=None)
+        end_naive = self._end.replace(tzinfo=None)
+        total_sec = max(1.0, (end_naive - start_naive).total_seconds())
+        done_sec = max(0.0, (cur_naive - start_naive).total_seconds())
+        pct = min(100.0, 100.0 * done_sec / total_sec)
         if 0 < pct < 100 and elapsed > 0:
             eta_sec = elapsed / (pct / 100.0) - elapsed
             eta_str = f"~{fmt_dur(eta_sec)}"
