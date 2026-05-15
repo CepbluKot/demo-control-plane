@@ -130,8 +130,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run identifier stored in ClickHouse (dag_run_id from Airflow)",
     )
     ch_out.add_argument(
-        "--ch-result-database",
-        default=os.getenv("CH_RESULT_DATABASE", "default"),
+        "--result-database",
+        default=os.getenv("RESULT_DATABASE", "default"),
         help="ClickHouse database for storing pipeline results",
     )
 
@@ -244,7 +244,7 @@ async def _main(argv: list[str] | None = None) -> int:
             port=args.ch_port,
             user=args.ch_user,
             password=args.ch_password,
-            result_database=args.ch_result_database,
+            result_database=args.result_database,
             run_id=args.run_id,
             incident_context=args.context,
             incident_start=args.start or "",

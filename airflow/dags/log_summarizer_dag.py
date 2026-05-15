@@ -146,7 +146,7 @@ with DAG(
             "CH_PASSWORD":     "{{ var.value.CLICKHOUSE_MONLOG_PASSWORD }}",
             "CH_DATABASE":        "{{ var.value.CH_DATABASE }}",
             "SAVE_TO_CH":         "true",
-            "CH_RESULT_DATABASE": "{{ var.value.CH_RESULT_DATABASE }}",
+            "RESULT_DATABASE": "{{ var.value.RESULT_DATABASE }}",
             "LLM_TOOL_CALLING":   "{{ 'true' if params.tool_calling else 'false' }}",
             "AIRFLOW_RUN_ID":    "{{ run_id }}",
             "LOGS_SQL":        "{{ params.logs_sql }}",
