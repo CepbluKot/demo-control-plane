@@ -1,26 +1,21 @@
 """CLI-точка входа для Log Summarizer.
 
+Конфиг среды (CH, LLM) берётся из .env или переменных окружения через Settings.
+Run-специфичные параметры передаются через CLI.
+
 Использование:
     python -m log_summarizer.main \\
-        --model qwen2.5-72b-instruct \\
-        --api-base http://localhost:8000 \\
-        --api-key sk-placeholder \\
         --context "payments service OOM at ~14:30 UTC" \\
         --start "2024-01-15T14:00:00" \\
         --end   "2024-01-15T15:00:00" \\
-        --logs-sql  "SELECT ... FROM logs WHERE ..." \\
-        --ch-host   localhost \\
-        --ch-port   8123 \\
-        --output    report.md
-
-Или короткий вариант через переменные окружения (см. --help).
+        --logs-sql /path/to/query.sql \\
+        --output   report.md
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -33,116 +28,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── ClickHouse ─────────────────────────────────────────────────────
-    ch = p.add_argument_group("ClickHouse")
-    ch.add_argument("--ch-host", default=os.getenv("CH_HOST", "localhost"))
-    ch.add_argument("--ch-port", type=int, default=int(os.getenv("CH_PORT", "8123")))
-    ch.add_argument("--ch-user", default=os.getenv("CH_USER", "default"))
-    ch.add_argument("--ch-password", default=os.getenv("CH_PASSWORD", ""))
-    ch.add_argument("--ch-database", default=os.getenv("CH_DATABASE", "default"))
-
     # ── SQL-шаблоны ────────────────────────────────────────────────────
     sql = p.add_argument_group("SQL templates")
     sql.add_argument(
         "--logs-sql",
-        default=os.getenv("LOGS_SQL"),
-        help=(
-            "SQL template with {start_time}, {end_time}, {limit}, {offset} placeholders. "
-            "Can also be a path to a .sql file."
-        ),
+        default=None,
+        help="SQL template or path to .sql file. Placeholders: {last_ts}, {period_end}, {limit}, {raw_limit}.",
     )
     sql.add_argument(
         "--metrics-sql",
-        default=os.getenv("METRICS_SQL"),
-        help="Optional SQL template for metrics. Same placeholders. Path or inline SQL.",
+        default=None,
+        help="Optional SQL template for metrics (path or inline).",
     )
 
     # ── Инцидент ───────────────────────────────────────────────────────
     inc = p.add_argument_group("Incident")
-    inc.add_argument(
-        "--context",
-        default=os.getenv("INCIDENT_CONTEXT", ""),
-        help="Free-text description of the incident",
-    )
-    inc.add_argument(
-        "--start",
-        default=os.getenv("INCIDENT_START"),
-        help="Incident start time in ISO8601 format (e.g. 2024-01-15T14:00:00)",
-    )
-    inc.add_argument(
-        "--end",
-        default=os.getenv("INCIDENT_END"),
-        help="Incident end time in ISO8601 format",
-    )
-    # ── LLM ────────────────────────────────────────────────────────────
-    llm = p.add_argument_group("LLM")
-    llm.add_argument("--model", default=os.getenv("LLM_MODEL", "default-model"))
-    llm.add_argument(
-        "--api-base",
-        default=os.getenv("LLM_API_BASE", "http://localhost:8000"),
-    )
-    llm.add_argument("--api-key", default=os.getenv("LLM_API_KEY", "sk-placeholder"))
-    llm.add_argument(
-        "--context-tokens",
-        type=int,
-        default=int(os.getenv("LLM_CONTEXT_TOKENS", "150000")),
-        help="Model context window in tokens",
-    )
-    llm.add_argument(
-        "--tool-calling",
-        action="store_true",
-        default=os.getenv("LLM_TOOL_CALLING", "").lower() in ("1", "true", "yes"),
-        help="Enable TOOLS mode in instructor (disable for vLLM)",
-    )
+    inc.add_argument("--context", default="", help="Free-text description of the incident")
+    inc.add_argument("--start", default=None, help="Incident start ISO8601, e.g. 2024-01-15T14:00:00")
+    inc.add_argument("--end",   default=None, help="Incident end ISO8601")
 
     # ── Параметры пайплайна ────────────────────────────────────────────
     pipe = p.add_argument_group("Pipeline tuning")
-    pipe.add_argument("--map-concurrency", type=int, default=5)
-    pipe.add_argument("--batch-size", type=int, default=1000, help="Log rows per ClickHouse page")
-    pipe.add_argument("--max-events-per-merge", type=int, default=30)
+    pipe.add_argument("--map-concurrency",      type=int, default=None)
+    pipe.add_argument("--batch-size",           type=int, default=None, help="Log rows per ClickHouse page")
+    pipe.add_argument("--max-events-per-merge", type=int, default=None)
+    pipe.add_argument("--context-tokens",       type=int, default=None, help="Override LLM context window size")
 
     # ── Вывод ──────────────────────────────────────────────────────────
     out = p.add_argument_group("Output")
-    out.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Write report to this file (default: stdout)",
-    )
-    out.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
+    out.add_argument("--output", "-o", default=None, help="Write report to file (default: stdout)")
     out.add_argument("--log-file", default=None, help="Optional log file path")
-
-    # ── Сохранение в ClickHouse ────────────────────────────────────────
-    ch_out = p.add_argument_group("ClickHouse result")
-    ch_out.add_argument(
-        "--save-to-ch",
-        action="store_true",
-        default=os.getenv("SAVE_TO_CH", "").lower() in ("1", "true", "yes"),
-        help="Save report to ClickHouse table log_summarizer_runs",
-    )
-    ch_out.add_argument(
-        "--run-id",
-        default=os.getenv("AIRFLOW_RUN_ID", ""),
-        help="Run identifier stored in ClickHouse (dag_run_id from Airflow)",
-    )
-    ch_out.add_argument(
-        "--result-database",
-        default=os.getenv("RESULT_DATABASE", "default"),
-        help="ClickHouse database for storing pipeline results",
-    )
 
     return p.parse_args(argv)
 
 
 def _read_sql(value: str | None) -> str:
-    """Если value — путь к файлу, читаем его; иначе возвращаем как есть."""
     if not value:
         return ""
-    # Если строка содержит переносы или пробелы — это SQL, не путь
     if "\n" in value or " " in value:
         return value.strip()
     try:
@@ -157,7 +79,6 @@ def _read_sql(value: str | None) -> str:
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
-    # Пробуем несколько форматов
     for fmt in (
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M:%S.%f",
@@ -168,66 +89,58 @@ def _parse_dt(value: str | None) -> datetime | None:
             return datetime.strptime(value, fmt)
         except ValueError:
             continue
-    raise ValueError(
-        f"Cannot parse datetime: {value!r}. Expected ISO8601, e.g. 2024-01-15T14:00:00"
-    )
+    raise ValueError(f"Cannot parse datetime: {value!r}. Expected ISO8601, e.g. 2024-01-15T14:00:00")
 
 
 async def _main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    # Настраиваем логирование до любых импортов пайплайна
-    from log_summarizer.utils.logging import setup_pipeline_logging
+    from log_summarizer.settings import Settings
+    s = Settings()
 
-    setup_pipeline_logging(level=args.log_level, log_file=args.log_file)
+    from log_summarizer.utils.logging import setup_pipeline_logging
+    setup_pipeline_logging(level=s.log_level, log_file=args.log_file or s.log_file)
 
     from log_summarizer.config import PipelineConfig
     from log_summarizer.orchestrator import PipelineOrchestrator
 
-    # Подготовка конфига
     logs_sql = _read_sql(args.logs_sql)
     if not logs_sql:
         print("ERROR: --logs-sql is required", file=sys.stderr)
         return 2
 
     config = PipelineConfig(
-        logs_sql_templates=[logs_sql] if logs_sql else [],
+        logs_sql_templates=[logs_sql],
         metrics_sql_template=_read_sql(args.metrics_sql) or None,
         incident_context=args.context,
         incident_start=_parse_dt(args.start),
         incident_end=_parse_dt(args.end),
-        model=args.model,
-        api_base=args.api_base,
-        api_key=args.api_key,
-        max_context_tokens=args.context_tokens,
-        batch_size=args.batch_size,
-        map_concurrency=args.map_concurrency,
-        max_events_per_merge=args.max_events_per_merge,
-        model_supports_tool_calling=args.tool_calling,
+        model=s.llm_model,
+        api_base=s.llm_api_base,
+        api_key=s.llm_api_key,
+        max_context_tokens=args.context_tokens or s.llm_context_tokens,
+        batch_size=args.batch_size or 1000,
+        map_concurrency=args.map_concurrency or 5,
+        max_events_per_merge=args.max_events_per_merge or 30,
+        model_supports_tool_calling=s.llm_tool_calling,
     )
 
-    # ClickHouse клиент
     try:
         import clickhouse_connect  # type: ignore[import-not-found]
-
         ch_client = clickhouse_connect.get_client(
-            host=args.ch_host,
-            port=args.ch_port,
-            username=args.ch_user,
-            password=args.ch_password,
-            database=args.ch_database,
+            host=s.ch_host,
+            port=s.ch_port,
+            username=s.ch_user,
+            password=s.ch_password,
+            database=s.ch_database,
         )
     except ImportError:
-        print(
-            "ERROR: clickhouse_connect not installed. Run: pip install clickhouse-connect",
-            file=sys.stderr,
-        )
+        print("ERROR: clickhouse_connect not installed. Run: pip install clickhouse-connect", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"ERROR: Cannot connect to ClickHouse: {exc}", file=sys.stderr)
         return 1
 
-    # Запуск пайплайна
     orchestrator = PipelineOrchestrator(ch_client, config)
     report = await orchestrator.run()
 
@@ -237,15 +150,15 @@ async def _main(argv: list[str] | None = None) -> int:
     else:
         print(report)
 
-    if args.save_to_ch:
+    if s.save_to_ch:
         from log_summarizer.ch_writer import save_report
         save_report(
-            host=args.ch_host,
-            port=args.ch_port,
-            user=args.ch_user,
-            password=args.ch_password,
-            result_database=args.result_database,
-            run_id=args.run_id,
+            host=s.ch_host,
+            port=s.ch_port,
+            user=s.ch_user,
+            password=s.ch_password,
+            result_database=s.result_database,
+            run_id=s.airflow_run_id,
             incident_context=args.context,
             incident_start=args.start or "",
             incident_end=args.end or "",
