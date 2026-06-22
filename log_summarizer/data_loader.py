@@ -150,6 +150,8 @@ class DataLoader:
                 cur_dt = None
                 for row in combined_rows:
                     ts = row.get("end_time") or row.get("timestamp") or row.get("time") or row.get("ts")
+                    if isinstance(ts, str):
+                        ts = self._parse_dt_value(ts)
                     if ts is not None and hasattr(ts, "replace"):
                         if cur_dt is None or ts > cur_dt:
                             cur_dt = ts
@@ -281,6 +283,25 @@ class DataLoader:
         if dt is None:
             return ""
         return dt.isoformat()
+
+    @staticmethod
+    def _parse_dt_value(value: str) -> Optional[datetime]:
+        """Best-effort парсинг timestamp-строк из ClickHouse для progress/logging."""
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return None
 
     @staticmethod
     def _row_to_log(

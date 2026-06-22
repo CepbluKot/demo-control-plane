@@ -144,7 +144,7 @@ SELECT
 FROM (
     SELECT
         min(timestamp)         AS start_time,
-        max(timestamp)         AS end_time,
+        toString(max(timestamp)) AS end_time,
         any(message)           AS message_text,
         count()                AS cnt,
         any(cluster)           AS namespace,
