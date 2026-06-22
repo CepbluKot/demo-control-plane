@@ -144,7 +144,7 @@ SELECT
 FROM (
     SELECT
         min(timestamp)         AS start_time,
-        toString(max(timestamp)) AS end_time,
+        formatDateTime(max(timestamp), '%Y-%m-%d %H:%i:%S.%f', 'Europe/Moscow') AS end_time,
         any(message)           AS message_text,
         count()                AS cnt,
         any(cluster)           AS namespace,
@@ -170,8 +170,8 @@ FROM (
                     1, 0
                 ) AS is_new_group
             FROM k8s_logs.`k-ndp-p11-ndp-flex-spark`
-            WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
-              AND timestamp <= parseDateTime64BestEffort('{period_end}')
+            WHERE timestamp >  parseDateTime64BestEffort('{last_ts}', 6, 'Europe/Moscow')
+              AND timestamp <= parseDateTime64BestEffort('{period_end}', 6, 'Europe/Moscow')
               AND cluster = 'ndp-p11'
               AND pod = 'fl32cfad0d758f29068a909050374e0d-65f0849eee1af10c-driver'
             ORDER BY timestamp ASC

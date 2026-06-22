@@ -172,7 +172,19 @@ class DataLoader:
             logger.debug("Fetched %d log rows (%d source(s))", len(page), len(all_templates))
 
             if uses_keyset:
-                last_ts = self._max_ts_from_rows(combined_rows, last_ts, last_page=is_last_page)
+                next_last_ts = self._max_ts_from_rows(combined_rows, last_ts, last_page=is_last_page)
+                if len(combined_rows) <= 3:
+                    logger.info(
+                        "  LOAD keyset: %d row(s), last_ts %s → %s",
+                        len(combined_rows), last_ts, next_last_ts,
+                    )
+                if next_last_ts == last_ts:
+                    logger.warning(
+                        "  LOAD остановлен: keyset watermark не продвинулся (last_ts=%s)",
+                        last_ts,
+                    )
+                    break
+                last_ts = next_last_ts
             else:
                 offset += page_size
 
