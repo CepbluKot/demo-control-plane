@@ -19,40 +19,87 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 # Московское время — UTC+3, без летнего перевода.
 # Используй MSK при задании временных окон инцидентов.
 MSK = timezone(timedelta(hours=3))
+
+
+class RuntimeSettings(BaseSettings):
+    """Runtime-настройки из окружения и .env.
+
+    Значения ниже остаются дефолтами для локального запуска, но в реальном
+    контуре их можно переопределять через .env или environment variables.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    api_base: str = Field(
+        "http://localhost:8000",
+        validation_alias=AliasChoices("API_BASE", "LLM_API_BASE"),
+    )
+    api_key: str = Field(
+        "sk-placeholder",
+        validation_alias=AliasChoices("API_KEY", "LLM_API_KEY"),
+    )
+    model: str = Field(
+        "PNX.QWEN3 235b a22b instruct",
+        validation_alias=AliasChoices("MODEL", "LLM_MODEL"),
+    )
+    max_context_tokens: int = Field(
+        100_000,
+        validation_alias=AliasChoices("MAX_CONTEXT_TOKENS", "LLM_CONTEXT_TOKENS"),
+    )
+    model_supports_tool_calling: bool = Field(
+        False,
+        validation_alias=AliasChoices("MODEL_SUPPORTS_TOOL_CALLING", "LLM_TOOL_CALLING"),
+    )
+
+    ch_host: str = Field("localhost", validation_alias="CH_HOST")
+    ch_port: int = Field(8123, validation_alias="CH_PORT")
+    ch_user: str = Field("default", validation_alias="CH_USER")
+    ch_password: str = Field("", validation_alias="CH_PASSWORD")
+    ch_database: str = Field("default", validation_alias="CH_DATABASE")
+
+
+SETTINGS = RuntimeSettings()
 
 # ══════════════════════════════════════════════════════════════════════
 #  LLM
 # ══════════════════════════════════════════════════════════════════════
 
 # Адрес vLLM / OpenAI-совместимого сервера (без /v1 — добавится автоматически)
-API_BASE = "http://localhost:8000"
+API_BASE = SETTINGS.api_base
 
 # API-ключ (для vLLM обычно любая строка)
-API_KEY = "sk-placeholder"
+API_KEY = SETTINGS.api_key
 
 # Название модели — точно как в /v1/models или как её называет vLLM
-MODEL = "PNX.QWEN3 235b a22b instruct"
+MODEL = SETTINGS.model
 
 # Размер контекстного окна модели в токенах
 # Пайплайн использует ~55% под логи, остальное — под промпты и ответ
-MAX_CONTEXT_TOKENS = 100_000
+MAX_CONTEXT_TOKENS = SETTINGS.max_context_tokens
 
 # False  — JSON mode через instructor (безопасно, работает с любым vLLM)
 # True   — TOOLS mode (быстрее, но vLLM должен поддерживать tool calling)
-MODEL_SUPPORTS_TOOL_CALLING = False
+MODEL_SUPPORTS_TOOL_CALLING = SETTINGS.model_supports_tool_calling
 
 # ══════════════════════════════════════════════════════════════════════
 #  ClickHouse
 # ══════════════════════════════════════════════════════════════════════
 
-CH_HOST     = "localhost"   # хост или IP ClickHouse
-CH_PORT     = 8123          # HTTP-порт (8123 по умолчанию)
-CH_USER     = "default"
-CH_PASSWORD = ""
-CH_DATABASE = "default"     # база данных по умолчанию (можно переопределить в SQL)
+CH_HOST     = SETTINGS.ch_host       # хост или IP ClickHouse
+CH_PORT     = SETTINGS.ch_port       # HTTP-порт (8123 по умолчанию)
+CH_USER     = SETTINGS.ch_user
+CH_PASSWORD = SETTINGS.ch_password
+CH_DATABASE = SETTINGS.ch_database   # база данных по умолчанию (можно переопределить в SQL)
 
 # ══════════════════════════════════════════════════════════════════════
 #  LOGS_SQLS — список SQL-шаблонов для загрузки логов
