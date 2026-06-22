@@ -123,119 +123,38 @@ CH_DATABASE = SETTINGS.ch_database   # база данных по умолчан
 # ══════════════════════════════════════════════════════════════════════
 
 LOGS_SQLS = [
-
-    # ── Источник 1: контейнерные логи (raw_lm.log_k8s_containers_MT) ─────────
-    """
-SELECT
-    start_time                        AS timestamp,
-    end_time,
-    namespace,
-    container_name,
-    pod_name,
-    image_tag,
-    concat(
-        '[', toString(start_time),
-        ' → ', toString(end_time), ']',
-        ' ×', toString(cnt),
-        '  ', namespace, '/', pod_name,
-        '  ', log_text
-    )                                 AS raw_line
-FROM (
-    SELECT
-        min(timestamp)                                                      AS start_time,
-        max(timestamp)                                                      AS end_time,
-        min(log)                                                            AS log_text,
-        count()                                                             AS cnt,
-        any(kubernetes_namespace_name)                                      AS namespace,
-        any(kubernetes_container_name)                                      AS container_name,
-        any(kubernetes_pod_name)                                            AS pod_name,
-        arrayElement(splitByChar('/', any(kubernetes_container_image)), -1) AS image_tag
-    FROM (
-        SELECT *,
-            sum(is_new_group) OVER (
-                PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-                ORDER BY timestamp ASC
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            ) AS group_id
-        FROM (
-            SELECT *,
-                if(
-                    right(log, 10) != ifNull(
-                        lagInFrame(right(log, 10)) OVER (
-                            PARTITION BY kubernetes_namespace_name, kubernetes_container_name
-                            ORDER BY timestamp ASC
-                        ), ''
-                    ),
-                    1, 0
-                ) AS is_new_group
-            FROM raw_lm.log_k8s_containers_MT
-            WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
-              AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND ext_ClusterName = 'ndp-p01'
-              AND (
-                    kubernetes_container_name LIKE '%airflow%'
-                    OR kubernetes_container_name LIKE '%spark%'
-                    OR kubernetes_container_name LIKE '%flex%'
-                    OR
-                    (
-                        kubernetes_namespace_name LIKE '%kube-system%'
-                        AND kubernetes_container_name NOT LIKE '%kube-apiserver%'
-                    )
-              )
-              AND multiSearchAny(lower(log), [
-                    'fatal', 'critical', 'error', 'exception',
-                    'alert', 'panic', 'failed', 'failure', 'crash', 'abort',
-                    'timeout', 'timed out', 'deadlock',
-                    'out of memory', 'oom', 'disk full',
-                    'no space left', 'permission denied',
-                    'access denied', 'unauthorized', 'forbidden',
-                    'connection refused', 'connection reset',
-                    'ssl error', 'segfault', 'killed',
-                    'rollback', 'traceback', 'stack trace'
-                ])
-              AND NOT multiSearchAny(lower(log), [
-                    'certificate_verify_failed',
-                    'info',
-                    'object has no attribute ''upper'''
-                ])
-            ORDER BY timestamp ASC
-            LIMIT {raw_limit}
-        )
-    )
-    GROUP BY group_id, kubernetes_namespace_name, kubernetes_container_name
-)
-ORDER BY start_time ASC
-LIMIT {limit}
-""",
-
-    # ── Источник 2: Kubernetes Events (raw_lm.log_k8s_events) ────────────────
-    # Тег [EVT:reason] в raw_line — LLM видит тип события (BackOff, OOMKilling, ...).
+    # ── Источник 1: Spark driver logs (k8s_logs.k-ndp-p11-ndp-flex-spark) ───
+    # Схлопывает подряд идущие одинаковые message внутри cluster/pod/container.
+    # namespace здесь заполняется значением cluster, потому что в таблице нет namespace.
     """
 SELECT
     start_time                AS timestamp,
     end_time,
     namespace,
     pod_name,
+    container_name,
+    node_name,
     concat(
         '[', toString(start_time),
         ' → ', toString(end_time), ']',
         ' ×', toString(cnt),
         '  ', namespace, '/', pod_name,
-        '  [EVT:', reason, '] ', message_text
+        '  [LOG:', container_name, '@', node_name, '] ', message_text
     )                         AS raw_line
 FROM (
     SELECT
-        min(timestamp)                AS start_time,
-        max(timestamp)               AS end_time,
-        any(message)                 AS message_text,
-        count()                      AS cnt,
-        any(involvedObject_namespace) AS namespace,
-        any(involvedObject_name)      AS pod_name,
-        any(reason)                  AS reason
+        min(timestamp)         AS start_time,
+        max(timestamp)         AS end_time,
+        any(message)           AS message_text,
+        count()                AS cnt,
+        any(cluster)           AS namespace,
+        any(pod)               AS pod_name,
+        any(container)         AS container_name,
+        any(node)              AS node_name
     FROM (
         SELECT *,
             sum(is_new_group) OVER (
-                PARTITION BY involvedObject_namespace, involvedObject_name
+                PARTITION BY cluster, pod, container
                 ORDER BY timestamp ASC
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ) AS group_id
@@ -244,33 +163,26 @@ FROM (
                 if(
                     message != ifNull(
                         lagInFrame(message) OVER (
-                            PARTITION BY involvedObject_namespace, involvedObject_name
+                            PARTITION BY cluster, pod, container
                             ORDER BY timestamp ASC
                         ), ''
                     ),
                     1, 0
                 ) AS is_new_group
-            FROM raw_lm.log_k8s_events
+            FROM k8s_logs.`k-ndp-p11-ndp-flex-spark`
             WHERE timestamp >  parseDateTime64BestEffort('{last_ts}')
               AND timestamp <= parseDateTime64BestEffort('{period_end}')
-              AND ext_ClusterName = 'ndp-p01'
-              AND reason IN (
-                    'BackOff', 'ImagePullBackOff',
-                    'OOMKilling', 'Evicted',
-                    'Failed', 'FailedCreate', 'FailedScheduling', 'FailedMount',
-                    'Killing', 'NodeNotReady', 'Unhealthy',
-                    'CrashLoopBackOff'
-              )
+              AND cluster = 'ndp-p11'
+              AND pod = 'fl32cfad0d758f29068a909050374e0d-65f0849eee1af10c-driver'
             ORDER BY timestamp ASC
             LIMIT {raw_limit}
         )
     )
-    GROUP BY group_id, involvedObject_namespace, involvedObject_name
+    GROUP BY group_id, cluster, pod, container
 )
 ORDER BY start_time ASC
 LIMIT {limit}
 """,
-
 ]
 
 # ── Валидация SQL-шаблонов ────────────────────────────────────────────────────
@@ -319,36 +231,35 @@ METRICS_SQL = ""
 # ══════════════════════════════════════════════════════════════════════
 INCIDENTS = [
     {
-        "name": "airflow-forbidden-pods-2026-03-18",
+        "name": "spark-driver-pod-finished-no-kube-logs",
         "context": """
-            Airflow: массовые ошибки Pod creation failed (Forbidden) в kubernetes_executor.
-            DAG-раны зависают в state=running, воркеры убиваются SIGTERM.
+            fl32cfad0d758f29068a909050374e0d-65f0849eee1af10c-driver pod завершает работу,
+            при этом в Kubernetes логов pod не обнаруживается.
+            Такие кейсы не единичны, происходят периодически, задания могут падать абсолютно разные.
         """,
         # Алерты: name обязателен; fired_at, severity, description — опционально.
         # ID присваиваются автоматически: alert-001, alert-002, ...
         # fired_at — в МСК (как зафиксировано в мониторинге).
         "alerts": [
             {
-                "name": "AirflowKubernetesExecutorFailed",
-                "fired_at": datetime(2026, 3, 18, 5, 8, 0, tzinfo=MSK),
+                "name": "SparkDriverPodFinishedWithoutKubeLogs",
+                "fired_at": datetime(2026, 6, 22, 10, 2, 0, tzinfo=MSK),
                 "severity": "critical",
-                "description": "Pod creation failed (Forbidden) in kubernetes_executor",
-            },
-            {
-                "name": "AirflowDAGRunStuck",
-                "fired_at": datetime(2026, 3, 18, 5, 15, 0, tzinfo=MSK),
-                "severity": "high",
+                "description": (
+                    "Spark driver pod fl32cfad0d758f29068a909050374e0d-65f0849eee1af10c-driver "
+                    "завершает работу, но Kubernetes logs для pod не находятся"
+                ),
             },
         ],
         # Узкое окно: когда наблюдались проблемы и сработали алерты (МСК).
         # Алерты должны попасть ВНУТРЬ этого окна.
-        "incident_start": datetime(2026, 3, 18, 5, 5, 0, tzinfo=MSK),
-        "incident_end":   datetime(2026, 3, 18, 5, 45, 0, tzinfo=MSK),
+        "incident_start": datetime(2026, 6, 22, 9, 50, 0, tzinfo=MSK),
+        "incident_end":   datetime(2026, 6, 22, 10, 5, 0, tzinfo=MSK),
 
         # Широкое окно: откуда грузить логи (контекст вокруг инцидента, МСК).
         # По умолчанию ±1 час от incident window. Можно убрать — тогда == incident.
-        "context_start": datetime(2026, 3, 18, 4, 0, 0, tzinfo=MSK),
-        "context_end":   datetime(2026, 3, 18, 7, 0, 0, tzinfo=MSK),
+        "context_start": datetime(2026, 6, 22, 9, 45, 0, tzinfo=MSK),
+        "context_end":   datetime(2026, 6, 22, 10, 10, 0, tzinfo=MSK),
     },
     # Пример второго инцидента — раскомментируй и заполни:
     # {
