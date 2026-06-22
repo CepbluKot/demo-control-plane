@@ -138,7 +138,12 @@ Zone-specific guidance:
 def format_alerts_section(alerts: list) -> str:
     """Форматирует секцию алертов для подстановки в MAP_SYSTEM_TEMPLATE."""
     if not alerts:
-        return ""
+        return (
+            "\n=== No explicit alerts ===\n"
+            "There are no timestamped alerts to explain. Use the incident context/comment "
+            "and the logs to produce a concise timeline, notable events, hypotheses, "
+            "and evidence. Leave alert_refs empty.\n"
+        )
     lines = ["\n=== Alerts to explain ===",
              "For each alert below, set alert_refs[].status based on what you see in the logs:"]
     for alert in alerts:
