@@ -355,6 +355,10 @@ MAX_BATCH_TOKENS = None
 # При превышении самые незначительные (по severity) отбрасываются.
 MAX_EVENTS_PER_MERGE = 30
 
+# Сколько секций multipass-отчёта можно генерировать параллельно.
+# 3 обычно даёт ускорение и не перегружает LLM-сервер так резко, как 13 сразу.
+REPORT_CONCURRENCY = 3
+
 # Разбивка периода загрузки на временны́е слайсы (часов на один слайс).
 # Для анализа всех Spark pod за несколько дней держим дневные слайсы,
 # чтобы оконные функции не считались сразу по всему 6-дневному диапазону.
@@ -417,6 +421,7 @@ async def run_incident(ch, incident: dict, run_dir: Path) -> tuple[str, str | Ex
         batch_raw_multiplier=BATCH_RAW_MULTIPLIER,
         max_events_per_merge=MAX_EVENTS_PER_MERGE,
         max_batch_tokens=MAX_BATCH_TOKENS,
+        report_concurrency=REPORT_CONCURRENCY,
         query_time_slice_hours=QUERY_TIME_SLICE_HOURS,
         # Артефакты: runs/{run_timestamp}/{incident_name}/
         # Оркестратор добавит ещё один уровень {artifact_timestamp}/ внутри.
@@ -658,9 +663,9 @@ async def resume(map_dir_path: str, incident_name: str | None) -> None:
     log.info("Лог resume → %s", log_path.resolve())
 
     # Находим конфиг инцидента
-    if MODE == "freeform":
+    if MODE in {"freeform", "context"}:
         incident = {
-            "name": "freeform-resume",
+            "name": f"{MODE}-resume",
             "context": FREEFORM_CONTEXT or "",
             "alerts": FREEFORM_ALERTS,
             "incident_start": FREEFORM_START,
@@ -689,6 +694,7 @@ async def resume(map_dir_path: str, incident_name: str | None) -> None:
         api_key=API_KEY,
         max_context_tokens=MAX_CONTEXT_TOKENS,
         model_supports_tool_calling=MODEL_SUPPORTS_TOOL_CALLING,
+        report_concurrency=REPORT_CONCURRENCY,
         runs_dir="",  # не создаём новую папку — пишем в artifact_dir
     )
 
@@ -735,8 +741,8 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     if args.list:
-        if MODE == "freeform":
-            print(f"  freeform  {FREEFORM_START} → {FREEFORM_END}")
+        if MODE in {"freeform", "context"}:
+            print(f"  {MODE}  {FREEFORM_START} → {FREEFORM_END}")
         else:
             for i in INCIDENTS:
                 s = i.get("incident_start") or i.get("start", "?")

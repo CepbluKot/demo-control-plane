@@ -95,6 +95,8 @@ class PipelineConfig:
     report_response_reserve_tokens: int = 30_000
     # Оценка размера system prompt
     report_system_prompt_tokens: int = 3_000
+    # Максимум параллельных LLM-вызовов при генерации multipass-отчёта.
+    report_concurrency: int = 3
 
     # ── Retry / timeouts ─────────────────────────────────────────────
     max_retries: int = 3

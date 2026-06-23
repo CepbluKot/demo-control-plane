@@ -1,7 +1,7 @@
 """MultipassReportGenerator — финальный отчёт: каждая секция — отдельный LLM-вызов.
 
 Принцип: секции независимы, каждая получает только нужный кусок MergedAnalysis.
-Секции 3–13 генерируются строго последовательно (1 запрос к LLM в каждый момент).
+Независимые секции генерируются ограниченным пулом LLM-вызовов.
 Секция 2 (Резюме) — последняя, получает «скелет» из готовых секций.
 
 ~11 LLM-вызовов при обычном прогоне (sec7 — программная заглушка, без LLM).
@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,7 @@ class MultipassReportGenerator:
         self.config = config
         self._run_dir = run_dir
         self._progress: Optional[ProgressTracker] = None  # живёт только во время generate()
+        self._progress_started: int = 0
 
     # ── Публичный API ─────────────────────────────────────────────────
 
@@ -69,9 +71,9 @@ class MultipassReportGenerator:
         merged: MergedAnalysis,
         degradation: dict | None = None,
     ) -> str:
-        """Генерирует финальный отчёт из 13 секций последовательно.
+        """Генерирует финальный отчёт из 13 LLM-секций.
 
-        LLM-вызовы строго по одному — без параллелизма.
+        Независимые секции выполняются параллельно с лимитом report_concurrency.
         Секция 2 (Резюме) — последней, получает скелет из остальных.
 
         Args:
@@ -88,6 +90,7 @@ class MultipassReportGenerator:
         # 13 LLM-вызовов: sec3,4,5,5a,6,8,9,10,11,12,13,14 + sec2 (последний)
         _LLM_TOTAL = 13
         self._progress = ProgressTracker(total=_LLM_TOTAL, label="REPORT")
+        self._progress_started = 0
 
         # Общие данные, вычисляются один раз
         events_index = {
@@ -112,24 +115,39 @@ class MultipassReportGenerator:
         # Секция 1 — программно, без LLM
         sec1  = self._sec_incident_context()
 
-        # Секции 3–14 — строго последовательно, по одному LLM-вызову.
-        # sec5 (технические цепочки) и sec5a (объяснение для человека) генерируются
-        # первыми, чтобы все последующие секции могли использовать их как контекст.
-        sec3  = await self._sec_data_coverage(merged)
-        sec4  = await self._sec_chronology(merged)
-        sec5  = await self._sec_causal_chains(merged, events_index)
-        sec5a = await self._sec_root_cause_explanation(merged, sec5)
+        report_concurrency = max(1, int(getattr(self.config, "report_concurrency", 1) or 1))
+        semaphore = asyncio.Semaphore(report_concurrency)
+        logger.info("  Multipass report concurrency: %d", report_concurrency)
 
-        # sec6–sec11 получают цепочку как контекст
-        sec6  = await self._sec_alert_links(merged, events_index, sec5a)
-        sec7  = await self._sec_metrics(merged)
-        sec8  = await self._sec_hypotheses(merged, events_index, sec5a)
-        sec9  = await self._sec_conflicts(merged, events_index, sec5a)
-        sec10 = await self._sec_gaps(merged, events_index, sec5a)
-        sec11 = await self._sec_impact(merged, sec5a)
-        sec12 = await self._sec_recommendations(merged, hypotheses_short, sec5a)
-        sec13 = await self._sec_limitations(merged, hypotheses_short, degradation or {})
-        sec14 = await self._sec_coverage_recommendations(merged, events_index)
+        async def _bounded(coro):
+            async with semaphore:
+                return await coro
+
+        # Первая волна: секции без зависимости от объяснения первопричины.
+        sec3_task = asyncio.create_task(_bounded(self._sec_data_coverage(merged)))
+        sec4_task = asyncio.create_task(_bounded(self._sec_chronology(merged)))
+        sec5_task = asyncio.create_task(_bounded(self._sec_causal_chains(merged, events_index)))
+        sec7_task = asyncio.create_task(_bounded(self._sec_metrics(merged)))
+        sec13_task = asyncio.create_task(_bounded(self._sec_limitations(merged, hypotheses_short, degradation or {})))
+        sec14_task = asyncio.create_task(_bounded(self._sec_coverage_recommendations(merged, events_index)))
+
+        sec5 = await sec5_task
+        sec5a = await _bounded(self._sec_root_cause_explanation(merged, sec5))
+
+        # Вторая волна: секции, которым полезен контекст sec5a.
+        sec6_task = asyncio.create_task(_bounded(self._sec_alert_links(merged, events_index, sec5a)))
+        sec8_task = asyncio.create_task(_bounded(self._sec_hypotheses(merged, events_index, sec5a)))
+        sec9_task = asyncio.create_task(_bounded(self._sec_conflicts(merged, events_index, sec5a)))
+        sec10_task = asyncio.create_task(_bounded(self._sec_gaps(merged, events_index, sec5a)))
+        sec11_task = asyncio.create_task(_bounded(self._sec_impact(merged, sec5a)))
+        sec12_task = asyncio.create_task(_bounded(self._sec_recommendations(merged, hypotheses_short, sec5a)))
+
+        sec3, sec4, sec7, sec13, sec14 = await asyncio.gather(
+            sec3_task, sec4_task, sec7_task, sec13_task, sec14_task,
+        )
+        sec6, sec8, sec9, sec10, sec11, sec12 = await asyncio.gather(
+            sec6_task, sec8_task, sec9_task, sec10_task, sec11_task, sec12_task,
+        )
 
         # Секция 2 — последняя
         sec2  = await self._sec_summary(merged, sec13, sec5a)
@@ -826,10 +844,10 @@ class MultipassReportGenerator:
         import time as _time
 
         if self._progress:
-            next_n = self._progress.done + 1
+            self._progress_started += 1
             logger.info(
                 "  [секция %d/%d] ▶  %s",
-                next_n, self._progress.total, name,
+                self._progress_started, self._progress.total, name,
             )
 
         t_sec = _time.monotonic()

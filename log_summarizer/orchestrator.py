@@ -345,7 +345,11 @@ class PipelineOrchestrator:
 
         # ── СТАДИЯ 5: Многопроходный LLM-отчёт ───────────────────────
         logger.info("")
-        logger.info("СТАДИЯ 5/%d  ▶  Многопроходный LLM-отчёт (14 секций последовательно)", _TOTAL_STAGES)
+        logger.info(
+            "СТАДИЯ 5/%d  ▶  Многопроходный LLM-отчёт (пул до %d LLM-вызовов)",
+            _TOTAL_STAGES,
+            self.config.report_concurrency,
+        )
         t5 = time.monotonic()
         await self._multipass_generator.generate(merged, degradation=degradation)
         t5_elapsed = time.monotonic() - t5
