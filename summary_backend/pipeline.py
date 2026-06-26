@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any
 
 from .audit import AuditWriter
@@ -22,19 +23,29 @@ from .text import CharBudgetChunker, split_atomic_units
 logger = get_logger("pipeline")
 
 
+SUMMARY_RESULT_SCHEMA_INSTRUCTION = (
+    "Return exactly one JSON object with this schema and no alternate top-level keys: "
+    '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}. '
+    "Put all narrative content inside summary and key_points."
+)
+
+
 MAP_SYSTEM = (
-    "You summarize one part of a large context. Return only structured JSON. "
+    "You summarize one part of a large context. "
+    f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
     "Keep the summary concise, factual, and grounded in the provided text."
 )
 
 REDUCE_SYSTEM = (
     "You merge several partial summaries into one consolidated summary. "
-    "Return only structured JSON. Preserve important facts and remove duplicates."
+    f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
+    "Preserve important facts and remove duplicates."
 )
 
 FINAL_SYSTEM = (
     "You produce the final user-facing summary from the consolidated context. "
-    "Return only structured JSON. Be concise and explicit about uncertainty."
+    f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
+    "Be concise and explicit about uncertainty."
 )
 
 REPORT_FORMAT_INSTRUCTIONS = {
@@ -233,6 +244,83 @@ class PipelineService:
             queued,
         )
         return job_id, queued
+
+    def rerun_node(self, job_id: str, node_id: str) -> tuple[NodeType, NodeStatus, bool]:
+        job = self.store.get_job_current(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        node = self._node_by_id(job_id, node_id)
+        node_type = NodeType(str(node["node_type"]))
+        if node_type not in {NodeType.MAP, NodeType.REDUCE, NodeType.FINAL}:
+            raise ValueError(f"node cannot be rerun: {node_id}")
+
+        existing_artifact_type = {
+            NodeType.MAP: ArtifactType.MAP_SUMMARY,
+            NodeType.REDUCE: ArtifactType.REDUCE_SUMMARY,
+            NodeType.FINAL: ArtifactType.FINAL_SUMMARY,
+        }[node_type]
+        if self.store.latest_artifact(job_id=job_id, node_id=node_id, artifact_type=existing_artifact_type):
+            raise ValueError(f"completed node already has an output artifact and cannot be rerun in place: {node_id}")
+
+        payload = self.store.get_node_payload(job_id, node_id)
+        request_payload = {
+            "node_id": node_id,
+            "node_type": str(node_type),
+            "previous_status": str(node.get("node_status") or ""),
+            "previous_event_type": str(node.get("last_event_type") or ""),
+        }
+        self.store.insert_job_event(
+            job_id=job_id,
+            event_type="JOB_NODE_RERUN_REQUESTED",
+            job_status=JobStatus.RUNNING,
+            actor="api",
+            message=node_id,
+            payload=request_payload,
+        )
+        self.store.insert_node_event(
+            job_id=job_id,
+            node_id=node_id,
+            event_type="NODE_RERUN_REQUESTED",
+            node_status=NodeStatus.PENDING,
+            node_type=node_type,
+            level=int(node["level"]),
+            node_index=int(node["node_index"]),
+            actor="api",
+            message="Node rerun requested",
+            payload={**payload, **request_payload},
+        )
+
+        queued = False
+        if self.queue is None:
+            if node_type == NodeType.MAP:
+                self.map_node(job_id, node_id)
+            elif node_type == NodeType.REDUCE:
+                self.reduce_node(job_id, node_id)
+            else:
+                self.finalize_job(job_id)
+        else:
+            self.store.insert_node_event(
+                job_id=job_id,
+                node_id=node_id,
+                event_type="NODE_ENQUEUED",
+                node_status=NodeStatus.QUEUED,
+                node_type=node_type,
+                level=int(node["level"]),
+                node_index=int(node["node_index"]),
+                actor="api",
+                message="Node rerun queued",
+                payload={**payload, **request_payload},
+            )
+            if node_type == NodeType.MAP:
+                self.queue.map_node(job_id, node_id)
+            elif node_type == NodeType.REDUCE:
+                self.queue.reduce_node(job_id, node_id)
+            else:
+                self.queue.finalize_job(job_id)
+            queued = True
+
+        log_kv(logger, "node_rerun_requested", job_id=job_id, node_id=node_id, node_type=node_type, queued=queued)
+        return node_type, NodeStatus.QUEUED if queued else NodeStatus.PENDING, queued
 
     def pause_job(self, job_id: str) -> None:
         self.store.insert_job_event(
@@ -715,23 +803,25 @@ class PipelineService:
         pending = [
             node
             for node in nodes
-            if node["node_type"] == node_type and node["node_status"] in {NodeStatus.PENDING, NodeStatus.WAITING_RETRY}
+            if node["node_type"] == node_type
+            and (
+                node["node_status"] in {NodeStatus.PENDING, NodeStatus.WAITING_RETRY}
+                or self._is_stale_queued_node(node)
+            )
         ]
         if not pending:
             return False
+        selected = pending[: self.settings.max_enqueue_nodes_per_advance]
         if self.queue is None:
-            for node in pending[: self.settings.max_enqueue_nodes_per_advance]:
+            for node in selected:
                 if node_type == NodeType.MAP:
                     self.map_node(job_id, str(node["node_id"]))
                 elif node_type == NodeType.REDUCE:
                     self.reduce_node(job_id, str(node["node_id"]))
             return True
 
-        for node in pending[: self.settings.max_enqueue_nodes_per_advance]:
-            if node_type == NodeType.MAP:
-                self.queue.map_node(job_id, str(node["node_id"]))
-            elif node_type == NodeType.REDUCE:
-                self.queue.reduce_node(job_id, str(node["node_id"]))
+        for node in selected:
+            payload = self.store.get_node_payload(job_id, str(node["node_id"]))
             self.store.insert_node_event(
                 job_id=job_id,
                 node_id=str(node["node_id"]),
@@ -741,9 +831,30 @@ class PipelineService:
                 level=int(node["level"]),
                 node_index=int(node["node_index"]),
                 actor="advance_job",
+                payload=payload,
             )
-        log_kv(logger, "nodes_enqueued", job_id=job_id, node_type=node_type, count=len(pending))
+            if node_type == NodeType.MAP:
+                self.queue.map_node(job_id, str(node["node_id"]))
+            elif node_type == NodeType.REDUCE:
+                self.queue.reduce_node(job_id, str(node["node_id"]))
+        log_kv(logger, "nodes_enqueued", job_id=job_id, node_type=node_type, count=len(selected))
         return True
+
+    def _is_stale_queued_node(self, node: dict[str, Any]) -> bool:
+        if node.get("node_status") != NodeStatus.QUEUED:
+            return False
+        updated_at = node.get("updated_at")
+        if updated_at is None:
+            return True
+        if isinstance(updated_at, str):
+            try:
+                updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            except ValueError:
+                return True
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
+        return age_seconds >= self.settings.queued_node_requeue_after_seconds
 
     def _stop_if_not_runnable(self, job_id: str) -> bool:
         job = self.store.get_job_current(job_id)

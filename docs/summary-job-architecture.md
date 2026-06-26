@@ -323,7 +323,7 @@ if N provider failures in short window:
     retry advance_job later
 ```
 
-Concurrency ограничивается на уровне Dramatiq workers/queues и, при необходимости, отдельным process-wide лимитером для LLM.
+Concurrency ограничивается на уровне Dramatiq workers/queues и отдельным Redis-backed global limiter для LLM. Лимитер общий для всех jobs, worker threads, worker processes и pod-ов, которые используют один `SUMMARY_BACKEND_BROKER_URL`; настройка `SUMMARY_BACKEND_LLM_MAX_CONCURRENCY` задает максимум одновременных outbound LLM HTTP calls.
 
 ---
 

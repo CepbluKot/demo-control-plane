@@ -7,9 +7,11 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
+from summary_backend.api import build_public_settings
 from summary_backend.config import get_settings
 from summary_backend.ids import sha256_text
 from summary_backend.input_models import InputSegment
+from summary_backend.llm_client import StructuredLLMClient
 from summary_backend.pipeline import PipelineService
 from summary_backend.ports import TaskQueue
 from summary_backend.schemas import ArtifactType, JobStatus, NodeStatus, NodeType, Stage, SummaryResult
@@ -205,7 +207,17 @@ class InMemorySummaryStore:
         ]
         if not events:
             return {}
-        latest = max(events, key=lambda event: event["_seq"])
+        def payload_priority(event: dict[str, Any]) -> tuple[int, int]:
+            payload = event.get("payload") or "{}"
+            if not payload or payload == "{}":
+                return (0, int(event["_seq"]))
+            if '"input_node_ids"' in payload:
+                return (3, int(event["_seq"]))
+            if '"chunk_hash"' in payload:
+                return (2, int(event["_seq"]))
+            return (1, int(event["_seq"]))
+
+        latest = max(events, key=payload_priority)
         return json.loads(latest["payload"] or "{}")
 
     def latest_artifact(
@@ -421,6 +433,100 @@ class ManualQueue(TaskQueue):
         self.items.append(("finalize", job_id, None))
 
 
+class SummaryServiceSettingsTests(unittest.TestCase):
+    def test_public_settings_do_not_expose_secrets(self) -> None:
+        settings = replace(
+            get_settings(),
+            openai_api_base="http://llm-gateway/v1",
+            openai_api_key="secret-api-key",
+            clickhouse_password="clickhouse-secret",
+            source_clickhouse_password="source-secret",
+            broker_url="redis://broker-user:broker-pass@redis:6379/0",
+            worker_processes=2,
+            worker_threads=8,
+            llm_max_concurrency=2,
+            llm_pool_acquire_timeout_seconds=30.0,
+            llm_pool_poll_interval_seconds=0.2,
+        )
+
+        payload = build_public_settings(settings).model_dump()
+
+        self.assertTrue(payload["llm"]["api_key_configured"])
+        self.assertTrue(payload["clickhouse"]["password_configured"])
+        self.assertTrue(payload["source_clickhouse"]["password_configured"])
+        self.assertEqual(payload["runtime"]["broker_url"], "redis://***:***@redis:6379/0")
+        self.assertEqual(payload["runtime"]["worker_processes"], 2)
+        self.assertEqual(payload["runtime"]["worker_threads"], 8)
+        self.assertEqual(payload["llm"]["max_concurrency"], 2)
+        self.assertEqual(payload["llm"]["pool_acquire_timeout_seconds"], 30.0)
+        self.assertEqual(payload["llm"]["pool_poll_interval_seconds"], 0.2)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("secret-api-key", serialized)
+        self.assertNotIn("clickhouse-secret", serialized)
+        self.assertNotIn("source-secret", serialized)
+        self.assertNotIn("broker-pass", serialized)
+
+
+class StructuredLLMClientParsingTests(unittest.TestCase):
+    def test_parse_summary_result_from_markdown_fenced_json(self) -> None:
+        payload = StructuredLLMClient._parse_response_payload(
+            content='```json\n{"summary":"ok","key_points":["a"],"warnings":[],"source_count":2}\n```',
+            response_model=SummaryResult,
+        )
+
+        result = SummaryResult.model_validate(payload)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary, "ok")
+        self.assertEqual(result.key_points, ["a"])
+        self.assertEqual(result.source_count, 2)
+
+    def test_parse_summary_result_normalizes_object_summary(self) -> None:
+        payload = StructuredLLMClient._parse_response_payload(
+            content=json.dumps(
+                {
+                    "summary": {
+                        "topic": "black holes",
+                        "key_points": [{"content": "event horizon"}, "Schwarzschild"],
+                    }
+                }
+            ),
+            response_model=SummaryResult,
+        )
+
+        result = SummaryResult.model_validate(payload)
+
+        self.assertTrue(result.ok)
+        self.assertIn("black holes", result.summary)
+        self.assertEqual(result.key_points, ["event horizon", "Schwarzschild"])
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(result.source_count, 1)
+
+    def test_parse_summary_result_normalizes_alternate_gateway_shape(self) -> None:
+        payload = StructuredLLMClient._parse_response_payload(
+            content="""```json
+{
+  "incident_timeline": {
+    "2026-06-26 17:00": "Service API latency increased after deployment v42",
+    "2026-06-26 17:05": "Rollback initiated"
+  },
+  "root_cause": "Deployment v42",
+  "impact": {"error_rate": "12%"},
+  "next_actions": "Add rollback verification"
+}
+```""",
+            response_model=SummaryResult,
+        )
+
+        result = SummaryResult.model_validate(payload)
+
+        self.assertTrue(result.ok)
+        self.assertIn("Incident timeline", result.summary)
+        self.assertIn("Deployment v42", result.summary)
+        self.assertIn("root cause: Deployment v42", result.key_points)
+        self.assertEqual(result.source_count, 1)
+
+
 class SummaryBackendPipelineTests(unittest.TestCase):
     def make_service(
         self,
@@ -497,6 +603,14 @@ class SummaryBackendPipelineTests(unittest.TestCase):
             )
         }
         self.assertEqual(reduce_levels, {1, 2, 3})
+        reduce_artifacts = store.list_artifacts(
+            job_id=job_id,
+            include_content=False,
+            artifact_type=ArtifactType.REDUCE_SUMMARY,
+        )
+        for artifact in reduce_artifacts:
+            metadata = json.loads(artifact["metadata"])
+            self.assertGreater(len(metadata["input_node_ids"]), 0)
         self.assertGreaterEqual(len(llm.calls), 12)
 
     def test_duplicate_node_delivery_is_idempotent(self) -> None:
@@ -655,6 +769,29 @@ class SummaryBackendPipelineTests(unittest.TestCase):
 
         self.drain(queue, service)
         self.assertEqual(store.get_job_current(new_job_id)["job_status"], JobStatus.DONE)
+
+    def test_rerun_failed_node_requeues_selected_node(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["row 1", "row 2"])
+        service.llm = FailingLLM("model returned invalid JSON")
+        job_id = service.create_job(input_text="raw text", title="source", metadata={})
+
+        queue.advance_job(job_id)
+        service.advance_job(job_id)
+        first_map = next(item for item in list(queue.items) if item[0] == "map")
+        queue.items.remove(first_map)
+        _, _, node_id = first_map
+        assert node_id is not None
+
+        service.map_node(job_id, node_id)
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.FAILED)
+
+        node_type, status, queued = service.rerun_node(job_id, node_id)
+
+        self.assertEqual(node_type, NodeType.MAP)
+        self.assertEqual(status, NodeStatus.QUEUED)
+        self.assertTrue(queued)
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.RUNNING)
+        self.assertIn(("map", job_id, node_id), queue.items)
 
     def test_recovery_requeues_runnable_jobs_only(self) -> None:
         service, store, _, queue = self.make_service(chunks=["chunk-1"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, TypeVar
 
@@ -11,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from .audit import AuditWriter
 from .config import Settings, get_settings
 from .errors import classify_error
+from .llm_pool import acquire_llm_pool_slot
 from .logging_setup import get_logger
 from .ports import AuditSink, SummaryStore
 from .schemas import SummaryResult
@@ -203,21 +205,24 @@ class StructuredLLMClient:
         response_json: dict[str, Any] | None = None
         content: str | None = None
         error: str | None = None
+        pool_wait_ms = 0
 
         try:
-            client = OpenAI(
-                base_url=_build_openai_base_url(self.settings.openai_api_base),
-                api_key=self.settings.openai_api_key,
-                max_retries=0,
-                timeout=self.settings.llm_timeout_seconds,
-            )
-            response = client.chat.completions.create(**request_json)
+            with acquire_llm_pool_slot(self.settings, job_id=job_id, node_id=node_id, stage=stage) as acquired_wait_ms:
+                pool_wait_ms = acquired_wait_ms
+                client = OpenAI(
+                    base_url=_build_openai_base_url(self.settings.openai_api_base),
+                    api_key=self.settings.openai_api_key,
+                    max_retries=0,
+                    timeout=self.settings.llm_timeout_seconds,
+                )
+                response = client.chat.completions.create(**request_json)
             if hasattr(response, "model_dump"):
                 response_json = response.model_dump(mode="json")
             else:
                 response_json = json.loads(response.model_dump_json())
             content = response.choices[0].message.content or "{}"
-            payload = json.loads(content)
+            payload = self._parse_response_payload(content=content, response_model=response_model)
             result = response_model.model_validate(payload)
             usage = getattr(response, "usage", None)
             prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -235,7 +240,12 @@ class StructuredLLMClient:
                 response_json=response_json,
                 content=content,
                 error=None,
-                metadata={"attempt": attempt, "latency_ms": latency_ms},
+                metadata={
+                    "attempt": attempt,
+                    "latency_ms": latency_ms,
+                    "llm_pool_wait_ms": pool_wait_ms,
+                    "llm_pool_max_concurrency": self.settings.llm_max_concurrency,
+                },
             )
             self.store.insert_llm_call(
                 job_id=job_id,
@@ -264,7 +274,12 @@ class StructuredLLMClient:
                 response_json=response_json,
                 content=content,
                 error=error,
-                metadata={"attempt": attempt, "latency_ms": latency_ms},
+                metadata={
+                    "attempt": attempt,
+                    "latency_ms": latency_ms,
+                    "llm_pool_wait_ms": pool_wait_ms,
+                    "llm_pool_max_concurrency": self.settings.llm_max_concurrency,
+                },
             )
             self.store.insert_llm_call(
                 job_id=job_id,
@@ -280,6 +295,167 @@ class StructuredLLMClient:
                 error_message=error,
             )
             raise
+
+    @classmethod
+    def _parse_response_payload(cls, *, content: str, response_model: type[TModel]) -> Any:
+        json_text = cls._extract_json_text(content)
+        if not json_text:
+            raise ValueError("LLM response did not contain JSON content")
+        try:
+            payload = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            preview = " ".join(content.strip().split())[:240]
+            raise ValueError(f"LLM response did not contain parseable JSON: {exc.msg}; preview={preview!r}") from exc
+        if response_model is SummaryResult:
+            return cls._normalize_summary_result_payload(payload)
+        return payload
+
+    @staticmethod
+    def _extract_json_text(content: str) -> str:
+        stripped = content.strip()
+        fenced = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            return fenced.group(1).strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return stripped
+
+        start_positions = [position for position in (stripped.find("{"), stripped.find("[")) if position >= 0]
+        if not start_positions:
+            return stripped
+        start = min(start_positions)
+        opening = stripped[start]
+        closing = "}" if opening == "{" else "]"
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(stripped)):
+            char = stripped[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == opening:
+                depth += 1
+            elif char == closing:
+                depth -= 1
+                if depth == 0:
+                    return stripped[start : index + 1]
+        return stripped[start:]
+
+    @classmethod
+    def _normalize_summary_result_payload(cls, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {
+                "ok": True,
+                "summary": cls._stringify_model_value(payload),
+                "key_points": [],
+                "warnings": [],
+                "source_count": 1,
+            }
+
+        summary = cls._first_present(payload, "summary", "result", "answer", "content", "text")
+        summary_dict = summary if isinstance(summary, dict) else {}
+        key_points = payload.get("key_points", summary_dict.get("key_points"))
+        warnings = payload.get("warnings", summary_dict.get("warnings"))
+        source_count = payload.get("source_count", payload.get("sourceCount", summary_dict.get("source_count", 1)))
+        summary_text = cls._stringify_model_value(summary)
+        if not summary_text:
+            fallback_payload = cls._substantive_payload(payload)
+            summary_text = cls._format_mapping_summary(fallback_payload)
+            if key_points is None:
+                key_points = cls._key_points_from_mapping(fallback_payload)
+        return {
+            "ok": bool(payload.get("ok", True)),
+            "summary": summary_text,
+            "key_points": cls._string_list(key_points),
+            "warnings": cls._string_list(warnings),
+            "source_count": cls._safe_positive_int(source_count, 1),
+        }
+
+    @staticmethod
+    def _first_present(payload: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in payload:
+                return payload[key]
+        return ""
+
+    @staticmethod
+    def _substantive_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        ignored = {"ok", "summary", "result", "answer", "content", "text", "key_points", "warnings", "source_count", "sourceCount"}
+        return {key: value for key, value in payload.items() if key not in ignored}
+
+    @classmethod
+    def _format_mapping_summary(cls, payload: dict[str, Any]) -> str:
+        lines: list[str] = []
+        for key, value in payload.items():
+            label = key.replace("_", " ").strip().capitalize() or "Details"
+            if isinstance(value, dict):
+                lines.append(f"{label}:")
+                for child_key, child_value in value.items():
+                    child_label = str(child_key).replace("_", " ").strip()
+                    lines.append(f"- {child_label}: {cls._stringify_compact(child_value)}")
+            elif isinstance(value, list):
+                lines.append(f"{label}:")
+                for item in value:
+                    lines.append(f"- {cls._stringify_compact(item)}")
+            else:
+                lines.append(f"{label}: {cls._stringify_compact(value)}")
+        return "\n".join(line for line in lines if line.strip())
+
+    @classmethod
+    def _key_points_from_mapping(cls, payload: dict[str, Any]) -> list[str]:
+        points: list[str] = []
+        for key, value in payload.items():
+            label = key.replace("_", " ").strip()
+            if not label:
+                continue
+            points.append(f"{label}: {cls._stringify_compact(value)}")
+        return points
+
+    @staticmethod
+    def _stringify_compact(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return " ".join(value.split())
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def _string_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [cls._stringify_model_value(item) for item in value if cls._stringify_model_value(item)]
+        return [cls._stringify_model_value(value)]
+
+    @staticmethod
+    def _safe_positive_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(1, parsed)
+
+    @staticmethod
+    def _stringify_model_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            if isinstance(value.get("content"), str):
+                return value["content"]
+            if isinstance(value.get("text"), str):
+                return value["text"]
+        return json.dumps(value, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _dry_summary(*, stage: str, text: str) -> str:

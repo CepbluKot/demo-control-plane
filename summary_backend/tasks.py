@@ -10,6 +10,7 @@ from .factory import create_pipeline_service
 from .ingestion import StagedUploadIngestionService
 from .logging_setup import configure_logging, get_logger
 from .queue import TaskQueue
+from .redis_locks import run_with_redis_lock
 from .store import ClickHouseStore
 
 settings = get_settings()
@@ -49,6 +50,10 @@ def _staged_upload_service():
     )
 
 
+def _llm_lock_timeout_seconds() -> float:
+    return max(300.0, float(settings.llm_timeout_seconds) + 120.0)
+
+
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)
 def ingest_upload(job_id: str) -> None:
     logger.info("actor.ingest_upload | job_id=%s", job_id)
@@ -58,25 +63,57 @@ def ingest_upload(job_id: str) -> None:
 @dramatiq.actor(max_retries=3, min_backoff=5000, max_backoff=300000)
 def advance_job(job_id: str) -> None:
     logger.info("actor.advance_job | job_id=%s", job_id)
-    _service().advance_job(job_id)
+    acquired, _ = run_with_redis_lock(
+        settings,
+        f"summary:job:{job_id}:advance",
+        timeout_seconds=60.0,
+        blocking_timeout_seconds=30.0,
+        action=lambda: _service().advance_job(job_id),
+    )
+    if not acquired:
+        raise RuntimeError(f"advance lock busy for job_id={job_id}")
 
 
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)
 def map_node(job_id: str, node_id: str) -> None:
     logger.info("actor.map_node | job_id=%s node_id=%s", job_id, node_id)
-    _service().map_node(job_id, node_id)
+    acquired, _ = run_with_redis_lock(
+        settings,
+        f"summary:job:{job_id}:node:{node_id}",
+        timeout_seconds=_llm_lock_timeout_seconds(),
+        blocking_timeout_seconds=0.0,
+        action=lambda: _service().map_node(job_id, node_id),
+    )
+    if not acquired:
+        logger.info("actor.map_node.locked_skip | job_id=%s node_id=%s", job_id, node_id)
 
 
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)
 def reduce_node(job_id: str, node_id: str) -> None:
     logger.info("actor.reduce_node | job_id=%s node_id=%s", job_id, node_id)
-    _service().reduce_node(job_id, node_id)
+    acquired, _ = run_with_redis_lock(
+        settings,
+        f"summary:job:{job_id}:node:{node_id}",
+        timeout_seconds=_llm_lock_timeout_seconds(),
+        blocking_timeout_seconds=0.0,
+        action=lambda: _service().reduce_node(job_id, node_id),
+    )
+    if not acquired:
+        logger.info("actor.reduce_node.locked_skip | job_id=%s node_id=%s", job_id, node_id)
 
 
 @dramatiq.actor(max_retries=3, min_backoff=10000, max_backoff=300000)
 def finalize_job(job_id: str) -> None:
     logger.info("actor.finalize_job | job_id=%s", job_id)
-    _service().finalize_job(job_id)
+    acquired, _ = run_with_redis_lock(
+        settings,
+        f"summary:job:{job_id}:finalize",
+        timeout_seconds=_llm_lock_timeout_seconds(),
+        blocking_timeout_seconds=0.0,
+        action=lambda: _service().finalize_job(job_id),
+    )
+    if not acquired:
+        logger.info("actor.finalize_job.locked_skip | job_id=%s", job_id)
 
 
 @dramatiq.actor(max_retries=1)

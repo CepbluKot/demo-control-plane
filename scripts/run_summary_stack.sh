@@ -22,6 +22,8 @@ export SUMMARY_BACKEND_BROKER_URL="${SUMMARY_BACKEND_BROKER_URL:-redis://localho
 export SUMMARY_BACKEND_API_HOST="${SUMMARY_BACKEND_API_HOST:-0.0.0.0}"
 export SUMMARY_BACKEND_API_PORT="${SUMMARY_BACKEND_API_PORT:-8088}"
 export SUMMARY_BACKEND_CORS_ORIGINS="${SUMMARY_BACKEND_CORS_ORIGINS:-http://localhost:8090,http://127.0.0.1:8090}"
+export SUMMARY_BACKEND_WORKER_PROCESSES="${SUMMARY_BACKEND_WORKER_PROCESSES:-1}"
+export SUMMARY_BACKEND_WORKER_THREADS="${SUMMARY_BACKEND_WORKER_THREADS:-4}"
 export SUMMARY_FRONTEND_HOST="${SUMMARY_FRONTEND_HOST:-0.0.0.0}"
 export SUMMARY_FRONTEND_PORT="${SUMMARY_FRONTEND_PORT:-8090}"
 export SUMMARY_FRONTEND_BACKEND_HTTP_URL="${SUMMARY_FRONTEND_BACKEND_HTTP_URL:-http://localhost:${SUMMARY_BACKEND_API_PORT}}"
@@ -46,7 +48,7 @@ start_process() {
   echo "$name started pid=$(cat "$pid_file") log=$log_file"
 }
 
-start_process worker "$DRAMATIQ_BIN" summary_backend.tasks --processes 1 --threads 1
+start_process worker "$DRAMATIQ_BIN" summary_backend.tasks --processes "$SUMMARY_BACKEND_WORKER_PROCESSES" --threads "$SUMMARY_BACKEND_WORKER_THREADS"
 start_process backend "$PYTHON_BIN" -m summary_backend
 start_process frontend "$PYTHON_BIN" -m summary_frontend
 

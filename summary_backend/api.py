@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
@@ -32,6 +33,13 @@ from .schemas import (
     NodeCurrent,
     PauseResumeResponse,
     RerunSummaryJobResponse,
+    RerunSummaryNodeResponse,
+    SummaryServiceDatabaseSettings,
+    SummaryServiceLlmSettings,
+    SummaryServicePipelineSettings,
+    SummaryServiceRuntimeSettings,
+    SummaryServiceSettingsResponse,
+    SummaryServiceStorageSettings,
     UploadedFileRecord,
 )
 from .snapshots import build_job_snapshot
@@ -62,6 +70,78 @@ def health() -> dict[str, object]:
         "dry_run": settings.dry_run,
         "clickhouse_database": settings.clickhouse_database,
     }
+
+
+@app.get("/settings", response_model=SummaryServiceSettingsResponse)
+def service_settings() -> SummaryServiceSettingsResponse:
+    return build_public_settings(settings)
+
+
+def build_public_settings(current_settings=settings) -> SummaryServiceSettingsResponse:
+    return SummaryServiceSettingsResponse(
+        service_name="summary-generator",
+        read_only=True,
+        runtime=SummaryServiceRuntimeSettings(
+            api_host=current_settings.api_host,
+            api_port=current_settings.api_port,
+            cors_origins=list(current_settings.cors_origins),
+            websocket_poll_interval_seconds=current_settings.websocket_poll_interval_seconds,
+            log_level=current_settings.log_level,
+            broker_url=_mask_url_credentials(current_settings.broker_url),
+            worker_processes=current_settings.worker_processes,
+            worker_threads=current_settings.worker_threads,
+        ),
+        storage=SummaryServiceStorageSettings(
+            log_dir=str(current_settings.log_dir),
+            audit_dir=str(current_settings.audit_dir),
+            upload_staging_dir=str(current_settings.upload_staging_dir),
+        ),
+        clickhouse=SummaryServiceDatabaseSettings(
+            host=current_settings.clickhouse_host,
+            port=current_settings.clickhouse_port,
+            username=current_settings.clickhouse_username,
+            database=current_settings.clickhouse_database,
+            secure=current_settings.clickhouse_secure,
+            password_configured=bool(current_settings.clickhouse_password),
+        ),
+        source_clickhouse=SummaryServiceDatabaseSettings(
+            host=current_settings.source_clickhouse_host,
+            port=current_settings.source_clickhouse_port,
+            username=current_settings.source_clickhouse_username,
+            database=current_settings.source_clickhouse_database,
+            secure=current_settings.source_clickhouse_secure,
+            password_configured=bool(current_settings.source_clickhouse_password),
+        ),
+        llm=SummaryServiceLlmSettings(
+            api_base=current_settings.openai_api_base,
+            model=current_settings.llm_model,
+            timeout_seconds=current_settings.llm_timeout_seconds,
+            max_retries=current_settings.llm_max_retries,
+            retry_backoff_seconds=current_settings.llm_retry_backoff_seconds,
+            max_concurrency=current_settings.llm_max_concurrency,
+            pool_acquire_timeout_seconds=current_settings.llm_pool_acquire_timeout_seconds,
+            pool_poll_interval_seconds=current_settings.llm_pool_poll_interval_seconds,
+            api_key_configured=bool(current_settings.openai_api_key),
+            dry_run=current_settings.dry_run,
+        ),
+        pipeline=SummaryServicePipelineSettings(
+            chunk_target_estimated_tokens=current_settings.chunk_target_estimated_tokens,
+            reduce_group_size=current_settings.reduce_group_size,
+            max_enqueue_nodes_per_advance=current_settings.max_enqueue_nodes_per_advance,
+        ),
+    )
+
+
+def _mask_url_credentials(value: str) -> str:
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    if not parsed.username and not parsed.password:
+        return value
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    netloc = f"***:***@{host}{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 @app.post("/summary-jobs", response_model=CreateSummaryJobResponse)
@@ -291,6 +371,24 @@ def rerun_summary_job(job_id: str) -> RerunSummaryJobResponse:
         source_job_id=job_id,
         job_id=new_job_id,
         status=JobStatus.CREATED,
+        queued=queued,
+    )
+
+
+@app.post("/summary-jobs/{job_id}/nodes/{node_id}/rerun", response_model=RerunSummaryNodeResponse)
+def rerun_summary_node(job_id: str, node_id: str) -> RerunSummaryNodeResponse:
+    service = _service()
+    try:
+        node_type, status, queued = service.rerun_node(job_id, node_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"summary job or node not found: {job_id}/{node_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RerunSummaryNodeResponse(
+        job_id=job_id,
+        node_id=node_id,
+        node_type=str(node_type),
+        status=status,
         queued=queued,
     )
 

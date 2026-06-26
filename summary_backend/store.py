@@ -413,7 +413,12 @@ class ClickHouseStore:
             SELECT payload
             FROM {self._table("summary_node_events")}
             WHERE job_id = %(job_id)s AND node_id = %(node_id)s
-            ORDER BY event_time DESC, event_id DESC
+              AND payload != ''
+              AND payload != '{{}}'
+            ORDER BY
+                multiIf(position(payload, '"input_node_ids"') > 0, 3, position(payload, '"chunk_hash"') > 0, 2, 0) DESC,
+                event_time DESC,
+                event_id DESC
             LIMIT 1
             """,
             parameters={"job_id": job_id, "node_id": node_id},

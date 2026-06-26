@@ -69,6 +69,62 @@ class SummaryResult(BaseModel):
     source_count: int
 
 
+class SummaryServiceRuntimeSettings(BaseModel):
+    api_host: str
+    api_port: int
+    cors_origins: list[str]
+    websocket_poll_interval_seconds: float
+    log_level: str
+    broker_url: str
+    worker_processes: int
+    worker_threads: int
+
+
+class SummaryServiceStorageSettings(BaseModel):
+    log_dir: str
+    audit_dir: str
+    upload_staging_dir: str
+
+
+class SummaryServiceDatabaseSettings(BaseModel):
+    host: str
+    port: int
+    username: str
+    database: str
+    secure: bool
+    password_configured: bool
+
+
+class SummaryServiceLlmSettings(BaseModel):
+    api_base: str
+    model: str
+    timeout_seconds: float
+    max_retries: int
+    retry_backoff_seconds: float
+    max_concurrency: int
+    pool_acquire_timeout_seconds: float
+    pool_poll_interval_seconds: float
+    api_key_configured: bool
+    dry_run: bool
+
+
+class SummaryServicePipelineSettings(BaseModel):
+    chunk_target_estimated_tokens: int
+    reduce_group_size: int
+    max_enqueue_nodes_per_advance: int
+
+
+class SummaryServiceSettingsResponse(BaseModel):
+    service_name: str
+    read_only: bool
+    runtime: SummaryServiceRuntimeSettings
+    storage: SummaryServiceStorageSettings
+    clickhouse: SummaryServiceDatabaseSettings
+    source_clickhouse: SummaryServiceDatabaseSettings
+    llm: SummaryServiceLlmSettings
+    pipeline: SummaryServicePipelineSettings
+
+
 class CreateSummaryJobRequest(BaseModel):
     input_text: str = Field(min_length=1)
     title: str | None = None
@@ -86,6 +142,14 @@ class RerunSummaryJobResponse(BaseModel):
     source_job_id: str
     job_id: str
     status: JobStatus
+    queued: bool
+
+
+class RerunSummaryNodeResponse(BaseModel):
+    job_id: str
+    node_id: str
+    node_type: str
+    status: NodeStatus
     queued: bool
 
 
