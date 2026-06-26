@@ -6,6 +6,7 @@ import dramatiq
 
 from .broker import configure_broker
 from .config import get_settings
+from .errors import LlmPoolBusyError
 from .factory import create_pipeline_service
 from .ingestion import StagedUploadIngestionService
 from .logging_setup import configure_logging, get_logger
@@ -18,6 +19,10 @@ configure_logging(settings)
 configure_broker(settings)
 
 logger = get_logger("tasks")
+
+
+def _llm_pool_retry_delay_ms() -> int:
+    return int(max(1.0, float(settings.llm_pool_retry_delay_seconds)) * 1000)
 
 
 class DramatiqTaskQueue(TaskQueue):
@@ -77,13 +82,19 @@ def advance_job(job_id: str) -> None:
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)
 def map_node(job_id: str, node_id: str) -> None:
     logger.info("actor.map_node | job_id=%s node_id=%s", job_id, node_id)
-    acquired, _ = run_with_redis_lock(
-        settings,
-        f"summary:job:{job_id}:node:{node_id}",
-        timeout_seconds=_llm_lock_timeout_seconds(),
-        blocking_timeout_seconds=0.0,
-        action=lambda: _service().map_node(job_id, node_id),
-    )
+    try:
+        acquired, _ = run_with_redis_lock(
+            settings,
+            f"summary:job:{job_id}:node:{node_id}",
+            timeout_seconds=_llm_lock_timeout_seconds(),
+            blocking_timeout_seconds=0.0,
+            action=lambda: _service().map_node(job_id, node_id),
+        )
+    except LlmPoolBusyError:
+        delay_ms = _llm_pool_retry_delay_ms()
+        logger.info("actor.map_node.llm_pool_busy_requeue | job_id=%s node_id=%s delay_ms=%s", job_id, node_id, delay_ms)
+        map_node.send_with_options(args=(job_id, node_id), delay=delay_ms)
+        return
     if not acquired:
         logger.info("actor.map_node.locked_skip | job_id=%s node_id=%s", job_id, node_id)
 
@@ -91,13 +102,19 @@ def map_node(job_id: str, node_id: str) -> None:
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)
 def reduce_node(job_id: str, node_id: str) -> None:
     logger.info("actor.reduce_node | job_id=%s node_id=%s", job_id, node_id)
-    acquired, _ = run_with_redis_lock(
-        settings,
-        f"summary:job:{job_id}:node:{node_id}",
-        timeout_seconds=_llm_lock_timeout_seconds(),
-        blocking_timeout_seconds=0.0,
-        action=lambda: _service().reduce_node(job_id, node_id),
-    )
+    try:
+        acquired, _ = run_with_redis_lock(
+            settings,
+            f"summary:job:{job_id}:node:{node_id}",
+            timeout_seconds=_llm_lock_timeout_seconds(),
+            blocking_timeout_seconds=0.0,
+            action=lambda: _service().reduce_node(job_id, node_id),
+        )
+    except LlmPoolBusyError:
+        delay_ms = _llm_pool_retry_delay_ms()
+        logger.info("actor.reduce_node.llm_pool_busy_requeue | job_id=%s node_id=%s delay_ms=%s", job_id, node_id, delay_ms)
+        reduce_node.send_with_options(args=(job_id, node_id), delay=delay_ms)
+        return
     if not acquired:
         logger.info("actor.reduce_node.locked_skip | job_id=%s node_id=%s", job_id, node_id)
 
@@ -105,13 +122,19 @@ def reduce_node(job_id: str, node_id: str) -> None:
 @dramatiq.actor(max_retries=3, min_backoff=10000, max_backoff=300000)
 def finalize_job(job_id: str) -> None:
     logger.info("actor.finalize_job | job_id=%s", job_id)
-    acquired, _ = run_with_redis_lock(
-        settings,
-        f"summary:job:{job_id}:finalize",
-        timeout_seconds=_llm_lock_timeout_seconds(),
-        blocking_timeout_seconds=0.0,
-        action=lambda: _service().finalize_job(job_id),
-    )
+    try:
+        acquired, _ = run_with_redis_lock(
+            settings,
+            f"summary:job:{job_id}:finalize",
+            timeout_seconds=_llm_lock_timeout_seconds(),
+            blocking_timeout_seconds=0.0,
+            action=lambda: _service().finalize_job(job_id),
+        )
+    except LlmPoolBusyError:
+        delay_ms = _llm_pool_retry_delay_ms()
+        logger.info("actor.finalize_job.llm_pool_busy_requeue | job_id=%s delay_ms=%s", job_id, delay_ms)
+        finalize_job.send_with_options(args=(job_id,), delay=delay_ms)
+        return
     if not acquired:
         logger.info("actor.finalize_job.locked_skip | job_id=%s", job_id)
 

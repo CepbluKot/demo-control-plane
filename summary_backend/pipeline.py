@@ -9,7 +9,7 @@ from typing import Any
 
 from .audit import AuditWriter
 from .config import Settings, get_settings
-from .errors import classify_error
+from .errors import LlmPoolBusyError, classify_error
 from .ids import make_node_id, new_job_id, sha256_text
 from .input_models import InputSegment, LogRecord
 from .input_segments import RowBudgetInputSegmenter
@@ -447,6 +447,17 @@ class PipelineService:
             user = f"Summarize this chunk:\n\n{chunk['content']}"
             try:
                 result = self.llm.call_summary(job_id=job_id, node_id=node_id, stage=Stage.MAP, system=MAP_SYSTEM, user=user)
+            except LlmPoolBusyError as exc:
+                self._defer_node_for_llm_pool(
+                    job_id=job_id,
+                    node_id=node_id,
+                    node_type=NodeType.MAP,
+                    level=int(node["level"]),
+                    node_index=int(node["node_index"]),
+                    actor="map_node",
+                    exc=exc,
+                )
+                raise
             except Exception as exc:
                 self._fail_node_and_job(
                     job_id=job_id,
@@ -512,6 +523,17 @@ class PipelineService:
                     system=REDUCE_SYSTEM,
                     user=user,
                 )
+            except LlmPoolBusyError as exc:
+                self._defer_node_for_llm_pool(
+                    job_id=job_id,
+                    node_id=node_id,
+                    node_type=NodeType.REDUCE,
+                    level=int(node["level"]),
+                    node_index=int(node["node_index"]),
+                    actor="reduce_node",
+                    exc=exc,
+                )
+                raise
             except Exception as exc:
                 self._fail_node_and_job(
                     job_id=job_id,
@@ -608,6 +630,17 @@ class PipelineService:
                     system=FINAL_SYSTEM,
                     user=user,
                 )
+            except LlmPoolBusyError as exc:
+                self._defer_node_for_llm_pool(
+                    job_id=job_id,
+                    node_id=final_node_id,
+                    node_type=NodeType.FINAL,
+                    level=0,
+                    node_index=0,
+                    actor="finalize_job",
+                    exc=exc,
+                )
+                raise
             except Exception as exc:
                 self._fail_node_and_job(
                     job_id=job_id,
@@ -940,6 +973,48 @@ class PipelineService:
             job_id=job_id,
             event_type="JOB_FAILED",
             job_status=JobStatus.FAILED,
+            actor=actor,
+            message=error[:500],
+            payload=payload,
+        )
+
+    def _defer_node_for_llm_pool(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        node_type: NodeType,
+        level: int,
+        node_index: int,
+        actor: str,
+        exc: LlmPoolBusyError,
+    ) -> None:
+        if self._stop_if_not_runnable(job_id):
+            return
+
+        error = str(exc)
+        payload = {
+            "error_class": classify_error(exc),
+            "error": error[:2000],
+            "node_type": str(node_type),
+            "retry_delay_seconds": self.settings.llm_pool_retry_delay_seconds,
+        }
+        self.store.insert_node_event(
+            job_id=job_id,
+            node_id=node_id,
+            event_type="NODE_WAITING_RETRY",
+            node_status=NodeStatus.WAITING_RETRY,
+            node_type=node_type,
+            level=level,
+            node_index=node_index,
+            actor=actor,
+            message=error[:500],
+            payload=payload,
+        )
+        self.store.insert_job_event(
+            job_id=job_id,
+            event_type="JOB_WAITING_RETRY",
+            job_status=JobStatus.WAITING_RETRY,
             actor=actor,
             message=error[:500],
             payload=payload,

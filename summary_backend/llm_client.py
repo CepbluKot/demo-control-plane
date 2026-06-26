@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from .audit import AuditWriter
 from .config import Settings, get_settings
-from .errors import classify_error
+from .errors import LlmPoolBusyError, classify_error
 from .llm_pool import acquire_llm_pool_slot
 from .logging_setup import get_logger
 from .ports import AuditSink, SummaryStore
@@ -94,6 +94,8 @@ class StructuredLLMClient:
                     response_model=response_model,
                     attempt=attempt,
                 )
+            except LlmPoolBusyError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 error_class = classify_error(exc)
@@ -261,6 +263,8 @@ class StructuredLLMClient:
                 response_json=json.dumps(response_json, ensure_ascii=False),
             )
             return result
+        except LlmPoolBusyError:
+            raise
         except (json.JSONDecodeError, ValidationError, Exception) as exc:
             error = str(exc)
             latency_ms = int((time.monotonic() - started) * 1000)

@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from .config import Settings
-from .errors import ProviderUnavailableError
+from .errors import LlmPoolBusyError
 from .logging_setup import get_logger
 
 logger = get_logger("llm_pool")
@@ -48,8 +48,8 @@ def acquire_llm_pool_slot(
     """Acquire one process/pod-wide LLM slot backed by Redis.
 
     The slot has a lease so a crashed worker does not permanently reduce
-    capacity. ``SUMMARY_BACKEND_LLM_POOL_ACQUIRE_TIMEOUT_SECONDS=0`` means wait
-    without a deadline.
+    capacity. Keep the acquire timeout short so Dramatiq threads are not held
+    while all outbound LLM slots are busy.
     """
 
     import redis
@@ -97,7 +97,7 @@ def acquire_llm_pool_slot(
                 return
 
             if deadline is not None and time.monotonic() >= deadline:
-                raise ProviderUnavailableError(
+                raise LlmPoolBusyError(
                     f"LLM pool acquire timeout after {acquire_timeout:.1f}s; max_concurrency={max_concurrency}"
                 )
             time.sleep(poll_interval)

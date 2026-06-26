@@ -9,6 +9,7 @@ from typing import Any
 
 from summary_backend.api import build_public_settings
 from summary_backend.config import get_settings
+from summary_backend.errors import LlmPoolBusyError
 from summary_backend.ids import sha256_text
 from summary_backend.input_models import InputSegment
 from summary_backend.llm_client import StructuredLLMClient
@@ -413,6 +414,31 @@ class FailingLLM:
         raise RuntimeError(self.message)
 
 
+class BusyPoolLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+
+    def call_summary(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+    ) -> SummaryResult:
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+            }
+        )
+        raise LlmPoolBusyError("LLM pool acquire timeout after 1.0s; max_concurrency=2")
+
+
 class ManualQueue(TaskQueue):
     def __init__(self) -> None:
         self.items: deque[tuple[str, str, str | None]] = deque()
@@ -695,6 +721,29 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         payload = json.loads(failed_event["payload"])
         self.assertEqual(payload["error_class"], "rate_limit")
         self.assertIn("429", failed_event["message"])
+
+    def test_llm_pool_busy_defers_node_without_failing_job(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["chunk-1"])
+        service.llm = BusyPoolLLM()
+        job_id = service.create_job(input_text="input", title="pool-busy", metadata={})
+
+        queue.advance_job(job_id)
+        service.advance_job(job_id)
+        first_map = next(item for item in list(queue.items) if item[0] == "map")
+        queue.items.remove(first_map)
+        _, _, node_id = first_map
+        assert node_id is not None
+
+        with self.assertRaises(LlmPoolBusyError):
+            service.map_node(job_id, node_id)
+
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.WAITING_RETRY)
+        nodes = store.list_nodes_current(job_id)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["node_status"], NodeStatus.WAITING_RETRY)
+        self.assertEqual(nodes[0]["last_event_type"], "NODE_WAITING_RETRY")
+        payload = json.loads(store.list_node_events(job_id)[-1]["payload"])
+        self.assertEqual(payload["error_class"], "llm_pool_busy")
 
     def test_final_prompt_uses_requested_report_format(self) -> None:
         service, store, llm, queue = self.make_service(chunks=["chunk-1"])

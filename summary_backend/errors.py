@@ -19,6 +19,10 @@ class ProviderUnavailableError(RetryableBackendError):
     pass
 
 
+class LlmPoolBusyError(ProviderUnavailableError):
+    pass
+
+
 class RateLimitError(RetryableBackendError):
     pass
 
@@ -33,6 +37,8 @@ def classify_error(exc: Exception) -> str:
         return "context_too_long"
     if "rate limit" in text or "429" in text:
         return "rate_limit"
+    if "llm pool" in text:
+        return "llm_pool_busy"
     if "timeout" in text or "timed out" in text:
         return "timeout"
     if "503" in text or "502" in text or "500" in text or "connection" in text:
