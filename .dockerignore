@@ -1,0 +1,12 @@
+.git
+.pytest_cache
+__pycache__
+*.pyc
+.venv-summary-backend
+.summary-stack-pids
+artifacts
+docs
+summary_frontend
+tests
+airflow_llm_probe
+docker-compose.test-infra.yml

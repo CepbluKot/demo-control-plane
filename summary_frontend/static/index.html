@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Summary Jobs</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Summary Jobs</h1>
+            <p id="jobSubtitle">No active job</p>
+          </div>
+          <div class="topbar-actions">
+            <span id="connectionBadge" class="badge badge-muted">offline</span>
+            <button id="reloadJobButton" type="button">Reload</button>
+            <button id="clearJobButton" type="button">Clear</button>
+          </div>
+        </header>
+
+        <section class="content-grid">
+          <aside class="panel compose-panel">
+            <form id="createJobForm">
+              <label for="jobTitle">Title</label>
+              <input id="jobTitle" name="jobTitle" type="text" autocomplete="off" placeholder="incident-2026-06-23" />
+
+              <label>Input source</label>
+              <div class="mode-tabs" role="tablist" aria-label="Input source">
+                <button class="mode-tab active" type="button" data-mode="text">Text</button>
+                <button class="mode-tab" type="button" data-mode="upload">Upload</button>
+                <button class="mode-tab" type="button" data-mode="reuse">Saved</button>
+                <button class="mode-tab" type="button" data-mode="query">SQL</button>
+              </div>
+
+              <div id="textPanel" class="source-panel active">
+                <label for="inputText">Input context</label>
+                <textarea id="inputText" name="inputText" spellcheck="false"></textarea>
+              </div>
+
+              <div id="uploadPanel" class="source-panel">
+                <label for="uploadFile">File</label>
+                <input id="uploadFile" name="uploadFile" type="file" />
+
+                <label for="uploadFormat">Format</label>
+                <select id="uploadFormat" name="uploadFormat">
+                  <option value="auto">Auto</option>
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON</option>
+                  <option value="markdown">Markdown</option>
+                </select>
+
+                <label for="uploadRawLineColumn">Raw line column</label>
+                <input id="uploadRawLineColumn" name="uploadRawLineColumn" type="text" autocomplete="off" placeholder="raw_line" />
+                <p id="uploadHint" class="form-hint">CSV, JSON and Markdown exports are parsed by the backend worker after staging.</p>
+              </div>
+
+              <div id="reusePanel" class="source-panel">
+                <div class="field-row">
+                  <label for="uploadedFileSelect">Saved upload</label>
+                  <button id="refreshUploadsButton" type="button">Refresh</button>
+                </div>
+                <select id="uploadedFileSelect" name="uploadedFileSelect"></select>
+                <div id="uploadedFileDetails" class="upload-details">No saved uploads loaded</div>
+
+                <label for="reuseFormat">Format override</label>
+                <select id="reuseFormat" name="reuseFormat">
+                  <option value="">Use saved format</option>
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON</option>
+                  <option value="markdown">Markdown</option>
+                </select>
+
+                <label for="reuseRawLineColumn">Raw line column override</label>
+                <input id="reuseRawLineColumn" name="reuseRawLineColumn" type="text" autocomplete="off" placeholder="leave empty to reuse saved value" />
+              </div>
+
+              <div id="queryPanel" class="source-panel">
+                <label for="queryText">ClickHouse SQL</label>
+                <textarea id="queryText" name="queryText" spellcheck="false" placeholder="SELECT timestamp, container_name, raw_line FROM logs ORDER BY timestamp LIMIT 1000"></textarea>
+
+                <label for="queryRawLineColumn">Raw line column</label>
+                <input id="queryRawLineColumn" name="queryRawLineColumn" type="text" autocomplete="off" placeholder="raw_line" />
+                <p class="form-hint">Only read-only SELECT/WITH queries are accepted.</p>
+              </div>
+
+              <div class="form-row">
+                <label class="checkbox-row" for="autoStart">
+                  <input id="autoStart" type="checkbox" checked />
+                  <span>Auto start</span>
+                </label>
+                <button id="createJobButton" type="submit">Create job</button>
+              </div>
+            </form>
+          </aside>
+
+          <section class="main-panel">
+            <section class="status-strip">
+              <div class="metric">
+                <span>Status</span>
+                <strong id="jobStatus">-</strong>
+              </div>
+              <div class="metric">
+                <span>Nodes done</span>
+                <strong id="nodesDone">0/0</strong>
+              </div>
+              <div class="metric">
+                <span>Artifacts</span>
+                <strong id="artifactTotal">0</strong>
+              </div>
+              <div class="metric">
+                <span>Updated</span>
+                <strong id="serverTime">-</strong>
+              </div>
+            </section>
+
+            <section class="job-actions">
+              <button id="pauseJobButton" type="button">Pause</button>
+              <button id="resumeJobButton" type="button">Resume</button>
+              <button id="cancelJobButton" type="button" class="danger">Cancel</button>
+            </section>
+
+            <section class="panel">
+              <div class="section-heading">
+                <h2>Pipeline</h2>
+                <div class="progress-track"><span id="progressBar"></span></div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Level</th>
+                      <th>Index</th>
+                      <th>Status</th>
+                      <th>Node</th>
+                    </tr>
+                  </thead>
+                  <tbody id="nodesBody"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="split-grid">
+              <section class="panel">
+                <div class="section-heading">
+                  <h2>Artifacts</h2>
+                </div>
+                <div id="artifactsList" class="artifact-list"></div>
+              </section>
+
+              <section class="panel">
+                <div class="section-heading">
+                  <h2>Events</h2>
+                </div>
+                <div id="eventsList" class="events-list"></div>
+              </section>
+            </section>
+
+            <section class="panel final-panel">
+              <div class="section-heading">
+                <h2>Final Summary</h2>
+              </div>
+              <pre id="finalSummary">-</pre>
+            </section>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

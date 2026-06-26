@@ -1,38 +1,68 @@
-# Установка
+# LLM Summary Generator
+
+Backend + frontend для устойчивого map/reduce summarization pipeline по большим логам.
+
+## Документы
+
+- [Архитектура summary job pipeline](docs/summary-job-architecture.md)
+- [Summary backend](docs/summary-backend.md)
+- [ТЗ на frontend](docs/summary-frontend-tz.md)
+- [Summary backend test scenarios](docs/summary-backend-test-scenarios.md)
+- [Тестовая инфраструктура](docs/test-infra.md)
+
+## Локальный запуск
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv-summary-backend
+source .venv-summary-backend/bin/activate
 pip install -r requirements.txt
 ```
 
-## Настройка `.env`
+Поднять Redis + ClickHouse:
+
+```bash
+docker compose --env-file .env.test-infra.example -f docker-compose.test-infra.yml up -d
+```
+
+Запустить backend, frontend и worker:
+
+```bash
+bash scripts/run_summary_stack.sh
+```
+
+Frontend: `http://localhost:8090`
+
+Backend: `http://localhost:8088`
+
+Остановка:
+
+```bash
+bash scripts/stop_summary_stack.sh
+```
+
+## Конфигурация
 
 ```bash
 cp .env.example .env
 ```
 
-## Описание ключевых параметров `.env`
+Ключевые группы настроек:
 
-| Параметр | Что делает |
+| Параметры | Что делают |
 |---|---|
-| `OPENAI_API_BASE_DB` | URL LLM API. |
-| `OPENAI_API_KEY_DB` | API-ключ для LLM. |
-| `LLM_MODEL_ID` | ID модели для LLM-вызовов. |
-| `CONTROL_PLANE_LOGS_CLICKHOUSE_HOST` / `PORT` / `USERNAME` / `PASSWORD` | Подключение к ClickHouse с логами. |
-| `CONTROL_PLANE_CLICKHOUSE_LOGS_QUERY` | SQL-шаблон для логов (`{period_start}`, `{period_end}`, `{limit}`, `{offset}`, `{last_ts}`). |
-| `CONTROL_PLANE_LOGS_PAGE_LIMIT` | Размер страницы чтения из БД. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_DB_BATCH_SIZE` | Размер DB-батча на странице `Logs Summarizer`. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_BATCH_SIZE` | Максимум строк на один MAP-вызов LLM. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_MIN_LLM_BATCH_SIZE` | Минимальный размер LLM-батча при авто-уменьшении. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_AUTO_SHRINK_ON_400` | Авто-уменьшение батча при overflow/400. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT` | Базовый timeout LLM-вызовов (сек), по умолчанию `1200` (20 минут). |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_MAX_RETRIES` | Количество retry (`-1` = бесконечно). |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_MAX_RETRIES` | Retry для финального этапа отчёта. |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_LLM_TIMEOUT` | Совместимость со старым конфигом; финальный этап использует timeout из UI (`CONTROL_PLANE_UI_LOGS_SUMMARY_LLM_TIMEOUT`). |
-| `CONTROL_PLANE_UI_LOGS_SUMMARY_FINAL_STAGE_CONTEXT_MAX_CHARS` | Лимит контекста для LLM на финальном этапе (сжатие только для prompt, в файлы сохраняется полный отчёт). |
-| `CONTROL_PLANE_LLM_USE_INSTRUCTOR` | Включает structured-вызовы через Instructor/Pydantic. |
-| `CONTROL_PLANE_LLM_SUPPORTS_TOOL_CALLING` | `false`, если ваш gateway/model не поддерживает tool-calling. |
-| `CONTROL_PLANE_LLM_MAP_PROMPT_TEMPLATE` / `REDUCE` / `FREEFORM` / `UI_FINAL_REPORT` | Кастомные шаблоны промптов. |
+| `SUMMARY_BACKEND_CLICKHOUSE_*` | ClickHouse-хранилище jobs, events, nodes, artifacts и input segments. |
+| `SUMMARY_BACKEND_SOURCE_CLICKHOUSE_*` | Источник логов для пользовательских SQL-запросов. Если не заданы, используются `SUMMARY_BACKEND_CLICKHOUSE_*`. |
+| `SUMMARY_BACKEND_BROKER_URL` | Redis broker для Dramatiq. |
+| `SUMMARY_BACKEND_OPENAI_API_BASE` / `SUMMARY_BACKEND_OPENAI_API_KEY` / `SUMMARY_BACKEND_LLM_MODEL` | LLM API. |
+| `SUMMARY_BACKEND_DRY_RUN` | Тестовый режим без реальных LLM-вызовов. |
+| `SUMMARY_BACKEND_UPLOAD_STAGING_DIR` | Staging-директория для файлов, загруженных через `/summary-jobs/upload`. |
+| `SUMMARY_FRONTEND_*` | Порт frontend-а и адрес backend-а. |
 
-Полный список параметров и примеры значений смотрите в `.env.example`.
+## Проверки
+
+```bash
+python -m unittest tests.test_summary_backend tests.test_summary_input_files tests.test_summary_query_sources tests.test_summary_frontend -v
+python -m compileall -q summary_backend summary_frontend tests scripts
+bash scripts/test_infra_smoke.sh
+SUMMARY_BACKEND_DRY_RUN=true python scripts/summary_backend_smoke.py --repeat 5
+```

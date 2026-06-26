@@ -6,6 +6,8 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+.venv-*/
+.summary-stack-pids/
 env/
 
 # Build / packaging
@@ -18,6 +20,7 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.playwright/
 .coverage
 coverage.xml
 
@@ -27,14 +30,11 @@ coverage.xml
 .vscode/
 
 # Environment files
-
+.env
 *.local
 
 # Runtime artifacts
 artifacts/
-
-# Streamlit local config/secrets
-.streamlit/secrets.toml
 
 # Logs
 *.log

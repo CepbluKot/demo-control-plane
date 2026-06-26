@@ -1,0 +1,373 @@
+"""FastAPI control plane for summary jobs."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+
+from .config import get_settings
+from .factory import create_pipeline_service
+from .ingestion import ClickHouseQueryIngestionService, StagedUploadIngestionService
+from .input_parsers import InputParseError
+from .logging_setup import configure_logging, get_logger
+from .query_sources import ClickHouseQueryLogRecordSource, QuerySourceError
+from .schemas import (
+    ArtifactRecord,
+    CreateSummaryJobFromUploadRequest,
+    CreateSummaryJobQueryRequest,
+    CreateSummaryJobQueryResponse,
+    CreateSummaryJobRequest,
+    CreateSummaryJobResponse,
+    CreateSummaryJobUploadResponse,
+    EventRecord,
+    InputSegmentRecord,
+    JobCurrent,
+    JobStatus,
+    JobStatusResponse,
+    NodeCurrent,
+    PauseResumeResponse,
+    RerunSummaryJobResponse,
+    UploadedFileRecord,
+)
+from .snapshots import build_job_snapshot
+from .store import ClickHouseStore
+from .tasks import DramatiqTaskQueue
+
+settings = get_settings()
+configure_logging(settings)
+logger = get_logger("api")
+
+app = FastAPI(title="Summary Job Control Plane", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(settings.cors_origins),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _service():
+    return create_pipeline_service(queue=DramatiqTaskQueue(), settings=settings)
+
+
+@app.get("/health")
+def health() -> dict[str, object]:
+    return {
+        "ok": True,
+        "dry_run": settings.dry_run,
+        "clickhouse_database": settings.clickhouse_database,
+    }
+
+
+@app.post("/summary-jobs", response_model=CreateSummaryJobResponse)
+def create_summary_job(request: CreateSummaryJobRequest) -> CreateSummaryJobResponse:
+    service = _service()
+    job_id = service.create_job(input_text=request.input_text, title=request.title, metadata=request.metadata)
+    queued = False
+    if request.auto_start:
+        service.queue.advance_job(job_id)  # type: ignore[union-attr]
+        queued = True
+    logger.info("api.create_summary_job | job_id=%s queued=%s", job_id, queued)
+    return CreateSummaryJobResponse(job_id=job_id, status=JobStatus.CREATED, queued=queued)
+
+
+@app.get("/summary-jobs", response_model=list[JobCurrent])
+def list_summary_jobs(
+    limit: int = Query(default=200, ge=1, le=1000),
+    status: JobStatus | None = Query(default=None),
+) -> list[JobCurrent]:
+    rows = ClickHouseStore(settings).list_jobs(limit=limit, status=str(status) if status else None)
+    return [JobCurrent.model_validate(row) for row in rows]
+
+
+@app.post("/summary-jobs/upload", response_model=CreateSummaryJobUploadResponse)
+def create_summary_job_from_upload(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    metadata: str = Form(default="{}"),
+    auto_start: bool = Form(default=True),
+    source_format: str = Form(default="auto"),
+    raw_line_column: str | None = Form(default=None),
+) -> CreateSummaryJobUploadResponse:
+    try:
+        metadata_payload = json.loads(metadata or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"metadata must be JSON object: {exc}") from exc
+    if not isinstance(metadata_payload, dict):
+        raise HTTPException(status_code=422, detail="metadata must be JSON object")
+
+    ingestion = StagedUploadIngestionService(
+        store=ClickHouseStore(settings),
+        queue=DramatiqTaskQueue(),
+        settings=settings,
+    )
+    try:
+        result = ingestion.create_staged_upload_job(
+            file=file.file,
+            filename=file.filename or "upload",
+            content_type=file.content_type or "",
+            title=title,
+            metadata=metadata_payload,
+            requested_format=source_format,
+            raw_line_column=raw_line_column,
+            auto_start=auto_start,
+        )
+    except InputParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("api.upload_failed | filename=%s", file.filename)
+        raise
+
+    return CreateSummaryJobUploadResponse(
+        job_id=result.job_id,
+        status=JobStatus.INGESTING,
+        queued=result.queued,
+        filename=result.filename,
+        source_format=result.source_format,
+        segments_count=0,
+        rows_count=0,
+    )
+
+
+@app.get("/summary-uploads", response_model=list[UploadedFileRecord])
+def list_summary_uploads(limit: int = Query(default=200, ge=1, le=1000)) -> list[UploadedFileRecord]:
+    rows = ClickHouseStore(settings).list_staged_uploads(limit=limit)
+    return [UploadedFileRecord.model_validate(row) for row in rows]
+
+
+@app.post("/summary-jobs/from-upload", response_model=CreateSummaryJobUploadResponse)
+def create_summary_job_from_existing_upload(
+    request: CreateSummaryJobFromUploadRequest,
+) -> CreateSummaryJobUploadResponse:
+    source_format = request.source_format
+    if source_format == "auto":
+        source_format = None
+    ingestion = StagedUploadIngestionService(
+        store=ClickHouseStore(settings),
+        queue=DramatiqTaskQueue(),
+        settings=settings,
+    )
+    try:
+        result = ingestion.create_job_from_existing_upload(
+            upload_id=request.upload_id,
+            title=request.title,
+            metadata=request.metadata,
+            source_format=source_format,
+            raw_line_column=request.raw_line_column,
+            auto_start=request.auto_start,
+        )
+    except InputParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("api.reuse_upload_failed | upload_id=%s", request.upload_id)
+        raise
+
+    return CreateSummaryJobUploadResponse(
+        job_id=result.job_id,
+        status=JobStatus.INGESTING,
+        queued=result.queued,
+        filename=result.filename,
+        source_format=result.source_format,
+        segments_count=0,
+        rows_count=0,
+    )
+
+
+@app.post("/summary-jobs/clickhouse-query", response_model=CreateSummaryJobQueryResponse)
+def create_summary_job_from_clickhouse_query(request: CreateSummaryJobQueryRequest) -> CreateSummaryJobQueryResponse:
+    ingestion = ClickHouseQueryIngestionService(
+        store=ClickHouseStore(settings),
+        queue=DramatiqTaskQueue(),
+        query_source=ClickHouseQueryLogRecordSource(settings),
+        settings=settings,
+    )
+    try:
+        result = ingestion.create_job_from_query(
+            query=request.query,
+            title=request.title,
+            metadata=request.metadata,
+            raw_line_column=request.raw_line_column,
+            auto_start=request.auto_start,
+        )
+    except QuerySourceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        logger.exception("api.clickhouse_query_failed")
+        raise
+
+    return CreateSummaryJobQueryResponse(
+        job_id=result.job_id,
+        status=JobStatus.CREATED,
+        queued=result.queued,
+        source_format=result.source_format,
+        segments_count=result.segments_count,
+        rows_count=result.rows_count,
+    )
+
+
+@app.get("/summary-jobs/{job_id}", response_model=JobStatusResponse)
+def get_summary_job(job_id: str) -> JobStatusResponse:
+    try:
+        return JobStatusResponse.model_validate(_service().get_status(job_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}") from None
+
+
+@app.get("/summary-jobs/{job_id}/snapshot")
+def get_summary_job_snapshot(job_id: str) -> dict[str, object]:
+    try:
+        return build_job_snapshot(_service(), job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"job not found: {job_id}") from None
+
+
+@app.get("/summary-jobs/{job_id}/events", response_model=list[EventRecord])
+def list_summary_job_events(job_id: str, limit: int = Query(default=500, ge=1, le=5000)) -> list[EventRecord]:
+    rows = ClickHouseStore(settings).list_job_events(job_id, limit=limit)
+    return [EventRecord.model_validate(row) for row in rows]
+
+
+@app.get("/summary-jobs/{job_id}/node-events")
+def list_summary_node_events(job_id: str, limit: int = Query(default=1000, ge=1, le=10000)) -> list[dict[str, object]]:
+    return ClickHouseStore(settings).list_node_events(job_id, limit=limit)
+
+
+@app.get("/events")
+def list_summary_recent_events(limit: int = Query(default=200, ge=1, le=1000)) -> dict[str, object]:
+    return {"events": ClickHouseStore(settings).list_recent_events(limit=limit)}
+
+
+@app.get("/summary-jobs/{job_id}/nodes", response_model=list[NodeCurrent])
+def list_summary_nodes(job_id: str) -> list[NodeCurrent]:
+    rows = ClickHouseStore(settings).list_nodes_current(job_id)
+    return [NodeCurrent.model_validate(row) for row in rows]
+
+
+@app.get("/summary-jobs/{job_id}/artifacts", response_model=list[ArtifactRecord])
+def list_summary_artifacts(
+    job_id: str,
+    include_content: bool = Query(default=False),
+) -> list[ArtifactRecord]:
+    rows = ClickHouseStore(settings).list_artifacts(job_id=job_id, include_content=include_content)
+    return [ArtifactRecord.model_validate(row) for row in rows]
+
+
+@app.get("/summary-jobs/{job_id}/input-segments", response_model=list[InputSegmentRecord])
+def list_summary_input_segments(
+    job_id: str,
+    include_content: bool = Query(default=False),
+) -> list[InputSegmentRecord]:
+    rows = ClickHouseStore(settings).list_input_segments(job_id=job_id, include_content=include_content)
+    return [InputSegmentRecord.model_validate(row) for row in rows]
+
+
+@app.post("/summary-jobs/{job_id}/pause", response_model=PauseResumeResponse)
+def pause_summary_job(job_id: str) -> PauseResumeResponse:
+    _service().pause_job(job_id)
+    return PauseResumeResponse(job_id=job_id, status=JobStatus.PAUSE_REQUESTED)
+
+
+@app.post("/summary-jobs/{job_id}/resume", response_model=PauseResumeResponse)
+def resume_summary_job(job_id: str) -> PauseResumeResponse:
+    _service().resume_job(job_id)
+    return PauseResumeResponse(job_id=job_id, status=JobStatus.RESUMED)
+
+
+@app.post("/summary-jobs/{job_id}/rerun", response_model=RerunSummaryJobResponse)
+def rerun_summary_job(job_id: str) -> RerunSummaryJobResponse:
+    service = _service()
+    try:
+        new_job_id, queued = service.rerun_job(job_id, auto_start=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"summary job not found: {job_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return RerunSummaryJobResponse(
+        source_job_id=job_id,
+        job_id=new_job_id,
+        status=JobStatus.CREATED,
+        queued=queued,
+    )
+
+
+@app.post("/summary-jobs/{job_id}/cancel", response_model=PauseResumeResponse)
+def cancel_summary_job(job_id: str) -> PauseResumeResponse:
+    _service().cancel_job(job_id)
+    return PauseResumeResponse(job_id=job_id, status=JobStatus.CANCEL_REQUESTED)
+
+
+@app.websocket("/ws/summary-jobs/{job_id}")
+async def watch_summary_job(websocket: WebSocket, job_id: str) -> None:
+    await websocket.accept()
+    logger.info("ws.connected | job_id=%s client=%s", job_id, websocket.client)
+    service = _service()
+    last_hash = ""
+    try:
+        while True:
+            try:
+                payload = {
+                    "type": "snapshot",
+                    "snapshot": build_job_snapshot(service, job_id),
+                }
+            except KeyError:
+                await websocket.send_json({"type": "error", "detail": f"job not found: {job_id}"})
+                await websocket.close(code=1008)
+                return
+
+            encoded = jsonable_encoder(payload)
+            current_hash = hashlib.sha256(
+                json.dumps(encoded, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if current_hash != last_hash:
+                await websocket.send_json(encoded)
+                last_hash = current_hash
+
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=settings.websocket_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                continue
+            if message == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        logger.info("ws.disconnected | job_id=%s", job_id)
+
+
+@app.websocket("/ws/events")
+async def watch_summary_events(websocket: WebSocket, limit: int = 200) -> None:
+    await websocket.accept()
+    logger.info("ws.events.connected | client=%s", websocket.client)
+    store = ClickHouseStore(settings)
+    last_hash = ""
+    try:
+        while True:
+            payload = {
+                "type": "events",
+                "events": store.list_recent_events(limit=max(1, min(limit, 1000))),
+            }
+            encoded = jsonable_encoder(payload)
+            current_hash = hashlib.sha256(
+                json.dumps(encoded, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if current_hash != last_hash:
+                await websocket.send_json(encoded)
+                last_hash = current_hash
+
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=settings.websocket_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                continue
+            if message == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        logger.info("ws.events.disconnected")
