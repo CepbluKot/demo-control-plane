@@ -137,7 +137,7 @@ def get_settings() -> Settings:
         openai_api_base=openai_api_base,
         openai_api_key=openai_api_key,
         llm_model=llm_model,
-        llm_timeout_seconds=_env_float("SUMMARY_BACKEND_LLM_TIMEOUT_SECONDS", 120.0),
+        llm_timeout_seconds=_env_float("SUMMARY_BACKEND_LLM_TIMEOUT_SECONDS", 600.0),
         llm_max_retries=_env_int("SUMMARY_BACKEND_LLM_MAX_RETRIES", 3),
         llm_retry_backoff_seconds=_env_float("SUMMARY_BACKEND_LLM_RETRY_BACKOFF_SECONDS", 2.0),
         llm_max_concurrency=max(1, _env_int("SUMMARY_BACKEND_LLM_MAX_CONCURRENCY", min(worker_threads, 2))),
