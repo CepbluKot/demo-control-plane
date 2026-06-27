@@ -5,17 +5,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 
+from .audit import AuditWriter
 from .config import get_settings
 from .factory import create_pipeline_service
 from .ingestion import ClickHouseQueryIngestionService, StagedUploadIngestionService
 from .input_parsers import InputParseError
+from .llm_client import StructuredLLMClient
 from .logging_setup import configure_logging, get_logger
+from .pipeline import FINAL_SYSTEM, FINAL_USER_TEMPLATE, MAP_SYSTEM, MAP_USER_TEMPLATE, REDUCE_SYSTEM, REDUCE_USER_TEMPLATE
 from .query_sources import ClickHouseQueryLogRecordSource, QuerySourceError
 from .schemas import (
     ArtifactRecord,
@@ -26,6 +30,8 @@ from .schemas import (
     CreateSummaryJobResponse,
     CreateSummaryJobUploadResponse,
     EventRecord,
+    GenerateSummaryPromptDraftRequest,
+    GenerateSummaryPromptDraftResponse,
     InputSegmentRecord,
     JobCurrent,
     JobStatus,
@@ -40,6 +46,8 @@ from .schemas import (
     SummaryServiceRuntimeSettings,
     SummaryServiceSettingsResponse,
     SummaryServiceStorageSettings,
+    SummaryPromptOverridesDraft,
+    SummaryPromptStageDraft,
     UploadedFileRecord,
 )
 from .snapshots import build_job_snapshot
@@ -75,6 +83,48 @@ def health() -> dict[str, object]:
 @app.get("/settings", response_model=SummaryServiceSettingsResponse)
 def service_settings() -> SummaryServiceSettingsResponse:
     return build_public_settings(settings)
+
+
+@app.post("/prompt-drafts", response_model=GenerateSummaryPromptDraftResponse)
+def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) -> GenerateSummaryPromptDraftResponse:
+    if settings.dry_run:
+        return _fallback_prompt_draft(request.request, request.output_json_schema)
+
+    store = ClickHouseStore(settings)
+    llm = StructuredLLMClient(store=store, settings=settings, audit=AuditWriter(settings))
+    system = (
+        "You design prompts for a three-stage summarization pipeline. "
+        "Return only JSON matching the requested schema. "
+        "Each stage must include a system prompt and a user prompt template. "
+        "The MAP and REDUCE stages must keep returning the internal SummaryResult JSON shape: "
+        '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}.'
+    )
+    output_schema_text = json.dumps(request.output_json_schema or {}, ensure_ascii=False, indent=2)
+    user = (
+        "Create prompt overrides for a summary-generation job.\n\n"
+        f"User request:\n{request.request.strip()}\n\n"
+        f"Desired final output JSON structure, if any:\n{output_schema_text}\n\n"
+        "Hard constraints:\n"
+        "- prompt_overrides.map.user must include the literal placeholder {chunk}.\n"
+        "- prompt_overrides.reduce.user must include the literal placeholder {summaries}.\n"
+        "- prompt_overrides.final.user must include the literal placeholder {summaries}.\n"
+        "- The final prompt may also use {report_format_instruction} and {output_json_schema}.\n"
+        "- Keep prompts concise enough for production use.\n"
+        "- Do not include Markdown fences."
+    )
+    try:
+        draft = llm.call_structured(
+            job_id="prompt_draft",
+            node_id="prompt_draft",
+            stage="PROMPT_DRAFT",
+            system=system,
+            user=user,
+            response_model=GenerateSummaryPromptDraftResponse,
+        )
+    except Exception as exc:
+        logger.exception("api.prompt_draft_failed")
+        raise HTTPException(status_code=502, detail=f"could not generate prompt draft: {exc}") from exc
+    return _normalize_prompt_draft(draft, request.request, request.output_json_schema)
 
 
 def build_public_settings(current_settings=settings) -> SummaryServiceSettingsResponse:
@@ -142,6 +192,75 @@ def _mask_url_credentials(value: str) -> str:
     port = f":{parsed.port}" if parsed.port else ""
     netloc = f"***:***@{host}{port}"
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _fallback_prompt_draft(
+    user_request: str,
+    output_json_schema: dict[str, Any] | None,
+) -> GenerateSummaryPromptDraftResponse:
+    clean_request = " ".join(user_request.split())[:1200]
+    request_line = f"\nUser-specific direction: {clean_request}" if clean_request else ""
+    final_user = FINAL_USER_TEMPLATE
+    if output_json_schema:
+        final_user = (
+            "Create the final JSON response from these summaries.\n\n"
+            "Output JSON structure:\n{output_json_schema}\n\n"
+            "Additional report/prompt instruction:\n{report_format_instruction}\n\n"
+            "Summaries:\n\n{summaries}"
+        )
+    return GenerateSummaryPromptDraftResponse(
+        prompt_overrides=SummaryPromptOverridesDraft(
+            map=SummaryPromptStageDraft(
+                system=f"{MAP_SYSTEM}{request_line}",
+                user=MAP_USER_TEMPLATE,
+            ),
+            reduce=SummaryPromptStageDraft(
+                system=f"{REDUCE_SYSTEM}{request_line}",
+                user=REDUCE_USER_TEMPLATE,
+            ),
+            final=SummaryPromptStageDraft(
+                system=f"{FINAL_SYSTEM}{request_line}",
+                user=final_user,
+            ),
+        )
+    )
+
+
+def _normalize_prompt_draft(
+    draft: GenerateSummaryPromptDraftResponse,
+    user_request: str,
+    output_json_schema: dict[str, Any] | None,
+) -> GenerateSummaryPromptDraftResponse:
+    fallback = _fallback_prompt_draft(user_request, output_json_schema).prompt_overrides
+    raw = draft.prompt_overrides
+    return GenerateSummaryPromptDraftResponse(
+        prompt_overrides=SummaryPromptOverridesDraft(
+            map=_normalize_prompt_stage(raw.map, fallback.map, "{chunk}"),
+            reduce=_normalize_prompt_stage(raw.reduce, fallback.reduce, "{summaries}"),
+            final=_normalize_prompt_stage(
+                raw.final,
+                fallback.final,
+                "{summaries}",
+                extra_placeholder="{output_json_schema}" if output_json_schema else None,
+            ),
+        )
+    )
+
+
+def _normalize_prompt_stage(
+    draft: SummaryPromptStageDraft,
+    fallback: SummaryPromptStageDraft,
+    required_placeholder: str,
+    *,
+    extra_placeholder: str | None = None,
+) -> SummaryPromptStageDraft:
+    system = (draft.system or "").strip()[:4000] or fallback.system
+    user = (draft.user or "").strip()[:8000] or fallback.user
+    if required_placeholder not in user:
+        user = f"{user.rstrip()}\n\nInput:\n{required_placeholder}"
+    if extra_placeholder and extra_placeholder not in user:
+        user = f"{user.rstrip()}\n\nOutput JSON structure:\n{extra_placeholder}"
+    return SummaryPromptStageDraft(system=system, user=user)
 
 
 @app.post("/summary-jobs", response_model=CreateSummaryJobResponse)

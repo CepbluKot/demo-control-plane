@@ -69,6 +69,10 @@ class SummaryResult(BaseModel):
     source_count: int
 
 
+class JsonObjectResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
 class SummaryServiceRuntimeSettings(BaseModel):
     api_host: str
     api_port: int
@@ -123,6 +127,32 @@ class SummaryServiceSettingsResponse(BaseModel):
     source_clickhouse: SummaryServiceDatabaseSettings
     llm: SummaryServiceLlmSettings
     pipeline: SummaryServicePipelineSettings
+
+
+class SummaryPromptStageDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system: str = Field(min_length=1)
+    user: str = Field(min_length=1)
+
+
+class SummaryPromptOverridesDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    map: SummaryPromptStageDraft
+    reduce: SummaryPromptStageDraft
+    final: SummaryPromptStageDraft
+
+
+class GenerateSummaryPromptDraftRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=4000)
+    output_json_schema: dict[str, Any] | None = None
+
+
+class GenerateSummaryPromptDraftResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_overrides: SummaryPromptOverridesDraft
 
 
 class CreateSummaryJobRequest(BaseModel):

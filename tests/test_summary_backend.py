@@ -15,7 +15,7 @@ from summary_backend.input_models import InputSegment
 from summary_backend.llm_client import StructuredLLMClient
 from summary_backend.pipeline import PipelineService
 from summary_backend.ports import TaskQueue
-from summary_backend.schemas import ArtifactType, JobStatus, NodeStatus, NodeType, Stage, SummaryResult
+from summary_backend.schemas import ArtifactType, JobStatus, JsonObjectResult, NodeStatus, NodeType, Stage, SummaryResult
 from summary_backend.snapshots import build_job_snapshot
 
 
@@ -386,6 +386,40 @@ class FakeLLM:
             warnings=[],
             source_count=max(1, user.count("Summary ")),
         )
+
+
+class CustomJsonLLM(FakeLLM):
+    def call_structured(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        response_model: type,
+    ):
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+            }
+        )
+        if response_model is JsonObjectResult:
+            return response_model.model_validate({
+                "headline": "custom output",
+                "items": [{"title": "first", "severity": "info"}],
+            })
+        return response_model.model_validate({
+            "ok": True,
+            "summary": f"{stage}:{node_id}:{len(user)}",
+            "key_points": [],
+            "warnings": [],
+            "source_count": 1,
+        })
 
 
 class FailingLLM:
@@ -770,6 +804,86 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         metadata = json.loads(final_artifact["metadata"])
         self.assertEqual(metadata["report_format"], "technical_rca")
         self.assertIn("Highlight remediation owners.", metadata["report_format_instruction"])
+
+    def test_prompt_overrides_are_used_for_pipeline_stages(self) -> None:
+        service, _, llm, queue = self.make_service(chunks=[f"chunk-{index}" for index in range(9)])
+        job_id = service.create_job(
+            input_text="input",
+            title="prompts",
+            metadata={
+                "prompt_overrides": {
+                    "map": {
+                        "system": "MAP SYS",
+                        "user": "MAP CUSTOM {chunk}",
+                    },
+                    "reduce": {
+                        "system": "REDUCE SYS",
+                        "user": "REDUCE CUSTOM {summaries}",
+                    },
+                    "final": {
+                        "system": "FINAL SYS",
+                        "user": "FINAL CUSTOM {summaries} / {report_format_instruction}",
+                    },
+                },
+                "report_format": "custom",
+                "report_format_instruction": "Use owner fields.",
+            },
+        )
+
+        queue.advance_job(job_id)
+        self.drain(queue, service)
+
+        map_call = next(call for call in llm.calls if call["stage"] == Stage.MAP)
+        reduce_call = next(call for call in llm.calls if str(call["stage"]).startswith(str(Stage.REDUCE)))
+        final_call = next(call for call in llm.calls if call["stage"] == Stage.FINAL)
+        self.assertEqual(map_call["system"], "MAP SYS")
+        self.assertIn("MAP CUSTOM chunk-", map_call["user"])
+        self.assertEqual(reduce_call["system"], "REDUCE SYS")
+        self.assertIn("REDUCE CUSTOM Summary", reduce_call["user"])
+        self.assertEqual(final_call["system"], "FINAL SYS")
+        self.assertIn("FINAL CUSTOM", final_call["user"])
+        self.assertIn("Use owner fields.", final_call["user"])
+
+    def test_final_output_json_schema_allows_custom_final_json_object(self) -> None:
+        store = InMemorySummaryStore()
+        llm = CustomJsonLLM()
+        queue = ManualQueue()
+        service = PipelineService(
+            store=store,
+            queue=queue,
+            llm=llm,
+            chunker=FakeChunker(["chunk-1"]),
+            input_segmenter=FakeInputSegmenter(["input"]),
+        )
+        job_id = service.create_job(
+            input_text="input",
+            title="custom-json",
+            metadata={
+                "output_json_schema": {
+                    "headline": "string",
+                    "items": [{"title": "string", "severity": "string"}],
+                },
+                "prompt_overrides": {
+                    "final": {
+                        "user": "CUSTOM JSON {output_json_schema} FROM {summaries}",
+                    },
+                },
+            },
+        )
+
+        queue.advance_job(job_id)
+        self.drain(queue, service)
+
+        final_call = next(call for call in llm.calls if call["stage"] == Stage.FINAL)
+        self.assertIn("CUSTOM JSON", final_call["user"])
+        self.assertIn('"headline": "string"', final_call["user"])
+        final_artifact = store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.FINAL_SUMMARY)
+        self.assertIsNotNone(final_artifact)
+        payload = json.loads(final_artifact["content"])
+        self.assertEqual(payload["headline"], "custom output")
+        self.assertEqual(payload["items"][0]["severity"], "info")
+        metadata = json.loads(final_artifact["metadata"])
+        self.assertIn("output_json_schema", metadata)
 
     def test_create_job_persists_text_as_input_segments_for_map_nodes(self) -> None:
         service, store, _, queue = self.make_service(chunks=["row 1", "row 2\nrow 3"])

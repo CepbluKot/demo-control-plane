@@ -16,7 +16,7 @@ from .input_segments import RowBudgetInputSegmenter
 from .llm_client import StructuredLLMClient
 from .logging_setup import get_logger, log_kv, log_stage, timed_stage
 from .ports import Chunker, InputSegmenter, SummaryLLM, SummaryStore, TaskQueue
-from .schemas import ArtifactType, JobStatus, NodeStatus, NodeType, Stage, SummaryResult
+from .schemas import ArtifactType, JobStatus, JsonObjectResult, NodeStatus, NodeType, Stage, SummaryResult
 from .store import ClickHouseStore
 from .text import CharBudgetChunker, split_atomic_units
 
@@ -46,6 +46,22 @@ FINAL_SYSTEM = (
     "You produce the final user-facing summary from the consolidated context. "
     f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
     "Be concise and explicit about uncertainty."
+)
+
+CUSTOM_JSON_FINAL_SYSTEM = (
+    "You produce the final user-facing JSON object from the consolidated context. "
+    "Return exactly one valid JSON object. Do not wrap it in Markdown and do not add prose outside JSON. "
+    "Match the user-provided output JSON structure as closely as possible."
+)
+
+MAP_USER_TEMPLATE = "Summarize this chunk:\n\n{chunk}"
+REDUCE_USER_TEMPLATE = "Merge these summaries:\n\n{summaries}"
+FINAL_USER_TEMPLATE = "Create the final summary from these summaries:\n\n{summaries}"
+FINAL_CUSTOM_JSON_USER_TEMPLATE = (
+    "Create the final JSON response from these summaries.\n\n"
+    "Output JSON structure to follow:\n{output_json_schema}\n\n"
+    "Additional report/prompt instruction:\n{report_format_instruction}\n\n"
+    "Summaries:\n\n{summaries}"
 )
 
 REPORT_FORMAT_INSTRUCTIONS = {
@@ -444,9 +460,16 @@ class PipelineService:
             if chunk is None:
                 raise RuntimeError(f"chunk artifact not found for node_id={node_id}")
 
-            user = f"Summarize this chunk:\n\n{chunk['content']}"
+            prompts = self._resolve_prompt_overrides(job_id)
+            system = self._stage_system_prompt(prompts, "map", MAP_SYSTEM)
+            user = self._stage_user_prompt(
+                prompts,
+                "map",
+                MAP_USER_TEMPLATE,
+                {"chunk": str(chunk["content"] or "")},
+            )
             try:
-                result = self.llm.call_summary(job_id=job_id, node_id=node_id, stage=Stage.MAP, system=MAP_SYSTEM, user=user)
+                result = self.llm.call_summary(job_id=job_id, node_id=node_id, stage=Stage.MAP, system=system, user=user)
             except LlmPoolBusyError as exc:
                 self._defer_node_for_llm_pool(
                     job_id=job_id,
@@ -514,13 +537,21 @@ class PipelineService:
                 actor="reduce_node",
                 payload=payload,
             )
-            user = self._build_reduce_user(input_summaries)
+            prompts = self._resolve_prompt_overrides(job_id)
+            system = self._stage_system_prompt(prompts, "reduce", REDUCE_SYSTEM)
+            summaries_text = self._format_reduce_input_summaries(input_summaries)
+            user = self._stage_user_prompt(
+                prompts,
+                "reduce",
+                REDUCE_USER_TEMPLATE,
+                {"summaries": summaries_text},
+            )
             try:
                 result = self.llm.call_summary(
                     job_id=job_id,
                     node_id=node_id,
                     stage=f"{Stage.REDUCE}_L{node['level']}",
-                    system=REDUCE_SYSTEM,
+                    system=system,
                     user=user,
                 )
             except LlmPoolBusyError as exc:
@@ -609,7 +640,14 @@ class PipelineService:
                 input_hash=sha256_text(input_text),
             )
             report_format = self._resolve_report_format(job_id)
-            final_payload = {"input_count": len(inputs), **report_format}
+            prompt_overrides = self._resolve_prompt_overrides(job_id)
+            output_json_schema = self._resolve_output_json_schema(job_id)
+            final_payload = {
+                "input_count": len(inputs),
+                **report_format,
+                **({"output_json_schema": output_json_schema} if output_json_schema else {}),
+                **({"prompt_overrides": prompt_overrides} if prompt_overrides else {}),
+            }
             self.store.insert_node_event(
                 job_id=job_id,
                 node_id=final_node_id,
@@ -621,14 +659,24 @@ class PipelineService:
                 actor="finalize_job",
                 payload=final_payload,
             )
-            user = self._build_final_user(input_text=input_text, report_format=report_format)
+            system = self._stage_system_prompt(
+                prompt_overrides,
+                "final",
+                CUSTOM_JSON_FINAL_SYSTEM if output_json_schema else FINAL_SYSTEM,
+            )
+            user = self._build_final_user(
+                input_text=input_text,
+                report_format=report_format,
+                prompt_overrides=prompt_overrides,
+                output_json_schema=output_json_schema,
+            )
             try:
-                result = self.llm.call_summary(
+                result = self._call_final_llm(
                     job_id=job_id,
                     node_id=final_node_id,
-                    stage=Stage.FINAL,
-                    system=FINAL_SYSTEM,
+                    system=system,
                     user=user,
+                    output_json_schema=output_json_schema,
                 )
             except LlmPoolBusyError as exc:
                 self._defer_node_for_llm_pool(
@@ -1088,6 +1136,101 @@ class PipelineService:
             "report_format_instruction": instruction,
         }
 
+    def _resolve_prompt_overrides(self, job_id: str) -> dict[str, dict[str, str]]:
+        metadata = self._job_metadata(job_id)
+        raw = metadata.get("prompt_overrides")
+        if not isinstance(raw, dict):
+            return {}
+
+        prompts: dict[str, dict[str, str]] = {}
+        for stage in ("map", "reduce", "final"):
+            stage_raw = raw.get(stage)
+            if not isinstance(stage_raw, dict):
+                continue
+            system = str(stage_raw.get("system") or "").strip()
+            user = str(stage_raw.get("user") or stage_raw.get("user_template") or "").strip()
+            clean: dict[str, str] = {}
+            if system:
+                clean["system"] = system[:4000]
+            if user:
+                clean["user"] = user[:8000]
+            if clean:
+                prompts[stage] = clean
+        return prompts
+
+    def _resolve_output_json_schema(self, job_id: str) -> dict[str, Any] | None:
+        metadata = self._job_metadata(job_id)
+        raw = (
+            metadata.get("output_json_schema")
+            or metadata.get("final_output_json_schema")
+            or metadata.get("response_json_schema")
+        )
+        if isinstance(raw, dict) and raw:
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            parsed = self._safe_json_loads(raw)
+            return parsed or None
+        return None
+
+    @staticmethod
+    def _stage_system_prompt(prompts: dict[str, dict[str, str]], stage: str, default_system: str) -> str:
+        return prompts.get(stage, {}).get("system") or default_system
+
+    @staticmethod
+    def _stage_user_prompt(
+        prompts: dict[str, dict[str, str]],
+        stage: str,
+        default_template: str,
+        values: dict[str, str],
+    ) -> str:
+        template = prompts.get(stage, {}).get("user") or default_template
+        return PipelineService._render_prompt_template(template, values)
+
+    @staticmethod
+    def _render_prompt_template(template: str, values: dict[str, str]) -> str:
+        rendered = template
+        for key, value in values.items():
+            rendered = rendered.replace("{" + key + "}", value)
+        return rendered
+
+    def _call_final_llm(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        system: str,
+        user: str,
+        output_json_schema: dict[str, Any] | None,
+    ) -> SummaryResult | JsonObjectResult:
+        if not output_json_schema:
+            return self.llm.call_summary(
+                job_id=job_id,
+                node_id=node_id,
+                stage=Stage.FINAL,
+                system=system,
+                user=user,
+            )
+
+        call_structured = getattr(self.llm, "call_structured", None)
+        if callable(call_structured):
+            return call_structured(
+                job_id=job_id,
+                node_id=node_id,
+                stage=Stage.FINAL,
+                system=system,
+                user=user,
+                response_model=JsonObjectResult,
+            )
+
+        # Test doubles may only implement call_summary. Keep them compatible.
+        return self.llm.call_summary(
+            job_id=job_id,
+            node_id=node_id,
+            stage=Stage.FINAL,
+            system=system,
+            user=user,
+        )
+
     @staticmethod
     def _report_format_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         preserved: dict[str, Any] = {}
@@ -1097,14 +1240,48 @@ class PipelineService:
             "output_format",
             "output_format_instruction",
             "desired_output_format",
+            "output_json_schema",
+            "final_output_json_schema",
+            "response_json_schema",
+            "prompt_overrides",
         ):
             if key in metadata:
                 preserved[key] = metadata[key]
         return preserved
 
     @staticmethod
-    def _build_final_user(*, input_text: str, report_format: dict[str, str]) -> str:
+    def _build_final_user(
+        *,
+        input_text: str,
+        report_format: dict[str, str],
+        prompt_overrides: dict[str, dict[str, str]],
+        output_json_schema: dict[str, Any] | None,
+    ) -> str:
         instruction = report_format.get("report_format_instruction", "").strip()
+        output_json_schema_text = json.dumps(output_json_schema, ensure_ascii=False, indent=2) if output_json_schema else ""
+        if output_json_schema:
+            return PipelineService._stage_user_prompt(
+                prompt_overrides,
+                "final",
+                FINAL_CUSTOM_JSON_USER_TEMPLATE,
+                {
+                    "summaries": input_text,
+                    "report_format_instruction": instruction or "Use the source evidence faithfully.",
+                    "output_json_schema": output_json_schema_text,
+                },
+            )
+
+        override = prompt_overrides.get("final", {}).get("user")
+        if override:
+            return PipelineService._render_prompt_template(
+                override,
+                {
+                    "summaries": input_text,
+                    "report_format_instruction": instruction,
+                    "output_json_schema": output_json_schema_text,
+                },
+            )
+
         if not instruction:
             return f"Create the final summary from these summaries:\n\n{input_text}"
         return (
@@ -1117,7 +1294,7 @@ class PipelineService:
         )
 
     @staticmethod
-    def _build_reduce_user(input_summaries: list[dict[str, Any]]) -> str:
+    def _format_reduce_input_summaries(input_summaries: list[dict[str, Any]]) -> str:
         blocks: list[str] = []
         for index, artifact in enumerate(input_summaries, start=1):
             try:
@@ -1128,7 +1305,7 @@ class PipelineService:
                 content = str(artifact["content"])
                 key_points = ""
             blocks.append(f"Summary {index}:\n{content}\n{key_points}".strip())
-        return "Merge these summaries:\n\n" + "\n\n".join(blocks)
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _safe_json_loads(raw: str) -> dict[str, Any]:
