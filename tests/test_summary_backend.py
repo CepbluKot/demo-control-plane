@@ -831,6 +831,29 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         queued_maps_after_second_advance = [item for item in queue.items if item[0] == "map"]
         self.assertEqual(len(queued_maps_after_second_advance), 2)
 
+    def test_job_llm_concurrency_can_reduce_dispatch_limit(self) -> None:
+        service, store, _, queue = self.make_service(chunks=[f"chunk-{index}" for index in range(4)])
+        job_id = service.create_job(input_text="input", title="job-dispatch-limit", metadata={"llm_concurrency": 1})
+
+        service.advance_job(job_id)
+
+        queued_maps = [item for item in queue.items if item[0] == "map"]
+        self.assertEqual(len(queued_maps), 1)
+        nodes = store.list_nodes_current(job_id)
+        self.assertEqual(
+            Counter(str(node["node_status"]) for node in nodes),
+            Counter({str(NodeStatus.QUEUED): 1, str(NodeStatus.PENDING): 3}),
+        )
+
+    def test_job_llm_concurrency_is_capped_by_env_limit(self) -> None:
+        service, _, _, queue = self.make_service(chunks=[f"chunk-{index}" for index in range(4)])
+        job_id = service.create_job(input_text="input", title="job-dispatch-limit", metadata={"llm_concurrency": 99})
+
+        service.advance_job(job_id)
+
+        queued_maps = [item for item in queue.items if item[0] == "map"]
+        self.assertEqual(len(queued_maps), 2)
+
     def test_advance_requeues_stale_running_nodes_after_worker_restart(self) -> None:
         service, store, _, queue = self.make_service(chunks=["chunk-1", "chunk-2", "chunk-3"])
         job_id = service.create_job(input_text="input", title="stale-running", metadata={})

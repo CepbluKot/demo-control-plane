@@ -973,7 +973,7 @@ class PipelineService:
             for node in nodes
             if node["node_type"] == node_type and self._is_active_llm_dispatch_node(node)
         )
-        dispatch_limit = self._llm_dispatch_limit()
+        dispatch_limit = self._llm_dispatch_limit(job_id)
         available_slots = max(0, dispatch_limit - active_count)
         if available_slots <= 0:
             log_kv(
@@ -1025,14 +1025,30 @@ class PipelineService:
         )
         return True
 
-    def _llm_dispatch_limit(self) -> int:
+    def _llm_dispatch_limit(self, job_id: str) -> int:
+        env_limit = max(1, int(self.settings.llm_max_concurrency))
+        job_limit = self._resolve_job_llm_concurrency(job_id, env_limit)
         return max(
             1,
             min(
                 max(1, int(self.settings.max_enqueue_nodes_per_advance)),
-                max(1, int(self.settings.llm_max_concurrency)),
+                env_limit,
+                job_limit,
             ),
         )
+
+    def _resolve_job_llm_concurrency(self, job_id: str, env_limit: int) -> int:
+        metadata = self._job_metadata(job_id)
+        raw = (
+            metadata.get("llm_concurrency")
+            or metadata.get("llm_max_concurrency")
+            or metadata.get("max_concurrent_llm_calls")
+        )
+        try:
+            requested = int(raw)
+        except (TypeError, ValueError):
+            return env_limit
+        return max(1, min(requested, env_limit))
 
     def _is_active_llm_dispatch_node(self, node: dict[str, Any]) -> bool:
         status = node.get("node_status")
@@ -1576,6 +1592,9 @@ class PipelineService:
             "response_json_schema",
             "prompt_overrides",
             "llm_model",
+            "llm_concurrency",
+            "llm_max_concurrency",
+            "max_concurrent_llm_calls",
         ):
             if key in metadata:
                 preserved[key] = metadata[key]
