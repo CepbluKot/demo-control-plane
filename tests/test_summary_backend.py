@@ -4,8 +4,9 @@ import json
 import unittest
 from collections import Counter, deque
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import patch
 
 from summary_backend.api import build_public_settings
 from summary_backend.config import get_settings
@@ -527,6 +528,31 @@ class SummaryServiceSettingsTests(unittest.TestCase):
         self.assertNotIn("broker-pass", serialized)
 
 
+class SummaryWorkerRecoveryTests(unittest.TestCase):
+    def test_worker_boot_enqueues_recovery_once(self) -> None:
+        from summary_backend import tasks as task_module
+
+        previous = task_module._recovery_enqueued_on_worker_boot
+        task_module._recovery_enqueued_on_worker_boot = False
+        try:
+            with patch.object(task_module.recover_jobs, "send") as send:
+                task_module._RecoveryOnWorkerBootMiddleware().after_worker_boot(None, object())
+                task_module._RecoveryOnWorkerBootMiddleware().after_worker_boot(None, object())
+
+            send.assert_called_once_with()
+        finally:
+            task_module._recovery_enqueued_on_worker_boot = previous
+
+    def test_recovery_poll_is_rescheduled_while_jobs_are_runnable(self) -> None:
+        from summary_backend import tasks as task_module
+
+        with patch.object(task_module.recover_jobs, "send_with_options") as send_with_options:
+            task_module._schedule_recovery_poll_if_needed(["job_running"])
+            task_module._schedule_recovery_poll_if_needed([])
+
+        send_with_options.assert_called_once_with(delay=task_module._recovery_poll_delay_ms())
+
+
 class StructuredLLMClientParsingTests(unittest.TestCase):
     def test_parse_summary_result_from_markdown_fenced_json(self) -> None:
         payload = StructuredLLMClient._parse_response_payload(
@@ -601,6 +627,7 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         settings = replace(
             get_settings(),
             reduce_group_size=reduce_group_size,
+            llm_max_concurrency=2,
             max_enqueue_nodes_per_advance=100,
             chunk_target_estimated_tokens=100,
         )
@@ -771,13 +798,62 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         with self.assertRaises(LlmPoolBusyError):
             service.map_node(job_id, node_id)
 
-        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.WAITING_RETRY)
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.WAITING_PROVIDER)
         nodes = store.list_nodes_current(job_id)
         self.assertEqual(len(nodes), 1)
-        self.assertEqual(nodes[0]["node_status"], NodeStatus.WAITING_RETRY)
-        self.assertEqual(nodes[0]["last_event_type"], "NODE_WAITING_RETRY")
+        self.assertEqual(nodes[0]["node_status"], NodeStatus.WAITING_PROVIDER)
+        self.assertEqual(nodes[0]["last_event_type"], "NODE_WAITING_PROVIDER")
         payload = json.loads(store.list_node_events(job_id)[-1]["payload"])
         self.assertEqual(payload["error_class"], "llm_pool_busy")
+
+    def test_advance_limits_enqueued_llm_nodes_to_pool_concurrency(self) -> None:
+        service, store, _, queue = self.make_service(chunks=[f"chunk-{index}" for index in range(7)])
+        job_id = service.create_job(input_text="input", title="dispatch-limit", metadata={})
+
+        service.advance_job(job_id)
+
+        queued_maps = [item for item in queue.items if item[0] == "map"]
+        self.assertEqual(len(queued_maps), 2)
+        nodes = store.list_nodes_current(job_id)
+        self.assertEqual(
+            Counter(str(node["node_status"]) for node in nodes),
+            Counter({str(NodeStatus.QUEUED): 2, str(NodeStatus.PENDING): 5}),
+        )
+
+        service.advance_job(job_id)
+
+        queued_maps_after_second_advance = [item for item in queue.items if item[0] == "map"]
+        self.assertEqual(len(queued_maps_after_second_advance), 2)
+
+    def test_advance_requeues_stale_running_nodes_after_worker_restart(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["chunk-1", "chunk-2", "chunk-3"])
+        job_id = service.create_job(input_text="input", title="stale-running", metadata={})
+        service.advance_job(job_id)
+        first_map = next(item for item in list(queue.items) if item[0] == "map")
+        queue.items.remove(first_map)
+        _, _, node_id = first_map
+        assert node_id is not None
+        node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        store.insert_node_event(
+            job_id=job_id,
+            node_id=node_id,
+            event_type="NODE_STARTED",
+            node_status=NodeStatus.RUNNING,
+            node_type=NodeType.MAP,
+            level=int(node["level"]),
+            node_index=int(node["node_index"]),
+            actor="map_node",
+        )
+        store.node_events[-1]["event_time"] = datetime.now(timezone.utc) - timedelta(
+            seconds=service.settings.llm_timeout_seconds + 180,
+        )
+
+        service.advance_job(job_id)
+
+        requeued_maps = [item for item in queue.items if item[0] == "map" and item[2] == node_id]
+        self.assertEqual(len(requeued_maps), 1)
+        current_node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        self.assertEqual(current_node["node_status"], NodeStatus.QUEUED)
 
     def test_final_prompt_uses_requested_report_format(self) -> None:
         service, store, llm, queue = self.make_service(chunks=["chunk-1"])
@@ -797,7 +873,7 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertIn("Desired report format", final_call["user"])
         self.assertIn("technical RCA", final_call["user"])
         self.assertIn("Highlight remediation owners.", final_call["user"])
-        self.assertIn("Keep the SummaryResult JSON schema unchanged", final_call["user"])
+        self.assertIn("put the complete requested report in the summary string", final_call["user"])
 
         final_artifact = store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.FINAL_SUMMARY)
         self.assertIsNotNone(final_artifact)
@@ -985,6 +1061,25 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertIn("job_ingesting", recovered)
         self.assertIn(("ingest", "job_ingesting", None), queue.items)
 
+    def test_advance_fails_job_without_input_instead_of_retrying_forever(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["chunk-1"])
+        store.insert_job_event(
+            job_id="job_missing_input",
+            event_type="JOB_CREATED",
+            job_status=JobStatus.CREATED,
+            actor="seed",
+            payload={"source": "test"},
+        )
+
+        service.advance_job("job_missing_input")
+
+        job = store.get_job_current("job_missing_input")
+        self.assertEqual(job["job_status"], JobStatus.FAILED)
+        self.assertEqual(job["last_event_type"], "JOB_FAILED")
+        payload = json.loads(store.list_job_events("job_missing_input")[-1]["payload"])
+        self.assertEqual(payload["error_class"], "missing_input")
+        self.assertEqual(list(queue.items), [])
+
     def test_snapshot_contains_ui_read_model(self) -> None:
         service, store, _, queue = self.make_service(chunks=["chunk-1", "chunk-2"])
         job_id = service.create_job(input_text="input", title="snapshot", metadata={})
@@ -1001,6 +1096,10 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertIn("node_events", snapshot)
         self.assertIsNotNone(snapshot["final_artifact"])
         self.assertEqual(snapshot["artifact_counts"][ArtifactType.FINAL_SUMMARY], 1)
+        self.assertEqual(snapshot["input_stats"]["segments_count"], 2)
+        self.assertEqual(snapshot["input_stats"]["rows_count"], 2)
+        self.assertGreater(snapshot["input_stats"]["chars"], 0)
+        self.assertGreater(snapshot["input_stats"]["estimated_tokens"], 0)
 
 
 if __name__ == "__main__":

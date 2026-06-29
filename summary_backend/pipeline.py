@@ -23,6 +23,10 @@ from .text import CharBudgetChunker, split_atomic_units
 logger = get_logger("pipeline")
 
 
+class MissingSummaryInputError(RuntimeError):
+    pass
+
+
 SUMMARY_RESULT_SCHEMA_INSTRUCTION = (
     "Return exactly one JSON object with this schema and no alternate top-level keys: "
     '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}. '
@@ -43,8 +47,10 @@ REDUCE_SYSTEM = (
 )
 
 FINAL_SYSTEM = (
-    "You produce the final user-facing summary from the consolidated context. "
+    "You produce the final user-facing report from the consolidated context. "
     f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
+    "Put the complete report in summary. Use key_points and warnings only when the user explicitly requested those fields. "
+    "Choose clear headings, bullets, or prose inside summary when no specific report structure was requested. "
     "Be concise and explicit about uncertainty."
 )
 
@@ -56,7 +62,12 @@ CUSTOM_JSON_FINAL_SYSTEM = (
 
 MAP_USER_TEMPLATE = "Summarize this chunk:\n\n{chunk}"
 REDUCE_USER_TEMPLATE = "Merge these summaries:\n\n{summaries}"
-FINAL_USER_TEMPLATE = "Create the final summary from these summaries:\n\n{summaries}"
+FINAL_USER_TEMPLATE = (
+    "Create the final user-facing report from these summaries. "
+    "If the user did not request a specific structure, choose the most useful report structure yourself. "
+    "Return the transport JSON schema, but put the whole report in the summary string.\n\n"
+    "{summaries}"
+)
 FINAL_CUSTOM_JSON_USER_TEMPLATE = (
     "Create the final JSON response from these summaries.\n\n"
     "Output JSON structure to follow:\n{output_json_schema}\n\n"
@@ -378,6 +389,14 @@ class PipelineService:
 
             nodes = self.store.list_nodes_current(job_id)
             if not nodes:
+                if not self._has_map_source_input(job_id):
+                    self._fail_job(
+                        job_id=job_id,
+                        actor="advance_job",
+                        exc=MissingSummaryInputError(f"input artifact or input segments not found for job_id={job_id}"),
+                        payload={"error_class": "missing_input", "stage": "create_map_nodes"},
+                    )
+                    return
                 self._create_map_nodes(job_id)
                 nodes = self.store.list_nodes_current(job_id)
 
@@ -887,12 +906,33 @@ class PipelineService:
             if node["node_type"] == node_type
             and (
                 node["node_status"] in {NodeStatus.PENDING, NodeStatus.WAITING_RETRY}
+                or self._is_waiting_provider_ready_node(node)
                 or self._is_stale_queued_node(node)
+                or self._is_stale_running_node(node)
             )
         ]
         if not pending:
             return False
-        selected = pending[: self.settings.max_enqueue_nodes_per_advance]
+        active_count = sum(
+            1
+            for node in nodes
+            if node["node_type"] == node_type and self._is_active_llm_dispatch_node(node)
+        )
+        dispatch_limit = self._llm_dispatch_limit()
+        available_slots = max(0, dispatch_limit - active_count)
+        if available_slots <= 0:
+            log_kv(
+                logger,
+                "nodes_wait_dispatch_capacity",
+                job_id=job_id,
+                node_type=node_type,
+                pending=len(pending),
+                active=active_count,
+                limit=dispatch_limit,
+            )
+            return True
+
+        selected = pending[:available_slots]
         if self.queue is None:
             for node in selected:
                 if node_type == NodeType.MAP:
@@ -918,24 +958,78 @@ class PipelineService:
                 self.queue.map_node(job_id, str(node["node_id"]))
             elif node_type == NodeType.REDUCE:
                 self.queue.reduce_node(job_id, str(node["node_id"]))
-        log_kv(logger, "nodes_enqueued", job_id=job_id, node_type=node_type, count=len(selected))
+        log_kv(
+            logger,
+            "nodes_enqueued",
+            job_id=job_id,
+            node_type=node_type,
+            count=len(selected),
+            pending=len(pending),
+            active=active_count,
+            limit=dispatch_limit,
+        )
         return True
+
+    def _llm_dispatch_limit(self) -> int:
+        return max(
+            1,
+            min(
+                max(1, int(self.settings.max_enqueue_nodes_per_advance)),
+                max(1, int(self.settings.llm_max_concurrency)),
+            ),
+        )
+
+    def _is_active_llm_dispatch_node(self, node: dict[str, Any]) -> bool:
+        status = node.get("node_status")
+        if status == NodeStatus.RUNNING and not self._is_stale_running_node(node):
+            return True
+        if status == NodeStatus.QUEUED and not self._is_stale_queued_node(node):
+            return True
+        if status == NodeStatus.WAITING_PROVIDER and not self._is_waiting_provider_ready_node(node):
+            return True
+        return False
+
+    def _is_stale_running_node(self, node: dict[str, Any]) -> bool:
+        if node.get("node_status") != NodeStatus.RUNNING:
+            return False
+        age_seconds = self._node_age_seconds(node)
+        if age_seconds is None:
+            return True
+        running_timeout_seconds = max(
+            float(self.settings.queued_node_requeue_after_seconds),
+            float(self.settings.llm_timeout_seconds) + 120.0,
+        )
+        return age_seconds >= running_timeout_seconds
+
+    def _is_waiting_provider_ready_node(self, node: dict[str, Any]) -> bool:
+        if node.get("node_status") != NodeStatus.WAITING_PROVIDER:
+            return False
+        age_seconds = self._node_age_seconds(node)
+        if age_seconds is None:
+            return True
+        return age_seconds >= max(1.0, float(self.settings.llm_pool_retry_delay_seconds))
 
     def _is_stale_queued_node(self, node: dict[str, Any]) -> bool:
         if node.get("node_status") != NodeStatus.QUEUED:
             return False
+        age_seconds = self._node_age_seconds(node)
+        if age_seconds is None:
+            return True
+        return age_seconds >= self.settings.queued_node_requeue_after_seconds
+
+    @staticmethod
+    def _node_age_seconds(node: dict[str, Any]) -> float | None:
         updated_at = node.get("updated_at")
         if updated_at is None:
-            return True
+            return None
         if isinstance(updated_at, str):
             try:
                 updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
             except ValueError:
-                return True
+                return None
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)
-        age_seconds = (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
-        return age_seconds >= self.settings.queued_node_requeue_after_seconds
+        return (datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
 
     def _stop_if_not_runnable(self, job_id: str) -> bool:
         job = self.store.get_job_current(job_id)
@@ -984,6 +1078,32 @@ class PipelineService:
             self.advance_job(job_id)
         else:
             self.queue.advance_job(job_id)
+
+    def _has_map_source_input(self, job_id: str) -> bool:
+        input_segments = self.store.list_input_segments(job_id=job_id, include_content=False)
+        if input_segments:
+            return True
+        return self.store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.INPUT) is not None
+
+    def _fail_job(self, *, job_id: str, actor: str, exc: Exception, payload: dict[str, Any] | None = None) -> None:
+        if self._stop_if_not_runnable(job_id):
+            return
+
+        error = str(exc)
+        failure_payload = {
+            "error_class": classify_error(exc),
+            "error": error[:2000],
+        }
+        if payload:
+            failure_payload.update(payload)
+        self.store.insert_job_event(
+            job_id=job_id,
+            event_type="JOB_FAILED",
+            job_status=JobStatus.FAILED,
+            actor=actor,
+            message=error[:500],
+            payload=failure_payload,
+        )
 
     def _fail_node_and_job(
         self,
@@ -1050,8 +1170,8 @@ class PipelineService:
         self.store.insert_node_event(
             job_id=job_id,
             node_id=node_id,
-            event_type="NODE_WAITING_RETRY",
-            node_status=NodeStatus.WAITING_RETRY,
+            event_type="NODE_WAITING_PROVIDER",
+            node_status=NodeStatus.WAITING_PROVIDER,
             node_type=node_type,
             level=level,
             node_index=node_index,
@@ -1061,8 +1181,8 @@ class PipelineService:
         )
         self.store.insert_job_event(
             job_id=job_id,
-            event_type="JOB_WAITING_RETRY",
-            job_status=JobStatus.WAITING_RETRY,
+            event_type="JOB_WAITING_PROVIDER",
+            job_status=JobStatus.WAITING_PROVIDER,
             actor=actor,
             message=error[:500],
             payload=payload,
@@ -1283,13 +1403,22 @@ class PipelineService:
             )
 
         if not instruction:
-            return f"Create the final summary from these summaries:\n\n{input_text}"
+            return PipelineService._stage_user_prompt(
+                prompt_overrides,
+                "final",
+                FINAL_USER_TEMPLATE,
+                {
+                    "summaries": input_text,
+                    "report_format_instruction": instruction,
+                    "output_json_schema": output_json_schema_text,
+                },
+            )
         return (
-            "Create the final summary from these summaries.\n\n"
+            "Create the final user-facing report from these summaries.\n\n"
             "Desired report format:\n"
             f"{instruction}\n\n"
-            "The desired report format affects only the string values inside the structured JSON response. "
-            "Keep the SummaryResult JSON schema unchanged.\n\n"
+            "Return the SummaryResult transport JSON schema, but put the complete requested report in the summary string. "
+            "Do not split the user-facing report into default key_points or warnings sections unless the user asked for those fields.\n\n"
             f"Summaries:\n\n{input_text}"
         )
 

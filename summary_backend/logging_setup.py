@@ -117,8 +117,11 @@ def timed_stage(logger: logging.Logger, name: str, **fields: object) -> Iterator
     log_kv(logger, f"{name}.start", **fields)
     try:
         yield
-    except Exception:
+    except Exception as exc:
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        if exc.__class__.__name__ == "LlmPoolBusyError":
+            log_kv(logger, f"{name}.deferred", elapsed_ms=elapsed_ms, reason="llm_pool_busy", **fields)
+            raise
         logger.exception("%s.error | elapsed_ms=%s", name, elapsed_ms)
         raise
     else:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dramatiq
+from dramatiq.middleware import Middleware
 
 from .broker import configure_broker
 from .config import get_settings
@@ -19,10 +20,29 @@ configure_logging(settings)
 configure_broker(settings)
 
 logger = get_logger("tasks")
+_recovery_enqueued_on_worker_boot = False
 
 
 def _llm_pool_retry_delay_ms() -> int:
     return int(max(1.0, float(settings.llm_pool_retry_delay_seconds)) * 1000)
+
+
+def _recovery_poll_delay_ms() -> int:
+    return int(max(5.0, float(settings.queued_node_requeue_after_seconds)) * 1000)
+
+
+class _RecoveryOnWorkerBootMiddleware(Middleware):
+    def after_worker_boot(self, broker, worker) -> None:
+        _enqueue_recovery_on_worker_boot()
+
+
+def _enqueue_recovery_on_worker_boot() -> None:
+    global _recovery_enqueued_on_worker_boot
+    if _recovery_enqueued_on_worker_boot:
+        return
+    _recovery_enqueued_on_worker_boot = True
+    logger.info("worker.boot.recover_jobs_enqueue")
+    recover_jobs.send()
 
 
 class DramatiqTaskQueue(TaskQueue):
@@ -142,4 +162,23 @@ def finalize_job(job_id: str) -> None:
 @dramatiq.actor(max_retries=1)
 def recover_jobs() -> None:
     logger.info("actor.recover_jobs")
-    _service().recover_jobs()
+    recovered_job_ids = _service().recover_jobs()
+    _schedule_recovery_poll_if_needed(recovered_job_ids)
+
+
+def _schedule_recovery_poll_if_needed(recovered_job_ids: list[str]) -> None:
+    if not recovered_job_ids:
+        return
+    delay_ms = _recovery_poll_delay_ms()
+    logger.info("actor.recover_jobs.reschedule | jobs=%s delay_ms=%s", len(recovered_job_ids), delay_ms)
+    recover_jobs.send_with_options(delay=delay_ms)
+
+
+def _install_recovery_on_worker_boot_middleware() -> None:
+    broker = dramatiq.get_broker()
+    if any(isinstance(middleware, _RecoveryOnWorkerBootMiddleware) for middleware in broker.middleware):
+        return
+    broker.add_middleware(_RecoveryOnWorkerBootMiddleware())
+
+
+_install_recovery_on_worker_boot_middleware()

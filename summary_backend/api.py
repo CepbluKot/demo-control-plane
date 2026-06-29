@@ -97,7 +97,9 @@ def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) ->
         "Return only JSON matching the requested schema. "
         "Each stage must include a system prompt and a user prompt template. "
         "The MAP and REDUCE stages must keep returning the internal SummaryResult JSON shape: "
-        '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}.'
+        '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}. '
+        "If a final output JSON structure is provided, the FINAL stage must return that structure. "
+        "Otherwise FINAL must keep the SummaryResult transport JSON shape and put the complete user-facing report in summary."
     )
     output_schema_text = json.dumps(request.output_json_schema or {}, ensure_ascii=False, indent=2)
     user = (
@@ -109,6 +111,7 @@ def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) ->
         "- prompt_overrides.reduce.user must include the literal placeholder {summaries}.\n"
         "- prompt_overrides.final.user must include the literal placeholder {summaries}.\n"
         "- The final prompt may also use {report_format_instruction} and {output_json_schema}.\n"
+        "- Without a final output JSON structure, the final prompt should let the LLM choose a useful report layout inside summary.\n"
         "- Keep prompts concise enough for production use.\n"
         "- Do not include Markdown fences."
     )
