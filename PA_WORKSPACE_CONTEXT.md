@@ -37,4 +37,4 @@ Important files:
 Operational note:
 
 - After each future change request, update relevant docs, run reasonable checks, commit, and push.
-- Use subagents for future PA workspace work whenever the task is not trivial and subagent tooling is available. If subagent startup fails because of authentication or refresh-token issues, report the blocker and continue locally.
+- Subagent delegation is disabled while subagent startup repeatedly fails with authentication or refresh-token errors. Continue locally until subagent authentication is explicitly fixed.
