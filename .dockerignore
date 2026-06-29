@@ -6,7 +6,6 @@ __pycache__
 .summary-stack-pids
 artifacts
 docs
-summary_frontend
 tests
 airflow_llm_probe
 docker-compose.test-infra.yml

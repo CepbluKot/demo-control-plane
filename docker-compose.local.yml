@@ -1,0 +1,125 @@
+name: llm-summary-local
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: llm-summary-local-clickhouse
+    environment:
+      CLICKHOUSE_DB: summary_test
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "28123:8123"
+      - "29000:9000"
+    volumes:
+      - summary_clickhouse_data:/var/lib/clickhouse
+      - ./infra/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "clickhouse-client --user \"$${CLICKHOUSE_USER:-default}\" --password \"$${CLICKHOUSE_PASSWORD:-}\" --query 'SELECT 1' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: llm-summary-local-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "26379:6379"
+    volumes:
+      - summary_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-summary-generator:local
+    container_name: llm-summary-local-backend
+    command: ["python", "-m", "summary_backend"]
+    environment:
+      SUMMARY_BACKEND_DRY_RUN: "true"
+      SUMMARY_BACKEND_API_HOST: "0.0.0.0"
+      SUMMARY_BACKEND_API_PORT: "8088"
+      SUMMARY_BACKEND_CORS_ORIGINS: "http://localhost:28090,http://127.0.0.1:28090"
+      SUMMARY_BACKEND_CLICKHOUSE_HOST: clickhouse
+      SUMMARY_BACKEND_CLICKHOUSE_PORT: "8123"
+      SUMMARY_BACKEND_CLICKHOUSE_USERNAME: default
+      SUMMARY_BACKEND_CLICKHOUSE_PASSWORD: ""
+      SUMMARY_BACKEND_CLICKHOUSE_DATABASE: summary_test
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_HOST: clickhouse
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_PORT: "8123"
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_USERNAME: default
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_PASSWORD: ""
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_DATABASE: summary_test
+      SUMMARY_BACKEND_BROKER_URL: redis://redis:6379/0
+      SUMMARY_BACKEND_LOG_LEVEL: INFO
+    ports:
+      - "28088:8088"
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: llm-summary-generator:local
+    container_name: llm-summary-local-worker
+    command: ["dramatiq", "summary_backend.tasks", "--processes", "1", "--threads", "4"]
+    environment:
+      SUMMARY_BACKEND_DRY_RUN: "true"
+      SUMMARY_BACKEND_CLICKHOUSE_HOST: clickhouse
+      SUMMARY_BACKEND_CLICKHOUSE_PORT: "8123"
+      SUMMARY_BACKEND_CLICKHOUSE_USERNAME: default
+      SUMMARY_BACKEND_CLICKHOUSE_PASSWORD: ""
+      SUMMARY_BACKEND_CLICKHOUSE_DATABASE: summary_test
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_HOST: clickhouse
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_PORT: "8123"
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_USERNAME: default
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_PASSWORD: ""
+      SUMMARY_BACKEND_SOURCE_CLICKHOUSE_DATABASE: summary_test
+      SUMMARY_BACKEND_BROKER_URL: redis://redis:6379/0
+      SUMMARY_BACKEND_LOG_LEVEL: INFO
+      SUMMARY_BACKEND_WORKER_PROCESSES: "1"
+      SUMMARY_BACKEND_WORKER_THREADS: "4"
+    volumes:
+      - ./artifacts:/app/artifacts
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    image: llm-summary-generator:local
+    container_name: llm-summary-local-frontend
+    command: ["python", "-m", "summary_frontend"]
+    environment:
+      SUMMARY_FRONTEND_HOST: "0.0.0.0"
+      SUMMARY_FRONTEND_PORT: "8090"
+      SUMMARY_FRONTEND_BACKEND_HTTP_URL: http://localhost:28088
+      SUMMARY_FRONTEND_BACKEND_WS_URL: ws://localhost:28088
+    ports:
+      - "28090:8090"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  summary_clickhouse_data:
+  summary_redis_data:

@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY summary_backend ./summary_backend
+COPY summary_frontend ./summary_frontend
 
 RUN mkdir -p /app/artifacts/summary_backend/logs \
     /app/artifacts/summary_backend/audit \
