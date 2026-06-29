@@ -403,6 +403,7 @@ class CustomJsonLLM(FakeLLM):
         system: str,
         user: str,
         response_model: type,
+        response_schema: dict | None = None,
     ):
         self.calls.append(
             {
@@ -411,6 +412,7 @@ class CustomJsonLLM(FakeLLM):
                 "stage": stage,
                 "system": system,
                 "user": user,
+                "response_schema": response_schema,
             }
         )
         if response_model is JsonObjectResult:
@@ -957,6 +959,12 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         final_call = next(call for call in llm.calls if call["stage"] == Stage.FINAL)
         self.assertIn("CUSTOM JSON", final_call["user"])
         self.assertIn('"headline": "string"', final_call["user"])
+        self.assertEqual(final_call["response_schema"]["type"], "object")
+        self.assertEqual(final_call["response_schema"]["properties"]["headline"]["type"], "string")
+        self.assertEqual(final_call["response_schema"]["properties"]["items"]["type"], "array")
+        self.assertEqual(final_call["response_schema"]["properties"]["items"]["items"]["properties"]["severity"]["type"], "string")
+        self.assertEqual(final_call["response_schema"]["required"], ["headline", "items"])
+        self.assertFalse(final_call["response_schema"]["additionalProperties"])
         final_artifact = store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.FINAL_SUMMARY)
         self.assertIsNotNone(final_artifact)
         payload = json.loads(final_artifact["content"])

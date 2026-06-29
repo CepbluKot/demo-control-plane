@@ -74,6 +74,7 @@ class StructuredLLMClient:
         user: str,
         model: str | None = None,
         response_model: type[TModel],
+        response_schema: dict[str, Any] | None = None,
     ) -> TModel:
         selected_model = (model or self.settings.llm_model).strip()
         if self.settings.dry_run:
@@ -85,6 +86,7 @@ class StructuredLLMClient:
                 user=user,
                 model=selected_model,
                 response_model=response_model,
+                response_schema=response_schema,
             )
 
         last_exc: Exception | None = None
@@ -98,6 +100,7 @@ class StructuredLLMClient:
                     user=user,
                     model=selected_model,
                     response_model=response_model,
+                    response_schema=response_schema,
                     attempt=attempt,
                 )
             except LlmPoolBusyError:
@@ -131,6 +134,7 @@ class StructuredLLMClient:
         user: str,
         model: str,
         response_model: type[TModel],
+        response_schema: dict[str, Any] | None = None,
     ) -> TModel:
         started = time.monotonic()
         request_json = {
@@ -141,6 +145,15 @@ class StructuredLLMClient:
                 {"role": "user", "content": user},
             ],
         }
+        if response_schema:
+            request_json["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__,
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
         summary_text = self._dry_summary(stage=stage, text=user)
         payload = {
             "ok": True,
@@ -190,11 +203,12 @@ class StructuredLLMClient:
         user: str,
         model: str,
         response_model: type[TModel],
+        response_schema: dict[str, Any] | None,
         attempt: int,
     ) -> TModel:
         from openai import OpenAI
 
-        schema = response_model.model_json_schema()
+        schema = response_schema or response_model.model_json_schema()
         request_json: dict[str, Any] = {
             "model": model,
             "messages": [

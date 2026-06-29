@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from time import perf_counter
@@ -1535,6 +1536,7 @@ class PipelineService:
 
         call_structured = getattr(self.llm, "call_structured", None)
         if callable(call_structured):
+            response_schema = self._build_final_response_schema(output_json_schema)
             kwargs = {
                 "job_id": job_id,
                 "node_id": node_id,
@@ -1545,6 +1547,8 @@ class PipelineService:
             }
             if self._call_accepts_keyword(call_structured, "model"):
                 kwargs["model"] = model
+            if self._call_accepts_keyword(call_structured, "response_schema"):
+                kwargs["response_schema"] = response_schema
             return call_structured(
                 **kwargs,
             )
@@ -1629,6 +1633,109 @@ class PipelineService:
             "Do not split the user-facing report into default key_points or warnings sections unless the user asked for those fields.\n\n"
             f"Summaries:\n\n{input_text}"
         )
+
+    @classmethod
+    def _build_final_response_schema(cls, output_json_schema: dict[str, Any]) -> dict[str, Any]:
+        if cls._looks_like_json_schema(output_json_schema):
+            return cls._normalize_response_json_schema(output_json_schema)
+        return cls._shape_object_to_json_schema(output_json_schema)
+
+    @classmethod
+    def _looks_like_json_schema(cls, value: dict[str, Any]) -> bool:
+        return "type" in value or "properties" in value or "$schema" in value
+
+    @classmethod
+    def _normalize_response_json_schema(cls, schema: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(schema)
+        normalized.pop("$schema", None)
+        normalized.setdefault("type", "object")
+        if normalized.get("type") != "object":
+            normalized = {
+                "type": "object",
+                "properties": {"value": normalized},
+                "required": ["value"],
+                "additionalProperties": False,
+            }
+        properties = normalized.get("properties")
+        if isinstance(properties, dict):
+            normalized["properties"] = {
+                str(key): cls._normalize_json_schema_node(value)
+                for key, value in properties.items()
+                if str(key).strip()
+            }
+            normalized.setdefault("required", list(normalized["properties"].keys()))
+        normalized.setdefault("additionalProperties", False)
+        return normalized
+
+    @classmethod
+    def _normalize_json_schema_node(cls, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            node = dict(value)
+            if cls._looks_like_json_schema(node):
+                node.pop("$schema", None)
+                if node.get("type") == "object" or isinstance(node.get("properties"), dict):
+                    node.setdefault("type", "object")
+                    properties = node.get("properties")
+                    if isinstance(properties, dict):
+                        node["properties"] = {
+                            str(key): cls._normalize_json_schema_node(child)
+                            for key, child in properties.items()
+                            if str(key).strip()
+                        }
+                        node.setdefault("required", list(node["properties"].keys()))
+                    node.setdefault("additionalProperties", False)
+                elif node.get("type") == "array":
+                    node["items"] = cls._normalize_json_schema_node(node.get("items", {"type": "string"}))
+                return node
+            return cls._shape_object_to_json_schema(node)
+        if isinstance(value, list):
+            return cls._shape_value_to_json_schema(value)
+        return cls._shape_scalar_to_json_schema(value)
+
+    @classmethod
+    def _shape_object_to_json_schema(cls, shape: dict[str, Any]) -> dict[str, Any]:
+        properties = {
+            str(key).strip(): cls._shape_value_to_json_schema(value)
+            for key, value in shape.items()
+            if str(key).strip()
+        }
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties.keys()),
+            "additionalProperties": False,
+        }
+
+    @classmethod
+    def _shape_value_to_json_schema(cls, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return cls._shape_object_to_json_schema(value)
+        if isinstance(value, list):
+            item = value[0] if value else "string"
+            return {
+                "type": "array",
+                "items": cls._shape_value_to_json_schema(item),
+            }
+        return cls._shape_scalar_to_json_schema(value)
+
+    @staticmethod
+    def _shape_scalar_to_json_schema(value: Any) -> dict[str, Any]:
+        if isinstance(value, bool):
+            return {"type": "boolean"}
+        if isinstance(value, int | float):
+            return {"type": "number"}
+        raw = str(value or "").strip()
+        lowered = raw.lower()
+        schema_type = "string"
+        for candidate in ("string", "number", "integer", "boolean"):
+            if lowered == candidate or lowered.startswith(f"{candidate} ") or lowered.startswith(f"{candidate}-") or lowered.startswith(f"{candidate}:"):
+                schema_type = candidate
+                break
+        node: dict[str, Any] = {"type": schema_type}
+        description = re.sub(r"^(string|number|integer|boolean)\s*[-:()]?\s*", "", raw, flags=re.IGNORECASE).strip()
+        if description:
+            node["description"] = description[:500]
+        return node
 
     @staticmethod
     def _format_reduce_input_summaries(input_summaries: list[dict[str, Any]]) -> str:
