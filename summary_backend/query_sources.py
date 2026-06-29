@@ -60,6 +60,21 @@ class ClickHouseQueryLogRecordSource:
             if callable(close):
                 close()
 
+    def preview_rows(self, query: str, *, limit: int = 100) -> tuple[list[str], list[dict[str, Any]]]:
+        query = validate_read_query(query)
+        safe_limit = max(1, min(int(limit), 500))
+        preview_query = f"SELECT * FROM ({query}) LIMIT {safe_limit}"
+        client = self._make_client()
+        try:
+            result = client.query(preview_query)
+            column_names = [str(name) for name in result.column_names]
+            rows = [dict(zip(column_names, row)) for row in result.result_rows]
+            return column_names, rows
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
     def _make_client(self):
         if self._client_factory is not None:
             return self._client_factory()

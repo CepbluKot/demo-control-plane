@@ -269,6 +269,34 @@ class ClickHouseStore:
             ],
         )
 
+    def latest_llm_call(self, *, job_id: str, node_id: str) -> dict[str, Any] | None:
+        result = self.client.query(
+            f"""
+            SELECT
+                toString(call_id) AS call_id,
+                job_id,
+                node_id,
+                created_at,
+                provider,
+                model,
+                status,
+                error_class,
+                http_status,
+                latency_ms,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                error_message
+            FROM {self._table("summary_llm_calls")}
+            WHERE job_id = %(job_id)s AND node_id = %(node_id)s
+            ORDER BY created_at DESC, call_id DESC
+            LIMIT 1
+            """,
+            parameters={"job_id": job_id, "node_id": node_id},
+        )
+        rows = self._rows(result)
+        return rows[0] if rows else None
+
     def get_job_current(self, job_id: str) -> dict[str, Any] | None:
         result = self.client.query(
             f"""

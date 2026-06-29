@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,6 +30,9 @@ from .schemas import (
     CreateSummaryJobRequest,
     CreateSummaryJobResponse,
     CreateSummaryJobUploadResponse,
+    DatasourceQueryPreviewMetadata,
+    DatasourceQueryPreviewRequest,
+    DatasourceQueryPreviewResponse,
     EventRecord,
     GenerateSummaryPromptDraftRequest,
     GenerateSummaryPromptDraftResponse,
@@ -168,6 +172,7 @@ def build_public_settings(current_settings=settings) -> SummaryServiceSettingsRe
         llm=SummaryServiceLlmSettings(
             api_base=current_settings.openai_api_base,
             model=current_settings.llm_model,
+            available_models=list(current_settings.llm_models or ((current_settings.llm_model,) if current_settings.llm_model else ())),
             timeout_seconds=current_settings.llm_timeout_seconds,
             max_retries=current_settings.llm_max_retries,
             retry_backoff_seconds=current_settings.llm_retry_backoff_seconds,
@@ -409,6 +414,31 @@ def create_summary_job_from_clickhouse_query(request: CreateSummaryJobQueryReque
         source_format=result.source_format,
         segments_count=result.segments_count,
         rows_count=result.rows_count,
+    )
+
+
+@app.post("/datasources/query", response_model=DatasourceQueryPreviewResponse)
+def preview_source_clickhouse_query(request: DatasourceQueryPreviewRequest) -> DatasourceQueryPreviewResponse:
+    source = ClickHouseQueryLogRecordSource(settings)
+    started_at = perf_counter()
+    try:
+        columns, rows = source.preview_rows(request.query, limit=request.limit)
+    except QuerySourceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("api.datasource_query_preview_failed")
+        raise HTTPException(status_code=502, detail=f"query preview failed: {exc}") from exc
+
+    return DatasourceQueryPreviewResponse(
+        datasource=request.datasource or "source_clickhouse",
+        query=request.query,
+        metadata=DatasourceQueryPreviewMetadata(
+            columns=columns,
+            records_count=len(rows),
+            execution_time_ms=max(1, round((perf_counter() - started_at) * 1000)),
+        ),
+        data=[],
+        raw_rows=jsonable_encoder(rows),
     )
 
 

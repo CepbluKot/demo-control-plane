@@ -153,7 +153,11 @@ class InMemorySummaryStore:
             )
 
     def insert_llm_call(self, **kwargs: Any) -> None:
-        self.llm_calls.append(dict(kwargs))
+        self.llm_calls.append({**dict(kwargs), "created_at": self._now()})
+
+    def latest_llm_call(self, *, job_id: str, node_id: str) -> dict[str, Any] | None:
+        calls = [call for call in self.llm_calls if call.get("job_id") == job_id and call.get("node_id") == node_id]
+        return calls[-1] if calls else None
 
     def get_job_current(self, job_id: str) -> dict[str, Any] | None:
         events = [event for event in self.job_events if event["job_id"] == job_id]

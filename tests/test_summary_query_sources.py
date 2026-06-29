@@ -35,6 +35,24 @@ class FakeClient:
         self.closed = True
 
 
+class FakePreviewResult:
+    column_names = ("timestamp", "message", "value")
+    result_rows = (("2026-01-01", "ok", 42),)
+
+
+class FakePreviewClient:
+    def __init__(self) -> None:
+        self.closed = False
+        self.query_text = ""
+
+    def query(self, query: str):
+        self.query_text = query
+        return FakePreviewResult()
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class SummaryQuerySourceTests(unittest.TestCase):
     def test_validate_read_query_allows_select_and_with(self) -> None:
         self.assertEqual(validate_read_query(" SELECT 1; "), "SELECT 1")
@@ -57,6 +75,20 @@ class SummaryQuerySourceTests(unittest.TestCase):
         self.assertEqual(records[0].container_name, "api")
         self.assertEqual(records[0].attrs["severity"], "error")
         self.assertEqual(records[0].raw_line, "failed")
+
+    def test_clickhouse_query_source_previews_limited_rows(self) -> None:
+        fake_client = FakePreviewClient()
+        source = ClickHouseQueryLogRecordSource(client_factory=lambda: fake_client)
+
+        columns, rows = source.preview_rows("SELECT timestamp, message, value FROM logs", limit=25)
+
+        self.assertTrue(fake_client.closed)
+        self.assertEqual(
+            fake_client.query_text,
+            "SELECT * FROM (SELECT timestamp, message, value FROM logs) LIMIT 25",
+        )
+        self.assertEqual(columns, ["timestamp", "message", "value"])
+        self.assertEqual(rows, [{"timestamp": "2026-01-01", "message": "ok", "value": 42}])
 
 
 if __name__ == "__main__":

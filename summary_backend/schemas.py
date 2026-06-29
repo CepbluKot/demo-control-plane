@@ -103,6 +103,7 @@ class SummaryServiceDatabaseSettings(BaseModel):
 class SummaryServiceLlmSettings(BaseModel):
     api_base: str
     model: str
+    available_models: list[str]
     timeout_seconds: float
     max_retries: int
     retry_backoff_seconds: float
@@ -231,6 +232,30 @@ class CreateSummaryJobQueryResponse(BaseModel):
     source_format: str
     segments_count: int
     rows_count: int
+
+
+class DatasourceQueryPreviewRequest(BaseModel):
+    datasource: str | None = None
+    datasourceConfig: dict[str, Any] | None = None
+    query: str = Field(min_length=1)
+    step: str | None = None
+    resultMode: str | None = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class DatasourceQueryPreviewMetadata(BaseModel):
+    columns: list[str]
+    records_count: int
+    execution_time_ms: int
+
+
+class DatasourceQueryPreviewResponse(BaseModel):
+    success: bool = True
+    datasource: str
+    query: str
+    metadata: DatasourceQueryPreviewMetadata
+    data: list[dict[str, Any]] = Field(default_factory=list)
+    raw_rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class JobCurrent(BaseModel):

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import inspect
 from collections import Counter
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from .audit import AuditWriter
@@ -448,6 +450,7 @@ class PipelineService:
                     event_type="JOB_DONE",
                     job_status=JobStatus.DONE,
                     actor="advance_job",
+                    payload={"duration_ms": self._job_elapsed_ms(job_id)},
                 )
                 return
 
@@ -480,6 +483,7 @@ class PipelineService:
                 raise RuntimeError(f"chunk artifact not found for node_id={node_id}")
 
             prompts = self._resolve_prompt_overrides(job_id)
+            llm_model = self._resolve_llm_model(job_id)
             system = self._stage_system_prompt(prompts, "map", MAP_SYSTEM)
             user = self._stage_user_prompt(
                 prompts,
@@ -487,8 +491,16 @@ class PipelineService:
                 MAP_USER_TEMPLATE,
                 {"chunk": str(chunk["content"] or "")},
             )
+            node_started = perf_counter()
             try:
-                result = self.llm.call_summary(job_id=job_id, node_id=node_id, stage=Stage.MAP, system=system, user=user)
+                result = self._call_summary_llm(
+                    job_id=job_id,
+                    node_id=node_id,
+                    stage=str(Stage.MAP),
+                    system=system,
+                    user=user,
+                    model=llm_model,
+                )
             except LlmPoolBusyError as exc:
                 self._defer_node_for_llm_pool(
                     job_id=job_id,
@@ -501,6 +513,7 @@ class PipelineService:
                 )
                 raise
             except Exception as exc:
+                duration_ms = int((perf_counter() - node_started) * 1000)
                 self._fail_node_and_job(
                     job_id=job_id,
                     node_id=node_id,
@@ -509,8 +522,11 @@ class PipelineService:
                     node_index=int(node["node_index"]),
                     actor="map_node",
                     exc=exc,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
                 )
                 return
+            duration_ms = int((perf_counter() - node_started) * 1000)
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=node_id,
@@ -529,6 +545,13 @@ class PipelineService:
                 level=int(node["level"]),
                 node_index=int(node["node_index"]),
                 actor="map_node",
+                payload=self._node_timing_payload(
+                    job_id=job_id,
+                    node_id=node_id,
+                    node_type=NodeType.MAP,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
+                ),
             )
             self._advance_or_inline(job_id)
 
@@ -557,6 +580,7 @@ class PipelineService:
                 payload=payload,
             )
             prompts = self._resolve_prompt_overrides(job_id)
+            llm_model = self._resolve_llm_model(job_id)
             system = self._stage_system_prompt(prompts, "reduce", REDUCE_SYSTEM)
             summaries_text = self._format_reduce_input_summaries(input_summaries)
             user = self._stage_user_prompt(
@@ -565,13 +589,15 @@ class PipelineService:
                 REDUCE_USER_TEMPLATE,
                 {"summaries": summaries_text},
             )
+            node_started = perf_counter()
             try:
-                result = self.llm.call_summary(
+                result = self._call_summary_llm(
                     job_id=job_id,
                     node_id=node_id,
                     stage=f"{Stage.REDUCE}_L{node['level']}",
                     system=system,
                     user=user,
+                    model=llm_model,
                 )
             except LlmPoolBusyError as exc:
                 self._defer_node_for_llm_pool(
@@ -585,6 +611,7 @@ class PipelineService:
                 )
                 raise
             except Exception as exc:
+                duration_ms = int((perf_counter() - node_started) * 1000)
                 self._fail_node_and_job(
                     job_id=job_id,
                     node_id=node_id,
@@ -593,8 +620,11 @@ class PipelineService:
                     node_index=int(node["node_index"]),
                     actor="reduce_node",
                     exc=exc,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
                 )
                 return
+            duration_ms = int((perf_counter() - node_started) * 1000)
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=node_id,
@@ -613,7 +643,14 @@ class PipelineService:
                 level=int(node["level"]),
                 node_index=int(node["node_index"]),
                 actor="reduce_node",
-                payload=payload,
+                payload=self._node_timing_payload(
+                    job_id=job_id,
+                    node_id=node_id,
+                    node_type=NodeType.REDUCE,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
+                    payload=payload,
+                ),
             )
             self._advance_or_inline(job_id)
 
@@ -627,6 +664,7 @@ class PipelineService:
                     event_type="JOB_DONE",
                     job_status=JobStatus.DONE,
                     actor="finalize_job",
+                    payload={"duration_ms": self._job_elapsed_ms(job_id)},
                 )
                 return
 
@@ -683,12 +721,14 @@ class PipelineService:
                 "final",
                 CUSTOM_JSON_FINAL_SYSTEM if output_json_schema else FINAL_SYSTEM,
             )
+            llm_model = self._resolve_llm_model(job_id)
             user = self._build_final_user(
                 input_text=input_text,
                 report_format=report_format,
                 prompt_overrides=prompt_overrides,
                 output_json_schema=output_json_schema,
             )
+            node_started = perf_counter()
             try:
                 result = self._call_final_llm(
                     job_id=job_id,
@@ -696,6 +736,7 @@ class PipelineService:
                     system=system,
                     user=user,
                     output_json_schema=output_json_schema,
+                    model=llm_model,
                 )
             except LlmPoolBusyError as exc:
                 self._defer_node_for_llm_pool(
@@ -709,6 +750,7 @@ class PipelineService:
                 )
                 raise
             except Exception as exc:
+                duration_ms = int((perf_counter() - node_started) * 1000)
                 self._fail_node_and_job(
                     job_id=job_id,
                     node_id=final_node_id,
@@ -717,8 +759,11 @@ class PipelineService:
                     node_index=0,
                     actor="finalize_job",
                     exc=exc,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
                 )
                 return
+            duration_ms = int((perf_counter() - node_started) * 1000)
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=final_node_id,
@@ -737,12 +782,21 @@ class PipelineService:
                 level=0,
                 node_index=0,
                 actor="finalize_job",
+                payload=self._node_timing_payload(
+                    job_id=job_id,
+                    node_id=final_node_id,
+                    node_type=NodeType.FINAL,
+                    duration_ms=duration_ms,
+                    llm_model=llm_model,
+                    payload=final_payload,
+                ),
             )
             self.store.insert_job_event(
                 job_id=job_id,
                 event_type="JOB_DONE",
                 job_status=JobStatus.DONE,
                 actor="finalize_job",
+                payload={"duration_ms": self._job_elapsed_ms(job_id)},
             )
 
     def recover_jobs(self) -> list[str]:
@@ -1115,6 +1169,8 @@ class PipelineService:
         node_index: int,
         actor: str,
         exc: Exception,
+        duration_ms: int | None = None,
+        llm_model: str | None = None,
     ) -> None:
         if self._stop_if_not_runnable(job_id):
             return
@@ -1125,6 +1181,13 @@ class PipelineService:
             "error": error[:2000],
             "node_type": str(node_type),
         }
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if llm_model:
+            payload["llm_model"] = llm_model
+        llm_payload = self._latest_llm_payload(job_id=job_id, node_id=node_id)
+        if llm_payload:
+            payload["llm"] = llm_payload
         self.store.insert_node_event(
             job_id=job_id,
             node_id=node_id,
@@ -1187,6 +1250,143 @@ class PipelineService:
             message=error[:500],
             payload=payload,
         )
+
+    def _call_summary_llm(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        model: str,
+    ) -> SummaryResult:
+        call_summary = self.llm.call_summary
+        kwargs = {
+            "job_id": job_id,
+            "node_id": node_id,
+            "stage": stage,
+            "system": system,
+            "user": user,
+        }
+        if self._call_accepts_keyword(call_summary, "model"):
+            return call_summary(**kwargs, model=model)
+        return call_summary(**kwargs)
+
+    @staticmethod
+    def _call_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return False
+        return keyword in parameters or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+    def _resolve_llm_model(self, job_id: str) -> str:
+        metadata = self._job_metadata(job_id)
+        requested = str(metadata.get("llm_model") or metadata.get("model") or "").strip()
+        available_models = tuple(model for model in self.settings.llm_models if model)
+        if requested and (not available_models or requested in available_models):
+            return requested
+        if requested and requested != self.settings.llm_model:
+            log_kv(
+                logger,
+                "llm_model_unavailable",
+                job_id=job_id,
+                requested=requested,
+                fallback=self.settings.llm_model,
+                available=",".join(available_models),
+            )
+        return self.settings.llm_model
+
+    def _node_timing_payload(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        node_type: NodeType,
+        duration_ms: int,
+        llm_model: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = dict(payload or {})
+        result["duration_ms"] = duration_ms
+        result["node_type"] = str(node_type)
+        result["llm_model"] = llm_model
+        llm_payload = self._latest_llm_payload(job_id=job_id, node_id=node_id)
+        if llm_payload:
+            result["llm"] = llm_payload
+        log_kv(
+            logger,
+            "node_timing",
+            job_id=job_id,
+            node_id=node_id,
+            node_type=node_type,
+            duration_ms=duration_ms,
+            llm_model=llm_model,
+            llm_latency_ms=llm_payload.get("latency_ms", 0) if llm_payload else 0,
+            llm_total_tokens=llm_payload.get("total_tokens", 0) if llm_payload else 0,
+        )
+        return result
+
+    def _latest_llm_payload(self, *, job_id: str, node_id: str) -> dict[str, Any]:
+        latest_llm_call = getattr(self.store, "latest_llm_call", None)
+        if not callable(latest_llm_call):
+            return {}
+        row = latest_llm_call(job_id=job_id, node_id=node_id)
+        if not row:
+            return {}
+        latency_ms = self._safe_positive_int(row.get("latency_ms"))
+        prompt_tokens = self._safe_positive_int(row.get("prompt_tokens"))
+        completion_tokens = self._safe_positive_int(row.get("completion_tokens"))
+        total_tokens = self._safe_positive_int(row.get("total_tokens"))
+        payload: dict[str, Any] = {
+            "provider": str(row.get("provider") or ""),
+            "model": str(row.get("model") or ""),
+            "status": str(row.get("status") or ""),
+            "latency_ms": latency_ms,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+        if latency_ms > 0:
+            seconds = latency_ms / 1000
+            payload["completion_tokens_per_second"] = round(completion_tokens / seconds, 2) if completion_tokens > 0 else 0
+            payload["total_tokens_per_second"] = round(total_tokens / seconds, 2) if total_tokens > 0 else 0
+        error_class = str(row.get("error_class") or "")
+        error_message = str(row.get("error_message") or "")
+        if error_class:
+            payload["error_class"] = error_class
+        if error_message:
+            payload["error_message"] = error_message[:2000]
+        return payload
+
+    @staticmethod
+    def _safe_positive_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _job_elapsed_ms(self, job_id: str) -> int:
+        events = self.store.list_job_events(job_id, limit=1000)
+        created_events = [event for event in events if str(event.get("event_type") or "") == "JOB_CREATED"]
+        start_event = created_events[0] if created_events else (events[0] if events else None)
+        start_time = self._parse_event_time(start_event.get("event_time")) if start_event else None
+        if start_time is None:
+            return 0
+        return max(0, int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000))
+
+    @staticmethod
+    def _parse_event_time(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
 
     def _node_by_id(self, job_id: str, node_id: str) -> dict[str, Any]:
         for node in self.store.list_nodes_current(job_id):
@@ -1321,25 +1521,32 @@ class PipelineService:
         system: str,
         user: str,
         output_json_schema: dict[str, Any] | None,
+        model: str,
     ) -> SummaryResult | JsonObjectResult:
         if not output_json_schema:
-            return self.llm.call_summary(
+            return self._call_summary_llm(
                 job_id=job_id,
                 node_id=node_id,
                 stage=Stage.FINAL,
                 system=system,
                 user=user,
+                model=model,
             )
 
         call_structured = getattr(self.llm, "call_structured", None)
         if callable(call_structured):
+            kwargs = {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": Stage.FINAL,
+                "system": system,
+                "user": user,
+                "response_model": JsonObjectResult,
+            }
+            if self._call_accepts_keyword(call_structured, "model"):
+                kwargs["model"] = model
             return call_structured(
-                job_id=job_id,
-                node_id=node_id,
-                stage=Stage.FINAL,
-                system=system,
-                user=user,
-                response_model=JsonObjectResult,
+                **kwargs,
             )
 
         # Test doubles may only implement call_summary. Keep them compatible.
@@ -1364,6 +1571,7 @@ class PipelineService:
             "final_output_json_schema",
             "response_json_schema",
             "prompt_overrides",
+            "llm_model",
         ):
             if key in metadata:
                 preserved[key] = metadata[key]

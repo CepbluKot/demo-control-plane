@@ -77,6 +77,7 @@ class Settings:
     openai_api_base: str
     openai_api_key: str
     llm_model: str
+    llm_models: tuple[str, ...]
     llm_timeout_seconds: float
     llm_max_retries: int
     llm_retry_backoff_seconds: float
@@ -97,6 +98,9 @@ def get_settings() -> Settings:
     openai_api_base = _env("SUMMARY_BACKEND_OPENAI_API_BASE", _env("OPENAI_API_BASE_DB", ""))
     openai_api_key = _env("SUMMARY_BACKEND_OPENAI_API_KEY", _env("OPENAI_API_KEY_DB", ""))
     llm_model = _env("SUMMARY_BACKEND_LLM_MODEL", _env("LLM_MODEL_ID", ""))
+    llm_models = _env_csv("SUMMARY_BACKEND_LLM_MODELS", llm_model)
+    if llm_model and llm_model not in llm_models:
+        llm_models = (llm_model, *llm_models)
     has_llm_config = bool(openai_api_base and openai_api_key and llm_model)
     clickhouse_host = _env("SUMMARY_BACKEND_CLICKHOUSE_HOST", "localhost")
     clickhouse_port = _env_int("SUMMARY_BACKEND_CLICKHOUSE_PORT", 8123)
@@ -137,6 +141,7 @@ def get_settings() -> Settings:
         openai_api_base=openai_api_base,
         openai_api_key=openai_api_key,
         llm_model=llm_model,
+        llm_models=llm_models,
         llm_timeout_seconds=_env_float("SUMMARY_BACKEND_LLM_TIMEOUT_SECONDS", 600.0),
         llm_max_retries=_env_int("SUMMARY_BACKEND_LLM_MAX_RETRIES", 3),
         llm_retry_backoff_seconds=_env_float("SUMMARY_BACKEND_LLM_RETRY_BACKOFF_SECONDS", 2.0),

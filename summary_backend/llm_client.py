@@ -52,6 +52,7 @@ class StructuredLLMClient:
         stage: str,
         system: str,
         user: str,
+        model: str | None = None,
     ) -> SummaryResult:
         return self.call_structured(
             job_id=job_id,
@@ -59,6 +60,7 @@ class StructuredLLMClient:
             stage=stage,
             system=system,
             user=user,
+            model=model,
             response_model=SummaryResult,
         )
 
@@ -70,8 +72,10 @@ class StructuredLLMClient:
         stage: str,
         system: str,
         user: str,
+        model: str | None = None,
         response_model: type[TModel],
     ) -> TModel:
+        selected_model = (model or self.settings.llm_model).strip()
         if self.settings.dry_run:
             return self._call_dry_run(
                 job_id=job_id,
@@ -79,6 +83,7 @@ class StructuredLLMClient:
                 stage=stage,
                 system=system,
                 user=user,
+                model=selected_model,
                 response_model=response_model,
             )
 
@@ -91,6 +96,7 @@ class StructuredLLMClient:
                     stage=stage,
                     system=system,
                     user=user,
+                    model=selected_model,
                     response_model=response_model,
                     attempt=attempt,
                 )
@@ -123,12 +129,13 @@ class StructuredLLMClient:
         stage: str,
         system: str,
         user: str,
+        model: str,
         response_model: type[TModel],
     ) -> TModel:
         started = time.monotonic()
         request_json = {
             "dry_run": True,
-            "model": "dry-run",
+            "model": model or "dry-run",
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -162,7 +169,7 @@ class StructuredLLMClient:
             job_id=job_id,
             node_id=node_id,
             provider="dry-run",
-            model="dry-run",
+            model=model or "dry-run",
             status="OK",
             latency_ms=latency_ms,
             prompt_tokens=estimate_tokens(system) + estimate_tokens(user),
@@ -181,6 +188,7 @@ class StructuredLLMClient:
         stage: str,
         system: str,
         user: str,
+        model: str,
         response_model: type[TModel],
         attempt: int,
     ) -> TModel:
@@ -188,7 +196,7 @@ class StructuredLLMClient:
 
         schema = response_model.model_json_schema()
         request_json: dict[str, Any] = {
-            "model": self.settings.llm_model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -253,7 +261,7 @@ class StructuredLLMClient:
                 job_id=job_id,
                 node_id=node_id,
                 provider="openai-compatible",
-                model=self.settings.llm_model,
+                model=model,
                 status="OK",
                 latency_ms=latency_ms,
                 prompt_tokens=prompt_tokens,
@@ -289,7 +297,7 @@ class StructuredLLMClient:
                 job_id=job_id,
                 node_id=node_id,
                 provider="openai-compatible",
-                model=self.settings.llm_model,
+                model=model,
                 status="ERROR",
                 error_class=classify_error(exc),
                 latency_ms=latency_ms,

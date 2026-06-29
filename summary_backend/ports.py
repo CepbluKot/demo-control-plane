@@ -96,6 +96,9 @@ class SummaryStore(Protocol):
     ) -> None:
         ...
 
+    def latest_llm_call(self, *, job_id: str, node_id: str) -> dict[str, Any] | None:
+        ...
+
     def get_job_current(self, job_id: str) -> dict[str, Any] | None:
         ...
 
@@ -155,6 +158,7 @@ class SummaryLLM(Protocol):
         stage: str,
         system: str,
         user: str,
+        model: str | None = None,
     ) -> SummaryResult:
         ...
 
