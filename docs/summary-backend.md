@@ -300,14 +300,21 @@ SUMMARY_BACKEND_SOURCE_CLICKHOUSE_SECURE
 
 ## Real LLM mode
 
-Dry-run автоматически включён, если нет LLM env. Для реальных вызовов:
+Если LLM env не заданы, backend может брать локальный gitignored fallback-конфиг
+`summary_backend/llm_gateway_defaults.json`, синхронизированный с `../llm_probe.py`.
+Для реальных вызовов можно либо использовать этот локальный конфиг, либо
+задать env явно:
 
 ```bash
-SUMMARY_BACKEND_DRY_RUN=false
 SUMMARY_BACKEND_OPENAI_API_BASE=http://llm-gateway.example/v1
 SUMMARY_BACKEND_OPENAI_API_KEY=...
 SUMMARY_BACKEND_LLM_MODEL='DeepSeek V3.2'
+SUMMARY_BACKEND_LLM_MODELS='DeepSeek V3.2,llmgateway/free'
 ```
+
+`SUMMARY_BACKEND_LLM_MODELS` определяет список моделей, доступных в UI для выбора.
+Выбранная модель уходит и в MAP/REDUCE/FINAL pipeline, и в LLM helper для генерации
+черновика prompt-ов отчета.
 
 Backend использует:
 

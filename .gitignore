@@ -32,6 +32,7 @@ coverage.xml
 # Environment files
 .env
 *.local
+summary_backend/llm_gateway_defaults.json
 
 # Runtime artifacts
 artifacts/

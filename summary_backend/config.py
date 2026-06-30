@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +43,15 @@ def _env_path(name: str, default: str) -> Path:
 
 def _env_csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in _env(name, default).split(",") if item.strip())
+
+
+def _load_llm_gateway_defaults() -> dict[str, object]:
+    config_path = Path(__file__).with_name("llm_gateway_defaults.json")
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -95,10 +105,24 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    openai_api_base = _env("SUMMARY_BACKEND_OPENAI_API_BASE", _env("OPENAI_API_BASE_DB", ""))
-    openai_api_key = _env("SUMMARY_BACKEND_OPENAI_API_KEY", _env("OPENAI_API_KEY_DB", ""))
-    llm_model = _env("SUMMARY_BACKEND_LLM_MODEL", _env("LLM_MODEL_ID", ""))
-    llm_models = _env_csv("SUMMARY_BACKEND_LLM_MODELS", llm_model)
+    llm_gateway_defaults = _load_llm_gateway_defaults()
+    default_api_base = str(llm_gateway_defaults.get("api_base") or "").strip()
+    default_api_key = str(llm_gateway_defaults.get("api_key") or "").strip()
+    default_model = str(llm_gateway_defaults.get("default_model") or "").strip()
+    raw_available_models = llm_gateway_defaults.get("available_models")
+    if not isinstance(raw_available_models, list):
+        raw_available_models = []
+    default_available_models = tuple(
+        str(model).strip()
+        for model in raw_available_models
+        if str(model).strip()
+    )
+    default_llm_models = default_available_models or ((default_model,) if default_model else ())
+
+    openai_api_base = _env("SUMMARY_BACKEND_OPENAI_API_BASE", _env("OPENAI_API_BASE_DB", default_api_base))
+    openai_api_key = _env("SUMMARY_BACKEND_OPENAI_API_KEY", _env("OPENAI_API_KEY_DB", default_api_key))
+    llm_model = _env("SUMMARY_BACKEND_LLM_MODEL", _env("LLM_MODEL_ID", default_model))
+    llm_models = _env_csv("SUMMARY_BACKEND_LLM_MODELS", ",".join(default_llm_models))
     if llm_model and llm_model not in llm_models:
         llm_models = (llm_model, *llm_models)
     has_llm_config = bool(openai_api_base and openai_api_key and llm_model)

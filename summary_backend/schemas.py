@@ -148,13 +148,39 @@ class SummaryPromptOverridesDraft(BaseModel):
 
 class GenerateSummaryPromptDraftRequest(BaseModel):
     request: str = Field(min_length=1, max_length=4000)
+    llm_model: str | None = None
     output_json_schema: dict[str, Any] | None = None
 
 
 class GenerateSummaryPromptDraftResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    report_name: str = ""
+    report_instruction: str = ""
+    use_custom_output_json: bool = False
+    output_json_schema: dict[str, Any] | None = None
     prompt_overrides: SummaryPromptOverridesDraft
+
+
+class PromptDraftJobStatus(StrEnum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+    DONE = "DONE"
+
+
+class PromptDraftJobRecord(BaseModel):
+    job_id: str
+    status: PromptDraftJobStatus
+    stage: str = ""
+    llm_model: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None = None
+    error_detail: str = ""
+    result: GenerateSummaryPromptDraftResponse | None = None
 
 
 class CreateSummaryJobRequest(BaseModel):

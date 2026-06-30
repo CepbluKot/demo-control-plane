@@ -53,10 +53,13 @@ cp .env.example .env
 | `SUMMARY_BACKEND_CLICKHOUSE_*` | ClickHouse-хранилище jobs, events, nodes, artifacts и input segments. |
 | `SUMMARY_BACKEND_SOURCE_CLICKHOUSE_*` | Источник логов для пользовательских SQL-запросов. Если не заданы, используются `SUMMARY_BACKEND_CLICKHOUSE_*`. |
 | `SUMMARY_BACKEND_BROKER_URL` | Redis broker для Dramatiq. |
-| `SUMMARY_BACKEND_OPENAI_API_BASE` / `SUMMARY_BACKEND_OPENAI_API_KEY` / `SUMMARY_BACKEND_LLM_MODEL` | LLM API. |
+| `SUMMARY_BACKEND_OPENAI_API_BASE` / `SUMMARY_BACKEND_OPENAI_API_KEY` / `SUMMARY_BACKEND_LLM_MODEL` / `SUMMARY_BACKEND_LLM_MODELS` | LLM API и список моделей, доступных для выбора в summary UI. |
 | `SUMMARY_BACKEND_DRY_RUN` | Тестовый режим без реальных LLM-вызовов. |
 | `SUMMARY_BACKEND_UPLOAD_STAGING_DIR` | Staging-директория для файлов, загруженных через `/summary-jobs/upload`. |
 | `SUMMARY_FRONTEND_*` | Порт frontend-а и адрес backend-а. |
+
+Если env для LLM не заданы, backend может использовать локальный gitignored fallback-конфиг
+`summary_backend/llm_gateway_defaults.json`, который синхронизирован с `../llm_probe.py`.
 
 ## Проверки
 

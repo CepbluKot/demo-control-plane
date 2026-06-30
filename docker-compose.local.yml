@@ -49,7 +49,6 @@ services:
     container_name: llm-summary-local-backend
     command: ["python", "-m", "summary_backend"]
     environment:
-      SUMMARY_BACKEND_DRY_RUN: "true"
       SUMMARY_BACKEND_API_HOST: "0.0.0.0"
       SUMMARY_BACKEND_API_PORT: "8088"
       SUMMARY_BACKEND_CORS_ORIGINS: "http://localhost:28090,http://127.0.0.1:28090"
@@ -80,7 +79,6 @@ services:
     container_name: llm-summary-local-worker
     command: ["dramatiq", "summary_backend.tasks", "--processes", "1", "--threads", "4"]
     environment:
-      SUMMARY_BACKEND_DRY_RUN: "true"
       SUMMARY_BACKEND_CLICKHOUSE_HOST: clickhouse
       SUMMARY_BACKEND_CLICKHOUSE_PORT: "8123"
       SUMMARY_BACKEND_CLICKHOUSE_USERNAME: default

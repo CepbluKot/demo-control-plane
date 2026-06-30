@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import unittest
 from collections import Counter, deque
 from dataclasses import replace
@@ -8,15 +10,35 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
 
-from summary_backend.api import build_public_settings
-from summary_backend.config import get_settings
+from summary_backend.api import (
+    PromptDraftConceptSpec,
+    PromptDraftJobManager,
+    _generate_prompt_draft_with_llm,
+    _normalize_prompt_draft_spec,
+    _resolve_requested_prompt_draft_model,
+    build_public_settings,
+)
+from summary_backend.config import get_settings, reset_settings_cache
 from summary_backend.errors import LlmPoolBusyError
 from summary_backend.ids import sha256_text
 from summary_backend.input_models import InputSegment
 from summary_backend.llm_client import StructuredLLMClient
 from summary_backend.pipeline import PipelineService
 from summary_backend.ports import TaskQueue
-from summary_backend.schemas import ArtifactType, JobStatus, JsonObjectResult, NodeStatus, NodeType, Stage, SummaryResult
+from summary_backend.schemas import (
+    ArtifactType,
+    GenerateSummaryPromptDraftRequest,
+    GenerateSummaryPromptDraftResponse,
+    JobStatus,
+    JsonObjectResult,
+    NodeStatus,
+    NodeType,
+    PromptDraftJobStatus,
+    Stage,
+    SummaryPromptOverridesDraft,
+    SummaryPromptStageDraft,
+    SummaryResult,
+)
 from summary_backend.snapshots import build_job_snapshot
 
 
@@ -393,6 +415,36 @@ class FakeLLM:
         )
 
 
+class ModelAwareLLM(FakeLLM):
+    def call_summary(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        model: str,
+    ) -> SummaryResult:
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+                "model": model,
+            }
+        )
+        return SummaryResult(
+            ok=True,
+            summary=f"{stage}:{node_id}:{len(user)}",
+            key_points=[user.splitlines()[0] if user.splitlines() else ""],
+            warnings=[],
+            source_count=max(1, user.count("Summary ")),
+        )
+
+
 class CustomJsonLLM(FakeLLM):
     def call_structured(
         self,
@@ -427,6 +479,41 @@ class CustomJsonLLM(FakeLLM):
             "warnings": [],
             "source_count": 1,
         })
+
+
+class PromptDraftLLMStub:
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = deque(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def call_structured(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        model: str | None = None,
+        response_model: type,
+        response_schema: dict | None = None,
+    ):
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+                "model": model,
+                "response_model": response_model,
+                "response_schema": response_schema,
+            }
+        )
+        response = self.responses.popleft()
+        if isinstance(response, response_model):
+            return response
+        return response_model.model_validate(response)
 
 
 class FailingLLM:
@@ -532,6 +619,193 @@ class SummaryServiceSettingsTests(unittest.TestCase):
         self.assertNotIn("clickhouse-secret", serialized)
         self.assertNotIn("source-secret", serialized)
         self.assertNotIn("broker-pass", serialized)
+
+    def test_settings_fallback_to_local_llm_gateway_defaults(self) -> None:
+        fallback_env = {
+            "SUMMARY_BACKEND_OPENAI_API_BASE": "",
+            "OPENAI_API_BASE_DB": "",
+            "SUMMARY_BACKEND_OPENAI_API_KEY": "",
+            "OPENAI_API_KEY_DB": "",
+            "SUMMARY_BACKEND_LLM_MODEL": "",
+            "LLM_MODEL_ID": "",
+            "SUMMARY_BACKEND_LLM_MODELS": "",
+            "SUMMARY_BACKEND_DRY_RUN": "",
+        }
+        try:
+            with patch.dict(os.environ, fallback_env, clear=False), patch(
+                "summary_backend.config._load_llm_gateway_defaults",
+                return_value={
+                    "api_base": "http://llm-gateway.local/v1",
+                    "api_key": "test-local-key",
+                    "default_model": "llmgateway/free",
+                    "available_models": ["llmgateway/free", "llmgateway/analysis"],
+                },
+            ):
+                reset_settings_cache()
+                settings = get_settings()
+
+            self.assertEqual(settings.openai_api_base, "http://llm-gateway.local/v1")
+            self.assertEqual(settings.openai_api_key, "test-local-key")
+            self.assertEqual(settings.llm_model, "llmgateway/free")
+            self.assertEqual(settings.llm_models, ("llmgateway/free", "llmgateway/analysis"))
+            self.assertFalse(settings.dry_run)
+        finally:
+            reset_settings_cache()
+
+
+class PromptDraftGenerationTests(unittest.TestCase):
+    def test_prompt_draft_spec_normalization_accepts_string_and_dict_shapes(self) -> None:
+        spec = PromptDraftConceptSpec(
+            map_focus="extract anomalies with timestamps",
+            reduce_focus={"merge_strategy": "dedupe by metric and time window"},
+            final_sections=[{"name": "Executive summary", "purpose": "top findings"}],
+            final_requirements={"evidence_rules": "cite concrete values"},
+        )
+
+        normalized = _normalize_prompt_draft_spec(spec, None)
+
+        self.assertEqual(normalized.map_focus, ["extract anomalies with timestamps"])
+        self.assertEqual(normalized.reduce_focus, ["merge_strategy: dedupe by metric and time window"])
+        self.assertEqual(normalized.final_sections, ["name: Executive summary; purpose: top findings"])
+        self.assertEqual(normalized.final_requirements, ["evidence_rules: cite concrete values"])
+
+    def test_prompt_draft_generation_uses_two_stage_llm_flow(self) -> None:
+        llm = PromptDraftLLMStub(
+            [
+                PromptDraftConceptSpec(
+                    report_name="Metric outliers report",
+                    report_instruction="Structured report for SREs.",
+                    objective="Analyze metric outliers and summarize evidence.",
+                    audience="SRE team",
+                    tone="Technical and concise",
+                    map_focus=["Extract anomalous metrics with timestamps"],
+                    reduce_focus=["Merge duplicates and preserve strongest evidence"],
+                    final_sections=["Executive summary", "Timeline", "Recommendations"],
+                    final_requirements=["Call out uncertainty explicitly"],
+                    use_custom_output_json=True,
+                    output_json_schema={"type": "object", "properties": {"wrong": {"type": "string"}}},
+                ),
+                GenerateSummaryPromptDraftResponse(
+                    report_name="",
+                    report_instruction="",
+                    use_custom_output_json=False,
+                    output_json_schema=None,
+                    prompt_overrides=SummaryPromptOverridesDraft(
+                        map=SummaryPromptStageDraft(system="map system", user="map user"),
+                        reduce=SummaryPromptStageDraft(system="reduce system", user="reduce user"),
+                        final=SummaryPromptStageDraft(system="final system", user="final user"),
+                    ),
+                ),
+            ]
+        )
+        request = GenerateSummaryPromptDraftRequest(
+            request="Сделай отчет по выбросам в метриках для SRE-команды.",
+            llm_model="llmgateway/free",
+            output_json_schema={"type": "object", "properties": {"summary": {"type": "string"}}},
+        )
+
+        result = _generate_prompt_draft_with_llm(
+            llm=llm,
+            request=request,
+            llm_model=request.llm_model,
+        )
+
+        self.assertEqual([call["stage"] for call in llm.calls], ["PROMPT_DRAFT_SPEC", "PROMPT_DRAFT_RENDER"])
+        self.assertEqual(result.report_name, "Metric outliers report")
+        self.assertEqual(result.report_instruction, "Structured report for SREs.")
+        self.assertTrue(result.use_custom_output_json)
+        self.assertEqual(result.output_json_schema, request.output_json_schema)
+        self.assertIn("{chunk}", result.prompt_overrides.map.user)
+        self.assertIn("{summaries}", result.prompt_overrides.reduce.user)
+        self.assertIn("{summaries}", result.prompt_overrides.final.user)
+        self.assertIn("{output_json_schema}", result.prompt_overrides.final.user)
+        self.assertIn("Metric outliers report", llm.calls[1]["user"])
+        self.assertIn("SRE team", llm.calls[1]["user"])
+
+    def test_invalid_prompt_draft_model_falls_back_to_default(self) -> None:
+        self.assertEqual(_resolve_requested_prompt_draft_model("gpt-4.1-mini"), get_settings().llm_model)
+        self.assertEqual(_resolve_requested_prompt_draft_model("llmgateway/free"), "llmgateway/free")
+        self.assertIsNone(_resolve_requested_prompt_draft_model("   "))
+
+
+class PromptDraftJobManagerTests(unittest.TestCase):
+    def test_prompt_draft_job_completes_in_background(self) -> None:
+        manager = PromptDraftJobManager()
+        expected = GenerateSummaryPromptDraftResponse(
+            report_name="Async report",
+            report_instruction="Instruction",
+            use_custom_output_json=False,
+            output_json_schema=None,
+            prompt_overrides=SummaryPromptOverridesDraft(
+                map=SummaryPromptStageDraft(system="map", user="{chunk}"),
+                reduce=SummaryPromptStageDraft(system="reduce", user="{summaries}"),
+                final=SummaryPromptStageDraft(system="final", user="{summaries}"),
+            ),
+        )
+
+        def runner(request, llm_model, stage_observer, cancel_checker):
+            stage_observer("PROMPT_DRAFT_SPEC")
+            self.assertFalse(cancel_checker())
+            stage_observer("PROMPT_DRAFT_RENDER")
+            return expected
+
+        job = manager.create_job(
+            request=GenerateSummaryPromptDraftRequest(request="draft async report"),
+            llm_model="llmgateway/free",
+            runner=runner,
+        )
+
+        final = self._wait_for_prompt_draft_job(manager, job.job_id)
+
+        self.assertEqual(final.status, PromptDraftJobStatus.DONE)
+        assert final.result is not None
+        self.assertEqual(final.result.report_name, "Async report")
+        self.assertEqual(final.stage, "DONE")
+
+    def test_prompt_draft_job_cancel_marks_job_cancelled(self) -> None:
+        manager = PromptDraftJobManager()
+
+        def runner(request, llm_model, stage_observer, cancel_checker):
+            stage_observer("PROMPT_DRAFT_SPEC")
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                if cancel_checker():
+                    raise RuntimeError("cancel requested")
+                time.sleep(0.01)
+            return GenerateSummaryPromptDraftResponse(
+                report_name="Should not finish",
+                report_instruction="",
+                use_custom_output_json=False,
+                output_json_schema=None,
+                prompt_overrides=SummaryPromptOverridesDraft(
+                    map=SummaryPromptStageDraft(system="map", user="{chunk}"),
+                    reduce=SummaryPromptStageDraft(system="reduce", user="{summaries}"),
+                    final=SummaryPromptStageDraft(system="final", user="{summaries}"),
+                ),
+            )
+
+        job = manager.create_job(
+            request=GenerateSummaryPromptDraftRequest(request="cancel async report"),
+            llm_model="llmgateway/free",
+            runner=runner,
+        )
+        manager.cancel_job(job.job_id)
+        final = self._wait_for_prompt_draft_job(manager, job.job_id)
+
+        self.assertEqual(final.status, PromptDraftJobStatus.CANCELLED)
+        self.assertIsNone(final.result)
+        self.assertEqual(final.stage, "CANCELLED")
+
+    def _wait_for_prompt_draft_job(self, manager: PromptDraftJobManager, job_id: str, timeout: float = 2.0):
+        deadline = time.time() + timeout
+        last = manager.get_job(job_id)
+        while time.time() < deadline:
+            current = manager.get_job(job_id)
+            if current.status in {PromptDraftJobStatus.DONE, PromptDraftJobStatus.FAILED, PromptDraftJobStatus.CANCELLED}:
+                return current
+            last = current
+            time.sleep(0.01)
+        self.fail(f"prompt draft job {job_id} did not finish in time; last status={last.status}")
 
 
 class SummaryWorkerRecoveryTests(unittest.TestCase):
@@ -948,6 +1222,37 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertEqual(final_call["system"], "FINAL SYS")
         self.assertIn("FINAL CUSTOM", final_call["user"])
         self.assertIn("Use owner fields.", final_call["user"])
+
+    def test_selected_llm_model_is_forwarded_to_pipeline_calls(self) -> None:
+        store = InMemorySummaryStore()
+        llm = ModelAwareLLM()
+        queue = ManualQueue()
+        settings = replace(
+            get_settings(),
+            llm_model="llmgateway/free",
+            llm_models=("llmgateway/free", "llmgateway/analysis"),
+        )
+        service = PipelineService(
+            store=store,
+            queue=queue,
+            llm=llm,
+            chunker=FakeChunker(["chunk-1"]),
+            input_segmenter=FakeInputSegmenter(["input"]),
+            settings=settings,
+        )
+        job_id = service.create_job(
+            input_text="input",
+            title="llm-model",
+            metadata={"llm_model": "llmgateway/analysis"},
+        )
+
+        queue.advance_job(job_id)
+        self.drain(queue, service)
+
+        map_call = next(call for call in llm.calls if call["stage"] == Stage.MAP)
+        final_call = next(call for call in llm.calls if call["stage"] == Stage.FINAL)
+        self.assertEqual(map_call["model"], "llmgateway/analysis")
+        self.assertEqual(final_call["model"], "llmgateway/analysis")
 
     def test_final_output_json_schema_allows_custom_final_json_object(self) -> None:
         store = InMemorySummaryStore()
