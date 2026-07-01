@@ -30,6 +30,7 @@ class NodeStatus(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
+    CANCELLED = "CANCELLED"
     WAITING_RETRY = "WAITING_RETRY"
     WAITING_PROVIDER = "WAITING_PROVIDER"
     DONE = "DONE"
@@ -109,6 +110,7 @@ class SummaryServiceLlmSettings(BaseModel):
     max_retries: int
     retry_backoff_seconds: float
     max_concurrency: int
+    assistant_max_concurrency: int
     pool_acquire_timeout_seconds: float
     pool_poll_interval_seconds: float
     api_key_configured: bool
@@ -117,6 +119,7 @@ class SummaryServiceLlmSettings(BaseModel):
 
 class SummaryServicePipelineSettings(BaseModel):
     chunk_target_estimated_tokens: int
+    reduce_target_estimated_tokens: int
     reduce_group_size: int
     max_enqueue_nodes_per_advance: int
 
@@ -173,6 +176,12 @@ class SummaryPromptOverridesDraft(BaseModel):
 class GenerateSummaryPromptDraftRequest(BaseModel):
     request: str = Field(min_length=1, max_length=4000)
     llm_model: str | None = None
+    use_custom_map_output_json: bool | None = None
+    map_output_json_schema: dict[str, Any] | None = None
+    use_custom_reduce_output_json: bool | None = None
+    reduce_output_json_schema: dict[str, Any] | None = None
+    use_custom_intermediate_output_json: bool | None = None
+    intermediate_output_json_schema: dict[str, Any] | None = None
     use_custom_output_json: bool | None = None
     output_json_schema: dict[str, Any] | None = None
 
@@ -182,6 +191,12 @@ class GenerateSummaryPromptDraftResponse(BaseModel):
 
     report_name: str = ""
     report_instruction: str = ""
+    use_custom_map_output_json: bool = False
+    map_output_json_schema: dict[str, Any] | None = None
+    use_custom_reduce_output_json: bool = False
+    reduce_output_json_schema: dict[str, Any] | None = None
+    use_custom_intermediate_output_json: bool = False
+    intermediate_output_json_schema: dict[str, Any] | None = None
     use_custom_output_json: bool = False
     output_json_schema: dict[str, Any] | None = None
     prompt_overrides: SummaryPromptOverridesDraft
@@ -314,6 +329,9 @@ class JobCurrent(BaseModel):
     job_id: str
     job_status: JobStatus
     last_event_type: str
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     updated_at: datetime | None = None
     events_count: int = 0
 
@@ -371,6 +389,34 @@ class EventRecord(BaseModel):
     actor: str
     message: str
     payload: str
+
+
+class SummaryLlmChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class SummaryNodeLlmCallResponse(BaseModel):
+    call_id: str = ""
+    created_at: datetime | None = None
+    job_id: str
+    node_id: str
+    provider: str = ""
+    model: str = ""
+    status: str = ""
+    error_class: str = ""
+    http_status: int = 0
+    latency_ms: int = 0
+    pool_wait_ms: int = 0
+    provider_latency_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    error_message: str = ""
+    messages: list[SummaryLlmChatMessage] = Field(default_factory=list)
+    assistant_message: str = ""
+    request_json: dict[str, Any] | None = None
+    response_json: dict[str, Any] | None = None
 
 
 class PauseResumeResponse(BaseModel):

@@ -417,6 +417,36 @@ class FakeLLM:
         )
 
 
+class LargeSummaryLLM(FakeLLM):
+    def call_summary(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+    ) -> SummaryResult:
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+            }
+        )
+        # Keep each intermediate summary larger than the reduce token target floor
+        # so the test exercises the forced-progress regrouping path.
+        return SummaryResult(
+            ok=True,
+            summary=("dense-summary " * 96).strip(),
+            key_points=["oversized"],
+            warnings=[],
+            source_count=max(1, user.count("Summary ")),
+        )
+
+
 class ModelAwareLLM(FakeLLM):
     def call_summary(
         self,
@@ -470,6 +500,18 @@ class CustomJsonLLM(FakeLLM):
             }
         )
         if response_model is JsonObjectResult:
+            properties = (
+                response_schema.get("properties")
+                if isinstance(response_schema, dict)
+                else None
+            )
+            if isinstance(properties, dict) and "chunk_summary" in properties:
+                return response_model.model_validate({
+                    "chunk_summary": f"{stage}:{node_id}",
+                    "key_points": ["point"],
+                    "evidence": [{"title": "metric spike", "details": "cpu=97%"}],
+                    "warnings": [],
+                })
             return response_model.model_validate({
                 "headline": "custom output",
                 "items": [{"title": "first", "severity": "info"}],
@@ -569,6 +611,45 @@ class BusyPoolLLM:
         raise LlmPoolBusyError("LLM pool acquire timeout after 1.0s; max_concurrency=2")
 
 
+class BlockingThenFastLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, str]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._call_count = 0
+
+    def call_summary(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+    ) -> SummaryResult:
+        self._call_count += 1
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+            }
+        )
+        if self._call_count == 1:
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("blocking llm was not released in time")
+        return SummaryResult(
+            ok=True,
+            summary=f"{stage}:{node_id}:{self._call_count}",
+            key_points=[user.splitlines()[0] if user.splitlines() else ""],
+            warnings=[],
+            source_count=max(1, user.count("Summary ")),
+        )
+
+
 class ManualQueue(TaskQueue):
     def __init__(self) -> None:
         self.items: deque[tuple[str, str, str | None]] = deque()
@@ -601,6 +682,7 @@ class SummaryServiceSettingsTests(unittest.TestCase):
             worker_processes=2,
             worker_threads=8,
             llm_max_concurrency=2,
+            llm_assistant_max_concurrency=4,
             llm_pool_acquire_timeout_seconds=30.0,
             llm_pool_poll_interval_seconds=0.2,
         )
@@ -614,6 +696,7 @@ class SummaryServiceSettingsTests(unittest.TestCase):
         self.assertEqual(payload["runtime"]["worker_processes"], 2)
         self.assertEqual(payload["runtime"]["worker_threads"], 8)
         self.assertEqual(payload["llm"]["max_concurrency"], 2)
+        self.assertEqual(payload["llm"]["assistant_max_concurrency"], 4)
         self.assertEqual(payload["llm"]["pool_acquire_timeout_seconds"], 30.0)
         self.assertEqual(payload["llm"]["pool_poll_interval_seconds"], 0.2)
         serialized = json.dumps(payload, ensure_ascii=False)
@@ -812,6 +895,50 @@ class PromptDraftGenerationTests(unittest.TestCase):
         self.assertFalse(result.output_json_schema["additionalProperties"])
         self.assertIn("{output_json_schema}", result.prompt_overrides.final.user)
 
+    def test_requested_custom_intermediate_output_json_generates_normalized_schema(self) -> None:
+        llm = PromptDraftLLMStub(
+            [
+                PromptDraftConceptSpec(
+                    report_name="Structured intermediate report",
+                    report_instruction="Instruction",
+                    use_custom_intermediate_output_json=True,
+                    intermediate_output_json_schema={
+                        "chunk_summary": "string",
+                        "evidence": [{"title": "string", "details": "string"}],
+                    },
+                ),
+                GenerateSummaryPromptDraftResponse(
+                    report_name="Structured intermediate report",
+                    report_instruction="Instruction",
+                    use_custom_intermediate_output_json=True,
+                    intermediate_output_json_schema={
+                        "chunk_summary": "string",
+                        "evidence": [{"title": "string", "details": "string"}],
+                    },
+                    prompt_overrides=SummaryPromptOverridesDraft(
+                        map=SummaryPromptStageDraft(system="map system", user="map user"),
+                        reduce=SummaryPromptStageDraft(system="reduce system", user="reduce user"),
+                        final=SummaryPromptStageDraft(system="final system", user="final user"),
+                    ),
+                ),
+            ]
+        )
+        request = GenerateSummaryPromptDraftRequest(
+            request="Сделай промежуточные JSON-объекты для MAP и REDUCE по логам.",
+            llm_model="llmgateway/free",
+            use_custom_intermediate_output_json=True,
+        )
+
+        result = _generate_prompt_draft_with_llm(llm=llm, request=request, llm_model=request.llm_model)
+
+        assert result.intermediate_output_json_schema is not None
+        self.assertTrue(result.use_custom_intermediate_output_json)
+        self.assertEqual(result.intermediate_output_json_schema["type"], "object")
+        self.assertEqual(result.intermediate_output_json_schema["properties"]["chunk_summary"]["type"], "string")
+        self.assertEqual(result.intermediate_output_json_schema["properties"]["evidence"]["type"], "array")
+        self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.map.user)
+        self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.reduce.user)
+
     def test_disabled_custom_output_json_discards_generated_schema(self) -> None:
         llm = PromptDraftLLMStub(
             [
@@ -921,6 +1048,113 @@ class LlmConnectivityCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "dry_run")
         self.assertIn("Dry run mode", result["detail"])
+
+    def test_structured_llm_client_uses_assistant_pool_kind(self) -> None:
+        class NoopStore:
+            def insert_llm_call(self, **kwargs: Any) -> None:
+                return None
+
+        captured: dict[str, Any] = {}
+
+        class FakeAcquire:
+            def __init__(self, *_args: Any, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def __enter__(self) -> int:
+                return 0
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+        class StubResponse:
+            def __init__(self) -> None:
+                self.choices = [type("Choice", (), {"message": type("Message", (), {"content": '{"ok": true, "summary": "done", "key_points": [], "source_count": 1}'})()})()]
+                self.usage = type(
+                    "Usage",
+                    (),
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                )()
+
+            def model_dump(self, mode: str = "json") -> dict[str, Any]:
+                del mode
+                return {"choices": [{"message": {"content": '{"ok": true, "summary": "done", "key_points": [], "source_count": 1}'}}]}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs: Any) -> None:
+                del kwargs
+                self.chat = type(
+                    "Chat",
+                    (),
+                    {"completions": type("Completions", (), {"create": staticmethod(lambda **_kwargs: StubResponse())})()},
+                )()
+
+        settings = replace(
+            get_settings(),
+            dry_run=False,
+            openai_api_base="http://llm-gateway.local/v1",
+            openai_api_key="secret",
+            llm_model="llmgateway/free",
+            llm_models=("llmgateway/free",),
+            llm_max_concurrency=2,
+            llm_assistant_max_concurrency=7,
+        )
+        client = StructuredLLMClient(
+            store=NoopStore(),
+            settings=settings,
+            pool_kind="assistant",
+        )
+
+        with patch("summary_backend.llm_client.acquire_llm_pool_slot", FakeAcquire), patch(
+            "openai.OpenAI",
+            FakeOpenAI,
+        ):
+            result = client.call_summary(
+                job_id="job-1",
+                node_id="node-1",
+                stage="MAP",
+                system="system",
+                user="user",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["pool_kind"], "assistant")
+
+    def test_prompt_draft_job_runner_builds_assistant_pool_client(self) -> None:
+        manager = PromptDraftJobManager()
+        captured: dict[str, Any] = {}
+        expected = GenerateSummaryPromptDraftResponse(
+            report_name="Draft",
+            report_instruction="Instruction",
+            use_custom_output_json=False,
+            output_json_schema=None,
+            prompt_overrides=SummaryPromptOverridesDraft(
+                map=SummaryPromptStageDraft(system="map", user="{chunk}"),
+                reduce=SummaryPromptStageDraft(system="reduce", user="{summaries}"),
+                final=SummaryPromptStageDraft(system="final", user="{summaries}"),
+            ),
+        )
+
+        class FakeStructuredLLMClient:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        def fake_generate_prompt_draft_with_llm(**kwargs: Any) -> GenerateSummaryPromptDraftResponse:
+            self.assertIsInstance(kwargs["llm"], FakeStructuredLLMClient)
+            return expected
+
+        with patch("summary_backend.api.StructuredLLMClient", FakeStructuredLLMClient), patch(
+            "summary_backend.api._generate_prompt_draft_with_llm",
+            side_effect=fake_generate_prompt_draft_with_llm,
+        ):
+            result = manager._run_job(
+                GenerateSummaryPromptDraftRequest(request="Draft report"),
+                "llmgateway/free",
+                lambda _stage: None,
+                lambda: False,
+            )
+
+        self.assertEqual(result.report_name, "Draft")
+        self.assertEqual(captured["pool_kind"], "assistant")
 
 
 class PromptDraftJobManagerTests(unittest.TestCase):
@@ -1234,7 +1468,104 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         for artifact in reduce_artifacts:
             metadata = json.loads(artifact["metadata"])
             self.assertGreater(len(metadata["input_node_ids"]), 0)
+
+        nodes = store.list_nodes_current(job_id)
+        map_node_indices = {
+            str(node["node_id"]): int(node["node_index"])
+            for node in nodes
+            if node["node_type"] == NodeType.MAP
+        }
+        level1_reduce_nodes = [
+            node
+            for node in nodes
+            if node["node_type"] == NodeType.REDUCE and int(node["level"]) == 1
+        ]
+        grouped_input_indices: list[list[int]] = []
+        for node in level1_reduce_nodes:
+            payload = store.get_node_payload(job_id, str(node["node_id"]))
+            input_indices = [map_node_indices[str(input_node_id)] for input_node_id in payload["input_node_ids"]]
+            grouped_input_indices.append(input_indices)
+            self.assertEqual(payload["input_sequence_start"], input_indices[0])
+            self.assertEqual(payload["input_sequence_end"], input_indices[-1])
+        self.assertEqual(grouped_input_indices, [[0, 1], [2, 3], [4]])
+
+        reduce_ranges_by_level = sorted(
+            [
+                (
+                    int(artifact["level"]),
+                    int(json.loads(artifact["metadata"])["sequence_start"]),
+                    int(json.loads(artifact["metadata"])["sequence_end"]),
+                )
+                for artifact in reduce_artifacts
+            ]
+        )
+        self.assertEqual(
+            reduce_ranges_by_level,
+            [
+                (1, 0, 1),
+                (1, 2, 3),
+                (1, 4, 4),
+                (2, 0, 3),
+                (2, 4, 4),
+                (3, 0, 4),
+            ],
+        )
+        final_nodes = [node for node in nodes if node["node_type"] == NodeType.FINAL]
+        self.assertEqual(len(final_nodes), 1)
+        final_payload = store.get_node_payload(job_id, str(final_nodes[0]["node_id"]))
+        self.assertEqual(final_payload["input_count"], 1)
+        self.assertEqual(len(final_payload["input_node_ids"]), 1)
         self.assertGreaterEqual(len(llm.calls), 12)
+
+    def test_reduce_grouping_forces_progress_when_token_budget_would_stall(self) -> None:
+        store = InMemorySummaryStore()
+        llm = LargeSummaryLLM()
+        queue = ManualQueue()
+        settings = replace(
+            get_settings(),
+            reduce_group_size=2,
+            reduce_target_estimated_tokens=256,
+            llm_max_concurrency=2,
+            max_enqueue_nodes_per_advance=100,
+            chunk_target_estimated_tokens=100,
+        )
+        service = PipelineService(
+            store=store,
+            queue=queue,
+            llm=llm,
+            chunker=FakeChunker(["chunk-1", "chunk-2", "chunk-3", "chunk-4"]),
+            input_segmenter=FakeInputSegmenter(["chunk-1", "chunk-2", "chunk-3", "chunk-4"]),
+            settings=settings,
+        )
+        job_id = service.create_job(input_text="input", title="reduce-force-progress", metadata={})
+
+        queue.advance_job(job_id)
+        self.drain(queue, service)
+
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.DONE)
+        reduce_nodes = [
+            node
+            for node in store.list_nodes_current(job_id)
+            if node["node_type"] == NodeType.REDUCE
+        ]
+        self.assertEqual(Counter(int(node["level"]) for node in reduce_nodes), Counter({1: 2, 2: 1}))
+
+        level1_payloads = [
+            store.get_node_payload(job_id, str(node["node_id"]))
+            for node in reduce_nodes
+            if int(node["level"]) == 1
+        ]
+        self.assertTrue(level1_payloads)
+        self.assertTrue(all(payload["grouping_strategy"] == "forced_progress" for payload in level1_payloads))
+        self.assertEqual([payload["input_count"] for payload in level1_payloads], [2, 2])
+
+        level2_payload = next(
+            store.get_node_payload(job_id, str(node["node_id"]))
+            for node in reduce_nodes
+            if int(node["level"]) == 2
+        )
+        self.assertEqual(level2_payload["grouping_strategy"], "forced_progress")
+        self.assertEqual(level2_payload["input_count"], 2)
 
     def test_duplicate_node_delivery_is_idempotent(self) -> None:
         service, store, llm, queue = self.make_service(chunks=["chunk-1", "chunk-2"])
@@ -1288,6 +1619,42 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.DONE)
         self.assertIsNotNone(store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.FINAL_SUMMARY))
 
+    def test_pause_marks_running_node_paused_and_drops_stale_result_before_resume(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["chunk-1"])
+        blocking_llm = BlockingThenFastLLM()
+        service.llm = blocking_llm
+        job_id = service.create_job(input_text="input", title="pause-running", metadata={})
+
+        service.advance_job(job_id)
+        first_map = next(item for item in list(queue.items) if item[0] == "map")
+        queue.items.remove(first_map)
+        _, _, node_id = first_map
+        assert node_id is not None
+
+        worker = threading.Thread(target=service.map_node, args=(job_id, node_id))
+        worker.start()
+        self.assertTrue(blocking_llm.started.wait(timeout=2))
+
+        service.pause_job(job_id)
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.PAUSED)
+        paused_node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        self.assertEqual(paused_node["node_status"], NodeStatus.PAUSED)
+
+        service.resume_job(job_id)
+        resumed_node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        self.assertEqual(resumed_node["node_status"], NodeStatus.PENDING)
+
+        blocking_llm.release.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(store.latest_artifact(job_id=job_id, node_id=node_id, artifact_type=ArtifactType.MAP_SUMMARY))
+
+        self.drain(queue, service)
+
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.DONE)
+        self.assertIsNotNone(store.latest_artifact(job_id=job_id, node_id=node_id, artifact_type=ArtifactType.MAP_SUMMARY))
+        self.assertEqual(len([call for call in blocking_llm.calls if call["node_id"] == node_id]), 2)
+
     def test_cancel_blocks_work(self) -> None:
         service, store, _, _ = self.make_service(chunks=["chunk-1", "chunk-2"])
         job_id = service.create_job(input_text="input", title="cancel", metadata={})
@@ -1299,6 +1666,36 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertEqual(len(store.list_nodes_current(job_id)), 0)
         artifact_counts = Counter(artifact["artifact_type"] for artifact in store.list_artifacts(job_id=job_id, include_content=False))
         self.assertEqual(artifact_counts, Counter({ArtifactType.INPUT: 1}))
+
+    def test_cancel_marks_running_node_cancelled_and_discards_late_result(self) -> None:
+        service, store, _, queue = self.make_service(chunks=["chunk-1"])
+        blocking_llm = BlockingThenFastLLM()
+        service.llm = blocking_llm
+        job_id = service.create_job(input_text="input", title="cancel-running", metadata={})
+
+        service.advance_job(job_id)
+        first_map = next(item for item in list(queue.items) if item[0] == "map")
+        queue.items.remove(first_map)
+        _, _, node_id = first_map
+        assert node_id is not None
+
+        worker = threading.Thread(target=service.map_node, args=(job_id, node_id))
+        worker.start()
+        self.assertTrue(blocking_llm.started.wait(timeout=2))
+
+        service.cancel_job(job_id)
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.CANCELLED)
+        cancelled_node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        self.assertEqual(cancelled_node["node_status"], NodeStatus.CANCELLED)
+
+        blocking_llm.release.set()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+
+        self.assertIsNone(store.latest_artifact(job_id=job_id, node_id=node_id, artifact_type=ArtifactType.MAP_SUMMARY))
+        self.assertEqual(store.get_job_current(job_id)["job_status"], JobStatus.CANCELLED)
+        current_node = next(item for item in store.list_nodes_current(job_id) if item["node_id"] == node_id)
+        self.assertEqual(current_node["node_status"], NodeStatus.CANCELLED)
 
     def test_llm_failure_marks_node_and_job_failed(self) -> None:
         service, store, _, queue = self.make_service(chunks=["chunk-1"])
@@ -1542,7 +1939,8 @@ class SummaryBackendPipelineTests(unittest.TestCase):
 
         final_call = next(call for call in llm.calls if call["stage"] == Stage.FINAL)
         self.assertIn("CUSTOM JSON", final_call["user"])
-        self.assertIn('"headline": "string"', final_call["user"])
+        self.assertIn('"headline"', final_call["user"])
+        self.assertIn('"type": "string"', final_call["user"])
         self.assertEqual(final_call["response_schema"]["type"], "object")
         self.assertEqual(final_call["response_schema"]["properties"]["headline"]["type"], "string")
         self.assertEqual(final_call["response_schema"]["properties"]["items"]["type"], "array")
@@ -1556,6 +1954,61 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["severity"], "info")
         metadata = json.loads(final_artifact["metadata"])
         self.assertIn("output_json_schema", metadata)
+
+    def test_intermediate_output_json_schema_applies_to_map_and_reduce_nodes(self) -> None:
+        store = InMemorySummaryStore()
+        llm = CustomJsonLLM()
+        queue = ManualQueue()
+        service = PipelineService(
+            store=store,
+            queue=queue,
+            llm=llm,
+            chunker=FakeChunker(["chunk-1", "chunk-2", "chunk-3"]),
+            input_segmenter=FakeInputSegmenter(["input-1", "input-2", "input-3"]),
+            settings=replace(
+                get_settings(),
+                reduce_group_size=2,
+                llm_max_concurrency=2,
+                max_enqueue_nodes_per_advance=100,
+                chunk_target_estimated_tokens=100,
+            ),
+        )
+        job_id = service.create_job(
+            input_text="input",
+            title="intermediate-json",
+            metadata={
+                "intermediate_output_json_schema": {
+                    "chunk_summary": "string",
+                    "key_points": ["string"],
+                    "evidence": [{"title": "string", "details": "string"}],
+                    "warnings": ["string"],
+                },
+            },
+        )
+
+        queue.advance_job(job_id)
+        self.drain(queue, service)
+
+        map_calls = [call for call in llm.calls if call["stage"] == Stage.MAP]
+        reduce_calls = [call for call in llm.calls if str(call["stage"]).startswith(f"{Stage.REDUCE}_L")]
+        self.assertTrue(map_calls)
+        self.assertTrue(reduce_calls)
+        self.assertTrue(all(call["response_schema"]["type"] == "object" for call in map_calls))
+        self.assertTrue(all(call["response_schema"]["type"] == "object" for call in reduce_calls))
+        self.assertIn('"chunk_summary"', map_calls[0]["user"])
+        self.assertIn('"type": "string"', map_calls[0]["user"])
+        self.assertIn('"chunk_summary"', reduce_calls[0]["user"])
+        self.assertIn('"type": "string"', reduce_calls[0]["user"])
+
+        map_artifact = store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.MAP_SUMMARY)
+        reduce_artifact = store.latest_artifact(job_id=job_id, artifact_type=ArtifactType.REDUCE_SUMMARY)
+        assert map_artifact is not None
+        assert reduce_artifact is not None
+        map_metadata = json.loads(map_artifact["metadata"])
+        reduce_metadata = json.loads(reduce_artifact["metadata"])
+        self.assertIn("intermediate_output_json_schema", map_metadata)
+        self.assertIn("intermediate_output_json_schema", reduce_metadata)
+        self.assertEqual(json.loads(map_artifact["content"])["chunk_summary"].split(":")[0], str(Stage.MAP))
 
     def test_create_job_persists_text_as_input_segments_for_map_nodes(self) -> None:
         service, store, _, queue = self.make_service(chunks=["row 1", "row 2\nrow 3"])
@@ -1686,7 +2139,13 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         snapshot = build_job_snapshot(service, job_id)
 
         self.assertEqual(snapshot["job"]["job_status"], JobStatus.DONE)
+        self.assertIsNotNone(snapshot["job"]["created_at"])
+        self.assertIsNotNone(snapshot["job"]["started_at"])
+        self.assertIsNotNone(snapshot["job"]["finished_at"])
+        self.assertLessEqual(snapshot["job"]["created_at"], snapshot["job"]["started_at"])
+        self.assertLessEqual(snapshot["job"]["started_at"], snapshot["job"]["finished_at"])
         self.assertIn("nodes", snapshot)
+        self.assertIn("node_links", snapshot)
         self.assertIn("artifacts", snapshot)
         self.assertIn("job_events", snapshot)
         self.assertIn("node_events", snapshot)
@@ -1696,6 +2155,16 @@ class SummaryBackendPipelineTests(unittest.TestCase):
         self.assertEqual(snapshot["input_stats"]["rows_count"], 2)
         self.assertGreater(snapshot["input_stats"]["chars"], 0)
         self.assertGreater(snapshot["input_stats"]["estimated_tokens"], 0)
+        self.assertEqual(
+            [(link["from_node_type"], link["to_node_type"]) for link in snapshot["node_links"]],
+            [
+                ("SOURCE", "MAP"),
+                ("SOURCE", "MAP"),
+                ("MAP", "REDUCE"),
+                ("MAP", "REDUCE"),
+                ("REDUCE", "FINAL"),
+            ],
+        )
 
 
 if __name__ == "__main__":

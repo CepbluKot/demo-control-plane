@@ -24,9 +24,22 @@ from .factory import create_pipeline_service
 from .ids import new_job_id
 from .ingestion import ClickHouseQueryIngestionService, StagedUploadIngestionService
 from .input_parsers import InputParseError
+from .job_timing import attach_job_lifecycle_timestamps
 from .llm_client import StructuredLLMClient
 from .logging_setup import configure_logging, get_logger
-from .pipeline import FINAL_SYSTEM, FINAL_USER_TEMPLATE, MAP_SYSTEM, MAP_USER_TEMPLATE, PipelineService, REDUCE_SYSTEM, REDUCE_USER_TEMPLATE
+from .pipeline import (
+    CUSTOM_JSON_MAP_SYSTEM,
+    CUSTOM_JSON_REDUCE_SYSTEM,
+    FINAL_SYSTEM,
+    FINAL_USER_TEMPLATE,
+    MAP_CUSTOM_JSON_USER_TEMPLATE,
+    MAP_SYSTEM,
+    MAP_USER_TEMPLATE,
+    PipelineService,
+    REDUCE_CUSTOM_JSON_USER_TEMPLATE,
+    REDUCE_SYSTEM,
+    REDUCE_USER_TEMPLATE,
+)
 from .query_sources import ClickHouseQueryLogRecordSource, QuerySourceError
 from .schemas import (
     ArtifactRecord,
@@ -62,6 +75,8 @@ from .schemas import (
     SummaryPromptStageDraft,
     SummaryLlmConnectivityCheckResponse,
     SummaryLlmConnectivityCheckResult,
+    SummaryLlmChatMessage,
+    SummaryNodeLlmCallResponse,
     UploadedFileRecord,
 )
 from .snapshots import build_job_snapshot
@@ -85,6 +100,92 @@ def _service():
     return create_pipeline_service(queue=DramatiqTaskQueue(), settings=settings)
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _stringify_llm_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            for key in ("text", "content"):
+                text = item.get(key)
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+                    break
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+        return "\n\n".join(part for part in parts if part.strip())
+    if isinstance(value, dict):
+        for key in ("text", "content"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _extract_llm_chat_messages(request_json: dict[str, Any] | None) -> list[SummaryLlmChatMessage]:
+    raw_messages = request_json.get("messages") if request_json else None
+    if not isinstance(raw_messages, list):
+        return []
+    messages: list[SummaryLlmChatMessage] = []
+    for raw in raw_messages:
+        if not isinstance(raw, dict):
+            continue
+        role = str(raw.get("role") or "").strip() or "message"
+        content = _stringify_llm_content(raw.get("content")).strip()
+        if not content:
+            continue
+        messages.append(SummaryLlmChatMessage(role=role, content=content))
+    return messages
+
+
+def _extract_llm_assistant_message(response_json: dict[str, Any] | None) -> str:
+    if not response_json:
+        return ""
+    choices = response_json.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = _stringify_llm_content(message.get("content")).strip()
+                if content:
+                    return content
+    content = response_json.get("content")
+    if content is not None:
+        if isinstance(content, (dict, list)):
+            return json.dumps(content, ensure_ascii=False, indent=2)
+        return _stringify_llm_content(content).strip()
+    return ""
+
+
 class _NoopSummaryStore:
     def insert_llm_call(self, **kwargs: Any) -> None:
         return None
@@ -102,6 +203,12 @@ class PromptDraftConceptSpec(BaseModel):
     reduce_focus: Any = Field(default_factory=list)
     final_sections: Any = Field(default_factory=list)
     final_requirements: Any = Field(default_factory=list)
+    use_custom_map_output_json: bool = False
+    map_output_json_schema: dict[str, Any] | None = None
+    use_custom_reduce_output_json: bool = False
+    reduce_output_json_schema: dict[str, Any] | None = None
+    use_custom_intermediate_output_json: bool = False
+    intermediate_output_json_schema: dict[str, Any] | None = None
     use_custom_output_json: bool = False
     output_json_schema: dict[str, Any] | None = None
 
@@ -234,7 +341,12 @@ class PromptDraftJobManager:
         cancel_checker: Callable[[], bool],
     ) -> GenerateSummaryPromptDraftResponse:
         store = ClickHouseStore(settings)
-        llm = StructuredLLMClient(store=store, settings=settings, audit=AuditWriter(settings))
+        llm = StructuredLLMClient(
+            store=store,
+            settings=settings,
+            audit=AuditWriter(settings),
+            pool_kind="assistant",
+        )
         return _generate_prompt_draft_with_llm(
             llm=llm,
             request=request,
@@ -380,7 +492,17 @@ def create_prompt_draft_job(request: GenerateSummaryPromptDraftRequest) -> Promp
     normalized_request = request.model_copy(update={"llm_model": llm_model})
     if settings.dry_run:
         job = prompt_draft_jobs.create_completed_job(
-            result=_fallback_prompt_draft(request.request, request.use_custom_output_json, request.output_json_schema),
+            result=_fallback_prompt_draft(
+                request.request,
+                request.use_custom_map_output_json,
+                request.map_output_json_schema,
+                request.use_custom_reduce_output_json,
+                request.reduce_output_json_schema,
+                request.use_custom_intermediate_output_json,
+                request.intermediate_output_json_schema,
+                request.use_custom_output_json,
+                request.output_json_schema,
+            ),
             llm_model=llm_model,
         )
     else:
@@ -410,10 +532,25 @@ def cancel_prompt_draft_job(job_id: str) -> PromptDraftJobRecord:
 @app.post("/prompt-drafts", response_model=GenerateSummaryPromptDraftResponse)
 def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) -> GenerateSummaryPromptDraftResponse:
     if settings.dry_run:
-        return _fallback_prompt_draft(request.request, request.use_custom_output_json, request.output_json_schema)
+        return _fallback_prompt_draft(
+            request.request,
+            request.use_custom_map_output_json,
+            request.map_output_json_schema,
+            request.use_custom_reduce_output_json,
+            request.reduce_output_json_schema,
+            request.use_custom_intermediate_output_json,
+            request.intermediate_output_json_schema,
+            request.use_custom_output_json,
+            request.output_json_schema,
+        )
 
     store = ClickHouseStore(settings)
-    llm = StructuredLLMClient(store=store, settings=settings, audit=AuditWriter(settings))
+    llm = StructuredLLMClient(
+        store=store,
+        settings=settings,
+        audit=AuditWriter(settings),
+        pool_kind="assistant",
+    )
     requested_llm_model = _resolve_requested_prompt_draft_model(request.llm_model)
     try:
         return _generate_prompt_draft_with_llm(
@@ -492,6 +629,7 @@ def build_public_settings(current_settings=settings) -> SummaryServiceSettingsRe
             max_retries=current_settings.llm_max_retries,
             retry_backoff_seconds=current_settings.llm_retry_backoff_seconds,
             max_concurrency=current_settings.llm_max_concurrency,
+            assistant_max_concurrency=current_settings.llm_assistant_max_concurrency,
             pool_acquire_timeout_seconds=current_settings.llm_pool_acquire_timeout_seconds,
             pool_poll_interval_seconds=current_settings.llm_pool_poll_interval_seconds,
             api_key_configured=bool(current_settings.openai_api_key),
@@ -499,6 +637,7 @@ def build_public_settings(current_settings=settings) -> SummaryServiceSettingsRe
         ),
         pipeline=SummaryServicePipelineSettings(
             chunk_target_estimated_tokens=current_settings.chunk_target_estimated_tokens,
+            reduce_target_estimated_tokens=current_settings.reduce_target_estimated_tokens,
             reduce_group_size=current_settings.reduce_group_size,
             max_enqueue_nodes_per_advance=current_settings.max_enqueue_nodes_per_advance,
         ),
@@ -521,6 +660,7 @@ def _probe_prompt_draft_llm_availability(*, llm_model: str | None) -> str:
             store=_NoopSummaryStore(),
             settings=settings,
             audit=AuditWriter(settings),
+            pool_kind="assistant",
         )
         probe = probe_client.probe_connection(
             model=llm_model,
@@ -586,6 +726,12 @@ def _mask_url_credentials(value: str) -> str:
 
 def _fallback_prompt_draft(
     user_request: str,
+    use_custom_map_output_json: bool | None,
+    map_output_json_schema: dict[str, Any] | None,
+    use_custom_reduce_output_json: bool | None,
+    reduce_output_json_schema: dict[str, Any] | None,
+    use_custom_intermediate_output_json: bool | None,
+    intermediate_output_json_schema: dict[str, Any] | None,
     use_custom_output_json: bool | None,
     output_json_schema: dict[str, Any] | None,
 ) -> GenerateSummaryPromptDraftResponse:
@@ -593,12 +739,30 @@ def _fallback_prompt_draft(
     request_line = f"\nUser-specific direction: {clean_request}" if clean_request else ""
     report_name = _fallback_report_name(clean_request)
     report_instruction = clean_request or "Create a concise report that follows the user request."
+    normalized_map_output_json_schema = _normalize_stage_output_json_schema(
+        map_output_json_schema,
+        provided_output_json_schema=map_output_json_schema or intermediate_output_json_schema,
+        use_custom_output_json=bool(use_custom_map_output_json or use_custom_intermediate_output_json),
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_map_output_json_schema,
+    )
+    normalized_reduce_output_json_schema = _normalize_stage_output_json_schema(
+        reduce_output_json_schema,
+        provided_output_json_schema=reduce_output_json_schema or intermediate_output_json_schema,
+        use_custom_output_json=bool(use_custom_reduce_output_json or use_custom_intermediate_output_json),
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_reduce_output_json_schema,
+    )
     normalized_output_json_schema = _normalize_output_json_schema(
         output_json_schema,
         provided_output_json_schema=output_json_schema,
         use_custom_output_json=bool(use_custom_output_json),
         user_request=user_request,
     )
+    map_system = f"{CUSTOM_JSON_MAP_SYSTEM if normalized_map_output_json_schema else MAP_SYSTEM}{request_line}"
+    map_user = MAP_CUSTOM_JSON_USER_TEMPLATE if normalized_map_output_json_schema else MAP_USER_TEMPLATE
+    reduce_system = f"{CUSTOM_JSON_REDUCE_SYSTEM if normalized_reduce_output_json_schema else REDUCE_SYSTEM}{request_line}"
+    reduce_user = REDUCE_CUSTOM_JSON_USER_TEMPLATE if normalized_reduce_output_json_schema else REDUCE_USER_TEMPLATE
     final_user = FINAL_USER_TEMPLATE
     if normalized_output_json_schema:
         final_user = (
@@ -610,16 +774,29 @@ def _fallback_prompt_draft(
     return GenerateSummaryPromptDraftResponse(
         report_name=report_name,
         report_instruction=report_instruction,
+        use_custom_map_output_json=normalized_map_output_json_schema is not None,
+        map_output_json_schema=normalized_map_output_json_schema,
+        use_custom_reduce_output_json=normalized_reduce_output_json_schema is not None,
+        reduce_output_json_schema=normalized_reduce_output_json_schema,
+        use_custom_intermediate_output_json=_schemas_equal(
+            normalized_map_output_json_schema,
+            normalized_reduce_output_json_schema,
+        ) and normalized_map_output_json_schema is not None,
+        intermediate_output_json_schema=(
+            normalized_map_output_json_schema
+            if _schemas_equal(normalized_map_output_json_schema, normalized_reduce_output_json_schema)
+            else None
+        ),
         use_custom_output_json=normalized_output_json_schema is not None,
         output_json_schema=normalized_output_json_schema,
         prompt_overrides=SummaryPromptOverridesDraft(
             map=SummaryPromptStageDraft(
-                system=f"{MAP_SYSTEM}{request_line}",
-                user=MAP_USER_TEMPLATE,
+                system=map_system,
+                user=map_user,
             ),
             reduce=SummaryPromptStageDraft(
-                system=f"{REDUCE_SYSTEM}{request_line}",
-                user=REDUCE_USER_TEMPLATE,
+                system=reduce_system,
+                user=reduce_user,
             ),
             final=SummaryPromptStageDraft(
                 system=f"{FINAL_SYSTEM}{request_line}",
@@ -667,6 +844,12 @@ def _generate_prompt_draft_with_llm(
     _raise_if_prompt_draft_cancelled(cancel_checker)
     normalized_spec = _normalize_prompt_draft_spec(
         spec,
+        request.map_output_json_schema,
+        request.use_custom_map_output_json,
+        request.reduce_output_json_schema,
+        request.use_custom_reduce_output_json,
+        request.intermediate_output_json_schema,
+        request.use_custom_intermediate_output_json,
         request.output_json_schema,
         request.use_custom_output_json,
         request.request,
@@ -686,6 +869,12 @@ def _generate_prompt_draft_with_llm(
     return _normalize_prompt_draft(
         merged_draft,
         request.request,
+        request.map_output_json_schema,
+        request.use_custom_map_output_json,
+        request.reduce_output_json_schema,
+        request.use_custom_reduce_output_json,
+        request.intermediate_output_json_schema,
+        request.use_custom_intermediate_output_json,
         request.output_json_schema,
         request.use_custom_output_json,
     )
@@ -703,12 +892,32 @@ def _generate_prompt_draft_concept_spec(
     llm_model: str | None,
 ) -> PromptDraftConceptSpec:
     output_schema_text = json.dumps(request.output_json_schema or {}, ensure_ascii=False, indent=2)
+    map_schema_text = json.dumps(
+        request.map_output_json_schema or request.intermediate_output_json_schema or {},
+        ensure_ascii=False,
+        indent=2,
+    )
+    reduce_schema_text = json.dumps(
+        request.reduce_output_json_schema or request.intermediate_output_json_schema or {},
+        ensure_ascii=False,
+        indent=2,
+    )
+    custom_map_requested = bool(
+        request.use_custom_map_output_json or request.map_output_json_schema or request.use_custom_intermediate_output_json or request.intermediate_output_json_schema
+    )
+    custom_reduce_requested = bool(
+        request.use_custom_reduce_output_json or request.reduce_output_json_schema or request.use_custom_intermediate_output_json or request.intermediate_output_json_schema
+    )
     custom_output_requested = bool(request.use_custom_output_json or request.output_json_schema)
     system = (
         "You convert a user's conceptual request for a three-stage summarization pipeline into a structured design spec. "
         "Return only JSON matching the requested schema. "
         "Extract implementation-ready intent for MAP, REDUCE, and FINAL so another model can write concrete prompts without guessing. "
         "Keep the spec concise, practical, and internally consistent. "
+        "If the user already provided a MAP JSON structure, preserve it and set use_custom_map_output_json to true. "
+        "If the user already provided a REDUCE JSON structure, preserve it and set use_custom_reduce_output_json to true. "
+        "If the user only provided one shared intermediate JSON structure, preserve it for both MAP and REDUCE, and also set use_custom_intermediate_output_json to true. "
+        "MAP and REDUCE may share the same schema when that is genuinely the best design, but do not force them to be identical when different stage outputs are more useful. "
         "If the user already provided a final output JSON structure, preserve it and set use_custom_output_json to true. "
         "If the request explicitly asks for a strict final JSON structure, create one that is directly usable as a JSON schema for an object response. "
         "If no strict final structure is clearly needed, keep use_custom_output_json false and output_json_schema null."
@@ -716,6 +925,10 @@ def _generate_prompt_draft_concept_spec(
     user = (
         "Create a structured prompt-design spec from this conceptual request.\n\n"
         f"User request:\n{request.request.strip()}\n\n"
+        f"Custom MAP JSON schema requested: {'yes' if custom_map_requested else 'no'}\n\n"
+        f"Desired MAP JSON structure, if any:\n{map_schema_text}\n\n"
+        f"Custom REDUCE JSON schema requested: {'yes' if custom_reduce_requested else 'no'}\n\n"
+        f"Desired REDUCE JSON structure, if any:\n{reduce_schema_text}\n\n"
         f"Custom final JSON schema requested: {'yes' if custom_output_requested else 'no'}\n\n"
         f"Desired final output JSON structure, if any:\n{output_schema_text}\n\n"
         "Fill the spec with implementation-ready detail:\n"
@@ -728,8 +941,11 @@ def _generate_prompt_draft_concept_spec(
         "- final_requirements: evidence rules, severity handling, uncertainty, required details, and other constraints\n"
         "- report_instruction: reusable instruction text for the report form\n"
         "- report_name: short human-friendly title when helpful\n"
+        "- use_custom_map_output_json/map_output_json_schema: only when structured MAP objects would materially help extraction, validation, or downstream merging\n"
+        "- use_custom_reduce_output_json/reduce_output_json_schema: only when structured REDUCE objects would materially help consolidation, traceability, or the FINAL stage\n"
+        "- use_custom_intermediate_output_json/intermediate_output_json_schema: only when MAP and REDUCE should intentionally share the same structure\n"
         "- use_custom_output_json/output_json_schema: only when strict structured final output is genuinely useful, unless the request explicitly says custom JSON output is required\n"
-        "- When output_json_schema is needed, return a practical object schema with stable keys and concrete field types\n"
+        "- When any output schema is needed, return a practical object schema with stable keys and concrete field types\n"
         "Do not write MAP, REDUCE, or FINAL prompts yet."
     )
     return llm.call_structured(
@@ -751,6 +967,8 @@ def _generate_prompt_draft_from_spec(
     spec: PromptDraftConceptSpec,
 ) -> GenerateSummaryPromptDraftResponse:
     spec_text = json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2)
+    map_schema_text = json.dumps(spec.map_output_json_schema or spec.intermediate_output_json_schema or {}, ensure_ascii=False, indent=2)
+    reduce_schema_text = json.dumps(spec.reduce_output_json_schema or spec.intermediate_output_json_schema or {}, ensure_ascii=False, indent=2)
     output_schema_text = json.dumps(spec.output_json_schema or {}, ensure_ascii=False, indent=2)
     system = (
         "You generate concrete MAP, REDUCE, and FINAL prompt fields for a three-stage summarization pipeline from a structured design spec. "
@@ -758,10 +976,12 @@ def _generate_prompt_draft_from_spec(
         "All three stages must follow the same objective, audience, tone, and evidence rules from the spec. "
         "Prompt quality is the primary objective; report_name and report_instruction should stay aligned with the spec. "
         "Each stage must include a system prompt and a user prompt template. "
-        "The MAP and REDUCE stages must keep returning the internal SummaryResult JSON shape: "
+        "If a MAP JSON structure is provided, MAP must return that exact structure. "
+        "If a REDUCE JSON structure is provided, REDUCE must return that exact structure. "
+        "Otherwise MAP or REDUCE must keep returning the internal SummaryResult JSON shape: "
         '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}. '
         "MAP should explain what to extract from a single chunk. "
-        "REDUCE should explain how to merge partial summaries without losing evidence. "
+        "REDUCE should explain how to merge partial summaries without losing evidence and while preserving sequence when relevant. "
         "If a final output JSON structure is provided, the FINAL stage must return that structure. "
         "Otherwise FINAL must keep the SummaryResult transport JSON shape and put the full report in summary."
     )
@@ -769,6 +989,8 @@ def _generate_prompt_draft_from_spec(
         "Create prompt field content for a summary-generation job from this structured design spec.\n\n"
         f"Original user request:\n{request.request.strip()}\n\n"
         f"Design spec:\n{spec_text}\n\n"
+        f"Desired MAP JSON structure, if any:\n{map_schema_text}\n\n"
+        f"Desired REDUCE JSON structure, if any:\n{reduce_schema_text}\n\n"
         f"Desired final output JSON structure, if any:\n{output_schema_text}\n\n"
         "Hard constraints:\n"
         "- report_name and report_instruction should stay consistent with the design spec.\n"
@@ -776,6 +998,7 @@ def _generate_prompt_draft_from_spec(
         "- prompt_overrides.map.user must include the literal placeholder {chunk}.\n"
         "- prompt_overrides.reduce.user must include the literal placeholder {summaries}.\n"
         "- prompt_overrides.final.user must include the literal placeholder {summaries}.\n"
+        "- If MAP or REDUCE uses a custom JSON schema, the corresponding user prompt should also include the literal placeholder {intermediate_output_json_schema}.\n"
         "- The final prompt may also use {report_format_instruction} and {output_json_schema}.\n"
         "- Without a custom final output schema, the final prompt should let the LLM choose a useful report layout inside summary.\n"
         "- Keep prompts concise enough for production use.\n"
@@ -794,10 +1017,45 @@ def _generate_prompt_draft_from_spec(
 
 def _normalize_prompt_draft_spec(
     spec: PromptDraftConceptSpec,
-    provided_output_json_schema: dict[str, Any] | None,
+    provided_map_output_json_schema: dict[str, Any] | None = None,
+    requested_use_custom_map_output_json: bool | None = None,
+    provided_reduce_output_json_schema: dict[str, Any] | None = None,
+    requested_use_custom_reduce_output_json: bool | None = None,
+    provided_intermediate_output_json_schema: dict[str, Any] | None = None,
+    requested_use_custom_intermediate_output_json: bool | None = None,
+    provided_output_json_schema: dict[str, Any] | None = None,
     requested_use_custom_output_json: bool | None = None,
     user_request: str = "",
 ) -> PromptDraftConceptSpec:
+    effective_use_custom_map_output_json = _resolve_prompt_draft_custom_stage_output_json_requested(
+        requested_use_custom_map_output_json,
+        fallback=spec.use_custom_map_output_json or spec.use_custom_intermediate_output_json,
+        provided_output_json_schema=provided_map_output_json_schema or provided_intermediate_output_json_schema,
+    )
+    normalized_map_output_json_schema = _normalize_stage_output_json_schema(
+        spec.map_output_json_schema or spec.intermediate_output_json_schema,
+        provided_output_json_schema=provided_map_output_json_schema or provided_intermediate_output_json_schema,
+        use_custom_output_json=effective_use_custom_map_output_json,
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_map_output_json_schema,
+    )
+    effective_use_custom_reduce_output_json = _resolve_prompt_draft_custom_stage_output_json_requested(
+        requested_use_custom_reduce_output_json,
+        fallback=spec.use_custom_reduce_output_json or spec.use_custom_intermediate_output_json,
+        provided_output_json_schema=provided_reduce_output_json_schema or provided_intermediate_output_json_schema,
+    )
+    normalized_reduce_output_json_schema = _normalize_stage_output_json_schema(
+        spec.reduce_output_json_schema or spec.intermediate_output_json_schema,
+        provided_output_json_schema=provided_reduce_output_json_schema or provided_intermediate_output_json_schema,
+        use_custom_output_json=effective_use_custom_reduce_output_json,
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_reduce_output_json_schema,
+    )
+    effective_use_custom_intermediate_output_json = _resolve_prompt_draft_custom_intermediate_output_json_requested(
+        requested_use_custom_intermediate_output_json,
+        fallback=spec.use_custom_intermediate_output_json,
+        provided_intermediate_output_json_schema=provided_intermediate_output_json_schema,
+    )
     effective_use_custom_output_json = _resolve_prompt_draft_custom_output_json_requested(
         requested_use_custom_output_json,
         fallback=spec.use_custom_output_json,
@@ -819,6 +1077,20 @@ def _normalize_prompt_draft_spec(
         reduce_focus=_normalize_prompt_spec_list(spec.reduce_focus),
         final_sections=_normalize_prompt_spec_list(spec.final_sections),
         final_requirements=_normalize_prompt_spec_list(spec.final_requirements),
+        use_custom_map_output_json=normalized_map_output_json_schema is not None,
+        map_output_json_schema=normalized_map_output_json_schema,
+        use_custom_reduce_output_json=normalized_reduce_output_json_schema is not None,
+        reduce_output_json_schema=normalized_reduce_output_json_schema,
+        use_custom_intermediate_output_json=bool(
+            effective_use_custom_intermediate_output_json
+            and _schemas_equal(normalized_map_output_json_schema, normalized_reduce_output_json_schema)
+            and normalized_map_output_json_schema is not None
+        ),
+        intermediate_output_json_schema=(
+            normalized_map_output_json_schema
+            if _schemas_equal(normalized_map_output_json_schema, normalized_reduce_output_json_schema)
+            else None
+        ),
         use_custom_output_json=normalized_output_json_schema is not None,
         output_json_schema=normalized_output_json_schema,
     )
@@ -831,6 +1103,22 @@ def _merge_prompt_draft_spec_into_draft(
     return GenerateSummaryPromptDraftResponse(
         report_name=(draft.report_name or "").strip() or spec.report_name,
         report_instruction=(draft.report_instruction or "").strip() or spec.report_instruction,
+        use_custom_map_output_json=bool(draft.use_custom_map_output_json or spec.use_custom_map_output_json),
+        map_output_json_schema=draft.map_output_json_schema or draft.intermediate_output_json_schema or spec.map_output_json_schema or spec.intermediate_output_json_schema,
+        use_custom_reduce_output_json=bool(draft.use_custom_reduce_output_json or spec.use_custom_reduce_output_json),
+        reduce_output_json_schema=draft.reduce_output_json_schema or draft.intermediate_output_json_schema or spec.reduce_output_json_schema or spec.intermediate_output_json_schema,
+        use_custom_intermediate_output_json=bool(
+            draft.use_custom_intermediate_output_json or spec.use_custom_intermediate_output_json
+        ),
+        intermediate_output_json_schema=(
+            draft.intermediate_output_json_schema
+            or spec.intermediate_output_json_schema
+            or (
+                draft.map_output_json_schema
+                if _schemas_equal(draft.map_output_json_schema, draft.reduce_output_json_schema)
+                else None
+            )
+        ),
         use_custom_output_json=bool(draft.use_custom_output_json or spec.use_custom_output_json),
         output_json_schema=draft.output_json_schema or spec.output_json_schema,
         prompt_overrides=draft.prompt_overrides,
@@ -873,11 +1161,56 @@ def _stringify_prompt_spec_value(value: Any) -> str:
 def _normalize_prompt_draft(
     draft: GenerateSummaryPromptDraftResponse,
     user_request: str,
+    map_output_json_schema: dict[str, Any] | None,
+    requested_use_custom_map_output_json: bool | None,
+    reduce_output_json_schema: dict[str, Any] | None,
+    requested_use_custom_reduce_output_json: bool | None,
+    intermediate_output_json_schema: dict[str, Any] | None,
+    requested_use_custom_intermediate_output_json: bool | None,
     output_json_schema: dict[str, Any] | None,
     requested_use_custom_output_json: bool | None,
 ) -> GenerateSummaryPromptDraftResponse:
-    fallback = _fallback_prompt_draft(user_request, requested_use_custom_output_json, output_json_schema)
+    fallback = _fallback_prompt_draft(
+        user_request,
+        requested_use_custom_map_output_json,
+        map_output_json_schema,
+        requested_use_custom_reduce_output_json,
+        reduce_output_json_schema,
+        requested_use_custom_intermediate_output_json,
+        intermediate_output_json_schema,
+        requested_use_custom_output_json,
+        output_json_schema,
+    )
     raw = draft.prompt_overrides
+    effective_use_custom_map_output_json = _resolve_prompt_draft_custom_stage_output_json_requested(
+        requested_use_custom_map_output_json,
+        fallback=draft.use_custom_map_output_json or draft.use_custom_intermediate_output_json,
+        provided_output_json_schema=map_output_json_schema or intermediate_output_json_schema,
+    )
+    normalized_map_output_json_schema = _normalize_stage_output_json_schema(
+        draft.map_output_json_schema or draft.intermediate_output_json_schema,
+        provided_output_json_schema=map_output_json_schema or intermediate_output_json_schema,
+        use_custom_output_json=effective_use_custom_map_output_json,
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_map_output_json_schema,
+    )
+    effective_use_custom_reduce_output_json = _resolve_prompt_draft_custom_stage_output_json_requested(
+        requested_use_custom_reduce_output_json,
+        fallback=draft.use_custom_reduce_output_json or draft.use_custom_intermediate_output_json,
+        provided_output_json_schema=reduce_output_json_schema or intermediate_output_json_schema,
+    )
+    normalized_reduce_output_json_schema = _normalize_stage_output_json_schema(
+        draft.reduce_output_json_schema or draft.intermediate_output_json_schema,
+        provided_output_json_schema=reduce_output_json_schema or intermediate_output_json_schema,
+        use_custom_output_json=effective_use_custom_reduce_output_json,
+        user_request=user_request,
+        fallback_builder=_build_fallback_generated_reduce_output_json_schema,
+    )
+    effective_use_custom_intermediate_output_json = _resolve_prompt_draft_custom_intermediate_output_json_requested(
+        requested_use_custom_intermediate_output_json,
+        fallback=draft.use_custom_intermediate_output_json,
+        provided_intermediate_output_json_schema=intermediate_output_json_schema,
+    )
     effective_use_custom_output_json = _resolve_prompt_draft_custom_output_json_requested(
         requested_use_custom_output_json,
         fallback=draft.use_custom_output_json,
@@ -892,11 +1225,35 @@ def _normalize_prompt_draft(
     return GenerateSummaryPromptDraftResponse(
         report_name=(draft.report_name or "").strip()[:200] or fallback.report_name,
         report_instruction=(draft.report_instruction or "").strip()[:4000] or fallback.report_instruction,
+        use_custom_map_output_json=normalized_map_output_json_schema is not None,
+        map_output_json_schema=normalized_map_output_json_schema,
+        use_custom_reduce_output_json=normalized_reduce_output_json_schema is not None,
+        reduce_output_json_schema=normalized_reduce_output_json_schema,
+        use_custom_intermediate_output_json=bool(
+            effective_use_custom_intermediate_output_json
+            and _schemas_equal(normalized_map_output_json_schema, normalized_reduce_output_json_schema)
+            and normalized_map_output_json_schema is not None
+        ),
+        intermediate_output_json_schema=(
+            normalized_map_output_json_schema
+            if _schemas_equal(normalized_map_output_json_schema, normalized_reduce_output_json_schema)
+            else None
+        ),
         use_custom_output_json=normalized_output_json_schema is not None,
         output_json_schema=normalized_output_json_schema,
         prompt_overrides=SummaryPromptOverridesDraft(
-            map=_normalize_prompt_stage(raw.map, fallback.prompt_overrides.map, "{chunk}"),
-            reduce=_normalize_prompt_stage(raw.reduce, fallback.prompt_overrides.reduce, "{summaries}"),
+            map=_normalize_prompt_stage(
+                raw.map,
+                fallback.prompt_overrides.map,
+                "{chunk}",
+                extra_placeholder="{intermediate_output_json_schema}" if normalized_map_output_json_schema else None,
+            ),
+            reduce=_normalize_prompt_stage(
+                raw.reduce,
+                fallback.prompt_overrides.reduce,
+                "{summaries}",
+                extra_placeholder="{intermediate_output_json_schema}" if normalized_reduce_output_json_schema else None,
+            ),
             final=_normalize_prompt_stage(
                 raw.final,
                 fallback.prompt_overrides.final,
@@ -915,12 +1272,45 @@ def _normalize_output_json_schema(
     user_request: str = "",
 ) -> dict[str, Any] | None:
     if provided_output_json_schema:
-        return PipelineService._build_final_response_schema(provided_output_json_schema)
+        return PipelineService._build_response_json_schema(provided_output_json_schema)
     if not use_custom_output_json:
         return None
     if isinstance(draft_output_json_schema, dict) and draft_output_json_schema:
-        return PipelineService._build_final_response_schema(draft_output_json_schema)
+        return PipelineService._build_response_json_schema(draft_output_json_schema)
     return _build_fallback_generated_output_json_schema(user_request)
+
+
+def _normalize_stage_output_json_schema(
+    draft_output_json_schema: dict[str, Any] | None,
+    *,
+    provided_output_json_schema: dict[str, Any] | None,
+    use_custom_output_json: bool,
+    user_request: str,
+    fallback_builder: Callable[[str], dict[str, Any]],
+) -> dict[str, Any] | None:
+    if provided_output_json_schema:
+        return PipelineService._build_response_json_schema(provided_output_json_schema)
+    if not use_custom_output_json:
+        return None
+    if isinstance(draft_output_json_schema, dict) and draft_output_json_schema:
+        return PipelineService._build_response_json_schema(draft_output_json_schema)
+    return fallback_builder(user_request)
+
+
+def _normalize_intermediate_output_json_schema(
+    draft_intermediate_output_json_schema: dict[str, Any] | None,
+    *,
+    provided_intermediate_output_json_schema: dict[str, Any] | None,
+    use_custom_intermediate_output_json: bool,
+    user_request: str = "",
+) -> dict[str, Any] | None:
+    if provided_intermediate_output_json_schema:
+        return PipelineService._build_response_json_schema(provided_intermediate_output_json_schema)
+    if not use_custom_intermediate_output_json:
+        return None
+    if isinstance(draft_intermediate_output_json_schema, dict) and draft_intermediate_output_json_schema:
+        return PipelineService._build_response_json_schema(draft_intermediate_output_json_schema)
+    return _build_fallback_generated_intermediate_output_json_schema(user_request)
 
 
 def _build_fallback_generated_output_json_schema(user_request: str) -> dict[str, Any]:
@@ -932,7 +1322,40 @@ def _build_fallback_generated_output_json_schema(user_request: str) -> dict[str,
         "recommendations": ["string: specific next action or recommendation"],
         "warnings": ["string: uncertainty, limitation, or caveat"],
     }
-    return PipelineService._build_final_response_schema(shape)
+    return PipelineService._build_response_json_schema(shape)
+
+
+def _build_fallback_generated_map_output_json_schema(user_request: str) -> dict[str, Any]:
+    title_description = _fallback_report_name(user_request)
+    shape = {
+        "chunk_summary": f"string: concise structured extraction for {title_description.lower() or 'this chunk'}",
+        "key_points": ["string: concrete finding extracted from the chunk"],
+        "evidence": [{"title": "string: evidence label", "details": "string: supporting detail or metric value"}],
+        "warnings": ["string: uncertainty, missing context, or caveat for this chunk"],
+    }
+    return PipelineService._build_response_json_schema(shape)
+
+
+def _build_fallback_generated_reduce_output_json_schema(user_request: str) -> dict[str, Any]:
+    title_description = _fallback_report_name(user_request)
+    shape = {
+        "merged_summary": f"string: consolidated structured summary for {title_description.lower() or 'the merged summaries'}",
+        "deduplicated_findings": ["string: merged evidence-backed finding with duplicates removed"],
+        "evidence_groups": [{"title": "string: grouped evidence label", "details": "string: consolidated supporting detail"}],
+        "warnings": ["string: remaining uncertainty, conflict, or missing context after merging"],
+    }
+    return PipelineService._build_response_json_schema(shape)
+
+
+def _build_fallback_generated_intermediate_output_json_schema(user_request: str) -> dict[str, Any]:
+    title_description = _fallback_report_name(user_request)
+    shape = {
+        "chunk_summary": f"string: concise structured summary for {title_description.lower() or 'this chunk'}",
+        "key_points": ["string: concrete evidence-backed point extracted from the chunk or merged summaries"],
+        "evidence": [{"title": "string: evidence label", "details": "string: supporting detail or metric value"}],
+        "warnings": ["string: uncertainty, missing context, or caveat for this chunk"],
+    }
+    return PipelineService._build_response_json_schema(shape)
 
 
 def _resolve_prompt_draft_custom_output_json_requested(
@@ -948,6 +1371,44 @@ def _resolve_prompt_draft_custom_output_json_requested(
     if requested_use_custom_output_json is False:
         return False
     return bool(fallback)
+
+
+def _resolve_prompt_draft_custom_stage_output_json_requested(
+    requested_use_custom_output_json: bool | None,
+    *,
+    fallback: bool,
+    provided_output_json_schema: dict[str, Any] | None,
+) -> bool:
+    if provided_output_json_schema:
+        return True
+    if requested_use_custom_output_json is True:
+        return True
+    if requested_use_custom_output_json is False:
+        return False
+    return bool(fallback)
+
+
+def _resolve_prompt_draft_custom_intermediate_output_json_requested(
+    requested_use_custom_intermediate_output_json: bool | None,
+    *,
+    fallback: bool,
+    provided_intermediate_output_json_schema: dict[str, Any] | None,
+) -> bool:
+    if provided_intermediate_output_json_schema:
+        return True
+    if requested_use_custom_intermediate_output_json is True:
+        return True
+    if requested_use_custom_intermediate_output_json is False:
+        return False
+    return bool(fallback)
+
+
+def _schemas_equal(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    return json.dumps(left, ensure_ascii=False, sort_keys=True) == json.dumps(right, ensure_ascii=False, sort_keys=True)
 
 
 def _fallback_report_name(user_request: str) -> str:
@@ -993,8 +1454,17 @@ def list_summary_jobs(
     limit: int = Query(default=200, ge=1, le=1000),
     status: JobStatus | None = Query(default=None),
 ) -> list[JobCurrent]:
-    rows = ClickHouseStore(settings).list_jobs(limit=limit, status=str(status) if status else None)
-    return [JobCurrent.model_validate(row) for row in rows]
+    store = ClickHouseStore(settings)
+    rows = store.list_jobs(limit=limit, status=str(status) if status else None)
+    return [
+        JobCurrent.model_validate(
+            attach_job_lifecycle_timestamps(
+                row,
+                store.list_job_events(str(row.get("job_id") or ""), limit=5000),
+            )
+        )
+        for row in rows
+    ]
 
 
 @app.post("/summary-jobs/upload", response_model=CreateSummaryJobUploadResponse)
@@ -1201,6 +1671,37 @@ def list_summary_input_segments(
 ) -> list[InputSegmentRecord]:
     rows = ClickHouseStore(settings).list_input_segments(job_id=job_id, include_content=include_content)
     return [InputSegmentRecord.model_validate(row) for row in rows]
+
+
+@app.get("/summary-jobs/{job_id}/nodes/{node_id}/llm-call", response_model=SummaryNodeLlmCallResponse)
+def get_summary_node_llm_call(job_id: str, node_id: str) -> SummaryNodeLlmCallResponse:
+    row = ClickHouseStore(settings).latest_llm_call(job_id=job_id, node_id=node_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"llm call not found for node: {job_id}/{node_id}")
+    request_json = _parse_json_object(row.get("request_json"))
+    response_json = _parse_json_object(row.get("response_json"))
+    return SummaryNodeLlmCallResponse(
+        call_id=str(row.get("call_id") or ""),
+        created_at=row.get("created_at"),
+        job_id=job_id,
+        node_id=node_id,
+        provider=str(row.get("provider") or ""),
+        model=str(row.get("model") or ""),
+        status=str(row.get("status") or ""),
+        error_class=str(row.get("error_class") or ""),
+        http_status=_safe_int(row.get("http_status")),
+        latency_ms=_safe_int(row.get("latency_ms")),
+        pool_wait_ms=_safe_int(row.get("pool_wait_ms")),
+        provider_latency_ms=_safe_int(row.get("provider_latency_ms")),
+        prompt_tokens=_safe_int(row.get("prompt_tokens")),
+        completion_tokens=_safe_int(row.get("completion_tokens")),
+        total_tokens=_safe_int(row.get("total_tokens")),
+        error_message=str(row.get("error_message") or ""),
+        messages=_extract_llm_chat_messages(request_json),
+        assistant_message=_extract_llm_assistant_message(response_json),
+        request_json=request_json,
+        response_json=response_json,
+    )
 
 
 @app.post("/summary-jobs/{job_id}/pause", response_model=PauseResumeResponse)

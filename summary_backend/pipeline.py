@@ -16,12 +16,13 @@ from .errors import LlmPoolBusyError, classify_error
 from .ids import make_node_id, new_job_id, sha256_text
 from .input_models import InputSegment, LogRecord
 from .input_segments import RowBudgetInputSegmenter
+from .job_timing import attach_job_lifecycle_timestamps
 from .llm_client import StructuredLLMClient
 from .logging_setup import get_logger, log_kv, log_stage, timed_stage
 from .ports import Chunker, InputSegmenter, SummaryLLM, SummaryStore, TaskQueue
 from .schemas import ArtifactType, JobStatus, JsonObjectResult, NodeStatus, NodeType, Stage, SummaryResult
 from .store import ClickHouseStore
-from .text import CharBudgetChunker, split_atomic_units
+from .text import CharBudgetChunker, estimate_tokens, split_atomic_units
 
 logger = get_logger("pipeline")
 
@@ -43,10 +44,24 @@ MAP_SYSTEM = (
     "Keep the summary concise, factual, and grounded in the provided text."
 )
 
+CUSTOM_JSON_MAP_SYSTEM = (
+    "You summarize one part of a large context into a structured intermediate JSON object. "
+    "Return exactly one valid JSON object. Do not wrap it in Markdown and do not add prose outside JSON. "
+    "Match the requested intermediate output JSON structure as closely as possible. "
+    "Keep the content concise, factual, and grounded in the provided text."
+)
+
 REDUCE_SYSTEM = (
     "You merge several partial summaries into one consolidated summary. "
     f"{SUMMARY_RESULT_SCHEMA_INSTRUCTION} "
     "Preserve important facts and remove duplicates."
+)
+
+CUSTOM_JSON_REDUCE_SYSTEM = (
+    "You merge several partial structured summaries into one consolidated intermediate JSON object. "
+    "Return exactly one valid JSON object. Do not wrap it in Markdown and do not add prose outside JSON. "
+    "Match the requested intermediate output JSON structure as closely as possible. "
+    "Preserve important facts, remove duplicates, and keep sequence-sensitive evidence in order when relevant."
 )
 
 FINAL_SYSTEM = (
@@ -64,7 +79,17 @@ CUSTOM_JSON_FINAL_SYSTEM = (
 )
 
 MAP_USER_TEMPLATE = "Summarize this chunk:\n\n{chunk}"
+MAP_CUSTOM_JSON_USER_TEMPLATE = (
+    "Summarize this chunk into the requested intermediate JSON structure.\n\n"
+    "Intermediate output JSON structure:\n{intermediate_output_json_schema}\n\n"
+    "Chunk:\n\n{chunk}"
+)
 REDUCE_USER_TEMPLATE = "Merge these summaries:\n\n{summaries}"
+REDUCE_CUSTOM_JSON_USER_TEMPLATE = (
+    "Merge these intermediate JSON summaries into one JSON object that follows the requested structure.\n\n"
+    "Intermediate output JSON structure:\n{intermediate_output_json_schema}\n\n"
+    "Summaries:\n\n{summaries}"
+)
 FINAL_USER_TEMPLATE = (
     "Create the final user-facing report from these summaries. "
     "If the user did not request a specific structure, choose the most useful report structure yourself. "
@@ -353,29 +378,85 @@ class PipelineService:
         return node_type, NodeStatus.QUEUED if queued else NodeStatus.PENDING, queued
 
     def pause_job(self, job_id: str) -> None:
+        interrupted_nodes = self._transition_job_nodes(
+            job_id,
+            from_statuses={
+                NodeStatus.PENDING,
+                NodeStatus.QUEUED,
+                NodeStatus.RUNNING,
+                NodeStatus.WAITING_RETRY,
+                NodeStatus.WAITING_PROVIDER,
+            },
+            target_status=NodeStatus.PAUSED,
+            event_type="NODE_PAUSED",
+            actor="api",
+            message="Node paused by user request",
+        )
         self.store.insert_job_event(
             job_id=job_id,
             event_type="JOB_PAUSE_REQUESTED",
             job_status=JobStatus.PAUSE_REQUESTED,
             actor="api",
+            payload={"interrupted_nodes": interrupted_nodes},
+        )
+        self.store.insert_job_event(
+            job_id=job_id,
+            event_type="JOB_PAUSED",
+            job_status=JobStatus.PAUSED,
+            actor="api",
+            payload={"interrupted_nodes": interrupted_nodes},
         )
 
     def resume_job(self, job_id: str) -> None:
+        resumed_nodes = self._transition_job_nodes(
+            job_id,
+            from_statuses={NodeStatus.PAUSED},
+            target_status=NodeStatus.PENDING,
+            event_type="NODE_RESUMED",
+            actor="api",
+            message="Node resumed and returned to pending",
+        )
         self.store.insert_job_event(
             job_id=job_id,
             event_type="JOB_RESUMED",
             job_status=JobStatus.RESUMED,
             actor="api",
+            payload={"resumed_nodes": resumed_nodes},
         )
-        if self.queue is not None:
+        if self.queue is None:
+            self.advance_job(job_id)
+        else:
             self.queue.advance_job(job_id)
 
     def cancel_job(self, job_id: str) -> None:
+        cancelled_nodes = self._transition_job_nodes(
+            job_id,
+            from_statuses={
+                NodeStatus.PENDING,
+                NodeStatus.QUEUED,
+                NodeStatus.RUNNING,
+                NodeStatus.PAUSED,
+                NodeStatus.WAITING_RETRY,
+                NodeStatus.WAITING_PROVIDER,
+            },
+            target_status=NodeStatus.CANCELLED,
+            event_type="NODE_CANCELLED",
+            actor="api",
+            message="Node cancelled by user request",
+        )
         self.store.insert_job_event(
             job_id=job_id,
             event_type="JOB_CANCEL_REQUESTED",
             job_status=JobStatus.CANCEL_REQUESTED,
             actor="api",
+            payload={"cancelled_nodes": cancelled_nodes},
+        )
+        self.store.insert_job_event(
+            job_id=job_id,
+            event_type="JOB_CANCELLED",
+            job_status=JobStatus.CANCELLED,
+            actor="api",
+            payload={"cancelled_nodes": cancelled_nodes},
         )
 
     def advance_job(self, job_id: str) -> None:
@@ -433,7 +514,7 @@ class PipelineService:
 
                 outputs = self.store.list_artifacts(
                     job_id=job_id,
-                    include_content=False,
+                    include_content=True,
                     artifact_type=ArtifactType.REDUCE_SUMMARY,
                     stage=Stage.REDUCE,
                     level=latest_reduce_level,
@@ -485,21 +566,26 @@ class PipelineService:
 
             prompts = self._resolve_prompt_overrides(job_id)
             llm_model = self._resolve_llm_model(job_id)
-            system = self._stage_system_prompt(prompts, "map", MAP_SYSTEM)
-            user = self._stage_user_prompt(
+            map_output_json_schema = self._resolve_map_output_json_schema(job_id)
+            system = self._stage_system_prompt(
                 prompts,
                 "map",
-                MAP_USER_TEMPLATE,
-                {"chunk": str(chunk["content"] or "")},
+                CUSTOM_JSON_MAP_SYSTEM if map_output_json_schema else MAP_SYSTEM,
+            )
+            user = self._build_map_user(
+                chunk_text=str(chunk["content"] or ""),
+                prompt_overrides=prompts,
+                output_json_schema=map_output_json_schema,
             )
             node_started = perf_counter()
             try:
-                result = self._call_summary_llm(
+                result = self._call_stage_llm_with_optional_schema(
                     job_id=job_id,
                     node_id=node_id,
                     stage=str(Stage.MAP),
                     system=system,
                     user=user,
+                    output_json_schema=map_output_json_schema,
                     model=llm_model,
                 )
             except LlmPoolBusyError as exc:
@@ -528,6 +614,9 @@ class PipelineService:
                 )
                 return
             duration_ms = int((perf_counter() - node_started) * 1000)
+            if not self._should_commit_node_result(job_id=job_id, node_id=node_id, expected_status=NodeStatus.RUNNING):
+                return
+            sequence_index = int(node["node_index"])
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=node_id,
@@ -535,7 +624,19 @@ class PipelineService:
                 stage=Stage.MAP,
                 level=0,
                 content=result.model_dump_json(indent=2),
-                metadata={"chunk_hash": chunk["content_hash"]},
+                metadata={
+                    "chunk_hash": chunk["content_hash"],
+                    "sequence_start": sequence_index,
+                    "sequence_end": sequence_index,
+                    **(
+                        {
+                            "map_output_json_schema": map_output_json_schema,
+                            "intermediate_output_json_schema": map_output_json_schema,
+                        }
+                        if map_output_json_schema else {}
+                    ),
+                    "reduce_input_estimated_tokens": self._estimate_reduce_input_tokens_from_summary_result(result),
+                },
             )
             self.store.insert_node_event(
                 job_id=job_id,
@@ -582,22 +683,27 @@ class PipelineService:
             )
             prompts = self._resolve_prompt_overrides(job_id)
             llm_model = self._resolve_llm_model(job_id)
-            system = self._stage_system_prompt(prompts, "reduce", REDUCE_SYSTEM)
-            summaries_text = self._format_reduce_input_summaries(input_summaries)
-            user = self._stage_user_prompt(
+            reduce_output_json_schema = self._resolve_reduce_output_json_schema(job_id)
+            system = self._stage_system_prompt(
                 prompts,
                 "reduce",
-                REDUCE_USER_TEMPLATE,
-                {"summaries": summaries_text},
+                CUSTOM_JSON_REDUCE_SYSTEM if reduce_output_json_schema else REDUCE_SYSTEM,
+            )
+            summaries_text = self._format_reduce_input_summaries(input_summaries)
+            user = self._build_reduce_user(
+                summaries_text=summaries_text,
+                prompt_overrides=prompts,
+                output_json_schema=reduce_output_json_schema,
             )
             node_started = perf_counter()
             try:
-                result = self._call_summary_llm(
+                result = self._call_stage_llm_with_optional_schema(
                     job_id=job_id,
                     node_id=node_id,
                     stage=f"{Stage.REDUCE}_L{node['level']}",
                     system=system,
                     user=user,
+                    output_json_schema=reduce_output_json_schema,
                     model=llm_model,
                 )
             except LlmPoolBusyError as exc:
@@ -626,6 +732,26 @@ class PipelineService:
                 )
                 return
             duration_ms = int((perf_counter() - node_started) * 1000)
+            if not self._should_commit_node_result(job_id=job_id, node_id=node_id, expected_status=NodeStatus.RUNNING):
+                return
+            sequence_start, sequence_end = self._reduce_input_sequence_bounds(
+                input_summaries,
+                node_index_by_id=self._node_index_by_id(job_id),
+            )
+            metadata = {
+                "input_node_ids": input_node_ids,
+                **(
+                    {
+                        "reduce_output_json_schema": reduce_output_json_schema,
+                        "intermediate_output_json_schema": reduce_output_json_schema,
+                    }
+                    if reduce_output_json_schema else {}
+                ),
+                "reduce_input_estimated_tokens": self._estimate_reduce_input_tokens_from_summary_result(result),
+            }
+            if sequence_start is not None and sequence_end is not None:
+                metadata["sequence_start"] = sequence_start
+                metadata["sequence_end"] = sequence_end
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=node_id,
@@ -633,7 +759,7 @@ class PipelineService:
                 stage=Stage.REDUCE,
                 level=int(node["level"]),
                 content=result.model_dump_json(indent=2),
-                metadata={"input_node_ids": input_node_ids},
+                metadata=metadata,
             )
             self.store.insert_node_event(
                 job_id=job_id,
@@ -701,6 +827,7 @@ class PipelineService:
             prompt_overrides = self._resolve_prompt_overrides(job_id)
             output_json_schema = self._resolve_output_json_schema(job_id)
             final_payload = {
+                "input_node_ids": [str(item.get("node_id") or "") for item in inputs if str(item.get("node_id") or "").strip()],
                 "input_count": len(inputs),
                 **report_format,
                 **({"output_json_schema": output_json_schema} if output_json_schema else {}),
@@ -765,6 +892,8 @@ class PipelineService:
                 )
                 return
             duration_ms = int((perf_counter() - node_started) * 1000)
+            if not self._should_commit_node_result(job_id=job_id, node_id=final_node_id, expected_status=NodeStatus.RUNNING):
+                return
             self.store.insert_artifact(
                 job_id=job_id,
                 node_id=final_node_id,
@@ -817,10 +946,11 @@ class PipelineService:
         job = self.store.get_job_current(job_id)
         if job is None:
             raise KeyError(job_id)
+        job_events = self.store.list_job_events(job_id, limit=5000)
         nodes = self.store.list_nodes_current(job_id)
         artifacts = self.store.list_artifacts(job_id=job_id, include_content=False)
         return {
-            "job": job,
+            "job": attach_job_lifecycle_timestamps(job, job_events),
             "node_counts": dict(Counter(str(node["node_status"]) for node in nodes)),
             "artifact_counts": dict(Counter(str(artifact["artifact_type"]) for artifact in artifacts)),
         }
@@ -918,18 +1048,50 @@ class PipelineService:
             )
 
     def _create_reduce_level_from_stage(self, job_id: str, *, source_type: ArtifactType, level: int) -> None:
-        artifacts = self.store.list_artifacts(job_id=job_id, include_content=False, artifact_type=source_type)
+        artifacts = self.store.list_artifacts(job_id=job_id, include_content=True, artifact_type=source_type)
         self._create_reduce_level_from_artifacts(job_id, artifacts, level)
 
     def _create_reduce_level_from_artifacts(self, job_id: str, artifacts: list[dict[str, Any]], level: int) -> None:
         if len(artifacts) <= 1:
             return
-        group_size = max(2, self.settings.reduce_group_size)
-        groups = [artifacts[i : i + group_size] for i in range(0, len(artifacts), group_size)]
-        log_stage(logger, f"CREATE REDUCE LEVEL {level} job_id={job_id} groups={len(groups)}")
+        node_index_by_id = self._node_index_by_id(job_id)
+        ordered_artifacts = self._order_reduce_input_artifacts(artifacts, node_index_by_id=node_index_by_id)
+        max_group_size = max(2, self.settings.reduce_group_size)
+        target_tokens = max(256, self.settings.reduce_target_estimated_tokens)
+        groups = self._group_reduce_input_artifacts(
+            ordered_artifacts,
+            max_group_size=max_group_size,
+            target_estimated_tokens=target_tokens,
+        )
+        grouping_strategy = "token_budget"
+        if len(ordered_artifacts) > 1 and len(groups) >= len(ordered_artifacts):
+            groups = self._group_reduce_input_artifacts_force_progress(
+                ordered_artifacts,
+                max_group_size=max_group_size,
+            )
+            grouping_strategy = "forced_progress"
+            log_kv(
+                logger,
+                "reduce_grouping_force_progress",
+                job_id=job_id,
+                level=level,
+                input_count=len(ordered_artifacts),
+                target_estimated_tokens=target_tokens,
+                max_group_size=max_group_size,
+                output_groups=len(groups),
+            )
+        log_stage(
+            logger,
+            f"CREATE REDUCE LEVEL {level} job_id={job_id} groups={len(groups)} "
+            f"max_group_size={max_group_size} target_estimated_tokens={target_tokens}",
+        )
         for index, group in enumerate(groups):
             input_node_ids = [str(item["node_id"]) for item in group]
             input_hash = sha256_text("|".join(str(item["content_hash"]) for item in group))
+            sequence_start, sequence_end = self._reduce_input_sequence_bounds(
+                group,
+                node_index_by_id=node_index_by_id,
+            )
             node_id = make_node_id(
                 job_id=job_id,
                 node_type=NodeType.REDUCE,
@@ -941,7 +1103,12 @@ class PipelineService:
                 "input_node_ids": input_node_ids,
                 "input_hash": input_hash,
                 "input_count": len(input_node_ids),
+                "input_estimated_tokens": sum(self._estimate_reduce_input_tokens_from_artifact(item) for item in group),
+                "grouping_strategy": grouping_strategy,
             }
+            if sequence_start is not None and sequence_end is not None:
+                payload["input_sequence_start"] = sequence_start
+                payload["input_sequence_end"] = sequence_end
             self.store.insert_node_event(
                 job_id=job_id,
                 node_id=node_id,
@@ -953,6 +1120,104 @@ class PipelineService:
                 actor="advance_job",
                 payload=payload,
             )
+
+    def _group_reduce_input_artifacts(
+        self,
+        artifacts: list[dict[str, Any]],
+        *,
+        max_group_size: int,
+        target_estimated_tokens: int,
+    ) -> list[list[dict[str, Any]]]:
+        groups: list[list[dict[str, Any]]] = []
+        current_group: list[dict[str, Any]] = []
+        current_tokens = 0
+
+        for artifact in artifacts:
+            artifact_tokens = max(1, self._estimate_reduce_input_tokens_from_artifact(artifact))
+            should_flush = (
+                bool(current_group)
+                and (
+                    len(current_group) >= max_group_size
+                    or current_tokens + artifact_tokens > target_estimated_tokens
+                )
+            )
+            if should_flush:
+                groups.append(current_group)
+                current_group = []
+                current_tokens = 0
+
+            current_group.append(artifact)
+            current_tokens += artifact_tokens
+
+            if len(current_group) >= max_group_size:
+                groups.append(current_group)
+                current_group = []
+                current_tokens = 0
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    def _group_reduce_input_artifacts_force_progress(
+        self,
+        artifacts: list[dict[str, Any]],
+        *,
+        max_group_size: int,
+    ) -> list[list[dict[str, Any]]]:
+        if not artifacts:
+            return []
+
+        groups: list[list[dict[str, Any]]] = []
+        cursor = 0
+        safe_group_size = max(2, max_group_size)
+
+        while cursor < len(artifacts):
+            remaining = len(artifacts) - cursor
+            take = min(safe_group_size, remaining)
+            # Avoid a trailing singleton when we still have room to rebalance this group.
+            if safe_group_size > 2 and remaining > safe_group_size and remaining - take == 1:
+                take -= 1
+            groups.append(artifacts[cursor:cursor + take])
+            cursor += take
+
+        return groups
+
+    def _node_index_by_id(self, job_id: str) -> dict[str, int]:
+        return {
+            str(node["node_id"]): int(node["node_index"])
+            for node in self.store.list_nodes_current(job_id)
+            if node.get("node_id") is not None and node.get("node_index") is not None
+        }
+
+    def _order_reduce_input_artifacts(
+        self,
+        artifacts: list[dict[str, Any]],
+        *,
+        node_index_by_id: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        indexed_artifacts = list(enumerate(artifacts))
+
+        def sort_key(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int, int, str, str, int]:
+            original_index, artifact = item
+            sequence_start, sequence_end = self._artifact_sequence_bounds(
+                artifact,
+                node_index_by_id=node_index_by_id,
+            )
+            fallback_index = node_index_by_id.get(str(artifact.get("node_id") or ""), 10**12)
+            created_at = artifact.get("created_at")
+            created_sort = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or "")
+            return (
+                0 if sequence_start is not None else 1,
+                sequence_start if sequence_start is not None else fallback_index,
+                sequence_end if sequence_end is not None else fallback_index,
+                fallback_index,
+                created_sort,
+                str(artifact.get("node_id") or ""),
+                original_index,
+            )
+
+        return [artifact for _, artifact in sorted(indexed_artifacts, key=sort_key)]
 
     def _enqueue_pending(self, job_id: str, nodes: list[dict[str, Any]], node_type: NodeType) -> bool:
         pending = [
@@ -1108,11 +1373,26 @@ class PipelineService:
             raise KeyError(job_id)
         status = str(job["job_status"])
         if status == JobStatus.PAUSE_REQUESTED:
+            interrupted_nodes = self._transition_job_nodes(
+                job_id,
+                from_statuses={
+                    NodeStatus.PENDING,
+                    NodeStatus.QUEUED,
+                    NodeStatus.RUNNING,
+                    NodeStatus.WAITING_RETRY,
+                    NodeStatus.WAITING_PROVIDER,
+                },
+                target_status=NodeStatus.PAUSED,
+                event_type="NODE_PAUSED",
+                actor="worker",
+                message="Node paused by worker stop gate",
+            )
             self.store.insert_job_event(
                 job_id=job_id,
                 event_type="JOB_PAUSED",
                 job_status=JobStatus.PAUSED,
                 actor="worker",
+                payload={"interrupted_nodes": interrupted_nodes},
             )
             return True
         if status == JobStatus.PAUSED:
@@ -1120,16 +1400,125 @@ class PipelineService:
         if status == JobStatus.INGESTING:
             return True
         if status == JobStatus.CANCEL_REQUESTED:
+            cancelled_nodes = self._transition_job_nodes(
+                job_id,
+                from_statuses={
+                    NodeStatus.PENDING,
+                    NodeStatus.QUEUED,
+                    NodeStatus.RUNNING,
+                    NodeStatus.PAUSED,
+                    NodeStatus.WAITING_RETRY,
+                    NodeStatus.WAITING_PROVIDER,
+                },
+                target_status=NodeStatus.CANCELLED,
+                event_type="NODE_CANCELLED",
+                actor="worker",
+                message="Node cancelled by worker stop gate",
+            )
             self.store.insert_job_event(
                 job_id=job_id,
                 event_type="JOB_CANCELLED",
                 job_status=JobStatus.CANCELLED,
                 actor="worker",
+                payload={"cancelled_nodes": cancelled_nodes},
             )
             return True
         if status in {JobStatus.CANCELLED, JobStatus.DONE, JobStatus.FAILED}:
             return True
         return False
+
+    def _transition_job_nodes(
+        self,
+        job_id: str,
+        *,
+        from_statuses: set[NodeStatus | str],
+        target_status: NodeStatus | str,
+        event_type: str,
+        actor: str,
+        message: str = "",
+    ) -> int:
+        allowed_statuses = {str(status) for status in from_statuses}
+        next_status = str(target_status)
+        transitioned = 0
+
+        for node in self.store.list_nodes_current(job_id):
+            current_status = str(node.get("node_status") or "")
+            if current_status not in allowed_statuses or current_status == next_status:
+                continue
+            payload = self.store.get_node_payload(job_id, str(node["node_id"]))
+            self.store.insert_node_event(
+                job_id=job_id,
+                node_id=str(node["node_id"]),
+                event_type=event_type,
+                node_status=target_status,
+                node_type=str(node["node_type"]),
+                level=int(node["level"]),
+                node_index=int(node["node_index"]),
+                actor=actor,
+                message=message,
+                payload=payload,
+            )
+            transitioned += 1
+
+        if transitioned:
+            log_kv(
+                logger,
+                "job_nodes_transitioned",
+                job_id=job_id,
+                actor=actor,
+                event_type=event_type,
+                target_status=next_status,
+                count=transitioned,
+            )
+        return transitioned
+
+    def _should_commit_node_result(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        expected_status: NodeStatus | str,
+    ) -> bool:
+        job = self.store.get_job_current(job_id)
+        if job is None:
+            log_kv(logger, "node_result_discarded", job_id=job_id, node_id=node_id, reason="job_missing")
+            return False
+        job_status = str(job.get("job_status") or "")
+        if job_status in {
+            JobStatus.PAUSE_REQUESTED,
+            JobStatus.PAUSED,
+            JobStatus.CANCEL_REQUESTED,
+            JobStatus.CANCELLED,
+            JobStatus.FAILED,
+            JobStatus.DONE,
+        }:
+            log_kv(
+                logger,
+                "node_result_discarded",
+                job_id=job_id,
+                node_id=node_id,
+                reason="job_not_runnable",
+                job_status=job_status,
+            )
+            return False
+        try:
+            node = self._node_by_id(job_id, node_id)
+        except KeyError:
+            log_kv(logger, "node_result_discarded", job_id=job_id, node_id=node_id, reason="node_missing")
+            return False
+        current_status = str(node.get("node_status") or "")
+        if current_status != str(expected_status):
+            log_kv(
+                logger,
+                "node_result_discarded",
+                job_id=job_id,
+                node_id=node_id,
+                reason="node_status_changed",
+                expected_status=str(expected_status),
+                current_status=current_status,
+            )
+            return False
+        return True
 
     def _skip_done(self, job_id: str, node_id: str, node_type: NodeType) -> None:
         node = self._node_by_id(job_id, node_id)
@@ -1357,22 +1746,34 @@ class PipelineService:
         if not row:
             return {}
         latency_ms = self._safe_positive_int(row.get("latency_ms"))
+        pool_wait_ms = self._safe_positive_int(row.get("pool_wait_ms"))
+        provider_latency_ms = self._safe_positive_int(row.get("provider_latency_ms"))
         prompt_tokens = self._safe_positive_int(row.get("prompt_tokens"))
         completion_tokens = self._safe_positive_int(row.get("completion_tokens"))
         total_tokens = self._safe_positive_int(row.get("total_tokens"))
+        effective_latency_ms = latency_ms
+        if provider_latency_ms <= 0 and effective_latency_ms > 0:
+            provider_latency_ms = max(0, effective_latency_ms - pool_wait_ms)
         payload: dict[str, Any] = {
             "provider": str(row.get("provider") or ""),
             "model": str(row.get("model") or ""),
             "status": str(row.get("status") or ""),
             "latency_ms": latency_ms,
+            "effective_latency_ms": effective_latency_ms,
+            "pool_wait_ms": pool_wait_ms,
+            "provider_latency_ms": provider_latency_ms,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
         }
-        if latency_ms > 0:
-            seconds = latency_ms / 1000
-            payload["completion_tokens_per_second"] = round(completion_tokens / seconds, 2) if completion_tokens > 0 else 0
-            payload["total_tokens_per_second"] = round(total_tokens / seconds, 2) if total_tokens > 0 else 0
+        if provider_latency_ms > 0:
+            provider_seconds = provider_latency_ms / 1000
+            payload["completion_tokens_per_second"] = round(completion_tokens / provider_seconds, 2) if completion_tokens > 0 else 0
+            payload["total_tokens_per_second"] = round(total_tokens / provider_seconds, 2) if total_tokens > 0 else 0
+        if effective_latency_ms > 0:
+            effective_seconds = effective_latency_ms / 1000
+            payload["effective_completion_tokens_per_second"] = round(completion_tokens / effective_seconds, 2) if completion_tokens > 0 else 0
+            payload["effective_total_tokens_per_second"] = round(total_tokens / effective_seconds, 2) if total_tokens > 0 else 0
         error_class = str(row.get("error_class") or "")
         error_message = str(row.get("error_message") or "")
         if error_class:
@@ -1501,16 +1902,48 @@ class PipelineService:
 
     def _resolve_output_json_schema(self, job_id: str) -> dict[str, Any] | None:
         metadata = self._job_metadata(job_id)
-        raw = (
-            metadata.get("output_json_schema")
-            or metadata.get("final_output_json_schema")
-            or metadata.get("response_json_schema")
+        return self._read_json_schema_from_metadata(
+            metadata,
+            "output_json_schema",
+            "final_output_json_schema",
+            "response_json_schema",
         )
-        if isinstance(raw, dict) and raw:
-            return raw
-        if isinstance(raw, str) and raw.strip():
-            parsed = self._safe_json_loads(raw)
-            return parsed or None
+
+    def _resolve_map_output_json_schema(self, job_id: str) -> dict[str, Any] | None:
+        metadata = self._job_metadata(job_id)
+        return self._read_json_schema_from_metadata(
+            metadata,
+            "map_output_json_schema",
+            "intermediate_output_json_schema",
+            "map_reduce_output_json_schema",
+        )
+
+    def _resolve_reduce_output_json_schema(self, job_id: str) -> dict[str, Any] | None:
+        metadata = self._job_metadata(job_id)
+        return self._read_json_schema_from_metadata(
+            metadata,
+            "reduce_output_json_schema",
+            "intermediate_output_json_schema",
+            "map_reduce_output_json_schema",
+        )
+
+    def _resolve_intermediate_output_json_schema(self, job_id: str) -> dict[str, Any] | None:
+        metadata = self._job_metadata(job_id)
+        return self._read_json_schema_from_metadata(
+            metadata,
+            "intermediate_output_json_schema",
+            "map_reduce_output_json_schema",
+        )
+
+    def _read_json_schema_from_metadata(self, metadata: dict[str, Any], *keys: str) -> dict[str, Any] | None:
+        for key in keys:
+            raw = metadata.get(key)
+            if isinstance(raw, dict) and raw:
+                return self._build_response_json_schema(raw)
+            if isinstance(raw, str) and raw.strip():
+                parsed = self._safe_json_loads(raw)
+                if parsed:
+                    return self._build_response_json_schema(parsed)
         return None
 
     @staticmethod
@@ -1534,6 +1967,101 @@ class PipelineService:
             rendered = rendered.replace("{" + key + "}", value)
         return rendered
 
+    def _build_map_user(
+        self,
+        *,
+        chunk_text: str,
+        prompt_overrides: dict[str, dict[str, str]],
+        output_json_schema: dict[str, Any] | None,
+    ) -> str:
+        output_json_schema_text = json.dumps(
+            output_json_schema,
+            ensure_ascii=False,
+            indent=2,
+        ) if output_json_schema else ""
+        return self._stage_user_prompt(
+            prompt_overrides,
+            "map",
+            MAP_CUSTOM_JSON_USER_TEMPLATE if output_json_schema else MAP_USER_TEMPLATE,
+            {
+                "chunk": chunk_text,
+                "intermediate_output_json_schema": output_json_schema_text,
+                "output_json_schema": output_json_schema_text,
+            },
+        )
+
+    def _build_reduce_user(
+        self,
+        *,
+        summaries_text: str,
+        prompt_overrides: dict[str, dict[str, str]],
+        output_json_schema: dict[str, Any] | None,
+    ) -> str:
+        output_json_schema_text = json.dumps(
+            output_json_schema,
+            ensure_ascii=False,
+            indent=2,
+        ) if output_json_schema else ""
+        return self._stage_user_prompt(
+            prompt_overrides,
+            "reduce",
+            REDUCE_CUSTOM_JSON_USER_TEMPLATE if output_json_schema else REDUCE_USER_TEMPLATE,
+            {
+                "summaries": summaries_text,
+                "intermediate_output_json_schema": output_json_schema_text,
+                "output_json_schema": output_json_schema_text,
+            },
+        )
+
+    def _call_stage_llm_with_optional_schema(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        output_json_schema: dict[str, Any] | None,
+        model: str,
+    ) -> SummaryResult | JsonObjectResult:
+        if not output_json_schema:
+            return self._call_summary_llm(
+                job_id=job_id,
+                node_id=node_id,
+                stage=stage,
+                system=system,
+                user=user,
+                model=model,
+            )
+
+        call_structured = getattr(self.llm, "call_structured", None)
+        if callable(call_structured):
+            response_schema = self._build_response_json_schema(output_json_schema)
+            kwargs = {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+                "response_model": JsonObjectResult,
+            }
+            if self._call_accepts_keyword(call_structured, "model"):
+                kwargs["model"] = model
+            if self._call_accepts_keyword(call_structured, "response_schema"):
+                kwargs["response_schema"] = response_schema
+            return call_structured(**kwargs)
+
+        kwargs = {
+            "job_id": job_id,
+            "node_id": node_id,
+            "stage": stage,
+            "system": system,
+            "user": user,
+        }
+        if self._call_accepts_keyword(self.llm.call_summary, "model"):
+            kwargs["model"] = model
+        return self.llm.call_summary(**kwargs)
+
     def _call_final_llm(
         self,
         *,
@@ -1556,7 +2084,7 @@ class PipelineService:
 
         call_structured = getattr(self.llm, "call_structured", None)
         if callable(call_structured):
-            response_schema = self._build_final_response_schema(output_json_schema)
+            response_schema = self._build_response_json_schema(output_json_schema)
             kwargs = {
                 "job_id": job_id,
                 "node_id": node_id,
@@ -1591,6 +2119,10 @@ class PipelineService:
             "output_format",
             "output_format_instruction",
             "desired_output_format",
+            "map_output_json_schema",
+            "reduce_output_json_schema",
+            "intermediate_output_json_schema",
+            "map_reduce_output_json_schema",
             "output_json_schema",
             "final_output_json_schema",
             "response_json_schema",
@@ -1658,10 +2190,14 @@ class PipelineService:
         )
 
     @classmethod
-    def _build_final_response_schema(cls, output_json_schema: dict[str, Any]) -> dict[str, Any]:
+    def _build_response_json_schema(cls, output_json_schema: dict[str, Any]) -> dict[str, Any]:
         if cls._looks_like_json_schema(output_json_schema):
             return cls._normalize_response_json_schema(output_json_schema)
         return cls._shape_object_to_json_schema(output_json_schema)
+
+    @classmethod
+    def _build_final_response_schema(cls, output_json_schema: dict[str, Any]) -> dict[str, Any]:
+        return cls._build_response_json_schema(output_json_schema)
 
     @classmethod
     def _looks_like_json_schema(cls, value: dict[str, Any]) -> bool:
@@ -1760,19 +2296,109 @@ class PipelineService:
             node["description"] = description[:500]
         return node
 
-    @staticmethod
-    def _format_reduce_input_summaries(input_summaries: list[dict[str, Any]]) -> str:
+    @classmethod
+    def _format_reduce_input_summaries(cls, input_summaries: list[dict[str, Any]]) -> str:
         blocks: list[str] = []
         for index, artifact in enumerate(input_summaries, start=1):
-            try:
-                payload = SummaryResult.model_validate_json(str(artifact["content"]))
-                content = payload.summary
-                key_points = "\n".join(f"- {point}" for point in payload.key_points)
-            except Exception:
-                content = str(artifact["content"])
-                key_points = ""
-            blocks.append(f"Summary {index}:\n{content}\n{key_points}".strip())
+            blocks.append(cls._format_reduce_input_summary_block(artifact, index=index))
         return "\n\n".join(blocks)
+
+    @classmethod
+    def _format_reduce_input_summary_block(cls, artifact: dict[str, Any], *, index: int) -> str:
+        raw_content = str(artifact.get("content") or "").strip()
+        try:
+            payload = SummaryResult.model_validate_json(raw_content)
+            content = payload.summary
+            key_points = "\n".join(f"- {point}" for point in payload.key_points)
+        except Exception:
+            try:
+                payload = json.loads(raw_content or "{}")
+                if isinstance(payload, dict):
+                    content = json.dumps(payload, ensure_ascii=False, indent=2)
+                elif isinstance(payload, list):
+                    content = json.dumps(payload, ensure_ascii=False, indent=2)
+                else:
+                    content = raw_content
+            except json.JSONDecodeError:
+                content = raw_content
+            key_points = ""
+        return f"Summary {index}:\n{content}\n{key_points}".strip()
+
+    @classmethod
+    def _reduce_input_sequence_bounds(
+        cls,
+        artifacts: list[dict[str, Any]],
+        *,
+        node_index_by_id: dict[str, int] | None = None,
+    ) -> tuple[int | None, int | None]:
+        if not artifacts:
+            return (None, None)
+        bounds = [
+            cls._artifact_sequence_bounds(artifact, node_index_by_id=node_index_by_id)
+            for artifact in artifacts
+        ]
+        valid_bounds = [(start, end) for start, end in bounds if start is not None and end is not None]
+        if not valid_bounds:
+            return (None, None)
+        return (min(start for start, _ in valid_bounds), max(end for _, end in valid_bounds))
+
+    @classmethod
+    def _artifact_sequence_bounds(
+        cls,
+        artifact: dict[str, Any],
+        *,
+        node_index_by_id: dict[str, int] | None = None,
+    ) -> tuple[int | None, int | None]:
+        metadata = cls._safe_json_loads(str(artifact.get("metadata") or "{}"))
+        sequence_start = cls._coerce_int(metadata.get("sequence_start"))
+        sequence_end = cls._coerce_int(metadata.get("sequence_end"))
+        if sequence_start is not None:
+            return (sequence_start, sequence_end if sequence_end is not None else sequence_start)
+
+        segment_index = cls._coerce_int(metadata.get("segment_index"))
+        if segment_index is None:
+            segment_index = cls._coerce_int(metadata.get("chunk_index"))
+        if segment_index is not None:
+            return (segment_index, segment_index)
+
+        if node_index_by_id is not None:
+            node_index = node_index_by_id.get(str(artifact.get("node_id") or ""))
+            if node_index is not None:
+                return (node_index, node_index)
+        return (None, None)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _estimate_reduce_input_tokens_from_artifact(cls, artifact: dict[str, Any]) -> int:
+        metadata = cls._safe_json_loads(str(artifact.get("metadata") or "{}"))
+        stored_estimate = metadata.get("reduce_input_estimated_tokens")
+        if isinstance(stored_estimate, (int, float)) and stored_estimate > 0:
+            return int(stored_estimate)
+        if artifact.get("content"):
+            return max(1, estimate_tokens(cls._format_reduce_input_summary_block(artifact, index=1)))
+        return 1
+
+    @classmethod
+    def _estimate_reduce_input_tokens_from_summary_result(cls, result: SummaryResult | JsonObjectResult) -> int:
+        block = cls._format_reduce_input_summary_block({"content": result.model_dump_json()}, index=1)
+        return max(1, estimate_tokens(block))
 
     @staticmethod
     def _safe_json_loads(raw: str) -> dict[str, Any]:
