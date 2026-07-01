@@ -76,7 +76,25 @@ def _staged_upload_service():
 
 
 def _llm_lock_timeout_seconds() -> float:
-    return max(300.0, float(settings.llm_timeout_seconds) + 120.0)
+    """TTL for the per-node Redis lock held while `call_structured` runs.
+
+    `call_structured` retries up to `llm_max_retries` times inside a single
+    lock acquisition, each attempt up to `llm_timeout_seconds`, with a
+    `llm_retry_backoff_seconds * attempt` sleep between failed attempts. The
+    lock must outlive the worst-case total of all attempts + backoffs, or it
+    expires mid-processing and a concurrent worker/rerun can acquire the same
+    node lock while this one is still running (release() then also fails
+    with LockError since Redis already dropped the key).
+    """
+    attempts = settings.llm_max_retries + 1
+    total_call_time = attempts * float(settings.llm_timeout_seconds)
+    total_backoff = (
+        float(settings.llm_retry_backoff_seconds)
+        * settings.llm_max_retries
+        * (settings.llm_max_retries + 1)
+        / 2
+    )
+    return max(300.0, total_call_time + total_backoff + 120.0)
 
 
 @dramatiq.actor(max_retries=5, min_backoff=10000, max_backoff=600000)

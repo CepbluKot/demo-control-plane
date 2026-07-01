@@ -437,7 +437,7 @@ def get_settings() -> Settings:
         llm_timeout_seconds=_env_float("SUMMARY_BACKEND_LLM_TIMEOUT_SECONDS", 600.0),
         llm_max_retries=_env_int("SUMMARY_BACKEND_LLM_MAX_RETRIES", 3),
         llm_retry_backoff_seconds=_env_float("SUMMARY_BACKEND_LLM_RETRY_BACKOFF_SECONDS", 2.0),
-        llm_max_concurrency=max(1, _env_int("SUMMARY_BACKEND_LLM_MAX_CONCURRENCY", min(worker_threads, 2))),
+        llm_max_concurrency=max(1, _env_int("SUMMARY_BACKEND_LLM_MAX_CONCURRENCY", 5)),
         llm_pool_acquire_timeout_seconds=max(0.1, _env_float("SUMMARY_BACKEND_LLM_POOL_ACQUIRE_TIMEOUT_SECONDS", 1.0)),
         llm_pool_poll_interval_seconds=max(0.05, _env_float("SUMMARY_BACKEND_LLM_POOL_POLL_INTERVAL_SECONDS", 0.25)),
         llm_pool_retry_delay_seconds=max(1.0, _env_float("SUMMARY_BACKEND_LLM_POOL_RETRY_DELAY_SECONDS", 5.0)),

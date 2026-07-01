@@ -69,6 +69,8 @@ services:
       SUMMARY_BACKEND_SOURCE_CLICKHOUSE_DATABASE: summary_test
       SUMMARY_BACKEND_BROKER_URL: redis://redis:6379/0
       SUMMARY_BACKEND_LOG_LEVEL: INFO
+      SUMMARY_BACKEND_WORKER_PROCESSES: "1"
+      SUMMARY_BACKEND_WORKER_THREADS: "6"
     ports:
       - "28088:8088"
     volumes:
@@ -82,7 +84,7 @@ services:
   worker:
     image: llm-summary-generator:local
     container_name: llm-summary-local-worker
-    command: ["dramatiq", "summary_backend.tasks", "--processes", "1", "--threads", "4"]
+    command: ["dramatiq", "summary_backend.tasks", "--processes", "1", "--threads", "6"]
     env_file:
       - path: .env.example
         required: true
@@ -102,7 +104,7 @@ services:
       SUMMARY_BACKEND_BROKER_URL: redis://redis:6379/0
       SUMMARY_BACKEND_LOG_LEVEL: INFO
       SUMMARY_BACKEND_WORKER_PROCESSES: "1"
-      SUMMARY_BACKEND_WORKER_THREADS: "4"
+      SUMMARY_BACKEND_WORKER_THREADS: "6"
     volumes:
       - ./artifacts:/app/artifacts
     depends_on:
