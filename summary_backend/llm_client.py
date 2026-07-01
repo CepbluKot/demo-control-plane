@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .audit import AuditWriter
-from .config import Settings, get_settings
+from .config import Settings, get_settings, resolve_llm_model_option
 from .errors import LlmPoolBusyError, classify_error
 from .llm_pool import acquire_llm_pool_slot
 from .logging_setup import get_logger
@@ -21,6 +21,11 @@ from .text import estimate_tokens
 logger = get_logger("llm_client")
 
 TModel = TypeVar("TModel", bound=BaseModel)
+
+
+class _ConnectivityProbePayload(BaseModel):
+    ok: bool
+    message: str
 
 
 def _build_openai_base_url(base_url: str) -> str:
@@ -76,7 +81,8 @@ class StructuredLLMClient:
         response_model: type[TModel],
         response_schema: dict[str, Any] | None = None,
     ) -> TModel:
-        selected_model = (model or self.settings.llm_model).strip()
+        selected_option = resolve_llm_model_option(self.settings, model)
+        selected_model = selected_option.model.strip()
         if self.settings.dry_run:
             return self._call_dry_run(
                 job_id=job_id,
@@ -84,10 +90,10 @@ class StructuredLLMClient:
                 stage=stage,
                 system=system,
                 user=user,
-                model=selected_model,
-                response_model=response_model,
-                response_schema=response_schema,
-            )
+                    model=selected_model,
+                    response_model=response_model,
+                    response_schema=response_schema,
+                )
 
         last_exc: Exception | None = None
         for attempt in range(1, self.settings.llm_max_retries + 2):
@@ -101,6 +107,15 @@ class StructuredLLMClient:
                     model=selected_model,
                     response_model=response_model,
                     response_schema=response_schema,
+                    api_base=selected_option.api_base or self.settings.openai_api_base,
+                    api_key=next(
+                        (
+                            profile.api_key
+                            for profile in self.settings.llm_profiles
+                            if profile.profile_id == selected_option.profile_id
+                        ),
+                        self.settings.openai_api_key,
+                    ),
                     attempt=attempt,
                 )
             except LlmPoolBusyError:
@@ -123,6 +138,125 @@ class StructuredLLMClient:
 
         assert last_exc is not None
         raise last_exc
+
+    def probe_connection(
+        self,
+        *,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        selected_option = resolve_llm_model_option(self.settings, model)
+        selected_model = selected_option.model.strip()
+        api_base = (selected_option.api_base or self.settings.openai_api_base).strip()
+        api_key = next(
+            (
+                profile.api_key
+                for profile in self.settings.llm_profiles
+                if profile.profile_id == selected_option.profile_id
+            ),
+            self.settings.openai_api_key,
+        ).strip()
+        if self.settings.dry_run:
+            return {
+                "ok": False,
+                "status": "dry_run",
+                "detail": "Dry run mode is enabled, so no external LLM request was made.",
+                "error_class": "",
+                "latency_ms": None,
+                "selected_model": selected_model,
+                "api_base": api_base,
+            }
+        if not selected_model:
+            return {
+                "ok": False,
+                "status": "not_configured",
+                "detail": "Model is not configured.",
+                "error_class": "not_configured",
+                "latency_ms": None,
+                "selected_model": "",
+                "api_base": api_base,
+            }
+        if not api_base:
+            return {
+                "ok": False,
+                "status": "not_configured",
+                "detail": "API base is not configured.",
+                "error_class": "not_configured",
+                "latency_ms": None,
+                "selected_model": selected_model,
+                "api_base": "",
+            }
+        if not api_key:
+            return {
+                "ok": False,
+                "status": "not_configured",
+                "detail": "API key is not configured.",
+                "error_class": "not_configured",
+                "latency_ms": None,
+                "selected_model": selected_model,
+                "api_base": api_base,
+            }
+
+        from openai import OpenAI
+
+        request_json: dict[str, Any] = {
+            "model": selected_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a connectivity check. "
+                        'Return exactly one JSON object: {"ok": true, "message": "string"}.'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": "Reply with a short confirmation message for the summary backend connectivity test.",
+                },
+            ],
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ConnectivityProbePayload",
+                    "strict": True,
+                    "schema": _ConnectivityProbePayload.model_json_schema(),
+                },
+            },
+        }
+        started = time.monotonic()
+        try:
+            client = OpenAI(
+                base_url=_build_openai_base_url(api_base),
+                api_key=api_key,
+                max_retries=0,
+                timeout=max(2.0, min(float(timeout_seconds or 15.0), self.settings.llm_timeout_seconds)),
+            )
+            response = client.chat.completions.create(**request_json)
+            content = response.choices[0].message.content or "{}"
+            payload = self._parse_response_payload(content=content, response_model=_ConnectivityProbePayload)
+            result = _ConnectivityProbePayload.model_validate(payload)
+            latency_ms = int((time.monotonic() - started) * 1000)
+            return {
+                "ok": bool(result.ok),
+                "status": "ok" if result.ok else "error",
+                "detail": result.message.strip() or "Connectivity check succeeded.",
+                "error_class": "",
+                "latency_ms": latency_ms,
+                "selected_model": selected_model,
+                "api_base": api_base,
+            }
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            return {
+                "ok": False,
+                "status": "error",
+                "detail": str(exc),
+                "error_class": classify_error(exc),
+                "latency_ms": latency_ms,
+                "selected_model": selected_model,
+                "api_base": api_base,
+            }
 
     def _call_dry_run(
         self,
@@ -204,6 +338,8 @@ class StructuredLLMClient:
         model: str,
         response_model: type[TModel],
         response_schema: dict[str, Any] | None,
+        api_base: str,
+        api_key: str,
         attempt: int,
     ) -> TModel:
         from openai import OpenAI
@@ -235,8 +371,8 @@ class StructuredLLMClient:
             with acquire_llm_pool_slot(self.settings, job_id=job_id, node_id=node_id, stage=stage) as acquired_wait_ms:
                 pool_wait_ms = acquired_wait_ms
                 client = OpenAI(
-                    base_url=_build_openai_base_url(self.settings.openai_api_base),
-                    api_key=self.settings.openai_api_key,
+                    base_url=_build_openai_base_url(api_base),
+                    api_key=api_key,
                     max_retries=0,
                     timeout=self.settings.llm_timeout_seconds,
                 )

@@ -104,6 +104,7 @@ class SummaryServiceLlmSettings(BaseModel):
     api_base: str
     model: str
     available_models: list[str]
+    available_model_options: list[dict[str, Any]] = Field(default_factory=list)
     timeout_seconds: float
     max_retries: int
     retry_backoff_seconds: float
@@ -131,6 +132,29 @@ class SummaryServiceSettingsResponse(BaseModel):
     pipeline: SummaryServicePipelineSettings
 
 
+class SummaryLlmConnectivityCheckResult(BaseModel):
+    value: str
+    label: str
+    profile_id: str = ""
+    profile_label: str = ""
+    model: str = ""
+    api_base: str = ""
+    ok: bool
+    status: str
+    detail: str = ""
+    error_class: str = ""
+    latency_ms: int | None = None
+
+
+class SummaryLlmConnectivityCheckResponse(BaseModel):
+    checked_at: datetime
+    dry_run: bool
+    total: int
+    ok_count: int
+    failed_count: int
+    results: list[SummaryLlmConnectivityCheckResult]
+
+
 class SummaryPromptStageDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -149,6 +173,7 @@ class SummaryPromptOverridesDraft(BaseModel):
 class GenerateSummaryPromptDraftRequest(BaseModel):
     request: str = Field(min_length=1, max_length=4000)
     llm_model: str | None = None
+    use_custom_output_json: bool | None = None
     output_json_schema: dict[str, Any] | None = None
 
 
@@ -165,6 +190,7 @@ class GenerateSummaryPromptDraftResponse(BaseModel):
 class PromptDraftJobStatus(StrEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    WAITING_PROVIDER = "WAITING_PROVIDER"
     CANCEL_REQUESTED = "CANCEL_REQUESTED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"

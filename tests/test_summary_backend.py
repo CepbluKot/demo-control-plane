@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import unittest
 from collections import Counter, deque
@@ -16,9 +17,10 @@ from summary_backend.api import (
     _generate_prompt_draft_with_llm,
     _normalize_prompt_draft_spec,
     _resolve_requested_prompt_draft_model,
+    _run_llm_connectivity_checks,
     build_public_settings,
 )
-from summary_backend.config import get_settings, reset_settings_cache
+from summary_backend.config import get_settings, reset_settings_cache, resolve_llm_model_option
 from summary_backend.errors import LlmPoolBusyError
 from summary_backend.ids import sha256_text
 from summary_backend.input_models import InputSegment
@@ -652,6 +654,47 @@ class SummaryServiceSettingsTests(unittest.TestCase):
         finally:
             reset_settings_cache()
 
+    def test_settings_support_multiple_llm_profiles_from_env(self) -> None:
+        profile_env = {
+            "SUMMARY_BACKEND_LLM_PROFILES": "gateway,openai",
+            "SUMMARY_BACKEND_LLM_PROFILE_DEFAULT": "openai",
+            "SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__LABEL": "Gateway",
+            "SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__API_BASE": "http://gateway.local/v1",
+            "SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__API_KEY": "gateway-key",
+            "SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__DEFAULT_MODEL": "llmgateway/free",
+            "SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__AVAILABLE_MODELS": "llmgateway/free,llmgateway/analysis",
+            "SUMMARY_BACKEND_LLM_PROFILE__OPENAI__LABEL": "OpenAI",
+            "SUMMARY_BACKEND_LLM_PROFILE__OPENAI__API_BASE": "https://api.openai.com/v1",
+            "SUMMARY_BACKEND_LLM_PROFILE__OPENAI__API_KEY": "openai-key",
+            "SUMMARY_BACKEND_LLM_PROFILE__OPENAI__DEFAULT_MODEL": "gpt-4.1-mini",
+            "SUMMARY_BACKEND_LLM_PROFILE__OPENAI__AVAILABLE_MODELS": "gpt-4.1-mini,gpt-4.1",
+            "SUMMARY_BACKEND_LLM_MODEL": "openai/gpt-4.1-mini",
+        }
+        try:
+            with patch.dict(os.environ, profile_env, clear=False), patch(
+                "summary_backend.config._load_llm_gateway_defaults",
+                return_value={},
+            ):
+                reset_settings_cache()
+                settings = get_settings()
+
+            self.assertEqual(settings.llm_default_profile, "openai")
+            self.assertEqual(settings.llm_model, "openai/gpt-4.1-mini")
+            self.assertEqual(
+                settings.llm_models,
+                (
+                    "gateway/llmgateway/free",
+                    "gateway/llmgateway/analysis",
+                    "openai/gpt-4.1-mini",
+                    "openai/gpt-4.1",
+                ),
+            )
+            self.assertEqual(settings.openai_api_base, "https://api.openai.com/v1")
+            self.assertEqual(resolve_llm_model_option(settings, "openai/gpt-4.1").model, "gpt-4.1")
+            self.assertEqual(resolve_llm_model_option(settings, "llmgateway/free").value, "gateway/llmgateway/free")
+        finally:
+            reset_settings_cache()
+
 
 class PromptDraftGenerationTests(unittest.TestCase):
     def test_prompt_draft_spec_normalization_accepts_string_and_dict_shapes(self) -> None:
@@ -701,6 +744,7 @@ class PromptDraftGenerationTests(unittest.TestCase):
         request = GenerateSummaryPromptDraftRequest(
             request="Сделай отчет по выбросам в метриках для SRE-команды.",
             llm_model="llmgateway/free",
+            use_custom_output_json=True,
             output_json_schema={"type": "object", "properties": {"summary": {"type": "string"}}},
         )
 
@@ -714,7 +758,11 @@ class PromptDraftGenerationTests(unittest.TestCase):
         self.assertEqual(result.report_name, "Metric outliers report")
         self.assertEqual(result.report_instruction, "Structured report for SREs.")
         self.assertTrue(result.use_custom_output_json)
-        self.assertEqual(result.output_json_schema, request.output_json_schema)
+        assert result.output_json_schema is not None
+        self.assertEqual(result.output_json_schema["type"], "object")
+        self.assertEqual(result.output_json_schema["properties"]["summary"]["type"], "string")
+        self.assertEqual(result.output_json_schema["required"], ["summary"])
+        self.assertFalse(result.output_json_schema["additionalProperties"])
         self.assertIn("{chunk}", result.prompt_overrides.map.user)
         self.assertIn("{summaries}", result.prompt_overrides.reduce.user)
         self.assertIn("{summaries}", result.prompt_overrides.final.user)
@@ -722,10 +770,157 @@ class PromptDraftGenerationTests(unittest.TestCase):
         self.assertIn("Metric outliers report", llm.calls[1]["user"])
         self.assertIn("SRE team", llm.calls[1]["user"])
 
+    def test_requested_custom_output_json_generates_normalized_schema(self) -> None:
+        llm = PromptDraftLLMStub(
+            [
+                PromptDraftConceptSpec(
+                    report_name="Outlier report",
+                    report_instruction="Instruction",
+                    use_custom_output_json=True,
+                    output_json_schema={"headline": "string", "items": [{"severity": "string", "impact": "string"}]},
+                ),
+                GenerateSummaryPromptDraftResponse(
+                    report_name="Outlier report",
+                    report_instruction="Instruction",
+                    use_custom_output_json=True,
+                    output_json_schema={"headline": "string", "items": [{"severity": "string", "impact": "string"}]},
+                    prompt_overrides=SummaryPromptOverridesDraft(
+                        map=SummaryPromptStageDraft(system="map system", user="map user"),
+                        reduce=SummaryPromptStageDraft(system="reduce system", user="reduce user"),
+                        final=SummaryPromptStageDraft(system="final system", user="final user"),
+                    ),
+                ),
+            ]
+        )
+        request = GenerateSummaryPromptDraftRequest(
+            request="Сделай отчет по аномалиям с четкой JSON-структурой.",
+            llm_model="llmgateway/free",
+            use_custom_output_json=True,
+        )
+
+        result = _generate_prompt_draft_with_llm(llm=llm, request=request, llm_model=request.llm_model)
+
+        assert result.output_json_schema is not None
+        self.assertTrue(result.use_custom_output_json)
+        self.assertEqual(result.output_json_schema["type"], "object")
+        self.assertEqual(result.output_json_schema["properties"]["headline"]["type"], "string")
+        self.assertEqual(result.output_json_schema["properties"]["items"]["type"], "array")
+        self.assertEqual(
+            result.output_json_schema["properties"]["items"]["items"]["properties"]["severity"]["type"],
+            "string",
+        )
+        self.assertFalse(result.output_json_schema["additionalProperties"])
+        self.assertIn("{output_json_schema}", result.prompt_overrides.final.user)
+
+    def test_disabled_custom_output_json_discards_generated_schema(self) -> None:
+        llm = PromptDraftLLMStub(
+            [
+                PromptDraftConceptSpec(
+                    report_name="Outlier report",
+                    report_instruction="Instruction",
+                    use_custom_output_json=True,
+                    output_json_schema={"headline": "string"},
+                ),
+                GenerateSummaryPromptDraftResponse(
+                    report_name="Outlier report",
+                    report_instruction="Instruction",
+                    use_custom_output_json=True,
+                    output_json_schema={"headline": "string"},
+                    prompt_overrides=SummaryPromptOverridesDraft(
+                        map=SummaryPromptStageDraft(system="map system", user="map user"),
+                        reduce=SummaryPromptStageDraft(system="reduce system", user="reduce user"),
+                        final=SummaryPromptStageDraft(system="final system", user="final user"),
+                    ),
+                ),
+            ]
+        )
+        request = GenerateSummaryPromptDraftRequest(
+            request="Сделай отчет по аномалиям без кастомного JSON.",
+            llm_model="llmgateway/free",
+            use_custom_output_json=False,
+        )
+
+        result = _generate_prompt_draft_with_llm(llm=llm, request=request, llm_model=request.llm_model)
+
+        self.assertFalse(result.use_custom_output_json)
+        self.assertIsNone(result.output_json_schema)
+        self.assertNotIn("{output_json_schema}", result.prompt_overrides.final.user)
+
     def test_invalid_prompt_draft_model_falls_back_to_default(self) -> None:
         self.assertEqual(_resolve_requested_prompt_draft_model("gpt-4.1-mini"), get_settings().llm_model)
         self.assertEqual(_resolve_requested_prompt_draft_model("llmgateway/free"), "llmgateway/free")
         self.assertIsNone(_resolve_requested_prompt_draft_model("   "))
+
+
+class LlmConnectivityCheckTests(unittest.TestCase):
+    def test_run_llm_connectivity_checks_returns_status_per_model(self) -> None:
+        settings = replace(
+            get_settings(),
+            llm_model="llmgateway/free",
+            llm_models=("llmgateway/free", "llmgateway/analysis"),
+        )
+
+        class StubClient:
+            def probe_connection(self, *, model: str | None = None):
+                if model == "llmgateway/free":
+                    return {
+                        "ok": True,
+                        "status": "ok",
+                        "detail": "free ok",
+                        "error_class": "",
+                        "latency_ms": 123,
+                        "selected_model": "llmgateway/free",
+                        "api_base": "http://gateway.local/v1",
+                    }
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "detail": "analysis failed",
+                    "error_class": "provider_unavailable",
+                    "latency_ms": 456,
+                    "selected_model": "llmgateway/analysis",
+                    "api_base": "http://gateway.local/v1",
+                }
+
+        results = _run_llm_connectivity_checks(client=StubClient(), current_settings=settings)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].value, "llmgateway/free")
+        self.assertTrue(results[0].ok)
+        self.assertEqual(results[0].status, "ok")
+        self.assertEqual(results[0].latency_ms, 123)
+        self.assertEqual(results[1].value, "llmgateway/analysis")
+        self.assertFalse(results[1].ok)
+        self.assertEqual(results[1].error_class, "provider_unavailable")
+
+        filtered = _run_llm_connectivity_checks(
+            client=StubClient(),
+            current_settings=settings,
+            llm_model="llmgateway/analysis",
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].value, "llmgateway/analysis")
+
+    def test_llm_probe_connection_reports_dry_run_without_network_call(self) -> None:
+        class NoopStore:
+            def insert_llm_call(self, **kwargs: Any) -> None:
+                return None
+
+        client = StructuredLLMClient(
+            store=NoopStore(),
+            settings=replace(
+                get_settings(),
+                dry_run=True,
+                llm_model="llmgateway/free",
+                llm_models=("llmgateway/free",),
+            ),
+        )
+
+        result = client.probe_connection(model="llmgateway/free")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "dry_run")
+        self.assertIn("Dry run mode", result["detail"])
 
 
 class PromptDraftJobManagerTests(unittest.TestCase):
@@ -761,6 +956,67 @@ class PromptDraftJobManagerTests(unittest.TestCase):
         assert final.result is not None
         self.assertEqual(final.result.report_name, "Async report")
         self.assertEqual(final.stage, "DONE")
+
+    def test_prompt_draft_job_waits_for_provider_and_retries(self) -> None:
+        manager = PromptDraftJobManager()
+        expected = GenerateSummaryPromptDraftResponse(
+            report_name="Recovered report",
+            report_instruction="Instruction",
+            use_custom_output_json=False,
+            output_json_schema=None,
+            prompt_overrides=SummaryPromptOverridesDraft(
+                map=SummaryPromptStageDraft(system="map", user="{chunk}"),
+                reduce=SummaryPromptStageDraft(system="reduce", user="{summaries}"),
+                final=SummaryPromptStageDraft(system="final", user="{summaries}"),
+            ),
+        )
+        call_counter = {"value": 0}
+        waiting_seen = False
+        release_retry = threading.Event()
+
+        def runner(request, llm_model, stage_observer, cancel_checker):
+            del request, llm_model, cancel_checker
+            call_counter["value"] += 1
+            if call_counter["value"] == 1:
+                raise LlmPoolBusyError("LLM pool acquire timeout after 1.0s; max_concurrency=2")
+            stage_observer("PROMPT_DRAFT_RENDER")
+            return expected
+
+        def block_retry_sleep(_seconds: float) -> None:
+            release_retry.wait(0.5)
+
+        with patch("summary_backend.api._probe_prompt_draft_llm_availability", return_value="LLM availability ping succeeded (42 ms)."), patch(
+            "summary_backend.api.time.sleep",
+            side_effect=block_retry_sleep,
+        ):
+            job = manager.create_job(
+                request=GenerateSummaryPromptDraftRequest(request="recover after provider wait"),
+                llm_model="llmgateway/free",
+                runner=runner,
+            )
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                current = manager.get_job(job.job_id)
+                if current.status == PromptDraftJobStatus.WAITING_PROVIDER:
+                    waiting_seen = True
+                    self.assertEqual(current.stage, "WAITING_PROVIDER")
+                    self.assertIn("LLM pool acquire timeout after 1.0s; max_concurrency=2", current.error_detail)
+                    self.assertIn("LLM availability ping succeeded (42 ms).", current.error_detail)
+                    release_retry.set()
+                    break
+                time.sleep(0.005)
+
+            release_retry.set()
+            final = self._wait_for_prompt_draft_job(manager, job.job_id)
+
+        self.assertTrue(waiting_seen)
+        self.assertEqual(call_counter["value"], 2)
+        self.assertEqual(final.status, PromptDraftJobStatus.DONE)
+        self.assertEqual(final.stage, "DONE")
+        self.assertEqual(final.error_detail, "")
+        assert final.result is not None
+        self.assertEqual(final.result.report_name, "Recovered report")
 
     def test_prompt_draft_job_cancel_marks_job_cancelled(self) -> None:
         manager = PromptDraftJobManager()

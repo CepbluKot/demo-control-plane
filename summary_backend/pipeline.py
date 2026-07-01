@@ -11,7 +11,7 @@ from time import perf_counter
 from typing import Any
 
 from .audit import AuditWriter
-from .config import Settings, get_settings
+from .config import Settings, build_settings_llm_model_options, get_settings, resolve_llm_model_option
 from .errors import LlmPoolBusyError, classify_error
 from .ids import make_node_id, new_job_id, sha256_text
 from .input_models import InputSegment, LogRecord
@@ -1301,10 +1301,14 @@ class PipelineService:
     def _resolve_llm_model(self, job_id: str) -> str:
         metadata = self._job_metadata(job_id)
         requested = str(metadata.get("llm_model") or metadata.get("model") or "").strip()
+        resolved = resolve_llm_model_option(self.settings, requested)
         available_models = tuple(model for model in self.settings.llm_models if model)
-        if requested and (not available_models or requested in available_models):
-            return requested
-        if requested and requested != self.settings.llm_model:
+        if requested:
+            if resolved.value == requested:
+                return requested
+            if any(option.model == requested for option in build_settings_llm_model_options(self.settings)):
+                return resolved.value
+        if requested and resolved.value != requested:
             log_kv(
                 logger,
                 "llm_model_unavailable",
@@ -1313,7 +1317,7 @@ class PipelineService:
                 fallback=self.settings.llm_model,
                 available=",".join(available_models),
             )
-        return self.settings.llm_model
+        return resolved.value or self.settings.llm_model
 
     def _node_timing_payload(
         self,

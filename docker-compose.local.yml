@@ -48,6 +48,11 @@ services:
     image: llm-summary-generator:local
     container_name: llm-summary-local-backend
     command: ["python", "-m", "summary_backend"]
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
       SUMMARY_BACKEND_API_HOST: "0.0.0.0"
       SUMMARY_BACKEND_API_PORT: "8088"
@@ -78,6 +83,11 @@ services:
     image: llm-summary-generator:local
     container_name: llm-summary-local-worker
     command: ["dramatiq", "summary_backend.tasks", "--processes", "1", "--threads", "4"]
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
       SUMMARY_BACKEND_CLICKHOUSE_HOST: clickhouse
       SUMMARY_BACKEND_CLICKHOUSE_PORT: "8123"
@@ -107,6 +117,11 @@ services:
     image: llm-summary-generator:local
     container_name: llm-summary-local-frontend
     command: ["python", "-m", "summary_frontend"]
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     environment:
       SUMMARY_FRONTEND_HOST: "0.0.0.0"
       SUMMARY_FRONTEND_PORT: "8090"

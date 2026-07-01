@@ -303,7 +303,12 @@ SUMMARY_BACKEND_SOURCE_CLICKHOUSE_SECURE
 Если LLM env не заданы, backend может брать локальный gitignored fallback-конфиг
 `summary_backend/llm_gateway_defaults.json`, синхронизированный с `../llm_probe.py`.
 Для реальных вызовов можно либо использовать этот локальный конфиг, либо
-задать env явно:
+задать env явно.
+При запуске через `docker-compose.local.yml` базовые env берутся из `.env.example`,
+а локальный `.env` используется как опциональный override для секретов и multi-profile
+LLM-конфига.
+
+Single-profile legacy mode:
 
 ```bash
 SUMMARY_BACKEND_OPENAI_API_BASE=http://llm-gateway.example/v1
@@ -313,7 +318,29 @@ SUMMARY_BACKEND_LLM_MODELS='DeepSeek V3.2,llmgateway/free'
 ```
 
 `SUMMARY_BACKEND_LLM_MODELS` определяет список моделей, доступных в UI для выбора.
-Выбранная модель уходит и в MAP/REDUCE/FINAL pipeline, и в LLM helper для генерации
+
+Multi-profile mode:
+
+```bash
+SUMMARY_BACKEND_LLM_PROFILES='gateway,openai'
+SUMMARY_BACKEND_LLM_PROFILE_DEFAULT='gateway'
+
+SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__LABEL='LLM Gateway'
+SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__API_BASE='http://llm-gateway.example/v1'
+SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__API_KEY='...'
+SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__DEFAULT_MODEL='llmgateway/free'
+SUMMARY_BACKEND_LLM_PROFILE__GATEWAY__AVAILABLE_MODELS='llmgateway/free,llmgateway/analysis'
+
+SUMMARY_BACKEND_LLM_PROFILE__OPENAI__LABEL='OpenAI'
+SUMMARY_BACKEND_LLM_PROFILE__OPENAI__API_BASE='https://api.openai.com/v1'
+SUMMARY_BACKEND_LLM_PROFILE__OPENAI__API_KEY='...'
+SUMMARY_BACKEND_LLM_PROFILE__OPENAI__DEFAULT_MODEL='gpt-4.1-mini'
+SUMMARY_BACKEND_LLM_PROFILE__OPENAI__AVAILABLE_MODELS='gpt-4.1-mini,gpt-4.1'
+```
+
+В UI такие варианты будут показаны как отдельные selectable options вроде
+`LLM Gateway - llmgateway/free` и `OpenAI - gpt-4.1-mini`.
+Выбранная опция уходит и в MAP/REDUCE/FINAL pipeline, и в LLM helper для генерации
 черновика prompt-ов отчета.
 
 Backend использует:

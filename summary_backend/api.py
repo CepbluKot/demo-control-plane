@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Callable
@@ -17,14 +18,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import AuditWriter
-from .config import get_settings
+from .config import build_settings_llm_model_options, get_settings, resolve_llm_model_option
+from .errors import LlmPoolBusyError
 from .factory import create_pipeline_service
 from .ids import new_job_id
 from .ingestion import ClickHouseQueryIngestionService, StagedUploadIngestionService
 from .input_parsers import InputParseError
 from .llm_client import StructuredLLMClient
 from .logging_setup import configure_logging, get_logger
-from .pipeline import FINAL_SYSTEM, FINAL_USER_TEMPLATE, MAP_SYSTEM, MAP_USER_TEMPLATE, REDUCE_SYSTEM, REDUCE_USER_TEMPLATE
+from .pipeline import FINAL_SYSTEM, FINAL_USER_TEMPLATE, MAP_SYSTEM, MAP_USER_TEMPLATE, PipelineService, REDUCE_SYSTEM, REDUCE_USER_TEMPLATE
 from .query_sources import ClickHouseQueryLogRecordSource, QuerySourceError
 from .schemas import (
     ArtifactRecord,
@@ -58,6 +60,8 @@ from .schemas import (
     SummaryServiceStorageSettings,
     SummaryPromptOverridesDraft,
     SummaryPromptStageDraft,
+    SummaryLlmConnectivityCheckResponse,
+    SummaryLlmConnectivityCheckResult,
     UploadedFileRecord,
 )
 from .snapshots import build_job_snapshot
@@ -79,6 +83,11 @@ app.add_middleware(
 
 def _service():
     return create_pipeline_service(queue=DramatiqTaskQueue(), settings=settings)
+
+
+class _NoopSummaryStore:
+    def insert_llm_call(self, **kwargs: Any) -> None:
+        return None
 
 
 class PromptDraftConceptSpec(BaseModel):
@@ -188,17 +197,29 @@ class PromptDraftJobManager:
     ) -> None:
         if not self._mark_running(job_id):
             return
-        try:
-            result = runner(request, llm_model, lambda stage: self._set_stage(job_id, stage), lambda: self._is_cancel_requested(job_id))
-        except PromptDraftCancelledError:
-            self._mark_cancelled(job_id)
-            return
-        except Exception as exc:
-            if self._is_cancel_requested(job_id):
+        while True:
+            try:
+                result = runner(request, llm_model, lambda stage: self._set_stage(job_id, stage), lambda: self._is_cancel_requested(job_id))
+                break
+            except PromptDraftCancelledError:
                 self._mark_cancelled(job_id)
-            else:
-                self._mark_failed(job_id, str(exc))
-            return
+                return
+            except LlmPoolBusyError as exc:
+                if self._is_cancel_requested(job_id):
+                    self._mark_cancelled(job_id)
+                    return
+                self._mark_waiting_provider(
+                    job_id,
+                    _build_prompt_draft_waiting_provider_detail(llm_model=llm_model, exc=exc),
+                )
+                time.sleep(max(1.0, float(settings.llm_pool_retry_delay_seconds)))
+                continue
+            except Exception as exc:
+                if self._is_cancel_requested(job_id):
+                    self._mark_cancelled(job_id)
+                else:
+                    self._mark_failed(job_id, str(exc))
+                return
 
         if self._is_cancel_requested(job_id):
             self._mark_cancelled(job_id)
@@ -232,6 +253,7 @@ class PromptDraftJobManager:
             job.status = PromptDraftJobStatus.RUNNING
             job.stage = "RUNNING"
             job.updated_at = self._utcnow()
+            job.error_detail = ""
             return True
 
     def _set_stage(self, job_id: str, stage: str) -> None:
@@ -241,8 +263,22 @@ class PromptDraftJobManager:
                 return
             job.stage = stage
             if job.status != PromptDraftJobStatus.CANCEL_REQUESTED:
-                job.status = PromptDraftJobStatus.RUNNING
+                job.status = PromptDraftJobStatus.WAITING_PROVIDER if stage == "WAITING_PROVIDER" else PromptDraftJobStatus.RUNNING
             job.updated_at = self._utcnow()
+            if stage != "WAITING_PROVIDER":
+                job.error_detail = ""
+
+    def _mark_waiting_provider(self, job_id: str, error_detail: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in {PromptDraftJobStatus.DONE, PromptDraftJobStatus.FAILED, PromptDraftJobStatus.CANCELLED}:
+                return
+            now = self._utcnow()
+            if job.status != PromptDraftJobStatus.CANCEL_REQUESTED:
+                job.status = PromptDraftJobStatus.WAITING_PROVIDER
+            job.stage = "WAITING_PROVIDER"
+            job.updated_at = now
+            job.error_detail = error_detail[:4000]
 
     def _mark_done(self, job_id: str, result: GenerateSummaryPromptDraftResponse) -> None:
         with self._lock:
@@ -322,13 +358,29 @@ def service_settings() -> SummaryServiceSettingsResponse:
     return build_public_settings(settings)
 
 
+@app.post("/settings/llm-connectivity-check", response_model=SummaryLlmConnectivityCheckResponse)
+def run_settings_llm_connectivity_check(llm_model: str | None = Query(default=None)) -> SummaryLlmConnectivityCheckResponse:
+    client = StructuredLLMClient(store=_NoopSummaryStore(), settings=settings, audit=AuditWriter(settings))
+    results = _run_llm_connectivity_checks(client=client, current_settings=settings, llm_model=llm_model)
+    ok_count = sum(1 for result in results if result.ok)
+    failed_count = len(results) - ok_count
+    return SummaryLlmConnectivityCheckResponse(
+        checked_at=datetime.now(timezone.utc),
+        dry_run=settings.dry_run,
+        total=len(results),
+        ok_count=ok_count,
+        failed_count=failed_count,
+        results=results,
+    )
+
+
 @app.post("/prompt-draft-jobs", response_model=PromptDraftJobRecord)
 def create_prompt_draft_job(request: GenerateSummaryPromptDraftRequest) -> PromptDraftJobRecord:
     llm_model = _resolve_requested_prompt_draft_model(request.llm_model)
     normalized_request = request.model_copy(update={"llm_model": llm_model})
     if settings.dry_run:
         job = prompt_draft_jobs.create_completed_job(
-            result=_fallback_prompt_draft(request.request, request.output_json_schema),
+            result=_fallback_prompt_draft(request.request, request.use_custom_output_json, request.output_json_schema),
             llm_model=llm_model,
         )
     else:
@@ -358,7 +410,7 @@ def cancel_prompt_draft_job(job_id: str) -> PromptDraftJobRecord:
 @app.post("/prompt-drafts", response_model=GenerateSummaryPromptDraftResponse)
 def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) -> GenerateSummaryPromptDraftResponse:
     if settings.dry_run:
-        return _fallback_prompt_draft(request.request, request.output_json_schema)
+        return _fallback_prompt_draft(request.request, request.use_custom_output_json, request.output_json_schema)
 
     store = ClickHouseStore(settings)
     llm = StructuredLLMClient(store=store, settings=settings, audit=AuditWriter(settings))
@@ -375,6 +427,7 @@ def generate_summary_prompt_draft(request: GenerateSummaryPromptDraftRequest) ->
 
 
 def build_public_settings(current_settings=settings) -> SummaryServiceSettingsResponse:
+    llm_model_options = build_settings_llm_model_options(current_settings)
     return SummaryServiceSettingsResponse(
         service_name="summary-generator",
         read_only=True,
@@ -413,6 +466,28 @@ def build_public_settings(current_settings=settings) -> SummaryServiceSettingsRe
             api_base=current_settings.openai_api_base,
             model=current_settings.llm_model,
             available_models=list(current_settings.llm_models or ((current_settings.llm_model,) if current_settings.llm_model else ())),
+            available_model_options=[
+                {
+                    "value": option.value,
+                    "label": option.label,
+                    "profile_id": option.profile_id,
+                    "profile_label": option.profile_label,
+                    "model": option.model,
+                    "api_base": option.api_base,
+                    "api_key_configured": bool(
+                        next(
+                            (
+                                profile.api_key
+                                for profile in current_settings.llm_profiles
+                                if profile.profile_id == option.profile_id
+                            ),
+                            current_settings.openai_api_key,
+                        )
+                    ),
+                    "is_default": option.value == current_settings.llm_model,
+                }
+                for option in llm_model_options
+            ],
             timeout_seconds=current_settings.llm_timeout_seconds,
             max_retries=current_settings.llm_max_retries,
             retry_backoff_seconds=current_settings.llm_retry_backoff_seconds,
@@ -430,6 +505,73 @@ def build_public_settings(current_settings=settings) -> SummaryServiceSettingsRe
     )
 
 
+def _build_prompt_draft_waiting_provider_detail(
+    *,
+    llm_model: str | None,
+    exc: LlmPoolBusyError,
+) -> str:
+    probe_detail = _probe_prompt_draft_llm_availability(llm_model=llm_model)
+    retry_delay_seconds = max(1.0, float(settings.llm_pool_retry_delay_seconds))
+    return f"{exc}. {probe_detail} Retrying in {retry_delay_seconds:.0f}s."
+
+
+def _probe_prompt_draft_llm_availability(*, llm_model: str | None) -> str:
+    try:
+        probe_client = StructuredLLMClient(
+            store=_NoopSummaryStore(),
+            settings=settings,
+            audit=AuditWriter(settings),
+        )
+        probe = probe_client.probe_connection(
+            model=llm_model,
+            timeout_seconds=min(5.0, max(2.0, float(settings.llm_timeout_seconds))),
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        return f"LLM availability ping failed: {exc}"
+
+    status = str(probe.get("status") or "error")
+    detail = str(probe.get("detail") or "").strip()
+    latency_ms = probe.get("latency_ms")
+    if status == "ok":
+        latency_suffix = f" ({latency_ms} ms)" if latency_ms is not None else ""
+        return f"LLM availability ping succeeded{latency_suffix}."
+    if status == "dry_run":
+        return detail or "Dry run mode is enabled."
+    if detail:
+        return f"LLM availability ping status={status}: {detail}"
+    return f"LLM availability ping status={status}."
+
+
+def _run_llm_connectivity_checks(
+    *,
+    client: StructuredLLMClient,
+    current_settings=settings,
+    llm_model: str | None = None,
+) -> list[SummaryLlmConnectivityCheckResult]:
+    results: list[SummaryLlmConnectivityCheckResult] = []
+    selected_model = (llm_model or "").strip()
+    for option in build_settings_llm_model_options(current_settings):
+        if selected_model and option.value != selected_model:
+            continue
+        probe = client.probe_connection(model=option.value)
+        results.append(
+            SummaryLlmConnectivityCheckResult(
+                value=option.value,
+                label=option.label,
+                profile_id=option.profile_id,
+                profile_label=option.profile_label,
+                model=probe.get("selected_model") or option.model,
+                api_base=probe.get("api_base") or option.api_base,
+                ok=bool(probe.get("ok")),
+                status=str(probe.get("status") or "error"),
+                detail=str(probe.get("detail") or ""),
+                error_class=str(probe.get("error_class") or ""),
+                latency_ms=int(probe["latency_ms"]) if probe.get("latency_ms") is not None else None,
+            )
+        )
+    return results
+
+
 def _mask_url_credentials(value: str) -> str:
     if not value:
         return value
@@ -444,14 +586,21 @@ def _mask_url_credentials(value: str) -> str:
 
 def _fallback_prompt_draft(
     user_request: str,
+    use_custom_output_json: bool | None,
     output_json_schema: dict[str, Any] | None,
 ) -> GenerateSummaryPromptDraftResponse:
     clean_request = " ".join(user_request.split())[:1200]
     request_line = f"\nUser-specific direction: {clean_request}" if clean_request else ""
     report_name = _fallback_report_name(clean_request)
     report_instruction = clean_request or "Create a concise report that follows the user request."
+    normalized_output_json_schema = _normalize_output_json_schema(
+        output_json_schema,
+        provided_output_json_schema=output_json_schema,
+        use_custom_output_json=bool(use_custom_output_json),
+        user_request=user_request,
+    )
     final_user = FINAL_USER_TEMPLATE
-    if output_json_schema:
+    if normalized_output_json_schema:
         final_user = (
             "Create the final JSON response from these summaries.\n\n"
             "Output JSON structure:\n{output_json_schema}\n\n"
@@ -461,8 +610,8 @@ def _fallback_prompt_draft(
     return GenerateSummaryPromptDraftResponse(
         report_name=report_name,
         report_instruction=report_instruction,
-        use_custom_output_json=bool(output_json_schema),
-        output_json_schema=output_json_schema or None,
+        use_custom_output_json=normalized_output_json_schema is not None,
+        output_json_schema=normalized_output_json_schema,
         prompt_overrides=SummaryPromptOverridesDraft(
             map=SummaryPromptStageDraft(
                 system=f"{MAP_SYSTEM}{request_line}",
@@ -483,6 +632,11 @@ def _fallback_prompt_draft(
 def _resolve_requested_prompt_draft_model(requested_llm_model: str | None) -> str | None:
     requested_model = (requested_llm_model or "").strip() or None
     available_models = tuple(model.strip() for model in settings.llm_models if model.strip())
+    if requested_model:
+        resolved = resolve_llm_model_option(settings, requested_model)
+        shorthand_match = any(option.model == requested_model for option in build_settings_llm_model_options(settings))
+        if shorthand_match:
+            return resolved.value
     if requested_model and available_models and requested_model not in available_models:
         logger.warning(
             "api.prompt_draft_model_unavailable | requested=%s fallback=%s available=%s",
@@ -511,7 +665,12 @@ def _generate_prompt_draft_with_llm(
         llm_model=llm_model,
     )
     _raise_if_prompt_draft_cancelled(cancel_checker)
-    normalized_spec = _normalize_prompt_draft_spec(spec, request.output_json_schema)
+    normalized_spec = _normalize_prompt_draft_spec(
+        spec,
+        request.output_json_schema,
+        request.use_custom_output_json,
+        request.request,
+    )
     if stage_observer:
         stage_observer("PROMPT_DRAFT_RENDER")
     draft = _generate_prompt_draft_from_spec(
@@ -524,7 +683,12 @@ def _generate_prompt_draft_with_llm(
     if stage_observer:
         stage_observer("PROMPT_DRAFT_NORMALIZE")
     merged_draft = _merge_prompt_draft_spec_into_draft(draft, normalized_spec)
-    return _normalize_prompt_draft(merged_draft, request.request, request.output_json_schema)
+    return _normalize_prompt_draft(
+        merged_draft,
+        request.request,
+        request.output_json_schema,
+        request.use_custom_output_json,
+    )
 
 
 def _raise_if_prompt_draft_cancelled(cancel_checker: Callable[[], bool] | None) -> None:
@@ -539,17 +703,20 @@ def _generate_prompt_draft_concept_spec(
     llm_model: str | None,
 ) -> PromptDraftConceptSpec:
     output_schema_text = json.dumps(request.output_json_schema or {}, ensure_ascii=False, indent=2)
+    custom_output_requested = bool(request.use_custom_output_json or request.output_json_schema)
     system = (
         "You convert a user's conceptual request for a three-stage summarization pipeline into a structured design spec. "
         "Return only JSON matching the requested schema. "
         "Extract implementation-ready intent for MAP, REDUCE, and FINAL so another model can write concrete prompts without guessing. "
         "Keep the spec concise, practical, and internally consistent. "
         "If the user already provided a final output JSON structure, preserve it and set use_custom_output_json to true. "
+        "If the request explicitly asks for a strict final JSON structure, create one that is directly usable as a JSON schema for an object response. "
         "If no strict final structure is clearly needed, keep use_custom_output_json false and output_json_schema null."
     )
     user = (
         "Create a structured prompt-design spec from this conceptual request.\n\n"
         f"User request:\n{request.request.strip()}\n\n"
+        f"Custom final JSON schema requested: {'yes' if custom_output_requested else 'no'}\n\n"
         f"Desired final output JSON structure, if any:\n{output_schema_text}\n\n"
         "Fill the spec with implementation-ready detail:\n"
         "- objective: what the summarization/reporting pipeline should accomplish\n"
@@ -561,7 +728,8 @@ def _generate_prompt_draft_concept_spec(
         "- final_requirements: evidence rules, severity handling, uncertainty, required details, and other constraints\n"
         "- report_instruction: reusable instruction text for the report form\n"
         "- report_name: short human-friendly title when helpful\n"
-        "- use_custom_output_json/output_json_schema: only when strict structured final output is genuinely useful\n"
+        "- use_custom_output_json/output_json_schema: only when strict structured final output is genuinely useful, unless the request explicitly says custom JSON output is required\n"
+        "- When output_json_schema is needed, return a practical object schema with stable keys and concrete field types\n"
         "Do not write MAP, REDUCE, or FINAL prompts yet."
     )
     return llm.call_structured(
@@ -627,11 +795,19 @@ def _generate_prompt_draft_from_spec(
 def _normalize_prompt_draft_spec(
     spec: PromptDraftConceptSpec,
     provided_output_json_schema: dict[str, Any] | None,
+    requested_use_custom_output_json: bool | None = None,
+    user_request: str = "",
 ) -> PromptDraftConceptSpec:
+    effective_use_custom_output_json = _resolve_prompt_draft_custom_output_json_requested(
+        requested_use_custom_output_json,
+        fallback=spec.use_custom_output_json,
+        provided_output_json_schema=provided_output_json_schema,
+    )
     normalized_output_json_schema = _normalize_output_json_schema(
         spec.output_json_schema,
         provided_output_json_schema=provided_output_json_schema,
-        use_custom_output_json=spec.use_custom_output_json,
+        use_custom_output_json=effective_use_custom_output_json,
+        user_request=user_request,
     )
     return PromptDraftConceptSpec(
         report_name=(spec.report_name or "").strip()[:200],
@@ -698,13 +874,20 @@ def _normalize_prompt_draft(
     draft: GenerateSummaryPromptDraftResponse,
     user_request: str,
     output_json_schema: dict[str, Any] | None,
+    requested_use_custom_output_json: bool | None,
 ) -> GenerateSummaryPromptDraftResponse:
-    fallback = _fallback_prompt_draft(user_request, output_json_schema)
+    fallback = _fallback_prompt_draft(user_request, requested_use_custom_output_json, output_json_schema)
     raw = draft.prompt_overrides
+    effective_use_custom_output_json = _resolve_prompt_draft_custom_output_json_requested(
+        requested_use_custom_output_json,
+        fallback=draft.use_custom_output_json,
+        provided_output_json_schema=output_json_schema,
+    )
     normalized_output_json_schema = _normalize_output_json_schema(
         draft.output_json_schema,
         provided_output_json_schema=output_json_schema,
-        use_custom_output_json=draft.use_custom_output_json,
+        use_custom_output_json=effective_use_custom_output_json,
+        user_request=user_request,
     )
     return GenerateSummaryPromptDraftResponse(
         report_name=(draft.report_name or "").strip()[:200] or fallback.report_name,
@@ -729,14 +912,42 @@ def _normalize_output_json_schema(
     *,
     provided_output_json_schema: dict[str, Any] | None,
     use_custom_output_json: bool,
+    user_request: str = "",
 ) -> dict[str, Any] | None:
     if provided_output_json_schema:
-        return provided_output_json_schema
+        return PipelineService._build_final_response_schema(provided_output_json_schema)
     if not use_custom_output_json:
         return None
-    if not isinstance(draft_output_json_schema, dict) or not draft_output_json_schema:
-        return None
-    return draft_output_json_schema
+    if isinstance(draft_output_json_schema, dict) and draft_output_json_schema:
+        return PipelineService._build_final_response_schema(draft_output_json_schema)
+    return _build_fallback_generated_output_json_schema(user_request)
+
+
+def _build_fallback_generated_output_json_schema(user_request: str) -> dict[str, Any]:
+    title_description = _fallback_report_name(user_request)
+    shape = {
+        "report_title": f"string: short title for {title_description.lower() or 'the report'}",
+        "summary": "string: concise executive summary of the final report",
+        "key_points": ["string: concrete evidence-backed finding"],
+        "recommendations": ["string: specific next action or recommendation"],
+        "warnings": ["string: uncertainty, limitation, or caveat"],
+    }
+    return PipelineService._build_final_response_schema(shape)
+
+
+def _resolve_prompt_draft_custom_output_json_requested(
+    requested_use_custom_output_json: bool | None,
+    *,
+    fallback: bool,
+    provided_output_json_schema: dict[str, Any] | None,
+) -> bool:
+    if provided_output_json_schema:
+        return True
+    if requested_use_custom_output_json is True:
+        return True
+    if requested_use_custom_output_json is False:
+        return False
+    return bool(fallback)
 
 
 def _fallback_report_name(user_request: str) -> str:
@@ -1082,6 +1293,44 @@ async def watch_summary_job(websocket: WebSocket, job_id: str) -> None:
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         logger.info("ws.disconnected | job_id=%s", job_id)
+
+
+@app.websocket("/ws/prompt-draft-jobs/{job_id}")
+async def watch_prompt_draft_job(websocket: WebSocket, job_id: str) -> None:
+    await websocket.accept()
+    logger.info("ws.prompt_draft.connected | job_id=%s client=%s", job_id, websocket.client)
+    last_hash = ""
+    try:
+        while True:
+            try:
+                payload = {
+                    "type": "snapshot",
+                    "job": prompt_draft_jobs.get_job(job_id),
+                }
+            except KeyError:
+                await websocket.send_json({"type": "error", "detail": f"prompt draft job not found: {job_id}"})
+                await websocket.close(code=1008)
+                return
+
+            encoded = jsonable_encoder(payload)
+            current_hash = hashlib.sha256(
+                json.dumps(encoded, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if current_hash != last_hash:
+                await websocket.send_json(encoded)
+                last_hash = current_hash
+
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=settings.websocket_poll_interval_seconds,
+                )
+            except asyncio.TimeoutError:
+                continue
+            if message == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        logger.info("ws.prompt_draft.disconnected | job_id=%s", job_id)
 
 
 @app.websocket("/ws/events")
