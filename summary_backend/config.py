@@ -309,12 +309,14 @@ class Settings:
     llm_max_retries: int
     llm_retry_backoff_seconds: float
     llm_max_concurrency: int
+    llm_assistant_max_concurrency: int
     llm_pool_acquire_timeout_seconds: float
     llm_pool_poll_interval_seconds: float
     llm_pool_retry_delay_seconds: float
     dry_run: bool
 
     chunk_target_estimated_tokens: int
+    reduce_target_estimated_tokens: int
     reduce_group_size: int
     max_enqueue_nodes_per_advance: int
     queued_node_requeue_after_seconds: float
@@ -400,6 +402,17 @@ def get_settings() -> Settings:
     clickhouse_secure = _env_bool("SUMMARY_BACKEND_CLICKHOUSE_SECURE", False)
     worker_processes = _env_int("SUMMARY_BACKEND_WORKER_PROCESSES", 1)
     worker_threads = _env_int("SUMMARY_BACKEND_WORKER_THREADS", 4)
+    llm_max_concurrency = max(1, _env_int("SUMMARY_BACKEND_LLM_MAX_CONCURRENCY", 5))
+    llm_assistant_max_concurrency = max(
+        1,
+        _env_int("SUMMARY_BACKEND_LLM_ASSISTANT_MAX_CONCURRENCY", llm_max_concurrency),
+    )
+
+    chunk_target_estimated_tokens = _env_int("SUMMARY_BACKEND_CHUNK_TARGET_ESTIMATED_TOKENS", 6000)
+    reduce_target_estimated_tokens = _env_int(
+        "SUMMARY_BACKEND_REDUCE_TARGET_ESTIMATED_TOKENS",
+        min(chunk_target_estimated_tokens, 4000),
+    )
 
     return Settings(
         api_host=_env("SUMMARY_BACKEND_API_HOST", "0.0.0.0"),
@@ -437,12 +450,14 @@ def get_settings() -> Settings:
         llm_timeout_seconds=_env_float("SUMMARY_BACKEND_LLM_TIMEOUT_SECONDS", 600.0),
         llm_max_retries=_env_int("SUMMARY_BACKEND_LLM_MAX_RETRIES", 3),
         llm_retry_backoff_seconds=_env_float("SUMMARY_BACKEND_LLM_RETRY_BACKOFF_SECONDS", 2.0),
-        llm_max_concurrency=max(1, _env_int("SUMMARY_BACKEND_LLM_MAX_CONCURRENCY", 5)),
+        llm_max_concurrency=llm_max_concurrency,
+        llm_assistant_max_concurrency=llm_assistant_max_concurrency,
         llm_pool_acquire_timeout_seconds=max(0.1, _env_float("SUMMARY_BACKEND_LLM_POOL_ACQUIRE_TIMEOUT_SECONDS", 1.0)),
         llm_pool_poll_interval_seconds=max(0.05, _env_float("SUMMARY_BACKEND_LLM_POOL_POLL_INTERVAL_SECONDS", 0.25)),
         llm_pool_retry_delay_seconds=max(1.0, _env_float("SUMMARY_BACKEND_LLM_POOL_RETRY_DELAY_SECONDS", 5.0)),
         dry_run=_env_bool("SUMMARY_BACKEND_DRY_RUN", not has_llm_config),
-        chunk_target_estimated_tokens=_env_int("SUMMARY_BACKEND_CHUNK_TARGET_ESTIMATED_TOKENS", 6000),
+        chunk_target_estimated_tokens=chunk_target_estimated_tokens,
+        reduce_target_estimated_tokens=reduce_target_estimated_tokens,
         reduce_group_size=_env_int("SUMMARY_BACKEND_REDUCE_GROUP_SIZE", 8),
         max_enqueue_nodes_per_advance=_env_int("SUMMARY_BACKEND_MAX_ENQUEUE_NODES_PER_ADVANCE", 500),
         queued_node_requeue_after_seconds=_env_float("SUMMARY_BACKEND_QUEUED_NODE_REQUEUE_AFTER_SECONDS", 30.0),

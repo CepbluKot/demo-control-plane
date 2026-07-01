@@ -113,6 +113,35 @@ Reduce уровней может быть сколько угодно:
 -> FINAL
 ```
 
+### 4.1. Стратегия JSON-схем
+
+Pipeline поддерживает два независимых структурированных режима:
+
+| Уровень | Metadata key | Как работает |
+|---|---|---|
+| Промежуточный `MAP` + `REDUCE` | `intermediate_output_json_schema` | Одна shared JSON Schema для обоих этапов. `MAP` возвращает объект этой схемы для одного чанка, `REDUCE` возвращает объект той же схемы для группы partial summaries |
+| Финальный `FINAL` | `output_json_schema` | Пользовательская JSON Schema только для финального ответа |
+
+Почему для `MAP` и `REDUCE` используется одна shared schema:
+
+- не требуется отдельная логика преобразования `map -> reduce`;
+- проще гарантировать merge совместимых объектов;
+- проще валидировать артефакты и повторять шаги;
+- удобнее анализировать sequence-sensitive данные вроде логов и таймсерий.
+
+Если `intermediate_output_json_schema` не задана, `MAP` и `REDUCE` продолжают использовать внутренний transport shape:
+
+```json
+{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}
+```
+
+Если `intermediate_output_json_schema` задана:
+
+- `MAP` и `REDUCE` вызываются через structured output с provider-native `json_schema`;
+- user prompt templates могут использовать placeholder `{intermediate_output_json_schema}`;
+- промежуточные артефакты хранят сам JSON-объект и metadata о sequence диапазоне;
+- порядок чанков сохраняется и для `REDUCE` grouping, и для последующих reduce-level merges.
+
 ---
 
 ## 5. Dramatiq actors

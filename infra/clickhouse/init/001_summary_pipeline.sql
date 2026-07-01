@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS summary_test.summary_llm_calls
     error_class LowCardinality(String) DEFAULT '',
     http_status UInt16 DEFAULT 0,
     latency_ms UInt32 DEFAULT 0,
+    pool_wait_ms UInt32 DEFAULT 0,
+    provider_latency_ms UInt32 DEFAULT 0,
     prompt_tokens UInt32 DEFAULT 0,
     completion_tokens UInt32 DEFAULT 0,
     total_tokens UInt32 DEFAULT 0,

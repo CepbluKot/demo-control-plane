@@ -36,6 +36,7 @@ def create_llm(store: SummaryStore, settings: Settings | None = None) -> Summary
         store=store,
         settings=settings,
         audit=AuditWriter(settings),
+        pool_kind="jobs",
     )
 
 

@@ -87,6 +87,8 @@ class SummaryStore(Protocol):
         error_class: str = "",
         http_status: int = 0,
         latency_ms: int = 0,
+        pool_wait_ms: int = 0,
+        provider_latency_ms: int = 0,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
@@ -159,6 +161,7 @@ class SummaryLLM(Protocol):
         system: str,
         user: str,
         model: str | None = None,
+        job_max_concurrency: int | None = None,
     ) -> SummaryResult:
         ...
 

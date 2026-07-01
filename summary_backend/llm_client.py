@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 from .audit import AuditWriter
 from .config import Settings, get_settings, resolve_llm_model_option
 from .errors import LlmPoolBusyError, classify_error
-from .llm_pool import acquire_llm_pool_slot
+from .llm_pool import LlmPoolKind, acquire_llm_pool_slot
 from .logging_setup import get_logger
 from .ports import AuditSink, SummaryStore
 from .schemas import SummaryResult
@@ -44,10 +44,19 @@ class StructuredLLMClient:
         store: SummaryStore,
         settings: Settings | None = None,
         audit: AuditSink | None = None,
+        pool_kind: LlmPoolKind = "jobs",
     ) -> None:
         self.settings = settings or get_settings()
         self.store = store
         self.audit = audit or AuditWriter(self.settings)
+        self.pool_kind = pool_kind
+
+    def _pool_max_concurrency(self) -> int:
+        return (
+            self.settings.llm_assistant_max_concurrency
+            if self.pool_kind == "assistant"
+            else self.settings.llm_max_concurrency
+        )
 
     def call_summary(
         self,
@@ -58,6 +67,7 @@ class StructuredLLMClient:
         system: str,
         user: str,
         model: str | None = None,
+        job_max_concurrency: int | None = None,
     ) -> SummaryResult:
         return self.call_structured(
             job_id=job_id,
@@ -66,6 +76,7 @@ class StructuredLLMClient:
             system=system,
             user=user,
             model=model,
+            job_max_concurrency=job_max_concurrency,
             response_model=SummaryResult,
         )
 
@@ -78,6 +89,7 @@ class StructuredLLMClient:
         system: str,
         user: str,
         model: str | None = None,
+        job_max_concurrency: int | None = None,
         response_model: type[TModel],
         response_schema: dict[str, Any] | None = None,
     ) -> TModel:
@@ -90,10 +102,11 @@ class StructuredLLMClient:
                 stage=stage,
                 system=system,
                 user=user,
-                    model=selected_model,
-                    response_model=response_model,
-                    response_schema=response_schema,
-                )
+                model=selected_model,
+                job_max_concurrency=job_max_concurrency,
+                response_model=response_model,
+                response_schema=response_schema,
+            )
 
         last_exc: Exception | None = None
         for attempt in range(1, self.settings.llm_max_retries + 2):
@@ -105,6 +118,7 @@ class StructuredLLMClient:
                     system=system,
                     user=user,
                     model=selected_model,
+                    job_max_concurrency=job_max_concurrency,
                     response_model=response_model,
                     response_schema=response_schema,
                     api_base=selected_option.api_base or self.settings.openai_api_base,
@@ -267,6 +281,7 @@ class StructuredLLMClient:
         system: str,
         user: str,
         model: str,
+        job_max_concurrency: int | None,
         response_model: type[TModel],
         response_schema: dict[str, Any] | None = None,
     ) -> TModel:
@@ -310,7 +325,11 @@ class StructuredLLMClient:
             response_json=response_json,
             content=content,
             error=None,
-            metadata={"dry_run": True, "latency_ms": latency_ms},
+            metadata={
+                "dry_run": True,
+                "latency_ms": latency_ms,
+                "job_max_concurrency": job_max_concurrency,
+            },
         )
         self.store.insert_llm_call(
             job_id=job_id,
@@ -336,6 +355,7 @@ class StructuredLLMClient:
         system: str,
         user: str,
         model: str,
+        job_max_concurrency: int | None,
         response_model: type[TModel],
         response_schema: dict[str, Any] | None,
         api_base: str,
@@ -366,10 +386,19 @@ class StructuredLLMClient:
         content: str | None = None
         error: str | None = None
         pool_wait_ms = 0
+        provider_latency_ms = 0
 
         try:
-            with acquire_llm_pool_slot(self.settings, job_id=job_id, node_id=node_id, stage=stage) as acquired_wait_ms:
+            with acquire_llm_pool_slot(
+                self.settings,
+                job_id=job_id,
+                node_id=node_id,
+                stage=stage,
+                pool_kind=self.pool_kind,
+                job_max_concurrency=job_max_concurrency,
+            ) as acquired_wait_ms:
                 pool_wait_ms = acquired_wait_ms
+                provider_started = time.monotonic()
                 client = OpenAI(
                     base_url=_build_openai_base_url(api_base),
                     api_key=api_key,
@@ -377,6 +406,7 @@ class StructuredLLMClient:
                     timeout=self.settings.llm_timeout_seconds,
                 )
                 response = client.chat.completions.create(**request_json)
+                provider_latency_ms = int((time.monotonic() - provider_started) * 1000)
             if hasattr(response, "model_dump"):
                 response_json = response.model_dump(mode="json")
             else:
@@ -403,8 +433,10 @@ class StructuredLLMClient:
                 metadata={
                     "attempt": attempt,
                     "latency_ms": latency_ms,
+                    "job_max_concurrency": job_max_concurrency,
                     "llm_pool_wait_ms": pool_wait_ms,
-                    "llm_pool_max_concurrency": self.settings.llm_max_concurrency,
+                    "llm_pool_kind": self.pool_kind,
+                    "llm_pool_max_concurrency": self._pool_max_concurrency(),
                 },
             )
             self.store.insert_llm_call(
@@ -414,6 +446,8 @@ class StructuredLLMClient:
                 model=model,
                 status="OK",
                 latency_ms=latency_ms,
+                pool_wait_ms=pool_wait_ms,
+                provider_latency_ms=provider_latency_ms,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
@@ -426,6 +460,7 @@ class StructuredLLMClient:
         except (json.JSONDecodeError, ValidationError, Exception) as exc:
             error = str(exc)
             latency_ms = int((time.monotonic() - started) * 1000)
+            effective_provider_latency_ms = provider_latency_ms or max(0, latency_ms - pool_wait_ms)
             self.audit.write_llm_call(
                 job_id=job_id,
                 node_id=node_id,
@@ -440,7 +475,8 @@ class StructuredLLMClient:
                     "attempt": attempt,
                     "latency_ms": latency_ms,
                     "llm_pool_wait_ms": pool_wait_ms,
-                    "llm_pool_max_concurrency": self.settings.llm_max_concurrency,
+                    "llm_pool_kind": self.pool_kind,
+                    "llm_pool_max_concurrency": self._pool_max_concurrency(),
                 },
             )
             self.store.insert_llm_call(
@@ -451,6 +487,8 @@ class StructuredLLMClient:
                 status="ERROR",
                 error_class=classify_error(exc),
                 latency_ms=latency_ms,
+                pool_wait_ms=pool_wait_ms,
+                provider_latency_ms=effective_provider_latency_ms,
                 prompt_tokens=estimate_tokens(system) + estimate_tokens(user),
                 request_json=json.dumps(request_json, ensure_ascii=False),
                 response_json=json.dumps(response_json or {}, ensure_ascii=False),

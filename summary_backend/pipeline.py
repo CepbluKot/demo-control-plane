@@ -1668,6 +1668,10 @@ class PipelineService:
         model: str,
     ) -> SummaryResult:
         call_summary = self.llm.call_summary
+        job_max_concurrency = self._resolve_job_llm_concurrency(
+            job_id,
+            max(1, int(self.settings.llm_max_concurrency)),
+        )
         kwargs = {
             "job_id": job_id,
             "node_id": node_id,
@@ -1675,6 +1679,8 @@ class PipelineService:
             "system": system,
             "user": user,
         }
+        if self._call_accepts_keyword(call_summary, "job_max_concurrency"):
+            kwargs["job_max_concurrency"] = job_max_concurrency
         if self._call_accepts_keyword(call_summary, "model"):
             return call_summary(**kwargs, model=model)
         return call_summary(**kwargs)
@@ -2037,6 +2043,10 @@ class PipelineService:
         call_structured = getattr(self.llm, "call_structured", None)
         if callable(call_structured):
             response_schema = self._build_response_json_schema(output_json_schema)
+            job_max_concurrency = self._resolve_job_llm_concurrency(
+                job_id,
+                max(1, int(self.settings.llm_max_concurrency)),
+            )
             kwargs = {
                 "job_id": job_id,
                 "node_id": node_id,
@@ -2045,6 +2055,8 @@ class PipelineService:
                 "user": user,
                 "response_model": JsonObjectResult,
             }
+            if self._call_accepts_keyword(call_structured, "job_max_concurrency"):
+                kwargs["job_max_concurrency"] = job_max_concurrency
             if self._call_accepts_keyword(call_structured, "model"):
                 kwargs["model"] = model
             if self._call_accepts_keyword(call_structured, "response_schema"):
@@ -2058,6 +2070,11 @@ class PipelineService:
             "system": system,
             "user": user,
         }
+        if self._call_accepts_keyword(self.llm.call_summary, "job_max_concurrency"):
+            kwargs["job_max_concurrency"] = self._resolve_job_llm_concurrency(
+                job_id,
+                max(1, int(self.settings.llm_max_concurrency)),
+            )
         if self._call_accepts_keyword(self.llm.call_summary, "model"):
             kwargs["model"] = model
         return self.llm.call_summary(**kwargs)
@@ -2085,6 +2102,10 @@ class PipelineService:
         call_structured = getattr(self.llm, "call_structured", None)
         if callable(call_structured):
             response_schema = self._build_response_json_schema(output_json_schema)
+            job_max_concurrency = self._resolve_job_llm_concurrency(
+                job_id,
+                max(1, int(self.settings.llm_max_concurrency)),
+            )
             kwargs = {
                 "job_id": job_id,
                 "node_id": node_id,
@@ -2093,6 +2114,8 @@ class PipelineService:
                 "user": user,
                 "response_model": JsonObjectResult,
             }
+            if self._call_accepts_keyword(call_structured, "job_max_concurrency"):
+                kwargs["job_max_concurrency"] = job_max_concurrency
             if self._call_accepts_keyword(call_structured, "model"):
                 kwargs["model"] = model
             if self._call_accepts_keyword(call_structured, "response_schema"):
@@ -2102,13 +2125,21 @@ class PipelineService:
             )
 
         # Test doubles may only implement call_summary. Keep them compatible.
-        return self.llm.call_summary(
-            job_id=job_id,
-            node_id=node_id,
-            stage=Stage.FINAL,
-            system=system,
-            user=user,
-        )
+        kwargs = {
+            "job_id": job_id,
+            "node_id": node_id,
+            "stage": Stage.FINAL,
+            "system": system,
+            "user": user,
+        }
+        if self._call_accepts_keyword(self.llm.call_summary, "job_max_concurrency"):
+            kwargs["job_max_concurrency"] = self._resolve_job_llm_concurrency(
+                job_id,
+                max(1, int(self.settings.llm_max_concurrency)),
+            )
+        if self._call_accepts_keyword(self.llm.call_summary, "model"):
+            kwargs["model"] = model
+        return self.llm.call_summary(**kwargs)
 
     @staticmethod
     def _report_format_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

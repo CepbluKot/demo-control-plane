@@ -477,6 +477,38 @@ class ModelAwareLLM(FakeLLM):
         )
 
 
+class JobConcurrencyAwareLLM(FakeLLM):
+    def call_summary(
+        self,
+        *,
+        job_id: str,
+        node_id: str,
+        stage: str,
+        system: str,
+        user: str,
+        job_max_concurrency: int | None = None,
+        model: str | None = None,
+    ) -> SummaryResult:
+        self.calls.append(
+            {
+                "job_id": job_id,
+                "node_id": node_id,
+                "stage": stage,
+                "system": system,
+                "user": user,
+                "job_max_concurrency": job_max_concurrency,
+                "model": model,
+            }
+        )
+        return SummaryResult(
+            ok=True,
+            summary=f"{stage}:{node_id}:{len(user)}",
+            key_points=[user.splitlines()[0] if user.splitlines() else ""],
+            warnings=[],
+            source_count=max(1, user.count("Summary ")),
+        )
+
+
 class CustomJsonLLM(FakeLLM):
     def call_structured(
         self,
@@ -939,6 +971,63 @@ class PromptDraftGenerationTests(unittest.TestCase):
         self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.map.user)
         self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.reduce.user)
 
+    def test_prompt_draft_generation_keeps_stage_specific_schemas_in_one_draft(self) -> None:
+        llm = PromptDraftLLMStub(
+            [
+                PromptDraftConceptSpec(
+                    report_name="Structured multi-stage report",
+                    report_instruction="Instruction",
+                    use_custom_map_output_json=True,
+                    map_output_json_schema={
+                        "chunk_summary": "string",
+                        "evidence": [{"metric": "string", "value": "number"}],
+                    },
+                    use_custom_reduce_output_json=True,
+                    reduce_output_json_schema={
+                        "merged_summary": "string",
+                        "deduplicated_findings": ["string"],
+                        "evidence_groups": [{"title": "string", "details": "string"}],
+                    },
+                    use_custom_output_json=True,
+                    output_json_schema={
+                        "executive_summary": "string",
+                        "recommendations": ["string"],
+                    },
+                ),
+                GenerateSummaryPromptDraftResponse(
+                    report_name="Structured multi-stage report",
+                    report_instruction="Instruction",
+                    prompt_overrides=SummaryPromptOverridesDraft(
+                        map=SummaryPromptStageDraft(system="map system", user="Map chunk:\n{chunk}"),
+                        reduce=SummaryPromptStageDraft(system="reduce system", user="Reduce merges:\n{summaries}"),
+                        final=SummaryPromptStageDraft(system="final system", user="Final report:\n{summaries}"),
+                    ),
+                ),
+            ]
+        )
+        request = GenerateSummaryPromptDraftRequest(
+            request="Сделай отдельные JSON для map chunks, reduce merges и final report.",
+            llm_model="llmgateway/free",
+        )
+
+        result = _generate_prompt_draft_with_llm(llm=llm, request=request, llm_model=request.llm_model)
+
+        self.assertTrue(result.use_custom_map_output_json)
+        self.assertTrue(result.use_custom_reduce_output_json)
+        self.assertTrue(result.use_custom_output_json)
+        assert result.map_output_json_schema is not None
+        assert result.reduce_output_json_schema is not None
+        assert result.output_json_schema is not None
+        self.assertEqual(result.map_output_json_schema["properties"]["chunk_summary"]["type"], "string")
+        self.assertEqual(result.reduce_output_json_schema["properties"]["merged_summary"]["type"], "string")
+        self.assertEqual(result.output_json_schema["properties"]["executive_summary"]["type"], "string")
+        self.assertIn("{chunk}", result.prompt_overrides.map.user)
+        self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.map.user)
+        self.assertIn("{summaries}", result.prompt_overrides.reduce.user)
+        self.assertIn("{intermediate_output_json_schema}", result.prompt_overrides.reduce.user)
+        self.assertIn("{summaries}", result.prompt_overrides.final.user)
+        self.assertIn("{output_json_schema}", result.prompt_overrides.final.user)
+
     def test_disabled_custom_output_json_discards_generated_schema(self) -> None:
         llm = PromptDraftLLMStub(
             [
@@ -1118,6 +1207,78 @@ class LlmConnectivityCheckTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(captured["pool_kind"], "assistant")
+        self.assertIsNone(captured.get("job_max_concurrency"))
+
+    def test_structured_llm_client_passes_job_max_concurrency_to_pool(self) -> None:
+        class NoopStore:
+            def insert_llm_call(self, **kwargs: Any) -> None:
+                return None
+
+        captured: dict[str, Any] = {}
+
+        class FakeAcquire:
+            def __init__(self, *_args: Any, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def __enter__(self) -> int:
+                return 0
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+        class StubResponse:
+            def __init__(self) -> None:
+                self.choices = [type("Choice", (), {"message": type("Message", (), {"content": '{"ok": true, "summary": "done", "key_points": [], "source_count": 1}'})()})()]
+                self.usage = type(
+                    "Usage",
+                    (),
+                    {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                )()
+
+            def model_dump(self, mode: str = "json") -> dict[str, Any]:
+                del mode
+                return {"choices": [{"message": {"content": '{"ok": true, "summary": "done", "key_points": [], "source_count": 1}'}}]}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs: Any) -> None:
+                del kwargs
+                self.chat = type(
+                    "Chat",
+                    (),
+                    {"completions": type("Completions", (), {"create": staticmethod(lambda **_kwargs: StubResponse())})()},
+                )()
+
+        settings = replace(
+            get_settings(),
+            dry_run=False,
+            openai_api_base="http://llm-gateway.local/v1",
+            openai_api_key="secret",
+            llm_model="llmgateway/free",
+            llm_models=("llmgateway/free",),
+            llm_max_concurrency=4,
+        )
+        client = StructuredLLMClient(
+            store=NoopStore(),
+            settings=settings,
+            pool_kind="jobs",
+        )
+
+        with patch("summary_backend.llm_client.acquire_llm_pool_slot", FakeAcquire), patch(
+            "openai.OpenAI",
+            FakeOpenAI,
+        ):
+            result = client.call_summary(
+                job_id="job-1",
+                node_id="node-1",
+                stage="MAP",
+                system="system",
+                user="user",
+                job_max_concurrency=1,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["pool_kind"], "jobs")
+        self.assertEqual(captured["job_max_concurrency"], 1)
 
     def test_prompt_draft_job_runner_builds_assistant_pool_client(self) -> None:
         manager = PromptDraftJobManager()
@@ -1780,6 +1941,19 @@ class SummaryBackendPipelineTests(unittest.TestCase):
 
         queued_maps = [item for item in queue.items if item[0] == "map"]
         self.assertEqual(len(queued_maps), 2)
+
+    def test_map_node_passes_job_llm_concurrency_into_llm_call(self) -> None:
+        service, store, _, _ = self.make_service(chunks=["chunk-1"])
+        llm = JobConcurrencyAwareLLM()
+        service.llm = llm
+        job_id = service.create_job(input_text="input", title="job-runtime-limit", metadata={"llm_concurrency": 1})
+        service.advance_job(job_id)
+
+        node = next(item for item in store.list_nodes_current(job_id) if item["node_type"] == str(NodeType.MAP))
+        service.map_node(job_id, str(node["node_id"]))
+
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(llm.calls[0]["job_max_concurrency"], 1)
 
     def test_advance_requeues_stale_running_nodes_after_worker_restart(self) -> None:
         service, store, _, queue = self.make_service(chunks=["chunk-1", "chunk-2", "chunk-3"])

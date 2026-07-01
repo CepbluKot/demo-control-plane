@@ -33,7 +33,19 @@ class ClickHouseStore:
                 database=self.settings.clickhouse_database,
                 secure=self.settings.clickhouse_secure,
             )
+            self._ensure_runtime_schema_extensions()
         return self._client
+
+    def _ensure_runtime_schema_extensions(self) -> None:
+        table = self._table("summary_llm_calls")
+        for command in (
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pool_wait_ms UInt32 DEFAULT 0",
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS provider_latency_ms UInt32 DEFAULT 0",
+        ):
+            try:
+                self._client.command(command)
+            except Exception as exc:  # pragma: no cover - defensive startup compatibility
+                logger.warning("clickhouse_schema_extension_failed | command=%s error=%s", command, exc)
 
     def close(self) -> None:
         if self._client is not None:
@@ -220,6 +232,8 @@ class ClickHouseStore:
         error_class: str = "",
         http_status: int = 0,
         latency_ms: int = 0,
+        pool_wait_ms: int = 0,
+        provider_latency_ms: int = 0,
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
@@ -239,6 +253,8 @@ class ClickHouseStore:
                     error_class,
                     http_status,
                     latency_ms,
+                    pool_wait_ms,
+                    provider_latency_ms,
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
@@ -258,6 +274,8 @@ class ClickHouseStore:
                 "error_class",
                 "http_status",
                 "latency_ms",
+                "pool_wait_ms",
+                "provider_latency_ms",
                 "prompt_tokens",
                 "completion_tokens",
                 "total_tokens",
@@ -283,9 +301,13 @@ class ClickHouseStore:
                 error_class,
                 http_status,
                 latency_ms,
+                pool_wait_ms,
+                provider_latency_ms,
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                request_json,
+                response_json,
                 error_message
             FROM {self._table("summary_llm_calls")}
             WHERE job_id = %(job_id)s AND node_id = %(node_id)s

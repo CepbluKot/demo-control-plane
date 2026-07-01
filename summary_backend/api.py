@@ -918,6 +918,7 @@ def _generate_prompt_draft_concept_spec(
         "If the user already provided a REDUCE JSON structure, preserve it and set use_custom_reduce_output_json to true. "
         "If the user only provided one shared intermediate JSON structure, preserve it for both MAP and REDUCE, and also set use_custom_intermediate_output_json to true. "
         "MAP and REDUCE may share the same schema when that is genuinely the best design, but do not force them to be identical when different stage outputs are more useful. "
+        "When structured outputs are useful across all three stages, prefer returning explicit MAP, REDUCE, and FINAL schemas together in one spec. "
         "If the user already provided a final output JSON structure, preserve it and set use_custom_output_json to true. "
         "If the request explicitly asks for a strict final JSON structure, create one that is directly usable as a JSON schema for an object response. "
         "If no strict final structure is clearly needed, keep use_custom_output_json false and output_json_schema null."
@@ -945,6 +946,7 @@ def _generate_prompt_draft_concept_spec(
         "- use_custom_reduce_output_json/reduce_output_json_schema: only when structured REDUCE objects would materially help consolidation, traceability, or the FINAL stage\n"
         "- use_custom_intermediate_output_json/intermediate_output_json_schema: only when MAP and REDUCE should intentionally share the same structure\n"
         "- use_custom_output_json/output_json_schema: only when strict structured final output is genuinely useful, unless the request explicitly says custom JSON output is required\n"
+        "- When structured outputs are useful for MAP, REDUCE, and FINAL, return all three stage schemas in this single spec instead of omitting them\n"
         "- When any output schema is needed, return a practical object schema with stable keys and concrete field types\n"
         "Do not write MAP, REDUCE, or FINAL prompts yet."
     )
@@ -978,6 +980,7 @@ def _generate_prompt_draft_from_spec(
         "Each stage must include a system prompt and a user prompt template. "
         "If a MAP JSON structure is provided, MAP must return that exact structure. "
         "If a REDUCE JSON structure is provided, REDUCE must return that exact structure. "
+        "If stage-specific schemas are present in the spec, keep them all in the generated draft response together with the prompts. "
         "Otherwise MAP or REDUCE must keep returning the internal SummaryResult JSON shape: "
         '{"ok": true, "summary": "string", "key_points": ["string"], "warnings": ["string"], "source_count": 1}. '
         "MAP should explain what to extract from a single chunk. "
