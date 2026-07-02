@@ -298,6 +298,11 @@ class Settings:
     broker_url: str
     worker_processes: int
     worker_threads: int
+    dify_api_base: str
+    dify_timeout_seconds: float
+    dify_secrets_path: Path
+    monitoring_scheduler_enabled: bool
+    monitoring_scheduler_poll_interval_seconds: float
 
     openai_api_base: str
     openai_api_key: str
@@ -441,6 +446,17 @@ def get_settings() -> Settings:
         broker_url=_env("SUMMARY_BACKEND_BROKER_URL", "redis://localhost:6379/0"),
         worker_processes=worker_processes,
         worker_threads=worker_threads,
+        dify_api_base=_env("SUMMARY_BACKEND_DIFY_API_BASE", "http://localhost:18000"),
+        dify_timeout_seconds=max(5.0, _env_float("SUMMARY_BACKEND_DIFY_TIMEOUT_SECONDS", 900.0)),
+        dify_secrets_path=_env_path(
+            "SUMMARY_BACKEND_DIFY_SECRETS_PATH",
+            str(Path(__file__).resolve().parents[2] / "dify-procative-pipline-bak" / "secrets.local.json"),
+        ),
+        monitoring_scheduler_enabled=_env_bool("SUMMARY_BACKEND_MONITORING_SCHEDULER_ENABLED", False),
+        monitoring_scheduler_poll_interval_seconds=max(
+            1.0,
+            _env_float("SUMMARY_BACKEND_MONITORING_SCHEDULER_POLL_INTERVAL_SECONDS", 15.0),
+        ),
         openai_api_base=openai_api_base,
         openai_api_key=openai_api_key,
         llm_default_profile=llm_default_profile,

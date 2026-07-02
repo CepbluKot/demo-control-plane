@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,14 +19,17 @@ logger = get_logger("store")
 class ClickHouseStore:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
-        self._client = None
+        self._local = threading.local()
+        self._schema_lock = threading.Lock()
+        self._schema_extensions_ready = False
 
     @property
     def client(self):
-        if self._client is None:
+        client = getattr(self._local, "client", None)
+        if client is None:
             import clickhouse_connect
 
-            self._client = clickhouse_connect.get_client(
+            client = clickhouse_connect.get_client(
                 host=self.settings.clickhouse_host,
                 port=self.settings.clickhouse_port,
                 username=self.settings.clickhouse_username,
@@ -33,26 +37,32 @@ class ClickHouseStore:
                 database=self.settings.clickhouse_database,
                 secure=self.settings.clickhouse_secure,
             )
-            self._ensure_runtime_schema_extensions()
-        return self._client
+            self._local.client = client
+            self._ensure_runtime_schema_extensions(client)
+        return client
 
-    def _ensure_runtime_schema_extensions(self) -> None:
-        table = self._table("summary_llm_calls")
-        for command in (
-            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pool_wait_ms UInt32 DEFAULT 0",
-            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS provider_latency_ms UInt32 DEFAULT 0",
-        ):
-            try:
-                self._client.command(command)
-            except Exception as exc:  # pragma: no cover - defensive startup compatibility
-                logger.warning("clickhouse_schema_extension_failed | command=%s error=%s", command, exc)
+    def _ensure_runtime_schema_extensions(self, client) -> None:
+        with self._schema_lock:
+            if self._schema_extensions_ready:
+                return
+            table = self._table("summary_llm_calls")
+            for command in (
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pool_wait_ms UInt32 DEFAULT 0",
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS provider_latency_ms UInt32 DEFAULT 0",
+            ):
+                try:
+                    client.command(command)
+                except Exception as exc:  # pragma: no cover - defensive startup compatibility
+                    logger.warning("clickhouse_schema_extension_failed | command=%s error=%s", command, exc)
+            self._schema_extensions_ready = True
 
     def close(self) -> None:
-        if self._client is not None:
+        client = getattr(self._local, "client", None)
+        if client is not None:
             try:
-                self._client.close()
+                client.close()
             finally:
-                self._client = None
+                self._local.client = None
 
     def _table(self, name: str) -> str:
         return f"{self.settings.clickhouse_database}.{name}"
@@ -677,3 +687,361 @@ class ClickHouseStore:
             """
         )
         return self._rows(result)
+
+    def insert_monitoring_profile_snapshot(
+        self,
+        *,
+        profile_id: str,
+        name: str,
+        service: str,
+        description: str,
+        workflow_id: str,
+        workflow_inputs: dict[str, Any] | None,
+        metadata: dict[str, Any] | None,
+        is_archived: bool,
+        created_at,
+        updated_at,
+    ) -> None:
+        self.client.insert(
+            self._table("monitoring_profiles"),
+            [
+                [
+                    profile_id,
+                    name,
+                    service,
+                    description,
+                    workflow_id,
+                    self._json(workflow_inputs),
+                    self._json(metadata),
+                    1 if is_archived else 0,
+                    created_at,
+                    updated_at,
+                ]
+            ],
+            column_names=[
+                "profile_id",
+                "name",
+                "service",
+                "description",
+                "workflow_id",
+                "workflow_inputs",
+                "metadata",
+                "is_archived",
+                "created_at",
+                "updated_at",
+            ],
+        )
+
+    def get_monitoring_profile_current(self, profile_id: str) -> dict[str, Any] | None:
+        result = self.client.query(
+            f"""
+            SELECT
+                profile_id,
+                argMax(name, tuple(updated_at, snapshot_id)) AS name,
+                argMax(service, tuple(updated_at, snapshot_id)) AS service,
+                argMax(description, tuple(updated_at, snapshot_id)) AS description,
+                argMax(workflow_id, tuple(updated_at, snapshot_id)) AS workflow_id,
+                argMax(workflow_inputs, tuple(updated_at, snapshot_id)) AS workflow_inputs,
+                argMax(metadata, tuple(updated_at, snapshot_id)) AS metadata,
+                argMax(is_archived, tuple(updated_at, snapshot_id)) AS is_archived,
+                min(created_at) AS created_at,
+                max(updated_at) AS snapshot_updated_at
+            FROM {self._table("monitoring_profiles")}
+            WHERE profile_id = %(profile_id)s
+            GROUP BY profile_id
+            """,
+            parameters={"profile_id": profile_id},
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows[0] if rows else None
+
+    def list_monitoring_profiles(self, *, include_archived: bool = False, limit: int = 500) -> list[dict[str, Any]]:
+        where_clause = "" if include_archived else "WHERE is_archived = 0"
+        result = self.client.query(
+            f"""
+            SELECT *
+            FROM (
+                SELECT
+                    profile_id,
+                    argMax(name, tuple(updated_at, snapshot_id)) AS name,
+                    argMax(service, tuple(updated_at, snapshot_id)) AS service,
+                    argMax(description, tuple(updated_at, snapshot_id)) AS description,
+                    argMax(workflow_id, tuple(updated_at, snapshot_id)) AS workflow_id,
+                    argMax(workflow_inputs, tuple(updated_at, snapshot_id)) AS workflow_inputs,
+                    argMax(metadata, tuple(updated_at, snapshot_id)) AS metadata,
+                    argMax(is_archived, tuple(updated_at, snapshot_id)) AS is_archived,
+                    min(created_at) AS created_at,
+                    max(updated_at) AS snapshot_updated_at
+                FROM {self._table("monitoring_profiles")}
+                GROUP BY profile_id
+            )
+            {where_clause}
+            ORDER BY snapshot_updated_at DESC, profile_id ASC
+            LIMIT %(limit)s
+            """,
+            parameters={"limit": limit},
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows
+
+    def insert_monitoring_schedule_snapshot(
+        self,
+        *,
+        profile_id: str,
+        cron: str,
+        timezone: str,
+        is_enabled: bool,
+        max_active_runs: int,
+        next_run_at,
+        last_run_at,
+        created_at,
+        updated_at,
+    ) -> None:
+        self.client.insert(
+            self._table("monitoring_schedules"),
+            [
+                [
+                    profile_id,
+                    cron,
+                    timezone,
+                    1 if is_enabled else 0,
+                    max_active_runs,
+                    next_run_at,
+                    last_run_at,
+                    created_at,
+                    updated_at,
+                ]
+            ],
+            column_names=[
+                "profile_id",
+                "cron",
+                "timezone",
+                "is_enabled",
+                "max_active_runs",
+                "next_run_at",
+                "last_run_at",
+                "created_at",
+                "updated_at",
+            ],
+        )
+
+    def get_monitoring_schedule_current(self, profile_id: str) -> dict[str, Any] | None:
+        result = self.client.query(
+            f"""
+            SELECT
+                profile_id,
+                argMax(cron, tuple(updated_at, snapshot_id)) AS cron,
+                argMax(timezone, tuple(updated_at, snapshot_id)) AS timezone,
+                argMax(is_enabled, tuple(updated_at, snapshot_id)) AS is_enabled,
+                argMax(max_active_runs, tuple(updated_at, snapshot_id)) AS max_active_runs,
+                argMax(next_run_at, tuple(updated_at, snapshot_id)) AS next_run_at,
+                argMax(last_run_at, tuple(updated_at, snapshot_id)) AS last_run_at,
+                min(created_at) AS created_at,
+                max(updated_at) AS snapshot_updated_at
+            FROM {self._table("monitoring_schedules")}
+            WHERE profile_id = %(profile_id)s
+            GROUP BY profile_id
+            """,
+            parameters={"profile_id": profile_id},
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows[0] if rows else None
+
+    def list_due_monitoring_schedules(self, *, now, limit: int = 50) -> list[dict[str, Any]]:
+        result = self.client.query(
+            f"""
+            SELECT *
+            FROM (
+                SELECT
+                    profile_id,
+                    argMax(cron, tuple(updated_at, snapshot_id)) AS cron,
+                    argMax(timezone, tuple(updated_at, snapshot_id)) AS timezone,
+                    argMax(is_enabled, tuple(updated_at, snapshot_id)) AS is_enabled,
+                    argMax(max_active_runs, tuple(updated_at, snapshot_id)) AS max_active_runs,
+                    argMax(next_run_at, tuple(updated_at, snapshot_id)) AS next_run_at,
+                    argMax(last_run_at, tuple(updated_at, snapshot_id)) AS last_run_at,
+                    min(created_at) AS created_at,
+                    max(updated_at) AS snapshot_updated_at
+                FROM {self._table("monitoring_schedules")}
+                GROUP BY profile_id
+            )
+            WHERE is_enabled = 1
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= %(now)s
+            ORDER BY next_run_at ASC, profile_id ASC
+            LIMIT %(limit)s
+            """,
+            parameters={"now": now, "limit": limit},
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows
+
+    def insert_monitoring_run_snapshot(
+        self,
+        *,
+        run_id: str,
+        profile_id: str,
+        status: str,
+        trigger_type: str,
+        workflow_id: str,
+        workflow_run_id: str,
+        task_id: str,
+        requested_at,
+        started_at,
+        finished_at,
+        scheduled_for,
+        inputs_json: dict[str, Any] | None,
+        output_json: dict[str, Any] | None,
+        error_message: str,
+        metadata: dict[str, Any] | None,
+        updated_at,
+    ) -> None:
+        self.client.insert(
+            self._table("monitoring_runs"),
+            [
+                [
+                    run_id,
+                    profile_id,
+                    status,
+                    trigger_type,
+                    workflow_id,
+                    workflow_run_id,
+                    task_id,
+                    requested_at,
+                    started_at,
+                    finished_at,
+                    scheduled_for,
+                    self._json(inputs_json),
+                    self._json(output_json),
+                    error_message,
+                    self._json(metadata),
+                    updated_at,
+                ]
+            ],
+            column_names=[
+                "run_id",
+                "profile_id",
+                "status",
+                "trigger_type",
+                "workflow_id",
+                "workflow_run_id",
+                "task_id",
+                "requested_at",
+                "started_at",
+                "finished_at",
+                "scheduled_for",
+                "inputs_json",
+                "output_json",
+                "error_message",
+                "metadata",
+                "updated_at",
+            ],
+        )
+
+    def get_monitoring_run_current(self, run_id: str) -> dict[str, Any] | None:
+        result = self.client.query(
+            f"""
+            SELECT
+                run_id,
+                argMax(profile_id, tuple(updated_at, snapshot_id)) AS profile_id,
+                argMax(status, tuple(updated_at, snapshot_id)) AS status,
+                argMax(trigger_type, tuple(updated_at, snapshot_id)) AS trigger_type,
+                argMax(workflow_id, tuple(updated_at, snapshot_id)) AS workflow_id,
+                argMax(workflow_run_id, tuple(updated_at, snapshot_id)) AS workflow_run_id,
+                argMax(task_id, tuple(updated_at, snapshot_id)) AS task_id,
+                argMax(requested_at, tuple(updated_at, snapshot_id)) AS requested_at,
+                argMax(started_at, tuple(updated_at, snapshot_id)) AS started_at,
+                argMax(finished_at, tuple(updated_at, snapshot_id)) AS finished_at,
+                argMax(scheduled_for, tuple(updated_at, snapshot_id)) AS scheduled_for,
+                argMax(inputs_json, tuple(updated_at, snapshot_id)) AS inputs_json,
+                argMax(output_json, tuple(updated_at, snapshot_id)) AS output_json,
+                argMax(error_message, tuple(updated_at, snapshot_id)) AS error_message,
+                argMax(metadata, tuple(updated_at, snapshot_id)) AS metadata,
+                max(updated_at) AS snapshot_updated_at
+            FROM {self._table("monitoring_runs")}
+            WHERE run_id = %(run_id)s
+            GROUP BY run_id
+            """,
+            parameters={"run_id": run_id},
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows[0] if rows else None
+
+    def list_monitoring_runs(
+        self,
+        *,
+        profile_id: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where_parts: list[str] = []
+        params: dict[str, Any] = {"limit": limit}
+        if profile_id:
+            where_parts.append("profile_id = %(profile_id)s")
+            params["profile_id"] = profile_id
+        if status:
+            where_parts.append("status = %(status)s")
+            params["status"] = status
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        result = self.client.query(
+            f"""
+            SELECT *
+            FROM (
+                SELECT
+                    run_id,
+                    argMax(profile_id, tuple(updated_at, snapshot_id)) AS profile_id,
+                    argMax(status, tuple(updated_at, snapshot_id)) AS status,
+                    argMax(trigger_type, tuple(updated_at, snapshot_id)) AS trigger_type,
+                    argMax(workflow_id, tuple(updated_at, snapshot_id)) AS workflow_id,
+                    argMax(workflow_run_id, tuple(updated_at, snapshot_id)) AS workflow_run_id,
+                    argMax(task_id, tuple(updated_at, snapshot_id)) AS task_id,
+                    argMax(requested_at, tuple(updated_at, snapshot_id)) AS requested_at,
+                    argMax(started_at, tuple(updated_at, snapshot_id)) AS started_at,
+                    argMax(finished_at, tuple(updated_at, snapshot_id)) AS finished_at,
+                    argMax(scheduled_for, tuple(updated_at, snapshot_id)) AS scheduled_for,
+                    argMax(inputs_json, tuple(updated_at, snapshot_id)) AS inputs_json,
+                    argMax(output_json, tuple(updated_at, snapshot_id)) AS output_json,
+                    argMax(error_message, tuple(updated_at, snapshot_id)) AS error_message,
+                    argMax(metadata, tuple(updated_at, snapshot_id)) AS metadata,
+                    max(updated_at) AS snapshot_updated_at
+                FROM {self._table("monitoring_runs")}
+                GROUP BY run_id
+            )
+            {where_clause}
+            ORDER BY snapshot_updated_at DESC, run_id DESC
+            LIMIT %(limit)s
+            """,
+            parameters=params,
+        )
+        rows = self._rows(result)
+        for row in rows:
+            row["updated_at"] = row.pop("snapshot_updated_at", None)
+        return rows
+
+    def count_monitoring_active_runs(self, profile_id: str) -> int:
+        result = self.client.query(
+            f"""
+            SELECT count()
+            FROM (
+                SELECT
+                    run_id,
+                    argMax(status, tuple(updated_at, snapshot_id)) AS status
+                FROM {self._table("monitoring_runs")}
+                WHERE profile_id = %(profile_id)s
+                GROUP BY run_id
+            )
+            WHERE status IN ('CREATED', 'RUNNING')
+            """,
+            parameters={"profile_id": profile_id},
+        )
+        return int(result.result_rows[0][0]) if result.result_rows else 0

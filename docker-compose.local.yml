@@ -71,10 +71,17 @@ services:
       SUMMARY_BACKEND_LOG_LEVEL: INFO
       SUMMARY_BACKEND_WORKER_PROCESSES: "1"
       SUMMARY_BACKEND_WORKER_THREADS: "6"
+      SUMMARY_BACKEND_DIFY_API_BASE: "http://host.docker.internal:18000"
+      SUMMARY_BACKEND_DIFY_SECRETS_PATH: "/app/runtime-secrets/dify-secrets.local.json"
+      SUMMARY_BACKEND_MONITORING_SCHEDULER_ENABLED: "false"
+      SUMMARY_BACKEND_MONITORING_SCHEDULER_POLL_INTERVAL_SECONDS: "20"
     ports:
       - "28088:8088"
     volumes:
       - ./artifacts:/app/artifacts
+      - ../dify-procative-pipline-bak/secrets.local.json:/app/runtime-secrets/dify-secrets.local.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       clickhouse:
         condition: service_healthy

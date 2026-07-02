@@ -10,6 +10,14 @@ def new_job_id() -> str:
     return f"job_{uuid.uuid4().hex}"
 
 
+def new_monitoring_profile_id() -> str:
+    return f"profile_{uuid.uuid4().hex}"
+
+
+def new_monitoring_run_id() -> str:
+    return f"run_{uuid.uuid4().hex}"
+
+
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

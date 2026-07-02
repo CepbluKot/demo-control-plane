@@ -422,3 +422,101 @@ class SummaryNodeLlmCallResponse(BaseModel):
 class PauseResumeResponse(BaseModel):
     job_id: str
     status: JobStatus
+
+
+class MonitoringRunStatus(StrEnum):
+    CREATED = "CREATED"
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+
+
+class MonitoringRunTrigger(StrEnum):
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+
+
+class MonitoringScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    cron: str = ""
+    timezone: str = "UTC"
+    max_active_runs: int = Field(default=1, ge=1)
+
+
+class CreateMonitoringProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    service: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    workflow_id: str = Field(min_length=1, max_length=200)
+    workflow_inputs: dict[str, Any] = Field(default_factory=dict)
+    schedule: MonitoringScheduleConfig | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MonitoringProfileRecord(BaseModel):
+    profile_id: str
+    name: str
+    service: str
+    description: str = ""
+    workflow_id: str
+    workflow_inputs: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    is_archived: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    schedule: MonitoringScheduleConfig | None = None
+    next_run_at: datetime | None = None
+    last_run_at: datetime | None = None
+
+
+class CreateMonitoringProfileResponse(BaseModel):
+    profile: MonitoringProfileRecord
+
+
+class MonitoringScheduleTickItem(BaseModel):
+    profile_id: str
+    action: str
+    run_id: str = ""
+    detail: str = ""
+    next_run_at: datetime | None = None
+
+
+class MonitoringSchedulerTickResponse(BaseModel):
+    checked_at: datetime
+    launched: int
+    skipped: int
+    items: list[MonitoringScheduleTickItem]
+
+
+class CreateMonitoringRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_inputs_override: dict[str, Any] = Field(default_factory=dict)
+
+
+class MonitoringRunRecord(BaseModel):
+    run_id: str
+    profile_id: str
+    status: MonitoringRunStatus
+    trigger_type: MonitoringRunTrigger
+    workflow_id: str
+    workflow_run_id: str = ""
+    task_id: str = ""
+    requested_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    scheduled_for: datetime | None = None
+    workflow_inputs: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    error_message: str = ""
+    updated_at: datetime | None = None
+
+
+class CreateMonitoringRunResponse(BaseModel):
+    run: MonitoringRunRecord

@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import AuditWriter
 from .config import build_settings_llm_model_options, get_settings, resolve_llm_model_option
+from .dify_client import DifyWorkflowClient
 from .errors import LlmPoolBusyError
 from .factory import create_pipeline_service
 from .ids import new_job_id
@@ -27,6 +28,7 @@ from .input_parsers import InputParseError
 from .job_timing import attach_job_lifecycle_timestamps
 from .llm_client import StructuredLLMClient
 from .logging_setup import configure_logging, get_logger
+from .monitoring import MonitoringSchedulerLoop, create_monitoring_service
 from .pipeline import (
     CUSTOM_JSON_MAP_SYSTEM,
     CUSTOM_JSON_REDUCE_SYSTEM,
@@ -49,6 +51,10 @@ from .schemas import (
     CreateSummaryJobRequest,
     CreateSummaryJobResponse,
     CreateSummaryJobUploadResponse,
+    CreateMonitoringProfileRequest,
+    CreateMonitoringProfileResponse,
+    CreateMonitoringRunRequest,
+    CreateMonitoringRunResponse,
     DatasourceQueryPreviewMetadata,
     DatasourceQueryPreviewRequest,
     DatasourceQueryPreviewResponse,
@@ -60,6 +66,9 @@ from .schemas import (
     JobStatus,
     JobStatusResponse,
     NodeCurrent,
+    MonitoringProfileRecord,
+    MonitoringRunRecord,
+    MonitoringSchedulerTickResponse,
     PauseResumeResponse,
     PromptDraftJobRecord,
     PromptDraftJobStatus,
@@ -95,9 +104,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+monitoring_store = ClickHouseStore(settings)
+monitoring_service = create_monitoring_service(
+    store=monitoring_store,
+    settings=settings,
+    workflow_client=DifyWorkflowClient(settings),
+)
+monitoring_scheduler = MonitoringSchedulerLoop(
+    monitoring_service,
+    settings.monitoring_scheduler_poll_interval_seconds,
+)
+
 
 def _service():
     return create_pipeline_service(queue=DramatiqTaskQueue(), settings=settings)
+
+
+@app.on_event("startup")
+def _startup_monitoring_scheduler() -> None:
+    if settings.monitoring_scheduler_enabled:
+        monitoring_scheduler.start()
+
+
+@app.on_event("shutdown")
+def _shutdown_monitoring_scheduler() -> None:
+    monitoring_scheduler.stop()
+    monitoring_store.close()
 
 
 def _safe_int(value: Any) -> int:
@@ -1758,6 +1790,70 @@ def rerun_summary_node(job_id: str, node_id: str) -> RerunSummaryNodeResponse:
 def cancel_summary_job(job_id: str) -> PauseResumeResponse:
     _service().cancel_job(job_id)
     return PauseResumeResponse(job_id=job_id, status=JobStatus.CANCEL_REQUESTED)
+
+
+@app.post("/monitoring-profiles", response_model=CreateMonitoringProfileResponse)
+def create_monitoring_profile(request: CreateMonitoringProfileRequest) -> CreateMonitoringProfileResponse:
+    try:
+        profile = monitoring_service.create_profile(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CreateMonitoringProfileResponse(profile=profile)
+
+
+@app.get("/monitoring-profiles", response_model=list[MonitoringProfileRecord])
+def list_monitoring_profiles(include_archived: bool = Query(default=False)) -> list[MonitoringProfileRecord]:
+    return monitoring_service.list_profiles(include_archived=include_archived)
+
+
+@app.get("/monitoring-profiles/{profile_id}", response_model=MonitoringProfileRecord)
+def get_monitoring_profile(profile_id: str) -> MonitoringProfileRecord:
+    profile = monitoring_service.get_profile(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"monitoring profile not found: {profile_id}")
+    return profile
+
+
+@app.post("/monitoring-profiles/{profile_id}/archive", response_model=CreateMonitoringProfileResponse)
+def archive_monitoring_profile(profile_id: str) -> CreateMonitoringProfileResponse:
+    try:
+        profile = monitoring_service.archive_profile(profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"monitoring profile not found: {profile_id}") from exc
+    return CreateMonitoringProfileResponse(profile=profile)
+
+
+@app.post("/monitoring-profiles/{profile_id}/run", response_model=CreateMonitoringRunResponse)
+def create_monitoring_run(profile_id: str, request: CreateMonitoringRunRequest) -> CreateMonitoringRunResponse:
+    try:
+        run = monitoring_service.create_run(profile_id, request)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"monitoring profile not found: {profile_id}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CreateMonitoringRunResponse(run=run)
+
+
+@app.get("/monitoring-runs", response_model=list[MonitoringRunRecord])
+def list_monitoring_runs(
+    profile_id: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> list[MonitoringRunRecord]:
+    return monitoring_service.list_runs(profile_id=profile_id, status=status, limit=limit)
+
+
+@app.get("/monitoring-runs/{run_id}", response_model=MonitoringRunRecord)
+def get_monitoring_run(run_id: str) -> MonitoringRunRecord:
+    run = monitoring_service.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"monitoring run not found: {run_id}")
+    return run
+
+
+@app.post("/monitoring-scheduler/tick", response_model=MonitoringSchedulerTickResponse)
+def tick_monitoring_scheduler(limit: int = Query(default=50, ge=1, le=500)) -> MonitoringSchedulerTickResponse:
+    return monitoring_service.run_due_schedules(limit=limit)
 
 
 @app.websocket("/ws/summary-jobs/{job_id}")

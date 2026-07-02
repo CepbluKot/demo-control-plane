@@ -1,4 +1,5 @@
 clickhouse-connect
+croniter
 dramatiq[redis]
 fastapi
 httpx

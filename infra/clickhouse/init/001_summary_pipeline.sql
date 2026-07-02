@@ -115,6 +115,62 @@ SELECT
 FROM summary_test.summary_node_events
 GROUP BY job_id, node_id;
 
+CREATE TABLE IF NOT EXISTS summary_test.monitoring_profiles
+(
+    snapshot_id UUID DEFAULT generateUUIDv4(),
+    profile_id String,
+    name String,
+    service String,
+    description String DEFAULT '',
+    workflow_id String,
+    workflow_inputs String DEFAULT '{}',
+    metadata String DEFAULT '{}',
+    is_archived UInt8 DEFAULT 0,
+    created_at DateTime64(3, 'UTC') DEFAULT now64(3),
+    updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = MergeTree
+ORDER BY (profile_id, updated_at, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS summary_test.monitoring_schedules
+(
+    snapshot_id UUID DEFAULT generateUUIDv4(),
+    profile_id String,
+    cron String DEFAULT '',
+    timezone String DEFAULT 'UTC',
+    is_enabled UInt8 DEFAULT 0,
+    max_active_runs UInt32 DEFAULT 1,
+    next_run_at Nullable(DateTime64(3, 'UTC')),
+    last_run_at Nullable(DateTime64(3, 'UTC')),
+    created_at DateTime64(3, 'UTC') DEFAULT now64(3),
+    updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = MergeTree
+ORDER BY (profile_id, updated_at, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS summary_test.monitoring_runs
+(
+    snapshot_id UUID DEFAULT generateUUIDv4(),
+    run_id String,
+    profile_id String,
+    status LowCardinality(String),
+    trigger_type LowCardinality(String),
+    workflow_id String,
+    workflow_run_id String DEFAULT '',
+    task_id String DEFAULT '',
+    requested_at DateTime64(3, 'UTC') DEFAULT now64(3),
+    started_at Nullable(DateTime64(3, 'UTC')),
+    finished_at Nullable(DateTime64(3, 'UTC')),
+    scheduled_for Nullable(DateTime64(3, 'UTC')),
+    inputs_json String DEFAULT '{}',
+    output_json String DEFAULT '{}',
+    error_message String DEFAULT '',
+    metadata String DEFAULT '{}',
+    updated_at DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = MergeTree
+ORDER BY (profile_id, run_id, updated_at, snapshot_id);
+
 INSERT INTO summary_test.summary_job_events
     (job_id, event_type, job_status, actor, message, payload)
 VALUES
